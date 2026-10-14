@@ -28,6 +28,10 @@ graphicle = { path = "../graphicle-graph" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "fs", "io-util", "io-std"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+# The CypherLite engine (neo4j-labs, tag v0.12.2, not on crates.io) — the
+# graph store core (src/store_graph.rs). default-features = false drops the
+# arrow/parquet snapshot codec (JSON snapshots instead); spike-verified.
+cypherlite = { path = "/Users/flm2dxqwm5/d/llm/graphicle/third_party/cypherlite/cypherlite/cypherlite", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

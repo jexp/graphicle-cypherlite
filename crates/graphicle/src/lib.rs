@@ -58,6 +58,7 @@ pub mod settings;
 pub mod setup;
 pub mod store;
 pub mod store_compat;
+pub mod store_graph;
 pub mod structured_memory;
 pub mod symbols;
 pub mod temporal_graph;
@@ -115,6 +116,16 @@ impl std::error::Error for Error {}
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Self::bad(format!("Storage operation failed: {e}"))
+    }
+}
+impl From<cypherlite::Error> for Error {
+    fn from(e: cypherlite::Error) -> Self {
+        match e {
+            cypherlite::Error::Conflict => {
+                Self::conflict("Write conflicted with a concurrent write")
+            }
+            other => Self::bad(format!("Graph storage operation failed: {other}")),
+        }
     }
 }
 impl From<serde_json::Error> for Error {
