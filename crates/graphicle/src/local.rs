@@ -920,7 +920,7 @@ pub fn graph_report(store: &Store, session: &Session, repository: &str) -> Resul
         let id = s(&repository, "id");
         let episode = crate::graph_projection::current_episode(db, id)?;
         Ok(
-            match crate::graph_projection::episode_row(&crate::store_graph::shared_for(db)?, id, &episode)? {
+            match crate::graph_projection::episode_row(&crate::store::graph_for(db)?, id, &episode)? {
                 Some(row) => {
                     json!({"status":"current","episode":episode,"nodes":row["node_count"],"edges":row["edge_count"]})
                 }
@@ -942,10 +942,10 @@ pub fn code_symbols(store: &Store, session: &Session, repository: &str) -> Optio
             let row = crate::store::repo(db, p, repository)?;
             let id = s(&row, "id");
             let episode = crate::graph_projection::current_episode(db, id)?;
-            if crate::graph_projection::episode_row(store.graph()?, id, &episode)?.is_none() {
+            if crate::graph_projection::episode_row(&store.graph()?, id, &episode)?.is_none() {
                 return Ok(None);
             }
-            let handle = crate::graph_projection::resident(store.graph()?, id, &episode)?;
+            let handle = crate::graph_projection::resident(&store.graph()?, id, &episode)?;
             let graph: &graphicle::graph::Graph = &handle;
             Ok(Some(
                 graph

@@ -281,10 +281,7 @@ fn a_skipped_arm_reports_projection_state_and_episode_lag() {
     // manifest only; it never searches the retained sync manifests for one.
     let db = f.store.connect().unwrap();
     crate::rewrite_episode_attributes(&db, &f.repo, |attributes| {
-        attributes
-            .as_object_mut()
-            .unwrap()
-            .remove("source_heads");
+        attributes.as_object_mut().unwrap().remove("source_heads");
     });
     let unknown = status(&f);
     assert_eq!(unknown["status"], "no_episode", "{unknown}");
@@ -451,7 +448,16 @@ fn a_recorded_episode_past_the_static_edge_bound_folds_its_edges() {
     .unwrap();
     let db = f.store.connect().unwrap();
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &f.repo).unwrap();
-    assert!(graphicle_runtime::graph_projection::persist(&db, &crate::gstore(&db), &f.repo, &episode, &graph).unwrap());
+    assert!(
+        graphicle_runtime::graph_projection::persist(
+            &db,
+            &crate::gstore(&db),
+            &f.repo,
+            &episode,
+            &graph
+        )
+        .unwrap()
+    );
     let packet = f.context("where is alpha called");
     assert_eq!(
         packet["graph_source"], "episode",

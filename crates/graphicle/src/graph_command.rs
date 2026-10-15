@@ -190,7 +190,7 @@ pub fn project_with_graph(
         .ok()?
     } else {
         // Live symbol versions of the projection (graph store).
-        let store = crate::store_graph::shared_for(&db).ok()?;
+        let store = crate::store::graph_for(&db).ok()?;
         store
             .read(|g| {
                 let mut symbol = false;
@@ -198,7 +198,10 @@ pub fn project_with_graph(
                     g,
                     "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
                      WHERE v.owner <> '' RETURN v.data AS data",
-                    crate::store_graph::Params::from([("r".to_string(), cypherlite::Value::String(found.id.as_str().into()))]),
+                    crate::store_graph::Params::from([(
+                        "r".to_string(),
+                        cypherlite::Value::String(found.id.as_str().into()),
+                    )]),
                 )? {
                     let text = crate::store::s(&row, "data");
                     if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
@@ -219,26 +222,34 @@ pub fn project_with_graph(
         None => true,
         Some(file) => {
             let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-            file.strip_prefix(&found.folder).ok().is_some_and(|relative| {
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                crate::store_graph::shared_for(&db)
-                    .and_then(|store| {
-                        store.read(|g| {
-                            crate::store_graph::one(
-                                g,
-                                "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
+            file.strip_prefix(&found.folder)
+                .ok()
+                .is_some_and(|relative| {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    crate::store::graph_for(&db)
+                        .and_then(|store| {
+                            store.read(|g| {
+                                crate::store_graph::one(
+                                    g,
+                                    "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
                                  WHERE v.owner = $owner RETURN v.data AS data LIMIT 1",
-                                crate::store_graph::Params::from([
-                                    ("r".to_string(), cypherlite::Value::String(found.id.as_str().into())),
-                                    ("owner".to_string(), cypherlite::Value::String(relative.as_str().into())),
-                                ]),
-                            )
+                                    crate::store_graph::Params::from([
+                                        (
+                                            "r".to_string(),
+                                            cypherlite::Value::String(found.id.as_str().into()),
+                                        ),
+                                        (
+                                            "owner".to_string(),
+                                            cypherlite::Value::String(relative.as_str().into()),
+                                        ),
+                                    ]),
+                                )
+                            })
                         })
-                    })
-                    .ok()
-                    .flatten()
-                    .is_some()
-            })
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
         }
     };
     Some(GraphFolder {

@@ -9,13 +9,13 @@
 //! thread on first use — check one out per worker thread and keep it, never
 //! one per request.
 use crate::{Error, Result};
-use cypherlite::{Connection, Database, OpenMode, OpenOptions, Value};
+use cypherlite::{Connection, Database, Value};
 use serde_json::{Map, Value as Json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -79,6 +79,18 @@ impl GraphStore {
     pub fn database(&self) -> &Database {
         &self.database
     }
+    /// The engine Arc, for the `graph_for` registry's weak dedup.
+    pub(crate) fn shared_engine(&self) -> Arc<Database> {
+        Arc::clone(&self.database)
+    }
+    /// Wrap an already-open engine (the `graph_for` registry dedups on it);
+    /// the schema was applied when the engine was first opened.
+    pub(crate) fn from_shared_engine(database: Arc<Database>, path: PathBuf) -> GraphStore {
+        GraphStore {
+            database,
+            location: Arc::new(StoreLocation::Path(path)),
+        }
+    }
     /// A connection for the calling thread. Keep it for the thread's
     /// lifetime; each connection spawns its query worker lazily.
     pub fn connection(&self) -> Result<Connection> {
@@ -132,83 +144,6 @@ impl GraphStore {
     pub fn checkpoint(&self) -> Result<()> {
         Ok(self.database.checkpoint()?)
     }
-    /// A read-only follower of the store at `path` (ADR-0137: tails the
-    /// writer's WAL on a background thread): for a process that reads the
-    /// graph beside the process holding the writer lease (a CLI command or
-    /// test runner next to a running server). Applies no schema (a follower
-    /// cannot write); writes fail with "database is read-only".
-    pub fn open_follower(path: impl AsRef<Path>) -> Result<GraphStore> {
-        let path = path.as_ref();
-        let uri = path
-            .to_str()
-            .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
-        Ok(Self {
-            database: Arc::new(Database::open_with(
-                uri,
-                OpenOptions::with_mode(OpenMode::Follow),
-            )?),
-            location: Arc::new(StoreLocation::Path(path.to_path_buf())),
-        })
-    }
-    /// The shared store for `path`, opened (schema applied) on first use.
-    /// The engine takes a single-process writer lease on a durable store, so
-    /// every `Store` and bridge call site in this process shares the one
-    /// instance per path — reopening the same directory must not open the
-    /// engine twice. A process that finds the lease taken opens a read-only
-    /// follower instead (migration plan §6.12 mitigation: read-only opens
-    /// coexist with the writer).
-    pub fn shared(path: impl AsRef<Path>) -> Result<GraphStore> {
-        // Canonicalize the parent (the store path itself may not exist yet):
-        // the same store reached through a symlinked directory (macOS
-        // /var → /private/var) is one store and holds one writer lease.
-        let key = match path
-            .as_ref()
-            .parent()
-            .map(|parent| parent.canonicalize())
-            .transpose()
-        {
-            Ok(Some(parent)) => parent.join(path.as_ref().file_name().unwrap_or_default()),
-            _ => path.as_ref().to_path_buf(),
-        };
-        let mut shared = SHARED
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(store) = shared.get(&key) {
-            return Ok(store.clone());
-        }
-        // Open the engine directly so the writer-lease error is visible:
-        // a process that finds the lease taken (a server, an mcp stdio
-        // session or a `sync --background` builder owns the store) opens a
-        // read-only follower instead; graph writes from it fail loudly.
-        let uri = key
-            .to_str()
-            .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
-        let store = match Database::open(uri) {
-            Ok(database) => {
-                let store = Self {
-                    database: Arc::new(database),
-                    location: Arc::new(StoreLocation::Path(key.clone())),
-                };
-                store.apply_schema()?;
-                store
-            }
-            Err(cypherlite::Error::Locked(_)) => GraphStore::open_follower(&key)?,
-            Err(error) => return Err(error.into()),
-        };
-        shared.insert(key, store.clone());
-        Ok(store)
-    }
-    /// The shared in-memory store (unit tests whose rusqlite side is
-    /// in-memory, transient processing).
-    pub fn shared_in_memory() -> Result<GraphStore> {
-        static MEMORY: OnceLock<GraphStore> = OnceLock::new();
-        if let Some(store) = MEMORY.get() {
-            return Ok(store.clone());
-        }
-        let store = GraphStore::open_in_memory()?;
-        Ok(MEMORY.get_or_init(|| store).clone())
-    }
     /// Apply the graph type and indexes. Runs at every open; safe to call
     /// again. Vector indexes are NOT created here — see
     /// [`GraphStore::ensure_vector_indexes`].
@@ -243,24 +178,6 @@ impl GraphStore {
             ))?;
         }
         Ok(())
-    }
-}
-
-/// The process-wide shared stores behind [`GraphStore::shared`].
-static SHARED: OnceLock<Mutex<HashMap<PathBuf, GraphStore>>> = OnceLock::new();
-
-/// The shared graph store beside a SQLite database file (`reviews.graph` in
-/// the same directory); an in-memory database maps to the shared in-memory
-/// store. Transition bridge for call sites that still hold only the
-/// rusqlite connection while their domain migrates — new code takes a
-/// `&GraphStore` (from [`crate::store::Store::graph`]).
-pub fn shared_for(db: &rusqlite::Connection) -> Result<GraphStore> {
-    match db.path().filter(|p| !p.is_empty()) {
-        Some(database) => match Path::new(database).parent() {
-            Some(directory) => GraphStore::shared(directory.join("reviews.graph")),
-            None => GraphStore::shared_in_memory(),
-        },
-        None => GraphStore::shared_in_memory(),
     }
 }
 
@@ -356,7 +273,9 @@ pub fn json_to_value(value: &Json) -> Value {
             }
         }
         Json::String(s) => Value::String(s.as_str().into()),
-        Json::Array(items) => Value::List(items.iter().map(json_to_value).collect::<Vec<_>>().into()),
+        Json::Array(items) => {
+            Value::List(items.iter().map(json_to_value).collect::<Vec<_>>().into())
+        }
         Json::Object(map) => Value::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -391,7 +310,15 @@ pub fn value_to_json(value: &Value) -> Json {
         Value::Node(node) => {
             let mut map = properties_to_json(&node.properties);
             map.insert("_id".into(), Json::from(node.id));
-            map.insert("_labels".into(), Json::Array(node.labels.iter().map(|l| Json::String(l.clone())).collect()));
+            map.insert(
+                "_labels".into(),
+                Json::Array(
+                    node.labels
+                        .iter()
+                        .map(|l| Json::String(l.clone()))
+                        .collect(),
+                ),
+            );
             Json::Object(map)
         }
         Value::Relationship(rel) => {

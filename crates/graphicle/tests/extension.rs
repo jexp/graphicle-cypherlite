@@ -829,7 +829,14 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
         json!([{"extension":"probe","error":"probe hook failed"}])
     );
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &fails).unwrap();
-    assert!(graphicle_runtime::graph_projection::is_recorded(&graphicle_runtime::store_graph::shared_for(&db).unwrap(), &fails, &episode).unwrap());
+    assert!(
+        graphicle_runtime::graph_projection::is_recorded(
+            &graphicle_runtime::store::graph_for(&db).unwrap(),
+            &fails,
+            &episode
+        )
+        .unwrap()
+    );
 }
 
 #[derive(Clone)]

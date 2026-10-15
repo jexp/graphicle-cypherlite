@@ -1,13 +1,30 @@
 //! Exact file-group fingerprints for incremental projection persistence.
 //!
 //! The complete assembled graph is still the authority. Hash every final
-//! record, including global normalization effects, then load/compare SQLite
-//! records only for groups that differ. SQL triggers invalidate fingerprints
-//! on every row mutation, so this is a cache rather than a second authority.
-use crate::{Result, graph_projection::CanonicalRecord, store::ensure_column};
+//! record, including global normalization effects, then load/compare stored
+//! records only for groups that differ. This is a cache, not a second
+//! authority.
+//!
+//! The graph store has no triggers, so projection-group invalidation is
+//! explicit write-path logic: any write that inserts, updates or deletes
+//! projection rows calls [`invalidate`] with the owner groups it touched, in
+//! the same transaction, and the projector publishes fresh digests with
+//! [`Plan::finish`] after its row writes. Groups are
+//! `(:ProjectionGroup {repository_id, owner, digest})` nodes; a missing
+//! `digest` marks the group dirty. Digests are hex strings (the engine has
+//! no byte-string value type). Bulk work is plain `UNWIND $rows` batches
+//! inside the caller's explicit transaction — no SAVEPOINT dance, and no
+//! `CALL {} IN TRANSACTIONS` (spike E6 measured it ~300× slower on
+//! `:memory:` in v0.12.2).
+use crate::{
+    Result,
+    graph_projection::CanonicalRecord,
+    store_graph::{Params, json_to_value, rows},
+};
+use cypherlite::Connection;
 use graphicle::{graph::Graph, record::Attributes};
-use rusqlite::{Connection, params};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -26,103 +43,43 @@ pub fn owner(attributes: &Attributes) -> &str {
         .unwrap_or("")
 }
 
-pub fn migrate(db: &Connection) -> Result<()> {
-    let transaction = db.unchecked_transaction()?;
-    let db = &*transaction;
-    let existed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='gf_projection_groups')", [], |r| r.get(0))?;
-    for table in ["gf_nodes", "gf_edges"] {
-        ensure_column(db, table, "owner", "TEXT NOT NULL DEFAULT ''")?;
+/// Explicit write-path replacement for the legacy SQL triggers: a write that
+/// inserts, updates or deletes projection rows marks every owner group it
+/// touched dirty by clearing the cached digest. Runs inside the same
+/// transaction as the mutation itself; there is no trigger to do it.
+// Used by the projection write path as it migrates (and by tests).
+#[allow(dead_code)]
+pub fn invalidate(
+    db: &mut Connection,
+    repository: &str,
+    owners: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<()> {
+    let owners: Vec<String> = owners.into_iter().map(|o| o.as_ref().to_string()).collect();
+    if owners.is_empty() {
+        return Ok(());
     }
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS gf_projection_groups (
-            repository_id TEXT NOT NULL REFERENCES repo_projects(id) ON DELETE CASCADE,
-            owner TEXT NOT NULL, digest BLOB,
-            PRIMARY KEY(repository_id,owner));
-         CREATE INDEX IF NOT EXISTS gf_nodes_owner ON gf_nodes(repository_id,owner) WHERE valid_to_episode IS NULL;
-         CREATE INDEX IF NOT EXISTS gf_edges_owner ON gf_edges(repository_id,owner) WHERE valid_to_episode IS NULL;"
+    let mut params = Params::new();
+    params.insert("repository".into(), json_to_value(&json!(repository)));
+    params.insert("owners".into(), json_to_value(&json!(owners)));
+    rows(
+        db,
+        "UNWIND $owners AS owner
+         MERGE (g:ProjectionGroup {repository_id: $repository, owner: owner})
+         SET g.digest = NULL",
+        params,
     )?;
-    if !existed {
-        for table in ["gf_nodes", "gf_edges"] {
-            db.execute_batch(&format!(
-                "UPDATE {table} SET owner=CASE
-                   WHEN json_type(attributes,'$.relpath')='text' THEN json_extract(attributes,'$.relpath')
-                   WHEN json_type(attributes,'$.source_file')='text' THEN json_extract(attributes,'$.source_file')
-                   ELSE '' END;
-                 INSERT OR IGNORE INTO gf_projection_groups(repository_id,owner)
-                   SELECT DISTINCT repository_id,owner FROM {table} WHERE valid_to_episode IS NULL;"))?;
-        }
-    }
-    install_triggers(db)?;
-    transaction.commit()?;
     Ok(())
 }
 
-fn install_triggers(db: &Connection) -> Result<()> {
-    for table in ["gf_nodes", "gf_edges"] {
-        db.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS {table}_group_insert AFTER INSERT ON {table} BEGIN
-                 INSERT INTO gf_projection_groups(repository_id,owner,digest) VALUES(NEW.repository_id,NEW.owner,NULL)
-                   ON CONFLICT(repository_id,owner) DO UPDATE SET digest=NULL WHERE digest IS NOT NULL;
-             END;
-             CREATE TRIGGER IF NOT EXISTS {table}_group_update AFTER UPDATE ON {table} BEGIN
-                 UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=OLD.repository_id AND owner=OLD.owner AND digest IS NOT NULL;
-                 INSERT INTO gf_projection_groups(repository_id,owner,digest) VALUES(NEW.repository_id,NEW.owner,NULL)
-                   ON CONFLICT(repository_id,owner) DO UPDATE SET digest=NULL WHERE digest IS NOT NULL;
-             END;
-             CREATE TRIGGER IF NOT EXISTS {table}_group_delete AFTER DELETE ON {table} BEGIN
-                 UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=OLD.repository_id AND owner=OLD.owner AND digest IS NOT NULL;
-             END;"))?;
-    }
-    Ok(())
+fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Keep the authoritative projection and its cache publication atomic.
-///
-/// Row triggers impose a statement journal on every insert. The projector
-/// already knows every changed group, so temporarily remove its cache
-/// triggers inside a savepoint. SQLite serializes writers and transactionally
-/// restores the schema on rollback; other connections never see a committed
-/// state without the triggers. Unrelated SQL writes retain normal invalidation.
-pub struct ProjectionWrite<'a> {
-    db: &'a Connection,
-    committed: bool,
-}
-
-impl<'a> ProjectionWrite<'a> {
-    pub fn begin(db: &'a Connection) -> Result<Self> {
-        db.execute_batch("SAVEPOINT graphicle_graph_projection")?;
-        let write = Self {
-            db,
-            committed: false,
-        };
-        for table in ["gf_nodes", "gf_edges"] {
-            for action in ["insert", "update", "delete"] {
-                db.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_group_{action}"))?;
-            }
-        }
-        Ok(write)
-    }
-
-    pub fn commit(mut self) -> Result<()> {
-        install_triggers(self.db)?;
-        self.db
-            .execute_batch("RELEASE graphicle_graph_projection")?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for ProjectionWrite<'_> {
-    fn drop(&mut self) {
-        if !self.committed && !self.db.is_autocommit() {
-            // A SQL error or panic must not leave partial rows or disabled
-            // triggers behind, even if the caller commits its outer transaction.
-            let _ = self.db.execute_batch(
-                "ROLLBACK TO graphicle_graph_projection; RELEASE graphicle_graph_projection",
-            );
-        }
-    }
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
 }
 
 struct HashWriter<'a>(&'a mut Sha256);
@@ -154,7 +111,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn new(db: &Connection, repository: &str, graph: &Graph) -> Result<Self> {
+    pub fn new(db: &mut Connection, repository: &str, graph: &Graph) -> Result<Self> {
         let mut groups: HashMap<&str, (Sha256, usize, usize)> = HashMap::new();
         for node in graph.nodes() {
             let group = groups.entry(owner(&node.attributes)).or_default();
@@ -178,13 +135,19 @@ impl Plan {
             )?;
             group.2 += 1;
         }
+        let mut params = Params::new();
+        params.insert("repository".into(), json_to_value(&json!(repository)));
         let mut previous = BTreeMap::new();
-        let mut query = db.prepare_cached(
-            "SELECT owner,digest FROM gf_projection_groups WHERE repository_id=?",
-        )?;
-        let mut rows = query.query([repository])?;
-        while let Some(row) = rows.next()? {
-            previous.insert(row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?);
+        for row in rows(
+            db,
+            "MATCH (g:ProjectionGroup {repository_id: $repository})
+             RETURN g.owner AS owner, g.digest AS digest",
+            params,
+        )? {
+            previous.insert(
+                row["owner"].as_str().unwrap_or("").to_string(),
+                row["digest"].as_str().and_then(unhex),
+            );
         }
         let mut next = BTreeMap::new();
         let mut dirty = BTreeSet::new();
@@ -226,21 +189,121 @@ impl Plan {
     }
 
     /// Publish the cache only after all authoritative rows have been written.
-    /// The caller keeps the plan and row updates in the same transaction.
-    pub fn finish(&self, db: &Connection, repository: &str) -> Result<()> {
-        let mut update = db.prepare_cached(
-            "INSERT INTO gf_projection_groups(repository_id,owner,digest) VALUES(?,?,?)
-            ON CONFLICT(repository_id,owner) DO UPDATE SET digest=excluded.digest",
-        )?;
-        let mut delete = db
-            .prepare_cached("DELETE FROM gf_projection_groups WHERE repository_id=? AND owner=?")?;
-        for owner in &self.dirty {
-            if let Some(digest) = self.next.get(owner) {
-                update.execute(params![repository, owner, digest.as_slice()])?;
-            } else {
-                delete.execute(params![repository, owner])?;
-            }
+    /// The caller keeps the plan and the row writes in the same transaction.
+    pub fn finish(&self, db: &mut Connection, repository: &str) -> Result<()> {
+        let updates: Vec<_> = self
+            .dirty
+            .iter()
+            .filter_map(|owner| {
+                self.next
+                    .get(owner)
+                    .map(|digest| json!({"owner": owner, "digest": hex(digest)}))
+            })
+            .collect();
+        if !updates.is_empty() {
+            let mut params = Params::new();
+            params.insert("repository".into(), json_to_value(&json!(repository)));
+            params.insert("rows".into(), json_to_value(&json!(updates)));
+            rows(
+                db,
+                "UNWIND $rows AS row
+                 MERGE (g:ProjectionGroup {repository_id: $repository, owner: row.owner})
+                 SET g.digest = row.digest",
+                params,
+            )?;
+        }
+        let removed: Vec<&String> = self
+            .dirty
+            .iter()
+            .filter(|owner| !self.next.contains_key(*owner))
+            .collect();
+        if !removed.is_empty() {
+            let mut params = Params::new();
+            params.insert("repository".into(), json_to_value(&json!(repository)));
+            params.insert("owners".into(), json_to_value(&json!(removed)));
+            rows(
+                db,
+                "UNWIND $owners AS owner
+                 MATCH (g:ProjectionGroup {repository_id: $repository, owner: owner})
+                 DELETE g",
+                params,
+            )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_graph::GraphStore;
+
+    fn graph(files: &[(&str, &str)]) -> Graph {
+        let nodes: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(i, (id, file))| {
+                json!({"id": id, "stable_id": id, "label": id, "relpath": file, "seq": i})
+            })
+            .collect();
+        Graph::from_node_link(
+            &json!({"directed": true, "multigraph": true, "nodes": nodes, "links": []}),
+            "links",
+        )
+        .unwrap()
+    }
+
+    fn attrs(file: &str) -> Attributes {
+        Attributes::from(json!({"relpath": file}).as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn dirty_groups_track_writes_without_triggers() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let first = graph(&[("a", "a.py"), ("b", "b.py")]);
+        let plan = store
+            .transaction(|db| {
+                let plan = Plan::new(db, "repo", &first)?;
+                assert_eq!(plan.stats.dirty_groups, 2);
+                plan.finish(db, "repo")?;
+                Ok(plan)
+            })
+            .unwrap();
+        assert!(plan.changed(&attrs("a.py")));
+        // Unchanged graph: nothing dirty once digests are published.
+        store
+            .transaction(|db| {
+                let plan = Plan::new(db, "repo", &first)?;
+                assert_eq!(plan.stats.dirty_groups, 0);
+                Ok(())
+            })
+            .unwrap();
+        // An explicit invalidation (the trigger replacement) dirties a group.
+        store
+            .transaction(|db| {
+                invalidate(db, "repo", ["a.py"])?;
+                let plan = Plan::new(db, "repo", &first)?;
+                assert_eq!(plan.dirty().iter().collect::<Vec<_>>(), ["a.py"]);
+                plan.finish(db, "repo")?;
+                Ok(())
+            })
+            .unwrap();
+        // A removed file's group disappears on finish.
+        let shrunk = graph(&[("a", "a.py")]);
+        store
+            .transaction(|db| {
+                let plan = Plan::new(db, "repo", &shrunk)?;
+                assert_eq!(plan.dirty().iter().collect::<Vec<_>>(), ["b.py"]);
+                plan.finish(db, "repo")?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                let plan = Plan::new(db, "repo", &shrunk)?;
+                assert_eq!(plan.stats.dirty_groups, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 }

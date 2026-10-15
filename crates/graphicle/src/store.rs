@@ -6,13 +6,76 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+/// Open (or reuse) the graph store belonging to the SQLite store file
+/// `database` (`reviews.graph/` beside it). Transitional, for migrated
+/// domains (projection/timeline/delta) whose call sites still hold a SQL
+/// connection.
+///
+/// The engine takes a single-process writer lease on a directory store, and
+/// this codebase still runs multi-process flows (CLI hooks beside a server),
+/// so opens are **transient**: a weak registry dedups concurrent opens in
+/// this process, the lease is released when the caller drops the store, and
+/// a "storage locked" open retries for up to 10 s (the busy-timeout the SQL
+/// store gets).
+pub fn graph_for(db: &Connection) -> Result<crate::store_graph::GraphStore> {
+    match db.path() {
+        Some(path) if !path.is_empty() => graph_store(Path::new(path)),
+        // In-memory SQL (unit tests of legacy SQL paths) gets a scratch
+        // graph; nothing written to it is expected to outlive the call.
+        _ => crate::store_graph::GraphStore::open_in_memory(),
+    }
+}
+
+fn graph_store(database: &Path) -> Result<crate::store_graph::GraphStore> {
+    use std::sync::Weak;
+    static STORES: OnceLock<Mutex<HashMap<PathBuf, Weak<cypherlite::Database>>>> = OnceLock::new();
+    // Key by canonical directory: the same folder reached through a symlink
+    // (e.g. /var vs /private/var) is one store.
+    let directory = database
+        .parent()
+        .ok_or_else(|| Error::bad("Database path has no parent"))?;
+    let directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+    let store_path = directory.join("reviews.graph");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stores = STORES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A live engine in this process is shared, not reopened: the writer
+        // lease is per engine, so a second open of the same path would lock
+        // against itself.
+        if let Some(engine) = stores.get(&directory).and_then(Weak::upgrade) {
+            return Ok(crate::store_graph::GraphStore::from_shared_engine(
+                engine,
+                store_path.clone(),
+            ));
+        }
+        match crate::store_graph::GraphStore::open(&store_path) {
+            Ok(store) => {
+                stores.insert(directory.clone(), Arc::downgrade(&store.shared_engine()));
+                return Ok(store);
+            }
+            Err(error) => {
+                if !error.to_string().contains("storage locked") || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                drop(stores);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
 
 /// A write transaction held longer than this is logged with its call site:
 /// every other writer waits for it, up to the 10-second busy timeout.
@@ -98,13 +161,6 @@ pub fn lock_report() -> Value {
 pub struct Store {
     pub directory: Arc<PathBuf>,
     pub database: Arc<PathBuf>,
-    /// The CypherLite store the graph-native domains (the bi-temporal code
-    /// projection first) keep their data in, beside `reviews.sqlite3`
-    /// (`docs/store-api.md`). Opened lazily on the first graph touch: the
-    /// engine takes a single-process writer lease, and a process that never
-    /// reads or writes the graph (a CLI command on the content store) must
-    /// not hold it.
-    graph: Arc<std::sync::OnceLock<crate::store_graph::GraphStore>>,
     /// Signalled when a job is queued, so an idle worker in this process
     /// starts it at once instead of at its next poll.
     pub wake: Arc<tokio::sync::Notify>,
@@ -333,7 +389,6 @@ impl Store {
         let store = Self {
             directory: Arc::new(directory.to_path_buf()),
             database: Arc::new(database),
-            graph: Arc::new(std::sync::OnceLock::new()),
             wake: Arc::new(tokio::sync::Notify::new()),
             limits: None,
         };
@@ -345,8 +400,10 @@ impl Store {
         db.execute_batch(include_str!("projection_schema.sql"))?;
         ensure_column(&db, "gf_episodes", "parent_episode", "TEXT")?;
         db.execute_batch(include_str!("temporal_schema.sql"))?;
-        crate::temporal_graph::migrate(&db)?;
-        crate::graph_delta::migrate(&db)?;
+        // The projection's SQL body still buckets rows by owner file; the
+        // group digests and triggers of graph_delta live in the graph store.
+        ensure_column(&db, "gf_nodes", "owner", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&db, "gf_edges", "owner", "TEXT NOT NULL DEFAULT ''")?;
         db.execute_batch(include_str!("product_schema.sql"))?;
         crate::work_state::migrate(&db)?;
         // Each folder's freshness record.
@@ -391,6 +448,12 @@ impl Store {
         self.limits = Some(Arc::new(limits));
         self
     }
+    /// The graph store beside the SQL store (`reviews.graph/`). Opened
+    /// transiently per call — see [`graph_for`] for the lease discipline.
+    pub fn graph(&self) -> Result<crate::store_graph::GraphStore> {
+        let db = self.connect()?;
+        graph_for(&db)
+    }
     /// The size limits in effect: those set with [`Store::with_limits`],
     /// else the environment's over Graphicle Core's defaults.
     pub fn limits(&self) -> Result<crate::limits::Limits> {
@@ -405,17 +468,6 @@ impl Store {
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "secure_delete", true)?;
         Ok(db)
-    }
-    /// The graph store the projection and other graph-native domains run
-    /// their Cypher against, opened on first use. Where another process owns
-    /// the writer lease this is a read-only follower (ADR-0137): reads tail
-    /// the writer's WAL, writes fail with "database is read-only".
-    pub fn graph(&self) -> Result<&crate::store_graph::GraphStore> {
-        if let Some(store) = self.graph.get() {
-            return Ok(store);
-        }
-        let store = crate::store_graph::GraphStore::shared(self.directory.join("reviews.graph"))?;
-        Ok(self.graph.get_or_init(|| store))
     }
     /// A write transaction (`BEGIN IMMEDIATE`): it takes SQLite's single write
     /// lock up front, so a read-then-write never fails to upgrade. Keep the
@@ -903,7 +955,7 @@ impl Store {
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
             let projection=crate::jobs::enqueue_projection(db,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
-            crate::graph_projection::clear_stale_when_current(db,self.graph()?,identifier)?;
+            crate::graph_projection::clear_stale_when_current(db,&self.graph()?,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
             let (limited,skipped)=analysis_report(db,identifier)?;
             if !limited.is_empty() {result["limited"]=json!(limited);}

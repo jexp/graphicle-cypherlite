@@ -11,6 +11,7 @@ use crate::{
     store_graph::{self, GraphStore, Params, json_to_value},
     string,
 };
+use cypherlite::{Connection as GraphConnection, Value as GValue};
 use graphicle::{
     build::{BuildOptions, Diagnostics, build_owned},
     extract::ExtractOptions,
@@ -18,8 +19,7 @@ use graphicle::{
     session::{GraphHandle, registry},
 };
 use graphicle_memory::graph::identity::{self, IdentityOptions};
-use cypherlite::{Connection as GraphConnection, Value as GValue};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -51,23 +51,25 @@ pub fn episode_of(heads: &BTreeMap<String, String>) -> String {
 // bi-temporal state — episodes, symbol identity nodes, their versions and the
 // typed relationships between them — lives in the [`GraphStore`] (a
 // CypherLite store beside the SQLite file, `docs/store-api.md`). Functions
-// whose collaborators have not migrated yet (content store, timeline,
-// symbols, invalidation) take the rusqlite `Connection` alongside the graph
-// store; the extra parameter goes away with the last SQL collaborator.
+// whose collaborators have not migrated yet (content store, symbols,
+// invalidation) also take the rusqlite `Connection`; the extra parameter
+// goes away with the last SQL collaborator.
 // `gf_episodes` is additionally mirrored into SQLite (slim rows, written by
 // `persist_with_report`) so those un-migrated readers keep working until
 // their own migration lands; the CypherLite store is the authority every
 // function here reads.
 // ---------------------------------------------------------------------------
 
-/// `begin` → `f` → `commit` on one graph connection, rolling back on error.
+/// `begin` → `f` → `commit` on the connection, rolling back on error.
 /// Unlike [`GraphStore::transaction`] there is no conflict retry and `f` is
 /// `FnOnce`: the projection's writes already run under the store's
 /// single-writer lock, so a write-write conflict cannot occur here.
-fn graph_tx<T>(store: &GraphStore, f: impl FnOnce(&mut GraphConnection) -> Result<T>) -> Result<T> {
-    let mut g = store.connection()?;
+fn graph_commit<T>(
+    g: &mut GraphConnection,
+    f: impl FnOnce(&mut GraphConnection) -> Result<T>,
+) -> Result<T> {
     g.begin()?;
-    match f(&mut g) {
+    match f(g) {
         Ok(value) => {
             g.commit()?;
             Ok(value)
@@ -126,11 +128,12 @@ fn gj(value: &Value) -> GValue {
 /// Rows of a read-only Cypher statement against the projection's graph store
 /// (`params` are JSON values). A probe for tests and tooling; the module's
 /// own reads go through the typed functions.
-pub fn graph_rows(store: &GraphStore, cypher: &str, params: &[(&str, Value)]) -> Result<Vec<Value>> {
-    let params: Params = params
-        .iter()
-        .map(|(k, v)| (k.to_string(), gj(v)))
-        .collect();
+pub fn graph_rows(
+    store: &GraphStore,
+    cypher: &str,
+    params: &[(&str, Value)],
+) -> Result<Vec<Value>> {
+    let params: Params = params.iter().map(|(k, v)| (k.to_string(), gj(v))).collect();
     store.read(|g| store_graph::rows(g, cypher, params))
 }
 
@@ -138,11 +141,9 @@ pub fn graph_rows(store: &GraphStore, cypher: &str, params: &[(&str, Value)]) ->
 /// transaction (test and tooling probe, e.g. tampering with a live row to
 /// check a repair).
 pub fn graph_write(store: &GraphStore, cypher: &str, params: &[(&str, Value)]) -> Result<()> {
-    let params: Params = params
-        .iter()
-        .map(|(k, v)| (k.to_string(), gj(v)))
-        .collect();
-    graph_tx(store, |g| {
+    let params: Params = params.iter().map(|(k, v)| (k.to_string(), gj(v))).collect();
+    let mut g = store.connection()?;
+    graph_commit(&mut g, |g| {
         g.query_with_params(cypher, params)?;
         Ok(())
     })
@@ -232,7 +233,37 @@ pub fn build_graph_with_report(
     let _serial = EXTRACTION.lock().unwrap_or_else(PoisonError::into_inner);
     let cache = cache_root(db, repository);
     let dir = crate::phase::phase("graph_materialize", || {
-        crate::graph_materialize::prepare(db, repository, &heads, cache.as_deref())
+        // Source objects are CAS nodes in the graph store. Transitional
+        // until content-store-cypher owns Object writes: the SQL content
+        // store still lands them in `repo_objects`, so mirror the wanted
+        // heads' blobs before materializing.
+        let mut graph_db = crate::store::graph_for(db)?.connection()?;
+        let mut read = db.prepare_cached(
+            "SELECT content,bytes FROM repo_objects WHERE repository_id=? AND sha256=?",
+        )?;
+        let mut objects = Vec::new();
+        for sha in heads.values() {
+            if let Some((content, bytes)) = read
+                .query_row(params![repository, sha], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .optional()?
+            {
+                objects.push(json!({"repository_id": repository, "sha256": sha,
+                    "content": content, "bytes": bytes}));
+            }
+        }
+        drop(read);
+        if !objects.is_empty() {
+            store_graph::rows(
+                &mut graph_db,
+                "UNWIND $rows AS row \
+                 MERGE (o:Object {repository_id: row.repository_id, sha256: row.sha256}) \
+                 SET o += row",
+                gparams([("rows", gj(&json!(objects)))]),
+            )?;
+        }
+        crate::graph_materialize::prepare(&mut graph_db, repository, &heads, cache.as_deref())
     })?;
     // Canonical root: node identities derive from paths relative to it, and a
     // root that crosses a symlink would make cached and fresh records diverge.
@@ -359,9 +390,7 @@ fn episode_row_g(
 ) -> Result<Option<Value>> {
     store_graph::one(
         g,
-        &format!(
-            "MATCH (e:Episode {{repository_id:$r, episode:$e}}) RETURN {EPISODE_COLUMNS}"
-        ),
+        &format!("MATCH (e:Episode {{repository_id:$r, episode:$e}}) RETURN {EPISODE_COLUMNS}"),
         gparams([("r", gs(repository)), ("e", gs(episode))]),
     )
 }
@@ -468,7 +497,9 @@ pub fn persist_with_report(
 ) -> Result<bool> {
     let stamp = now();
     let heads = crate::store::heads(db, repository)?;
-    let delta = crate::graph_delta::Plan::new(db, repository, graph)?;
+    let mut g = store.connection()?;
+    // The fingerprint plan reads the graph-side ProjectionGroup cache.
+    let delta = crate::graph_delta::Plan::new(&mut g, repository, graph)?;
     let mut attributes = episode_attributes(graph, extraction);
     if let Some(report) = attributes
         .get_mut(EXTRACTION_RUN)
@@ -481,10 +512,33 @@ pub fn persist_with_report(
         attributes[SOURCE_HEADS] = json!(heads);
     }
     let attributes = graphicle_memory::text::canonical(&attributes);
-    let recorded = record_episode(store, repository, episode, graph, &attributes, &stamp, &delta)?;
+    let recorded = record_episode(
+        &mut g,
+        repository,
+        episode,
+        graph,
+        &attributes,
+        &stamp,
+        &delta,
+    )?;
     let Some(recorded) = recorded else {
         return Ok(false);
     };
+    // The timeline assertion and the group digests publish after the
+    // episode's rows, in one commit.
+    let instant = crate::temporal_graph::instant(&stamp)?;
+    graph_commit(&mut g, |g| {
+        crate::temporal_graph::observe(
+            g,
+            repository,
+            episode,
+            "default",
+            instant,
+            instant,
+            "projection",
+        )?;
+        delta.finish(g, repository)
+    })?;
     // The transition's SQLite mirror of the episode row: the timeline's
     // baseline and selector lookups still read `gf_episodes` until that
     // domain migrates. The CypherLite store is the authority; the mirror is
@@ -505,10 +559,7 @@ pub fn persist_with_report(
         ],
     )?;
     // Collaborators that still live in SQLite (their domains migrate in
-    // their own steps): the timeline observation, dependency bookkeeping and
-    // the live-symbol tables.
-    let instant = crate::temporal_graph::instant(&stamp)?;
-    crate::temporal_graph::observe(db, repository, episode, "default", instant, instant, "projection")?;
+    // their own steps): dependency bookkeeping and the live-symbol tables.
     // Live nodes are fresh derivations of their source files.
     let workspace = crate::invalidation::workspace_of(db, repository)?;
     crate::invalidation::record_graph_nodes(
@@ -522,7 +573,6 @@ pub fn persist_with_report(
         recorded.closed.iter().map(String::as_str),
         recorded.partial,
     )?;
-    delta.finish(db, repository)?;
     // The live-symbol table follows the current head set's episode, by the
     // files this projection rewrote when it described the previous one, and
     // pins quotes that waited for this content.
@@ -592,7 +642,7 @@ struct LiveEdge {
 /// is already recorded. Runs inside the caller's graph transaction
 /// ([`graph_tx`]), so a failure leaves no partial episode behind.
 fn record_episode(
-    store: &GraphStore,
+    g: &mut GraphConnection,
     repository: &str,
     episode: &str,
     graph: &Graph,
@@ -605,10 +655,10 @@ fn record_episode(
     // retry converges — the diff below is recomputed against whatever the
     // partial record left live, digest-equal rows are skipped, and the
     // markers (unresolved calls, contradictions) are MERGE'd.
-    if episode_row(store, repository, episode)?.is_some() {
+    if episode_row_g(g, repository, episode)?.is_some() {
         return Ok(None);
     }
-    let (history, live_nodes, live_edges) = store.read(|g| {
+    let (history, live_nodes, live_edges) = (|g: &mut GraphConnection| -> Result<_> {
         let history = episode_history_g(g, repository)?;
         let owners = gj(&json!(delta.dirty()));
         // Live state of the dirty owner groups: one entry per live version,
@@ -662,7 +712,7 @@ fn record_episode(
             );
         }
         Ok((history, live_nodes, live_edges))
-    })?;
+    })(g)?;
     let sequence = history
         .last()
         .map_or(1, |e| e["sequence"].as_i64().unwrap_or(0) + 1);
@@ -671,7 +721,12 @@ fn record_episode(
     let parent = history.last().map(|e| s(e, "episode").to_string());
     let sequences: HashMap<String, i64> = history
         .iter()
-        .map(|e| (s(e, "episode").to_string(), e["sequence"].as_i64().unwrap_or(0)))
+        .map(|e| {
+            (
+                s(e, "episode").to_string(),
+                e["sequence"].as_i64().unwrap_or(0),
+            )
+        })
         .chain(std::iter::once((episode.to_string(), sequence)))
         .collect();
 
@@ -699,9 +754,14 @@ fn record_episode(
                     .get("stable_id")
                     .and_then(Value::as_str)
                     .unwrap_or(&node_ids[index]);
+                // `ord` reproduces the SQL rowid order (first appearance)
+                // that `load` streamed: retrieval walks graph indices in
+                // that order.
+                let ord = (sequence << 32) | insert_nodes.len() as i64;
                 insert_nodes.push(gj(&json!({
                     "node_id": node_ids[index],
                     "stable_id": stable_id,
+                    "ord": ord,
                     "kind": node.attributes.get("kind").cloned().unwrap_or(Value::Null),
                     "qualified_name": node.attributes.get("qualified_name").cloned().unwrap_or(Value::Null),
                     "relpath": node.attributes.get("relpath").cloned().unwrap_or(Value::Null),
@@ -790,6 +850,7 @@ fn record_episode(
                         "derivation": field("derivation"),
                         "source_node_id": node_ids[source],
                         "target_node_id": node_ids[target],
+                        "ord": (sequence << 32) | (insert_edges.len() as i64),
                     },
                 })));
             }
@@ -835,14 +896,14 @@ fn record_episode(
     // partial record left live (digest-equal rows are skipped, markers are
     // MERGE'd) and converges.
     for chunk in insert_nodes.chunks(BATCH) {
-        graph_tx(store, |g| {
+        graph_commit(g, |g| {
             g.query_with_params(
                 "UNWIND $rows AS row \
                  MERGE (s:Symbol {repository_id:$r, stable_id: row.stable_id}) \
                  SET s.node_id = row.node_id, s.kind = row.kind, \
                      s.qualified_name = row.qualified_name, s.relpath = row.relpath \
                  CREATE (s)-[:HAS_VERSION]->(v:SymbolVersion:Live {repository_id:$r, stable_id: row.stable_id, \
-                     node_id: row.node_id, data: row.data, owner: row.owner, \
+                     node_id: row.node_id, data: row.data, owner: row.owner, ord: row.ord, \
                      valid_from_episode: $e, created_at: $stamp})",
                 gparams([
                     ("r", gs(repository)),
@@ -855,7 +916,7 @@ fn record_episode(
         })?;
     }
     for chunk in insert_edges.chunks(BATCH) {
-        graph_tx(store, |g| {
+        graph_commit(g, |g| {
             g.query_with_params(
                 "UNWIND $rows AS row \
                  MATCH (a:Symbol {repository_id:$r, stable_id: row.source_stable}), \
@@ -873,7 +934,7 @@ fn record_episode(
         })?;
     }
     for chunk in close_edges.chunks(BATCH) {
-        graph_tx(store, |g| {
+        graph_commit(g, |g| {
             // Closing an edge is a type-flip: the live relationship is
             // deleted and recreated as `<TYPE>_HIST` with the validity
             // window set, its properties snapshotted in the WITH before the
@@ -900,7 +961,7 @@ fn record_episode(
         })?;
     }
     for chunk in close_nodes.chunks(BATCH) {
-        graph_tx(store, |g| {
+        graph_commit(g, |g| {
             // Closing a version is a label flip: `REMOVE v:Live` leaves the
             // version node behind as history with its validity window set.
             g.query_with_params(
@@ -920,13 +981,12 @@ fn record_episode(
     }
     // The final transaction records the episode itself: unresolved calls,
     // contradiction markers, the Episode node and its FOLLOWS edge.
-    graph_tx(store, |g| {
+    graph_commit(g, |g| {
         persist_unresolved_calls(g, repository, episode, graph, stamp)?;
         if !disappeared.is_empty() {
             // Cardinality-one relations in the new graph: (relation,
             // subject) → the subject's targets with their edge references.
-            let mut single_now: HashMap<(String, String), Vec<(String, String)>> =
-                HashMap::new();
+            let mut single_now: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
             for (source, target, edge) in graph.iter_edges() {
                 let relation = edge
                     .attributes
@@ -1148,9 +1208,12 @@ fn record_contradiction(
 ) -> Result<()> {
     let attributes: Map<String, Value> =
         serde_json::from_str(&closed.attributes).unwrap_or_default();
-    let Some((subject, old_other)) =
-        single_valued(&closed.relation, &closed.source, &closed.target, &attributes)
-    else {
+    let Some((subject, old_other)) = single_valued(
+        &closed.relation,
+        &closed.source,
+        &closed.target,
+        &attributes,
+    ) else {
         return Ok(());
     };
     let Some(current) = single_now.get(&(closed.relation.clone(), subject.clone())) else {
@@ -1307,7 +1370,7 @@ fn load_g(g: &mut GraphConnection, repository: &str, episode: &str) -> Result<Gr
         "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:SymbolVersion) \
          RETURN v.node_id AS node_id, v.data AS data, \
          v.valid_from_episode AS valid_from, v.valid_to_episode AS valid_to \
-         ORDER BY v.node_id",
+         ORDER BY v.ord",
         gparams([("r", gs(repository))]),
     )? {
         if !as_of(s(&row, "valid_from"), row["valid_to"].as_str()) {
@@ -1327,7 +1390,7 @@ fn load_g(g: &mut GraphConnection, repository: &str, episode: &str) -> Result<Gr
          WHERE r.valid_from_episode IS NOT NULL \
          RETURN r.source_node_id AS source, r.target_node_id AS target, r.key AS key, r.data AS data, \
          r.valid_from_episode AS valid_from, r.valid_to_episode AS valid_to \
-         ORDER BY r.source_node_id, r.target_node_id, r.key",
+         ORDER BY r.ord",
         gparams([("r", gs(repository))]),
     )? {
         if !as_of(s(&row, "valid_from"), row["valid_to"].as_str()) {
@@ -1461,11 +1524,7 @@ fn persist_unresolved_calls(
 
 /// The episode's `unresolved_calls` as stored (empty once retention has
 /// dropped them).
-pub fn unresolved_calls(
-    store: &GraphStore,
-    repository: &str,
-    episode: &str,
-) -> Result<Vec<Value>> {
+pub fn unresolved_calls(store: &GraphStore, repository: &str, episode: &str) -> Result<Vec<Value>> {
     store.read(|g| unresolved_calls_g(g, repository, episode))
 }
 
@@ -1515,7 +1574,8 @@ pub fn label_episode(
     }
     // Re-labelling moves the label; labelling the same episode again is a
     // no-op.
-    graph_tx(store, |g| {
+    let mut g = store.connection()?;
+    graph_commit(&mut g, |g| {
         g.query_with_params(
             "MERGE (l:EpisodeLabel {workspace:$w, repository_id:$r, label:$label}) \
              SET l.episode = $e, l.created_at = $stamp",
@@ -1572,16 +1632,21 @@ pub fn resolve_episode(
     if episode_row(store, repository, selector)?.is_some() {
         return Ok(selector.to_string());
     }
-    store.read(|g| {
-        store_graph::one(
-            g,
-            "MATCH (l:EpisodeLabel {workspace:$w, repository_id:$r, label:$label}) \
+    store
+        .read(|g| {
+            store_graph::one(
+                g,
+                "MATCH (l:EpisodeLabel {workspace:$w, repository_id:$r, label:$label}) \
              RETURN l.episode AS episode_id",
-            gparams([("w", gs(workspace)), ("r", gs(repository)), ("label", gs(selector))]),
-        )
-    })?
-    .map(|row| s(&row, "episode_id").to_string())
-    .ok_or_else(|| Error::bad("Unknown episode or label for this repository"))
+                gparams([
+                    ("w", gs(workspace)),
+                    ("r", gs(repository)),
+                    ("label", gs(selector)),
+                ]),
+            )
+        })?
+        .map(|row| s(&row, "episode_id").to_string())
+        .ok_or_else(|| Error::bad("Unknown episode or label for this repository"))
 }
 
 /// The most recently recorded episode of the repository.
@@ -1683,11 +1748,7 @@ pub type Built = (String, Graph, Value);
 /// graph. Extraction reads blobs and a file cache only, never SQLite writes,
 /// so it must not run while holding the write lock: a large repository takes
 /// longer than the store's busy timeout.
-pub fn prebuild(
-    db: &Connection,
-    store: &GraphStore,
-    repository: &str,
-) -> Result<Option<Built>> {
+pub fn prebuild(db: &Connection, store: &GraphStore, repository: &str) -> Result<Option<Built>> {
     let episode = current_episode(db, repository)?;
     if episode_row(store, repository, &episode)?.is_some() {
         resident(store, repository, &episode)?;
@@ -1760,7 +1821,14 @@ pub fn project_store(
         match built {
             Some((episode, graph, extraction)) if episode == current => {
                 let recorded = crate::phase::phase("graph_persist", || {
-                    persist_with_report(db, &gstore, identifier, &episode, &graph, Some(&extraction))
+                    persist_with_report(
+                        db,
+                        &gstore,
+                        identifier,
+                        &episode,
+                        &graph,
+                        Some(&extraction),
+                    )
                 })?;
                 if recorded {
                     registry().open(
@@ -1790,7 +1858,7 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             listing["repo"] = json!(s(&repository, "name"));
-            listing["count"] = json!(episodes(self.graph()?, s(&repository, "id"))?.len());
+            listing["count"] = json!(episodes(&self.graph()?, s(&repository, "id"))?.len());
             Ok(())
         })?;
         Ok(listing)
@@ -1803,8 +1871,9 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
-            let mut listed = episodes(self.graph()?, identifier)?;
-            let labels = labels(self.graph()?, workspace, identifier)?;
+            let gstore = self.graph()?;
+            let mut listed = episodes(&gstore, identifier)?;
+            let labels = labels(&gstore, workspace, identifier)?;
             for episode in &mut listed {
                 let mine: Vec<Value> = labels
                     .iter()
@@ -1832,8 +1901,8 @@ impl Store {
         self.authorized(workspace, token, "collect", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
-            let resolved = resolve_episode(db, self.graph()?, workspace, identifier, episode)?;
-            label_episode(db, self.graph()?, workspace, identifier, label, &resolved)?;
+            let resolved = resolve_episode(db, &self.graph()?, workspace, identifier, episode)?;
+            label_episode(db, &self.graph()?, workspace, identifier, label, &resolved)?;
             Ok(json!({"label": label, "episode": resolved}))
         })
     }
@@ -1875,13 +1944,18 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
-            let view = crate::temporal_graph::select(db, workspace, identifier, args)?;
+            // The timeline, aliases and hyperedges are graph-side
+            // (temporal_graph migrated), on one connection with the
+            // projection reads.
+            let gstore = self.graph()?;
+            let mut g = gstore.connection()?;
+            let view = crate::temporal_graph::select(&mut g, workspace, identifier, args)?;
             let episode = view.episode;
-            let row = episode_row(self.graph()?, identifier, &episode)?
+            let row = episode_row_g(&mut g, identifier, &episode)?
                 .ok_or_else(|| Error::bad("Unknown graph episode for this repository"))?;
-            let mut graph = resident(self.graph()?, identifier, &episode)?;
+            let mut graph = resident(&gstore, identifier, &episode)?;
             if args["canonical"] == true {
-                let aliases = crate::temporal_graph::aliases_at(db, identifier, view.valid, view.known)?;
+                let aliases = crate::temporal_graph::aliases_at(&mut g, identifier, view.valid, view.known)?;
                 let mut owned = graph.into_graph();
                 graphicle_memory::graph::canonical::apply(&mut owned, &aliases)?;
                 graph = GraphHandle::new(owned);
@@ -1946,12 +2020,12 @@ impl Store {
                 fields.insert("key".into(), edge.key.clone());
                 edges.push(Value::Object(fields.into()));
             }
-            let labels: Vec<Value> = labels(self.graph()?, workspace, identifier)?
+            let labels: Vec<Value> = labels(&gstore, workspace, identifier)?
                 .into_iter()
                 .filter(|l| l["episode_id"] == json!(episode))
                 .map(|l| l["label"].clone())
                 .collect();
-            let (hyperedges,hyperedges_truncated)=crate::temporal_graph::hyperedges_at(db, identifier, view.valid, view.known, &graph)?;
+            let (hyperedges,hyperedges_truncated)=crate::temporal_graph::hyperedges_at(&mut g, identifier, view.valid, view.known, &graph)?;
             Ok(json!({
                 "as_of": if view.metadata["selection"]=="episode" {json!(selector)} else {Value::Null},
                 "temporal": view.metadata,
@@ -1968,7 +2042,7 @@ impl Store {
                 "edges": edges,
                 "edges_truncated": edges_truncated,
                 "truncated": truncated,
-                "contradictions": contradictions(self.graph()?, identifier, Some(&episode))?,
+                "contradictions": contradictions(&gstore, identifier, Some(&episode))?,
                 "hyperedges": hyperedges,"hyperedges_truncated":hyperedges_truncated,
                 "freshness": crate::invalidation::repository_freshness(db, &p.workspace, identifier)?,
             }))
@@ -2250,7 +2324,8 @@ fn same_cross_edges(
         "exporter_version",
         "version_status",
     ];
-    let mut previous: Vec<String> = store_graph::rows(g,
+    let mut previous: Vec<String> = store_graph::rows(
+        g,
         "MATCH (a:Symbol {repository_id:$s})-[r:CROSS_CALL]->(b:Symbol {repository_id:$t}) \
          RETURN r.source_node_id AS source_node_id, r.source_stable_id AS source_stable_id, \
          r.target_node_id AS target_node_id, r.target_stable_id AS target_stable_id, \
@@ -2259,7 +2334,10 @@ fn same_cross_edges(
          r.version_constraint AS version_constraint, r.exporter_version AS exporter_version, \
          r.version_status AS version_status",
         gparams([("s", gs(source)), ("t", gs(target))]),
-    )?.iter().map(|row| json!(FIELDS.iter().map(|field| &row[*field]).collect::<Vec<_>>()).to_string()).collect();
+    )?
+    .iter()
+    .map(|row| json!(FIELDS.iter().map(|field| &row[*field]).collect::<Vec<_>>()).to_string())
+    .collect();
     let mut next: Vec<String> = edges
         .iter()
         .map(|edge| {
@@ -2361,6 +2439,7 @@ fn export_index(
 /// is re-linked.
 pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Result<Value> {
     let workspace = p.workspace.as_str();
+    let mut g = store.connection()?;
     let mut hidden = 0usize;
     let mut unprojected = Vec::new();
     let mut candidates: Vec<(String, String, String, bool)> = Vec::new();
@@ -2474,7 +2553,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
         .partition(|repo| skipped.contains(&repo.id));
     if hidden == 0 {
         for copy in &shadowed {
-            graph_tx(store, |g| {
+            graph_commit(&mut g, |g| {
                 close_cross_edges(
                     g,
                     "r.source_repository_id = $id OR r.target_repository_id = $id",
@@ -2512,7 +2591,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
     }
     for repo in &repos {
         if hidden == 0 {
-            graph_tx(store, |g| record_packages(g, workspace, repo))?;
+            graph_commit(&mut g, |g| record_packages(g, workspace, repo))?;
         }
     }
     let stamp = now();
@@ -2558,8 +2637,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
             if j == i {
                 continue;
             }
-            let live = store
-                .read(|g| live_pair_episodes(g, &importer.id, &exporter.id))?;
+            let live = live_pair_episodes(&mut g, &importer.id, &exporter.id)?;
             let current_pair = (importer.episode.clone(), exporter.episode.clone());
             let edges: Vec<&xrepo::CrossEdge> = report
                 .edges
@@ -2568,7 +2646,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
                 .collect();
             let unchanged = live.len() == 1
                 && live[0] == current_pair
-                && store.read(|g| same_cross_edges(g, &importer.id, &exporter.id, &edges))?;
+                && same_cross_edges(&mut g, &importer.id, &exporter.id, &edges)?;
             let nothing_recorded = live.is_empty();
             if unchanged || (nothing_recorded && edges.is_empty()) {
                 pairs.push(json!({
@@ -2586,7 +2664,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
                 } else {
                     (&exporter.id, &exporter.episode)
                 };
-                closed += graph_tx(store, |g| {
+                closed += graph_commit(&mut g, |g| {
                     close_cross_edges(
                         g,
                         "r.source_repository_id = $sr AND r.target_repository_id = $tr \
@@ -2601,7 +2679,7 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
                     )
                 })?;
             }
-            graph_tx(store, |g| {
+            graph_commit(&mut g, |g| {
                 insert_cross_edges(g, workspace, importer, exporter, &edges, &stamp)
             })?;
             rewritten_any = true;
@@ -2614,22 +2692,20 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
         }
         // Unresolved imports are per importing repository; rewrite them when
         // the importer moved or any partner pair was re-linked.
-        let live_unresolved = store.read(|g| {
-            store_graph::rows(
-                g,
-                "MATCH (u:UnresolvedCross {source_repository_id:$id}) \
-                 WHERE u.valid_to_episode IS NULL \
-                 RETURN DISTINCT u.source_episode AS source_episode, u.exporter_episodes AS exporter_episodes",
-                gparams([("id", gs(&importer.id))]),
-            )
-        })?;
+        let live_unresolved = store_graph::rows(
+            &mut g,
+            "MATCH (u:UnresolvedCross {source_repository_id:$id}) \
+             WHERE u.valid_to_episode IS NULL \
+             RETURN DISTINCT u.source_episode AS source_episode, u.exporter_episodes AS exporter_episodes",
+            gparams([("id", gs(&importer.id))]),
+        )?;
         let stale = live_unresolved.iter().any(|r| {
             s(r, "source_episode") != importer.episode
                 || s(r, "exporter_episodes") != exporter_episodes
         });
         let first_time = live_unresolved.is_empty();
         if rewritten_any || stale || (first_time && !report.unresolved.is_empty()) {
-            graph_tx(store, |g| {
+            graph_commit(&mut g, |g| {
                 g.query_with_params(
                     "MATCH (u:UnresolvedCross {source_repository_id:$id}) \
                      WHERE u.valid_to_episode IS NULL \
@@ -2992,7 +3068,7 @@ impl Store {
     /// result's `documents`.
     pub fn graph_link(&self, workspace: &str, token: &str) -> Result<Value> {
         let (mut result, principal) = self.authorized(workspace, token, "read", |db, p| {
-            Ok((link_workspace(db, self.graph()?, p)?, p.hash.clone()))
+            Ok((link_workspace(db, &self.graph()?, p)?, p.hash.clone()))
         })?;
         result["documents"] =
             match crate::doc_links::relink(self, workspace, &principal, |_| Ok(())) {
@@ -3032,10 +3108,11 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
+            let gstore = self.graph()?;
             Ok(json!({
-                "incoming": cross_edges_into(db, self.graph()?, p, identifier, None)?,
-                "outgoing": live_cross_edges(db, self.graph()?, p, identifier, CrossDirection::Outgoing)?,
-                "unresolved": cross_unresolved_toward(db, self.graph()?, p, identifier, None)?,
+                "incoming": cross_edges_into(db, &gstore, p, identifier, None)?,
+                "outgoing": live_cross_edges(db, &gstore, p, identifier, CrossDirection::Outgoing)?,
+                "unresolved": cross_unresolved_toward(db, &gstore, p, identifier, None)?,
             }))
         })
     }

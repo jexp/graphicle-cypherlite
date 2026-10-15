@@ -235,8 +235,12 @@ impl Fixture {
     fn episode_nodes(&self) -> BTreeSet<(String, String)> {
         let db = self.store.connect().unwrap();
         let episode = self.episode();
-        let handle =
-            graphicle_runtime::graph_projection::resident(&crate::gstore(&db), &self.repo, &episode).unwrap();
+        let handle = graphicle_runtime::graph_projection::resident(
+            &crate::gstore(&db),
+            &self.repo,
+            &episode,
+        )
+        .unwrap();
         handle
             .nodes()
             .iter()

@@ -1862,11 +1862,12 @@ fn a_project_whose_episode_cannot_be_read_leaves_the_others_linking() {
         .read(|db| graph_projection::current_episode(db, &broken))
         .unwrap();
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&broken],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(broken))],
+            );
             Ok(())
         })
         .unwrap();
@@ -2218,12 +2219,14 @@ async fn basic_answers_and_mcp_recall_take_the_switch() {
         .store
         .read(|db| graph_projection::current_episode(db, &repo))
         .unwrap();
+    // Corrupt the episode's attributes in the authoritative graph store.
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&repo],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(repo))],
+            );
             Ok(())
         })
         .unwrap();

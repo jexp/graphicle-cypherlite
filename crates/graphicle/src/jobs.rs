@@ -267,7 +267,11 @@ pub fn enqueue_projection(
                 params![payload.to_string(), now(), s(&existing, "id")],
             )?;
         }
-        if crate::graph_projection::is_recorded(&crate::store_graph::shared_for(db)?, repository, &episode)? {
+        if crate::graph_projection::is_recorded(
+            &crate::store::graph_for(db)?,
+            repository,
+            &episode,
+        )? {
             // A sync back to a recorded head set queues no
             // projection, so the live-symbol table follows it here. A
             // failure only leaves the table behind, which the symbol check
@@ -278,7 +282,7 @@ pub fn enqueue_projection(
                 for label in &labels {
                     crate::graph_projection::label_episode(
                         db,
-                        &crate::store_graph::shared_for(db)?,
+                        &crate::store::graph_for(db)?,
                         &p.workspace,
                         repository,
                         label,
@@ -442,7 +446,11 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         if current != expected {
             return Ok(Err(current));
         }
-        Ok(Ok(crate::graph_projection::prebuild(db, &crate::store_graph::shared_for(db)?, &identifier)?))
+        Ok(Ok(crate::graph_projection::prebuild(
+            db,
+            &crate::store::graph_for(db)?,
+            &identifier,
+        )?))
     })?;
     let built = match built {
         Ok(built) => built,
@@ -454,11 +462,17 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         if current != expected {
             return Ok(skipped(&current));
         }
-        let info = crate::graph_projection::project_prebuilt(db, &crate::store_graph::shared_for(db)?, identifier, &p, built)?;
+        let info = crate::graph_projection::project_prebuilt(
+            db,
+            &crate::store::graph_for(db)?,
+            identifier,
+            &p,
+            built,
+        )?;
         for label in &labels {
             crate::graph_projection::label_episode(
                 db,
-                &crate::store_graph::shared_for(db)?,
+                &crate::store::graph_for(db)?,
                 &p.workspace,
                 identifier,
                 label,
@@ -644,7 +658,8 @@ fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
     store.transaction(|db| {
         leased(db, job)?;
         let p = authorize_hash(db, &job.workspace, &job.principal_hash, "read")?;
-        let summary = crate::graph_projection::link_workspace(db, &crate::store_graph::shared_for(db)?, &p)?;
+        let summary =
+            crate::graph_projection::link_workspace(db, &crate::store::graph_for(db)?, &p)?;
         let mut result = json!({
             "edges": summary["edges"],
             "unresolved": summary["unresolved"],

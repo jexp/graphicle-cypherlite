@@ -472,8 +472,15 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
         ("endpoint", &endpoint),
         ("remove", &removed),
     ] {
-        graph_projection::persist_with_report(&db, &store, &f.repo, episode, graph, Some(&json!({})))
-            .unwrap();
+        graph_projection::persist_with_report(
+            &db,
+            &store,
+            &f.repo,
+            episode,
+            graph,
+            Some(&json!({})),
+        )
+        .unwrap();
         assert_eq!(
             sorted_node_link(&graph_projection::load(&store, &f.repo, episode).unwrap()),
             sorted_node_link(graph)
@@ -512,13 +519,17 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
             ("data", json!(graphicle_memory::text::canonical(&tampered))),
         ],
     );
-    db.execute(
-        "UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=? AND owner='a.py'",
-        [&f.repo],
+    graphicle_runtime::graph_delta::invalidate(&mut store.connection().unwrap(), &f.repo, ["a.py"])
+        .unwrap();
+    graph_projection::persist_with_report(
+        &db,
+        &store,
+        &f.repo,
+        "repair",
+        &removed,
+        Some(&json!({})),
     )
     .unwrap();
-    graph_projection::persist_with_report(&db, &store, &f.repo, "repair", &removed, Some(&json!({})))
-        .unwrap();
     assert_eq!(stats("repair")["dirty_groups"], 1);
     assert_eq!(
         sorted_node_link(&graph_projection::load(&store, &f.repo, "repair").unwrap()),
@@ -526,13 +537,25 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
     );
     // Reopening an existing store preserves valid cache entries.
     drop(db);
-    let reopened = Store::open(f._dir.path()).unwrap().connect().unwrap();
-    let valid: i64 = reopened
-        .query_row(
-            "SELECT count(*) FROM gf_projection_groups WHERE repository_id=? AND length(digest)=32",
-            [&f.repo],
-            |r| r.get(0),
-        )
+    let reopened = Store::open(f._dir.path()).unwrap();
+    let valid = reopened
+        .graph()
+        .unwrap()
+        .read(|db| {
+            let mut params = graphicle_runtime::store_graph::Params::new();
+            params.insert(
+                "repository".into(),
+                graphicle_runtime::store_graph::json_to_value(&json!(f.repo)),
+            );
+            let row = graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (g:ProjectionGroup {repository_id: $repository})
+                 WHERE g.digest IS NOT NULL
+                 RETURN count(*) AS n",
+                params,
+            )?;
+            Ok(row.unwrap()["n"].as_i64().unwrap())
+        })
         .unwrap();
     assert_eq!(valid, 2);
 }
@@ -569,13 +592,16 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         "links",
     )
     .unwrap();
-    let error =
-        graph_projection::persist_with_report(&db, &store, &f.repo, "failed", &conflict, Some(&json!({})))
-            .unwrap_err();
-    assert!(
-        error.to_string().contains("property type"),
-        "{error}"
-    );
+    let error = graph_projection::persist_with_report(
+        &db,
+        &store,
+        &f.repo,
+        "failed",
+        &conflict,
+        Some(&json!({})),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("property type"), "{error}");
     assert!(!graph_projection::is_recorded(&store, &f.repo, "failed").unwrap());
     // The episode's SQLite mirror took no row either.
     assert_eq!(
@@ -617,13 +643,17 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
             ("data", json!(graphicle_memory::text::canonical(&tampered))),
         ],
     );
-    db.execute(
-        "UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=? AND owner='a.py'",
-        [&f.repo],
+    graphicle_runtime::graph_delta::invalidate(&mut store.connection().unwrap(), &f.repo, ["a.py"])
+        .unwrap();
+    graph_projection::persist_with_report(
+        &db,
+        &store,
+        &f.repo,
+        "repair",
+        &original,
+        Some(&json!({})),
     )
     .unwrap();
-    graph_projection::persist_with_report(&db, &store, &f.repo, "repair", &original, Some(&json!({})))
-        .unwrap();
     assert_eq!(
         sorted_node_link(&graph_projection::load(&store, &f.repo, "repair").unwrap()),
         sorted_node_link(&original),

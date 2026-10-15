@@ -111,7 +111,14 @@ impl Fixture {
             .unwrap();
         self.drain_jobs();
         let db = self.store.connect().unwrap();
-        graph_projection::resolve_episode(&db, &crate::gstore(&db), &self.workspace, &self.repo, sha).unwrap()
+        graph_projection::resolve_episode(
+            &db,
+            &crate::gstore(&db),
+            &self.workspace,
+            &self.repo,
+            sha,
+        )
+        .unwrap()
     }
     fn drain_jobs(&self) {
         while let Some(job) = self.store.lease_job().unwrap() {

@@ -352,7 +352,8 @@ fn identical_tree_under_a_new_sha_labels_the_existing_episode() {
     assert_eq!(committed["replayed"], false);
     assert_eq!(f.drain_jobs().len(), 1);
     let db = f.db();
-    let episode = resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap();
+    let episode =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap();
     // Same tree, new commit: the sync layer replays without a sync id and the
     // existing episode gains the new sha without any explicit label call.
     let replay = f.prepare(&[("m.py", NESTED)], "ccc333");
@@ -407,7 +408,8 @@ fn replay_before_projection_requeues_a_skipped_projection_job() {
     let results = f.drain_jobs();
     assert_eq!(results.len(), 1, "{results:?}");
     let db = f.db();
-    let episode = resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "ccc333").unwrap();
+    let episode =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "ccc333").unwrap();
     assert_eq!(
         resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap(),
         episode
@@ -423,7 +425,8 @@ async fn as_of_by_commit_sha_reconstructs_history_and_impact_accepts_selectors()
     f.drain_jobs();
     let db = f.db();
     let first = resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap();
-    let second = resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "bbb222").unwrap();
+    let second =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "bbb222").unwrap();
     assert_ne!(first, second);
 
     let old = f
@@ -599,8 +602,14 @@ fn single_valued_inheritance_change_records_a_contradiction() {
     assert!(s(mark, "new_target").ends_with("other"), "{mark}");
     // The old edge was type-flipped to INHERITS_HIST by this episode and the
     // new one opened live; the marker names both by their edge reference.
-    assert!(s(mark, "old_edge").contains(s(mark, "old_target")), "{mark}");
-    assert!(s(mark, "new_edge").contains(s(mark, "new_target")), "{mark}");
+    assert!(
+        s(mark, "old_edge").contains(s(mark, "old_target")),
+        "{mark}"
+    );
+    assert!(
+        s(mark, "new_edge").contains(s(mark, "new_target")),
+        "{mark}"
+    );
     let old = crate::grows(
         &db,
         "MATCH (a:Symbol {repository_id:$r})-[r:INHERITS_HIST]->(b:Symbol) \

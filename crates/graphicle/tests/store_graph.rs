@@ -1,9 +1,7 @@
 //! Smoke tests for the CypherLite store core (`store_graph`): opening a
 //! store applies the schema idempotently, the transaction helper commits and
 //! rolls back, and UNWIND/SEARCH round-trips work through the façade helpers.
-use graphicle_runtime::store_graph::{
-    GraphStore, json_to_value, one, rows, s, value_to_json,
-};
+use graphicle_runtime::store_graph::{GraphStore, json_to_value, one, rows, s, value_to_json};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -24,7 +22,9 @@ fn a_directory_store_reopens_without_reapplying_anything() {
         let store = GraphStore::open(&path).unwrap();
         store
             .transaction(|db| {
-                db.query("CREATE (:Memory {id: 'm1', kind: 'note', title: 'First', body: 'rust graph'})")?;
+                db.query(
+                    "CREATE (:Memory {id: 'm1', kind: 'note', title: 'First', body: 'rust graph'})",
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -33,7 +33,13 @@ fn a_directory_store_reopens_without_reapplying_anything() {
     // data is still there.
     let store = GraphStore::open(&path).unwrap();
     let row = store
-        .read(|db| one(db, "MATCH (m:Memory {id: 'm1'}) RETURN m.title AS title", BTreeMap::new()))
+        .read(|db| {
+            one(
+                db,
+                "MATCH (m:Memory {id: 'm1'}) RETURN m.title AS title",
+                BTreeMap::new(),
+            )
+        })
         .unwrap()
         .unwrap();
     assert_eq!(s(&row, "title"), "First");
@@ -58,7 +64,13 @@ fn unwind_merge_round_trip_and_graph_type_enforcement() {
         })
         .unwrap();
     let found = store
-        .read(|db| rows(db, "MATCH (c:Chunk) RETURN c.id AS id ORDER BY id", BTreeMap::new()))
+        .read(|db| {
+            rows(
+                db,
+                "MATCH (c:Chunk) RETURN c.id AS id ORDER BY id",
+                BTreeMap::new(),
+            )
+        })
         .unwrap();
     assert_eq!(json!(found), json!([{"id": "c1"}, {"id": "c2"}]));
 
@@ -70,7 +82,13 @@ fn unwind_merge_round_trip_and_graph_type_enforcement() {
     });
     assert!(result.is_err(), "mandatory property must be enforced");
     let count = store
-        .read(|db| one(db, "MATCH (w:Workspace) RETURN count(w) AS n", BTreeMap::new()))
+        .read(|db| {
+            one(
+                db,
+                "MATCH (w:Workspace) RETURN count(w) AS n",
+                BTreeMap::new(),
+            )
+        })
         .unwrap()
         .unwrap();
     assert_eq!(count["n"], json!(0), "the failed transaction rolled back");

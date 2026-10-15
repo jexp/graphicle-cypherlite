@@ -499,9 +499,18 @@ fn linking_a_single_repository_workspace_is_skipped_and_records_nothing() {
     // The cross-repository state is graph-native now: CROSS_CALL
     // relationships, Package and UnresolvedCross nodes.
     for (label, cypher) in [
-        ("gf_cross_edges", "MATCH (a:Symbol)-[r:CROSS_CALL]->(b:Symbol) WHERE r.workspace_id = $w RETURN count(r) AS n"),
-        ("gf_cross_packages", "MATCH (p:Package {workspace_id:$w}) RETURN count(p) AS n"),
-        ("gf_cross_unresolved", "MATCH (u:UnresolvedCross {workspace_id:$w}) RETURN count(u) AS n"),
+        (
+            "gf_cross_edges",
+            "MATCH (a:Symbol)-[r:CROSS_CALL]->(b:Symbol) WHERE r.workspace_id = $w RETURN count(r) AS n",
+        ),
+        (
+            "gf_cross_packages",
+            "MATCH (p:Package {workspace_id:$w}) RETURN count(p) AS n",
+        ),
+        (
+            "gf_cross_unresolved",
+            "MATCH (u:UnresolvedCross {workspace_id:$w}) RETURN count(u) AS n",
+        ),
     ] {
         let count = crate::grows(&db, cypher, &[("w", json!(f.workspace))])[0]["n"]
             .as_i64()

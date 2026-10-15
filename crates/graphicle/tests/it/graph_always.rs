@@ -263,10 +263,7 @@ fn while_a_sync_waits_for_its_projection_the_arm_reads_the_latest_episode() {
     let latest = f.current();
     let db = f.store.connect().unwrap();
     crate::rewrite_episode_attributes(&db, &f.repo, |attributes| {
-        attributes
-            .as_object_mut()
-            .unwrap()
-            .remove("source_heads");
+        attributes.as_object_mut().unwrap().remove("source_heads");
     });
     f.sync(&[("a.py", A_V1), ("b.py", "def run():\n    return 0\n")]);
     let unknown = f.context("who calls beta");
@@ -1276,7 +1273,7 @@ fn sync_builds_the_graph_now_later_or_in_the_background() {
     let store = Store::open(&data).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !store
-        .read(|db| graph_projection::is_recorded(&crate::gstore_reader(db), &project, &episode))
+        .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
         .unwrap()
     {
         assert!(
@@ -1388,7 +1385,7 @@ fn mcp_builds_a_waiting_graph_at_start_and_leaves_no_job_running() {
     let store = Store::open(&data).unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     while !store
-        .read(|db| graph_projection::is_recorded(&crate::gstore_reader(db), &project, &episode))
+        .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
         .unwrap()
     {
         assert!(Instant::now() < deadline, "mcp did not build {episode}");
@@ -1476,7 +1473,7 @@ fn mcp_on_sigterm_finishes_the_job_in_hand_and_leaves_none_running() {
     assert_eq!(state(&store), "complete");
     assert!(
         store
-            .read(|db| graph_projection::is_recorded(&crate::gstore_reader(db), &project, &episode))
+            .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
             .unwrap()
     );
     // Not an assertion on timing: a fast machine may finish first.

@@ -522,7 +522,9 @@ fn a_retained_answer_links_only_windows_of_live_code_symbols() {
     let (alpha, alpha_revision) = f.symbol("a.py", "alpha");
     let episode = f.current_episode(&f.repo);
     let db = f.store.connect().unwrap();
-    let graph = graphicle_runtime::graph_projection::resident(&crate::gstore(&db), &f.repo, &episode).unwrap();
+    let graph =
+        graphicle_runtime::graph_projection::resident(&crate::gstore(&db), &f.repo, &episode)
+            .unwrap();
     // The code-graph facts the arm reports for the window of the node of
     // a.py whose `key` is `value`.
     let facts = |key: &str, value: &str| -> Value {
