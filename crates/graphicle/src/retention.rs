@@ -297,6 +297,7 @@ fn document_date(metadata: &Value, by: Dated) -> Option<chrono::DateTime<chrono:
 /// Select the documents `policy` would forget at `now`.
 pub fn source_plan(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     principal: &crate::store::Principal,
     repository: &Value,
     policy: &SourcePolicy,
@@ -306,7 +307,7 @@ pub fn source_plan(
     let cutoff = now - chrono::Duration::days(i64::from(policy.max_age_days));
     let mut cited = std::collections::BTreeSet::new();
     if policy.skip_cited_by_reviewed {
-        for memory in crate::memory::list(db, repository, principal, true)? {
+        for memory in crate::memory::list(db, graph, repository, principal, true)? {
             if memory["state"] != "reviewed" {
                 continue;
             }
@@ -380,7 +381,7 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
             let identifier = s(&repository, "id");
-            let plan = source_plan(db, p, &repository, &policy, chrono::Utc::now())?;
+            let plan = source_plan(db, &self.graph(), p, &repository, &policy, chrono::Utc::now())?;
             let mut connectors = serde_json::Map::new();
             for (connector, documents) in &plan.documents {
                 let mut removes: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -391,7 +392,7 @@ impl Store {
                         connector,
                         batch.iter().map(|d| (*d).clone()).collect(),
                     );
-                    let forget = crate::deletion::plan(db, &p.workspace, identifier, &scope)?;
+                    let forget = crate::deletion::plan(db, &self.graph(), &p.workspace, identifier, &scope)?;
                     for (table, n) in forget.rows() {
                         *removes.entry(table).or_default() += n;
                     }

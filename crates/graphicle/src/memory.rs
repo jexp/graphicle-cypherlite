@@ -1,8 +1,61 @@
 use crate::store::{self, Principal, Store, decode, one, repo, rows, s};
+use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result, digest, id, integer, native, now, string};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The memories of one repository, newest-updated first, as plain records
+/// (the shape `repo_memories` rows had; vector-index properties such as
+/// `embedding` stay on the node but out of the listing). `data` is a
+/// stringified-JSON property (the engine stores no map values) and is
+/// decoded here, as `store::decode` did for the SQL rows.
+pub(crate) fn memory_rows(graph: &GraphStore, repository: &str) -> Result<Vec<Value>> {
+    const FIELDS: &str = "m.id AS id, m.repository_id AS repository_id, m.kind AS kind, \
+        m.revision AS revision, m.state AS state, m.title AS title, m.body AS body, \
+        m.data AS data, m.created_at AS created_at, m.updated_at AS updated_at";
+    let mut values = graph.read(|db| {
+        store_graph::rows(
+            db,
+            &format!(
+                "MATCH (m:Memory {{repository_id: $repo}}) RETURN {FIELDS} \
+                 ORDER BY m.updated_at DESC, m.id"
+            ),
+            store_graph::params(&json!({"repo": repository})),
+        )
+    })?;
+    for row in &mut values {
+        decode(row, "data")?;
+    }
+    Ok(values)
+}
+
+/// One memory by id, repository-scoped, as a plain record (`data` decoded).
+pub(crate) fn memory_row(
+    graph: &GraphStore,
+    repository: &str,
+    identifier: &str,
+) -> Result<Option<Value>> {
+    let row = graph.read(|db| {
+        store_graph::one(
+            db,
+            "MATCH (m:Memory {id: $id, repository_id: $repo}) RETURN m",
+            store_graph::params(&json!({"id": identifier, "repo": repository})),
+        )
+    })?;
+    match row {
+        Some(row) => {
+            let mut record = store_graph::node(&row, "m");
+            decode(&mut record, "data")?;
+            // Vector-index properties stay on the node, out of the record.
+            if let Some(map) = record.as_object_mut() {
+                map.retain(|k, _| !k.starts_with("embedding"));
+            }
+            Ok(Some(record))
+        }
+        None => Ok(None),
+    }
+}
 
 pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
     let identifier = s(repository, "id");
@@ -111,19 +164,29 @@ pub fn state(documents: &[Value]) -> String {
             .collect::<Vec<_>>()
     ))
 }
-pub fn reviewed_state(db: &Connection, repository: &Value, p: &Principal) -> Result<String> {
-    reviewed_state_for(db, repository, &list(db, repository, p, true)?)
+pub fn reviewed_state(
+    db: &Connection,
+    graph: &GraphStore,
+    repository: &Value,
+    p: &Principal,
+) -> Result<String> {
+    reviewed_state_for(graph, repository, &list(db, graph, repository, p, true)?)
 }
 /// `reviewed_state` over sources the caller already read for this principal.
 pub fn reviewed_state_of(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     documents: &[Value],
 ) -> Result<String> {
-    reviewed_state_for(db, repository, &list_of(db, repository, documents, true)?)
+    reviewed_state_for(
+        graph,
+        repository,
+        &list_of(db, graph, repository, documents, true)?,
+    )
 }
 pub fn reviewed_state_for(
-    db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     memories: &[Value],
 ) -> Result<String> {
@@ -134,8 +197,20 @@ pub fn reviewed_state_for(
         .collect();
     // Identity review edits graph links without editing memory text/revisions.
     // Include visible links so cached and in-flight answers observe that change.
-    let links: Vec<_> = rows(db,"SELECT l.claim_id,l.subject_id,l.object_id,c.memory_id FROM am_entity_links l JOIN am_claims c ON c.id=l.claim_id AND c.repository_id=l.repository_id WHERE l.repository_id=? ORDER BY l.claim_id,l.subject_id,l.object_id",[s(repository,"id")])?
-        .into_iter().filter(|l|visible.contains(s(l,"memory_id"))).collect();
+    let links: Vec<_> = graph
+        .read(|db| {
+            store_graph::rows(
+                db,
+                "MATCH (c:Claim {repository_id: $repo})-[:HAS_SUBJECT]->(sub:Entity) \
+                 MATCH (c)-[:HAS_OBJECT]->(obj:Entity) \
+                 RETURN c.id AS claim_id, sub.id AS subject_id, obj.id AS object_id, \
+                 c.memory_id AS memory_id ORDER BY claim_id, subject_id, object_id",
+                store_graph::params(&json!({"repo": s(repository, "id")})),
+            )
+        })?
+        .into_iter()
+        .filter(|l| visible.contains(s(l, "memory_id")))
+        .collect();
     Ok(digest(&json!({"memories":memories.iter()
         .filter(|m| m["state"] == "reviewed" || m["state"] == "retired")
         .map(|m|json!([m["id"],m["revision"],m["state"],m["stale"]])).collect::<Vec<_>>(),"entity_links":links})))
@@ -329,12 +404,14 @@ pub fn reasons(
 }
 pub fn list(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     p: &Principal,
     include_retired: bool,
 ) -> Result<Vec<Value>> {
     list_of(
         db,
+        graph,
         repository,
         &documents(db, repository, p)?,
         include_retired,
@@ -343,23 +420,17 @@ pub fn list(
 /// `list` over the sources one principal can read (`documents`).
 pub fn list_of(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     documents: &[Value],
     include_retired: bool,
 ) -> Result<Vec<Value>> {
-    let mut values = rows(
-        db,
-        "SELECT * FROM repo_memories WHERE repository_id=? ORDER BY updated_at DESC,id",
-        [s(repository, "id")],
-    )?;
+    let mut values = memory_rows(graph, s(repository, "id"))?;
     if values.len() > graphicle_memory::lifecycle::MAX_MEMORIES {
         return Err(Error::bad(format!(
             "Memory count exceeds the {}-record listing bound",
             graphicle_memory::lifecycle::MAX_MEMORIES
         )));
-    }
-    for row in &mut values {
-        decode(row, "data")?;
     }
     let original = values.clone();
     let lookup = Lookup::new(db, s(repository, "id"), documents, &original, None)?;
@@ -431,6 +502,7 @@ fn accessible_with(data: &Value, allowed: &BTreeSet<&str>, by_id: &BTreeMap<&str
 #[allow(clippy::too_many_arguments)]
 pub fn save(
     db: &Connection,
+    graph: &GraphStore,
     repository: &str,
     identifier: Option<&str>,
     expected: Option<i64>,
@@ -449,41 +521,56 @@ pub fn save(
         return Err(Error::bad("Invalid memory title, body or state"));
     }
     let identifier = identifier.map(str::to_string).unwrap_or_else(id);
-    let old = one(
-        db,
-        "SELECT * FROM repo_memories WHERE repository_id=? AND id=?",
-        params![repository, identifier],
-    )?;
-    if let Some(ref row) = old {
-        if expected != row["revision"].as_i64() {
-            return Err(Error::conflict(
-                "Memory changed; review its current revision",
-            ));
-        }
-    } else if expected.is_some() {
-        return Err(Error::conflict("Memory no longer exists"));
-    }
-    let revision = old
-        .as_ref()
-        .and_then(|r| r["revision"].as_i64())
-        .unwrap_or(0)
-        + 1;
     let stamp = now();
-    let created = old
-        .as_ref()
-        .map(|r| s(r, "created_at").to_string())
-        .unwrap_or(stamp.clone());
-    let written = db.execute("INSERT INTO repo_memories VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,revision=excluded.revision,state=excluded.state,title=excluded.title,body=excluded.body,data=excluded.data,updated_at=excluded.updated_at WHERE repo_memories.repository_id=excluded.repository_id",params![identifier,repository,kind,revision,state,title,body,data.to_string(),created,stamp])?;
-    if written != 1 {
-        return Err(Error::conflict(
-            "Memory identifier unavailable in this repository",
-        ));
-    }
-    let raw = json!({"id":identifier,"repository_id":repository,"kind":kind,"revision":revision,"state":state,"title":title,"body":body,"data":data.to_string(),"created_at":created,"updated_at":stamp});
-    db.execute(
-        "INSERT INTO repo_memory_revisions VALUES(?,?,?,?)",
-        params![identifier, revision, raw.to_string(), stamp],
-    )?;
+    // The optimistic revision check and the write share one graph
+    // transaction; the engine reruns the closure on a write-write conflict.
+    let raw = graph.transaction(|db| {
+        let old = store_graph::one(
+            db,
+            "MATCH (m:Memory {id: $id}) RETURN m",
+            store_graph::params(&json!({"id": identifier})),
+        )?
+        .map(|row| store_graph::node(&row, "m"));
+        if let Some(ref row) = old {
+            if s(row, "repository_id") != repository {
+                return Err(Error::conflict(
+                    "Memory identifier unavailable in this repository",
+                ));
+            }
+            if expected != row["revision"].as_i64() {
+                return Err(Error::conflict(
+                    "Memory changed; review its current revision",
+                ));
+            }
+        } else if expected.is_some() {
+            return Err(Error::conflict("Memory no longer exists"));
+        }
+        let revision = old
+            .as_ref()
+            .and_then(|r| r["revision"].as_i64())
+            .unwrap_or(0)
+            + 1;
+        let created = old
+            .as_ref()
+            .map(|r| s(r, "created_at").to_string())
+            .unwrap_or(stamp.clone());
+        let raw = json!({"id":identifier,"repository_id":repository,"kind":kind,"revision":revision,"state":state,"title":title,"body":body,"data":data.to_string(),"created_at":created,"updated_at":stamp});
+        store_graph::rows(
+            db,
+            "MERGE (m:Memory {id: $id}) \
+             SET m.repository_id = $repo, m.kind = $kind, m.revision = $revision, \
+                 m.state = $state, m.title = $title, m.body = $body, m.data = $data, \
+                 m.created_at = $created, m.updated_at = $stamp \
+             CREATE (r:MemoryRevision {memory_id: $id, revision: $revision, \
+                 data: $raw, created_at: $stamp})-[:REVISION_OF]->(m) \
+             RETURN m.id AS id",
+            store_graph::params(&json!({"id":identifier,"repo":repository,"kind":kind,
+                "revision":revision,"state":state,"title":title,"body":body,
+                "data":data.to_string(),
+                "created":created,"stamp":stamp,"raw":raw.to_string()})),
+        )?;
+        Ok(raw)
+    })?;
     store::invalidate(db, repository)?;
     let workspace = crate::invalidation::workspace_of(db, repository)?;
     crate::invalidation::record_memory(db, &workspace, repository, &identifier, data)?;
@@ -494,7 +581,7 @@ pub fn save(
         db,
         repository,
         "memory_saved",
-        json!({"id":identifier,"revision":revision,"state":state}),
+        json!({"id":identifier,"revision":raw["revision"],"state":state}),
     )?;
     let mut value = raw;
     value["data"] = data.clone();
@@ -566,18 +653,19 @@ impl Store {
             data["notes"] = json!({});
             data["authority"] = json!("member_reviewed_statement");
             data["maintainer"] = json!(args["maintainer"].as_str().unwrap_or("Member"));
-            crate::structured_memory::attach(db, s(&repository, "id"), args, &mut data)?;
+            crate::structured_memory::attach(&self.graph(), s(&repository, "id"), args, &mut data)?;
             let replaced = if args.get("supersedes").is_some() {
                 crate::structured_memory::replacement(
                     args,
                     &mut data,
-                    &list_of(db, &repository, &docs, true)?,
+                    &list_of(db, &self.graph(), &repository, &docs, true)?,
                 )?
             } else {
                 None
             };
             let result = save(
                 db,
+                &self.graph(),
                 s(&repository, "id"),
                 args["memory_id"].as_str(),
                 args["expected_revision"].as_i64(),
@@ -588,7 +676,13 @@ impl Store {
                 &data,
             )?;
             if let Some(old) = replaced {
-                crate::structured_memory::close_replaced(db, s(&repository, "id"), &old, &result)?;
+                crate::structured_memory::close_replaced(
+                    db,
+                    &self.graph(),
+                    s(&repository, "id"),
+                    &old,
+                    &result,
+                )?;
             }
             Ok(result)
         })
@@ -596,13 +690,19 @@ impl Store {
     pub fn refresh_context(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            prepare_refresh(db, &repository, p, string(args, "memory_id", 100)?)
+            prepare_refresh(
+                db,
+                &self.graph(),
+                &repository,
+                p,
+                string(args, "memory_id", 100)?,
+            )
         })
     }
     pub fn review_memory(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "approve", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            apply_review(db, &repository, p, args, None)
+            apply_review(db, &self.graph(), &repository, p, args, None)
         })
     }
 }
@@ -612,6 +712,7 @@ impl Store {
 /// of a model review is supplied internally, never accepted from API arguments.
 pub(crate) fn apply_review(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     p: &Principal,
     args: &Value,
@@ -621,7 +722,7 @@ pub(crate) fn apply_review(
         return Err(Error::denied());
     }
     let identifier = s(repository, "id");
-    let memories = list(db, repository, p, true)?;
+    let memories = list(db, graph, repository, p, true)?;
     let old = memories
         .iter()
         .find(|m| s(m, "id") == s(args, "memory_id"))
@@ -671,6 +772,7 @@ pub(crate) fn apply_review(
         }
         let result = save(
             db,
+            graph,
             identifier,
             Some(s(current, "id")),
             current["revision"].as_i64(),
@@ -684,6 +786,7 @@ pub(crate) fn apply_review(
         retired["applied_to"] = json!(s(current, "id"));
         save(
             db,
+            graph,
             identifier,
             Some(s(old, "id")),
             old["revision"].as_i64(),
@@ -697,6 +800,7 @@ pub(crate) fn apply_review(
     } else {
         save(
             db,
+            graph,
             identifier,
             Some(s(old, "id")),
             old["revision"].as_i64(),
@@ -707,17 +811,25 @@ pub(crate) fn apply_review(
             &data,
         )?
     };
-    crate::claims::apply_memory_review(db, identifier, s(old, "id"), s(&result, "id"), decision)?;
+    crate::claims::apply_memory_review(
+        db,
+        graph,
+        identifier,
+        s(old, "id"),
+        s(&result, "id"),
+        decision,
+    )?;
     Ok(result)
 }
 
 pub fn prepare_refresh(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     p: &Principal,
     memory_id: &str,
 ) -> Result<Value> {
-    let memories = list(db, repository, p, true)?;
+    let memories = list(db, graph, repository, p, true)?;
     let old = memories
         .iter()
         .find(|m| s(m, "id") == memory_id && m["state"] != "retired")
@@ -764,11 +876,12 @@ pub fn prepare_refresh(
 }
 pub fn propose_refresh(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     p: &Principal,
     args: &Value,
 ) -> Result<Value> {
-    let prepared = prepare_refresh(db, repository, p, string(args, "memory_id", 100)?)?;
+    let prepared = prepare_refresh(db, graph, repository, p, string(args, "memory_id", 100)?)?;
     let context = &prepared["context"];
     if context["sha256"] != args["context_sha256"] {
         return Err(Error::conflict("Refresh context changed"));
@@ -823,7 +936,7 @@ pub fn propose_refresh(
     data["candidate"] = json!({"evidence":citations,"title":context["title"]});
     data["warnings"] =
         json!(["Review the changes against current sources. Earlier revisions remain available."]);
-    let old = list(db, repository, p, false)?
+    let old = list(db, graph, repository, p, false)?
         .into_iter()
         .find(|m| m["id"] == context["memory_id"])
         .ok_or_else(|| Error::conflict("Memory disappeared"))?;
@@ -851,6 +964,7 @@ pub fn propose_refresh(
     data["notes"] = old["data"].get("notes").cloned().unwrap_or(json!({}));
     let draft = save(
         db,
+        graph,
         s(repository, "id"),
         None,
         None,

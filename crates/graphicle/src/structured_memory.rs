@@ -2,11 +2,12 @@
 //! No second store, implicit approval, model call or benchmark-specific policy.
 use crate::{
     Error, Result, memory, now, query,
-    store::{Store, decode, repo, rows, s},
+    store::{Store, repo, s},
+    store_graph::{self, GraphStore},
     string,
 };
 use graphicle_memory::recall::{self, Metadata, Query, Record};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 pub fn metadata(value: &Value) -> Result<Metadata> {
@@ -18,17 +19,12 @@ pub fn metadata(value: &Value) -> Result<Metadata> {
 
 /// Only a member-approved note (or the existing explicit review workflow)
 /// can introduce trusted recall metadata. An edit that omits it preserves it.
-pub fn attach(db: &Connection, repository: &str, args: &Value, data: &mut Value) -> Result<()> {
+pub fn attach(graph: &GraphStore, repository: &str, args: &Value, data: &mut Value) -> Result<()> {
     if let Some(value) = args.get("recall") {
         data["recall"] = serde_json::to_value(metadata(value)?)?;
     } else if let Some(identifier) = args["memory_id"].as_str()
-        && let Some(mut prior) = crate::store::one(
-            db,
-            "SELECT data FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, identifier],
-        )?
+        && let Some(prior) = memory::memory_row(graph, repository, identifier)?
     {
-        decode(&mut prior, "data")?;
         if let Some(value) = prior["data"].get("recall") {
             data["recall"] = serde_json::to_value(metadata(value)?)?;
         }
@@ -93,7 +89,13 @@ pub fn replacement(args: &Value, data: &mut Value, memories: &[Value]) -> Result
     Ok(Some(old.clone()))
 }
 
-pub fn close_replaced(db: &Connection, repository: &str, old: &Value, new: &Value) -> Result<()> {
+pub fn close_replaced(
+    db: &Connection,
+    graph: &GraphStore,
+    repository: &str,
+    old: &Value,
+    new: &Value,
+) -> Result<()> {
     let mut data = old["data"].clone();
     let mut recall = metadata(&data["recall"])?;
     recall.valid_to = metadata(&new["data"]["recall"])?.valid_from;
@@ -104,6 +106,7 @@ pub fn close_replaced(db: &Connection, repository: &str, old: &Value, new: &Valu
     // replacement until it takes effect, and keeps the old fact before then.
     memory::save(
         db,
+        graph,
         repository,
         Some(s(old, "id")),
         old["revision"].as_i64(),
@@ -154,8 +157,9 @@ impl Store {
         };
         self.authorized_read(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
+            let graph = self.graph();
             let documents = memory::documents(db, &repository, p)?;
-            let visible = memory::list_of(db, &repository, &documents, true)?;
+            let visible = memory::list_of(db, &graph, &repository, &documents, true)?;
             let mut memories = Vec::new();
             let mut descriptors = Vec::new();
             let mut evidence_memories = Vec::new();
@@ -171,19 +175,31 @@ impl Store {
                 }
                 let selected = if let Some(known) = known {
                     let mut selected = None;
-                    for mut revision in rows(db,
-                        "SELECT data,created_at FROM repo_memory_revisions WHERE memory_id=? ORDER BY revision",
-                        [s(current, "id")])? {
-                        if graphicle_memory::temporal::instant(s(&revision, "created_at")).map_err(Error::bad)? <= known {
-                            decode(&mut revision, "data")?;
-                            let mut value = revision["data"].clone();
-                            decode(&mut value, "data")?;
+                    for revision in graph.read(|g| {
+                        store_graph::rows(
+                            g,
+                            "MATCH (r:MemoryRevision {memory_id: $id}) \
+                             RETURN r.data AS data, r.created_at AS created_at \
+                             ORDER BY r.revision",
+                            store_graph::params(&json!({"id": s(current, "id")})),
+                        )
+                    })? {
+                        if graphicle_memory::temporal::instant(s(&revision, "created_at"))
+                            .map_err(Error::bad)?
+                            <= known
+                        {
+                            let mut value: Value = serde_json::from_str(s(&revision, "data"))?;
+                            value["data"] = serde_json::from_str(s(&value, "data"))?;
                             selected = Some(value);
                         }
                     }
                     selected
-                } else { Some(current.clone()) };
-                let Some(mut selected) = selected else { continue };
+                } else {
+                    Some(current.clone())
+                };
+                let Some(mut selected) = selected else {
+                    continue;
+                };
                 // list_of has already checked current access and calculated
                 // transitive freshness for every memory in one batch. Only a
                 // historical revision needs its own dependency revalidation.
@@ -198,7 +214,9 @@ impl Store {
                             &visible,
                         )?
                         .is_empty()
-                } else { selected["stale"] == true };
+                } else {
+                    selected["stale"] == true
+                };
                 if selected["state"] != "reviewed" || unavailable {
                     withheld += 1;
                     continue;
@@ -209,32 +227,57 @@ impl Store {
                     continue;
                 };
                 let descriptor = metadata(value)?;
-                if recall::eligibility(&descriptor, &request, at).map_err(Error::bad)?.is_none() {
+                if recall::eligibility(&descriptor, &request, at)
+                    .map_err(Error::bad)?
+                    .is_none()
+                {
                     evidence_memories.push(selected.clone());
                 }
                 descriptors.push(descriptor);
                 memories.push(selected);
             }
-            let records: Vec<_> = memories.iter().zip(&descriptors).map(|(m, metadata)|
-                Record { id: s(m, "id"), text: s(m, "body"), metadata }).collect();
+            let records: Vec<_> = memories
+                .iter()
+                .zip(&descriptors)
+                .map(|(m, metadata)| Record {
+                    id: s(m, "id"),
+                    text: s(m, "body"),
+                    metadata,
+                })
+                .collect();
             let selection = recall::select(&records, &request, at).map_err(Error::bad)?;
-            let by_id: std::collections::BTreeMap<_, _> = memories.iter().map(|m| (s(m,"id"), m)).collect();
-            let selected: Vec<Value> = selection.hits.iter().map(|hit| -> Result<Value> {
-                let mut memory = by_id[hit.id.as_str()].clone();
-                memory["match"] = serde_json::to_value(hit)?;
-                Ok(memory)
-            }).collect::<Result<_>>()?;
-            let snapshot = query::Snapshot { repository, state: memory::state(&documents),
-                documents, memories: evidence_memories, graph: json!({"edges":[]}) };
+            let by_id: std::collections::BTreeMap<_, _> =
+                memories.iter().map(|m| (s(m, "id"), m)).collect();
+            let selected: Vec<Value> = selection
+                .hits
+                .iter()
+                .map(|hit| -> Result<Value> {
+                    let mut memory = by_id[hit.id.as_str()].clone();
+                    memory["match"] = serde_json::to_value(hit)?;
+                    Ok(memory)
+                })
+                .collect::<Result<_>>()?;
+            let snapshot = query::Snapshot {
+                repository,
+                state: memory::state(&documents),
+                documents,
+                memories: evidence_memories,
+                graph: json!({"edges":[]}),
+            };
             let sources = crate::memory_evidence::gather(&snapshot, &selected)?;
-            let windows: Vec<_> = sources.hits.iter().map(|hit|
-                json!({"id":hit["source"]["id"],"text":hit["text"]})).collect();
+            let windows: Vec<_> = sources
+                .hits
+                .iter()
+                .map(|hit| json!({"id":hit["source"]["id"],"text":hit["text"]}))
+                .collect();
             let support = sources.coverage(&windows);
-            Ok(json!({"memories":selected,"selection":selection,"evidence":sources.hits,
+            Ok(
+                json!({"memories":selected,"selection":selection,"evidence":sources.hits,
                 "memory_support":support,
                 "withheld_unreviewed_or_stale":withheld,"match_mode":request.match_mode,
                 "as_of":request.as_of,"known_at":args["known_at"],"model_calls":0,
-                "semantic_entailment_verified":false}))
+                "semantic_entailment_verified":false}),
+            )
         })
     }
 }

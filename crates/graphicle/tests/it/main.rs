@@ -49,6 +49,7 @@ mod grounded_v3;
 mod invalidation;
 mod jobs_bounds;
 mod local_inference;
+mod memory_graph;
 mod memory_handoffs;
 mod memory_symbols;
 mod observer;

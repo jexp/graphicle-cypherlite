@@ -195,6 +195,7 @@ fn project_args(args: &Value, repository: &str) -> Value {
 /// `repository_id`, when given, names the project read first.
 pub fn context(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     args: &Value,
     embedding: Option<&crate::model::Profile>,
@@ -218,6 +219,7 @@ pub fn context(
         let id = s(&repository, "id").to_string();
         match query::project_packet(
             db,
+            graph,
             p,
             &repository,
             &project_args(args, &id),

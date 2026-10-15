@@ -261,7 +261,9 @@ pub fn json_to_value(value: &Json) -> Value {
             }
         }
         Json::String(s) => Value::String(s.as_str().into()),
-        Json::Array(items) => Value::List(items.iter().map(json_to_value).collect::<Vec<_>>().into()),
+        Json::Array(items) => {
+            Value::List(items.iter().map(json_to_value).collect::<Vec<_>>().into())
+        }
         Json::Object(map) => Value::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -296,7 +298,15 @@ pub fn value_to_json(value: &Value) -> Json {
         Value::Node(node) => {
             let mut map = properties_to_json(&node.properties);
             map.insert("_id".into(), Json::from(node.id));
-            map.insert("_labels".into(), Json::Array(node.labels.iter().map(|l| Json::String(l.clone())).collect()));
+            map.insert(
+                "_labels".into(),
+                Json::Array(
+                    node.labels
+                        .iter()
+                        .map(|l| Json::String(l.clone()))
+                        .collect(),
+                ),
+            );
             Json::Object(map)
         }
         Value::Relationship(rel) => {
@@ -351,6 +361,31 @@ pub fn one(db: &mut Connection, cypher: &str, params: Params) -> Result<Option<J
 /// counterpart of `store::s`.
 pub fn s<'a>(value: &'a Json, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
+}
+
+/// Query parameters from a JSON object (`{"id": …}` → `$id`). Modules build
+/// their parameter maps as JSON and convert here, keeping the
+/// serde_json-in/out boundary.
+pub fn params(value: &Json) -> Params {
+    value
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A `RETURN n` node column as a plain record: its properties without the
+/// engine's `_id`/`_labels` bookkeeping, so a migrated module's rows keep
+/// the exact shape its SQL rows had.
+pub fn node(row: &Json, key: &str) -> Json {
+    let mut node = row[key].clone();
+    if let Some(map) = node.as_object_mut() {
+        map.retain(|k, _| !k.starts_with('_'));
+    }
+    node
 }
 
 /// A call site's file relative to its crate (see `store::crate_relative`).

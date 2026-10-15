@@ -5,7 +5,7 @@ use graphicle_memory::text;
 use graphicle_runtime::{
     jobs::Worker,
     model,
-    store::{self, Store, s},
+    store::{Store, s},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -112,17 +112,10 @@ async fn embed(configuration: &model::Config, contents: &[&str]) -> (Value, Vec<
         )
         .unwrap();
     assert_eq!(result["state"], "complete", "{result}");
-    let vectors = store
-        .authorized(ws, key, "read", |db, _| {
-            store::rows(
-                db,
-                "SELECT vector FROM am_vectors WHERE repository_id=?",
-                [project_id],
-            )
-        })
+    let vectors = graphicle_runtime::vector::graph_vectors_all(&store.graph(), project_id)
         .unwrap()
         .iter()
-        .map(|row| serde_json::from_str(s(row, "vector")).unwrap())
+        .map(|row| serde_json::from_value(row["vector"].clone()).unwrap())
         .collect();
     (result["result"].clone(), sorted(vectors))
 }

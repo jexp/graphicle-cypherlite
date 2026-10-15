@@ -818,6 +818,7 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
                     .collect::<Vec<_>>();
                 claims::propose(
                     db,
+                    &f.store.graph(),
                     &repo,
                     p,
                     &json!([value]),
@@ -833,7 +834,12 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
     let targets = f
         .store
         .authorized(&f.workspace, &f.key, "read", |db, p| {
-            claims::current(db, &graphicle_runtime::store::repo(db, p, &f.project)?, p)
+            claims::current(
+                db,
+                &f.store.graph(),
+                &graphicle_runtime::store::repo(db, p, &f.project)?,
+                p,
+            )
         })
         .unwrap();
     let mut corrected = claim(
@@ -869,8 +875,8 @@ fn private_sources_do_not_leak_through_memory_children_or_history() {
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Private","config":{"acl":{"workspace_readers":false,"credentials":[]}}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"secret","title":"Private","content":"Confidential project detail."}]}))).unwrap();
     let source = format!("connector:{}:secret", s(&connector, "id"));
-    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|{let parent=memory::save(db,&f.project,None,None,"note","Private note","Confidential project detail.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential project detail.")},"notes":{}}))?;
-        memory::save(db,&f.project,None,None,"context","Derived note","Also confidential.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{},"notes":{s(&parent,"id"):1}}))?;Ok(())}).unwrap();
+    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|{let parent=memory::save(db,&f.store.graph(),&f.project,None,None,"note","Private note","Confidential project detail.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential project detail.")},"notes":{}}))?;
+        memory::save(db,&f.store.graph(),&f.project,None,None,"context","Derived note","Also confidential.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{},"notes":{s(&parent,"id"):1}}))?;Ok(())}).unwrap();
     let reader = f
         .store
         .grant(
@@ -1098,6 +1104,7 @@ async fn reflection_receives_actual_reviewed_memory_text() {
         .authorized(&f.workspace, &f.key, "approve", |db, _| {
             memory::save(
                 db,
+                &f.store.graph(),
                 &f.project,
                 None,
                 None,
@@ -1240,7 +1247,7 @@ fn source_snapshot_pin_backup_restore_and_forgetting_are_real() {
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Private","config":{"acl":{"workspace_readers":false,"credentials":[]}}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"private","title":"Private source","content":"Confidential source."}]}))).unwrap();
     let source = format!("connector:{}:private", s(&connector, "id"));
-    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|memory::save(db,&f.project,None,None,"note","Remember","Confidential source.","reviewed",&json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential source.")}}))).unwrap();
+    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|memory::save(db,&f.store.graph(),&f.project,None,None,"note","Remember","Confidential source.","reviewed",&json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential source.")}}))).unwrap();
     let removed = f
         .store
         .maintain(

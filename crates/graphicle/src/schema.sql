@@ -375,7 +375,9 @@
                 -- projection of that file content ran. Goes with its memory.
                 CREATE TABLE IF NOT EXISTS gf_symbol_pins (
                     repository_id TEXT NOT NULL REFERENCES repo_projects(id) ON DELETE CASCADE,
-                    memory_id TEXT NOT NULL REFERENCES repo_memories(id) ON DELETE CASCADE,
+                    -- Memories are graph nodes now (cypherlite-backend): the
+                    -- old FOREIGN KEY to repo_memories would reject every pin.
+                    memory_id TEXT NOT NULL,
                     relpath TEXT NOT NULL, sha256 TEXT NOT NULL,
                     byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL,
                     state TEXT NOT NULL, covered INTEGER, symbols TEXT, episode TEXT,

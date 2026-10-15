@@ -4,7 +4,7 @@ use crate::{
     claims,
     jobs::{self, Job, Worker},
     memory, model, query,
-    store::{decode, one, rows, s},
+    store::{decode, one, s},
 };
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -191,7 +191,10 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
         graphicle_memory::semantic::INSTRUCTIONS
     );
     let (snapshot, targets) = jobs::guarded_read(&worker.store, job, |db, p, repo| {
-        Ok((query::snapshot(db, repo, p)?, claims::current(db, repo, p)?))
+        Ok((
+            query::snapshot(db, &worker.store.graph(), repo, p)?,
+            claims::current(db, &worker.store.graph(), repo, p)?,
+        ))
     })?;
     let configuration =
         crate::settings::configuration(&worker.store, &job.workspace, &worker.config)?;
@@ -349,7 +352,7 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
             .cloned()
             .collect();
         let result = jobs::guarded(&worker.store, job, |db, p, repo| {
-            let fresh = claims::current(db, repo, p)?;
+            let fresh = claims::current(db, &worker.store.graph(), repo, p)?;
             for target in &target_context {
                 if !fresh.iter().any(|t| {
                     t["id"] == target["id"] && t["memory_revision"] == target["memory_revision"]
@@ -361,6 +364,7 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
             }
             let result = claims::propose(
                 db,
+                &worker.store.graph(),
                 repo,
                 p,
                 &value["claims"],
@@ -376,7 +380,12 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
                 .iter()
                 .filter(|d| d["replayed"] != true)
             {
-                inherit_visibility(db, s(draft, "memory_id"), &snapshot.documents)?;
+                inherit_visibility(
+                    db,
+                    &worker.store.graph(),
+                    s(draft, "memory_id"),
+                    &snapshot.documents,
+                )?;
             }
             db.execute(
                 "INSERT INTO am_document_reads VALUES(?,?,?,?,?,?,?)",
@@ -401,22 +410,39 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
 }
 fn inherit_visibility(
     db: &rusqlite::Connection,
+    graph: &crate::store_graph::GraphStore,
     memory_id: &str,
     documents: &[Value],
 ) -> Result<()> {
-    if let Some(mut row) = one(db, "SELECT * FROM repo_memories WHERE id=?", [memory_id])? {
+    let _ = db;
+    if let Some(mut row) = graph
+        .read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (m:Memory {id: $id}) RETURN m",
+                crate::store_graph::params(&json!({"id": memory_id})),
+            )
+        })?
+        .map(|r| crate::store_graph::node(&r, "m"))
+    {
+        // The record keeps the SQL row's shape: no vector-index properties.
+        if let Some(map) = row.as_object_mut() {
+            map.retain(|k, _| !k.starts_with("embedding"));
+        }
         decode(&mut row, "data")?;
         visibility(&mut row["data"], documents);
-        db.execute(
-            "UPDATE repo_memories SET data=? WHERE id=?",
-            params![row["data"].to_string(), memory_id],
-        )?;
         let mut journal = row.clone();
         journal["data"] = json!(row["data"].to_string());
-        db.execute(
-            "UPDATE repo_memory_revisions SET data=? WHERE memory_id=? AND revision=?",
-            params![journal.to_string(), memory_id, row["revision"].as_i64()],
-        )?;
+        graph.transaction(|g| {
+            crate::store_graph::rows(
+                g,
+                "MATCH (m:Memory {id: $id}) SET m.data = $data                  WITH m MATCH (r:MemoryRevision {memory_id: $id, revision: m.revision})                  SET r.data = $raw RETURN m.id AS id",
+                crate::store_graph::params(
+                    &json!({"id":memory_id,"data":row["data"].to_string(),"raw":journal.to_string()}),
+                ),
+            )?;
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -466,7 +492,13 @@ fn refresh_correction(document: &Value, operations: &Value, skipped: &[Value]) -
 
 pub async fn refresh(worker: &Worker, job: &Job) -> Result<Value> {
     let prepared = jobs::guarded_read(&worker.store, job, |db, p, repo| {
-        memory::prepare_refresh(db, repo, p, string(&job.payload, "memory_id", 100)?)
+        memory::prepare_refresh(
+            db,
+            &worker.store.graph(),
+            repo,
+            p,
+            string(&job.payload, "memory_id", 100)?,
+        )
     })?;
     let contract = native("document.contract", json!({}))?;
     let schema = object(json!({"operations":contract,"evidence":evidence_schema()}));
@@ -509,6 +541,7 @@ pub async fn refresh(worker: &Worker, job: &Job) -> Result<Value> {
     jobs::guarded(&worker.store, job, |db, p, repo| {
         memory::propose_refresh(
             db,
+            &worker.store.graph(),
             repo,
             p,
             &json!({"memory_id":job.payload["memory_id"],"context_sha256":context["sha256"],"operations":result["operations"],"evidence":result["evidence"]}),
@@ -641,21 +674,12 @@ async fn semantic_rankings_role(
         "query_embedding"
     };
     let hashes:Vec<_>=questions.iter().map(|question|digest(&json!({"kind":role,"profile":key,"question":question,"principal":job.principal_hash,"source_state":job.payload["source_state"]}))).collect();
+    let vectors = crate::vector::graph_vector_index(&worker.store.graph(), &job.repository, &key)?
+        .into_iter()
+        .filter(|(identity, sha)| valid.get(identity.as_str()) == Some(&sha.as_str()))
+        .count();
     // Writes a cached-call record, so it takes the write path.
-    let (vectors, mut query_vectors) = jobs::guarded(&worker.store, job, |db, _, _| {
-        let mut vectors = BTreeMap::new();
-        for row in rows(
-            db,
-            "SELECT identity,source_sha,vector FROM am_vectors WHERE repository_id=? AND model_key=?",
-            params![job.repository, key],
-        )? {
-            if valid.get(s(&row, "identity")) == Some(&s(&row, "source_sha")) {
-                vectors.insert(
-                    s(&row, "identity").to_string(),
-                    serde_json::from_str::<Vec<f64>>(s(&row, "vector"))?,
-                );
-            }
-        }
+    let mut query_vectors = jobs::guarded(&worker.store, job, |db, _, _| {
         let mut queries = Vec::new();
         for hash in &hashes {
             let cached = one(
@@ -686,9 +710,9 @@ async fn semantic_rankings_role(
             };
             queries.push(vector);
         }
-        Ok((vectors, queries))
+        Ok(queries)
     })?;
-    if vectors.is_empty() {
+    if vectors == 0 {
         return Ok(empty());
     }
     let pending: Vec<_> = query_vectors
@@ -724,7 +748,13 @@ async fn semantic_rankings_role(
             if job.payload["vector_backend"] == "qdrant" {
                 crate::vector::ranking(worker, job, &candidates, &vector, &key).await?
             } else {
-                query::semantic_ranking(&candidates, &vectors, &vector)?
+                query::semantic_ranking(
+                    &worker.store.graph(),
+                    &job.repository,
+                    &key,
+                    &candidates,
+                    &vector,
+                )?
             }
         } else {
             json!({})
@@ -734,13 +764,13 @@ async fn semantic_rankings_role(
 }
 pub async fn recall(worker: &Worker, job: &Job) -> Result<Value> {
     let mut snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(db, &worker.store.graph(), repo, p)
     })?;
     if job.payload["memory_retrieval"] == false {
         snap.memories.clear();
     }
     let graph = jobs::guarded(&worker.store, job, |db, p, repo| {
-        crate::graph::for_query(db, repo, p, &snap, &job.payload)
+        crate::graph::for_query(db, &worker.store.graph(), repo, p, &snap, &job.payload)
     })?;
     let question = string(&job.payload, "question", 8000)?;
     let variants = graphicle_memory::retrieval::query_variants(
@@ -778,7 +808,7 @@ fn reviewed_excerpts(snap: &query::Snapshot, packet: &Value) -> Vec<Value> {
 
 pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
     let mut snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(db, &worker.store.graph(), repo, p)
     })?;
     if job.payload["memory_retrieval"] == false {
         snap.memories.clear();
@@ -789,7 +819,7 @@ pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
     let question = string(&job.payload, "question", 8000)?;
     let budget = crate::answer_review::selected_budget(&job.payload, profile.input_limit)?;
     let graph = jobs::guarded(&worker.store, job, |db, p, repo| {
-        crate::graph::for_query(db, repo, p, &snap, &job.payload)
+        crate::graph::for_query(db, &worker.store.graph(), repo, p, &snap, &job.payload)
     })?;
     let initial_rankings = crate::graph::add_rankings(
         &snap,
@@ -934,6 +964,7 @@ pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
                         data["job_id"] = json!(job.id);
                         let draft = memory::save(
                             db,
+                            &worker.store.graph(),
                             &job.repository,
                             None,
                             None,
@@ -1063,7 +1094,7 @@ const REFLECT: &str = "Answer the user's entire question from supplied sources. 
 
 pub async fn embed(worker: &Worker, job: &Job) -> Result<Value> {
     let snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(db, &worker.store.graph(), repo, p)
     })?;
     let (candidates, _) = query::candidates(&snap)?;
     let configuration =
@@ -1071,16 +1102,9 @@ pub async fn embed(worker: &Worker, job: &Job) -> Result<Value> {
     let (_, profile) = configuration.profile(job.payload["model"].as_str())?;
     let key = model::key(profile);
     let existing: std::collections::HashSet<(String, String)> =
-        jobs::guarded(&worker.store, job, |db, _, _| {
-            rows(
-                db,
-                "SELECT identity,source_sha FROM am_vectors WHERE repository_id=? AND model_key=?",
-                params![job.repository, key],
-            )
-        })?
-        .iter()
-        .map(|v| (s(v, "identity").to_owned(), s(v, "source_sha").to_owned()))
-        .collect();
+        crate::vector::graph_vector_index(&worker.store.graph(), &job.repository, &key)?
+            .into_iter()
+            .collect();
     let mut pending: Vec<_> = candidates
         .iter()
         .filter(|c| {
@@ -1170,22 +1194,23 @@ fn store_vectors(
     vectors: &[Vec<f64>],
 ) -> Result<()> {
     jobs::guarded(&worker.store, job, |db, p, repo| {
-        let current = query::snapshot(db, repo, p)?;
+        let current = query::snapshot(db, &worker.store.graph(), repo, p)?;
         if current.state != state {
             return Err(Error::conflict("Memory changed during embedding"));
         }
-        for (row, vector) in rows.iter().zip(vectors) {
-            db.execute(
-                "INSERT OR REPLACE INTO am_vectors VALUES(?,?,?,?,?,?)",
-                params![
-                    job.repository,
-                    s(row, "identity"),
-                    s(row, "source_sha"),
-                    key,
-                    vector.len(),
-                    serde_json::to_string(vector)?
-                ],
-            )?;
+        let embeddings: Vec<(String, String, Vec<f64>)> = rows
+            .iter()
+            .zip(vectors)
+            .map(|(row, vector)| {
+                (
+                    s(row, "identity").to_string(),
+                    s(row, "source_sha").to_string(),
+                    vector.clone(),
+                )
+            })
+            .collect();
+        crate::vector::store_embeddings(&worker.store.graph(), &job.repository, key, &embeddings)?;
+        for (row, _) in rows.iter().zip(vectors) {
             let embedding = format!("{}:{}", job.repository, s(row, "identity"));
             crate::invalidation::record_document_dependencies(
                 db,

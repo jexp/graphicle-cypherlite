@@ -193,7 +193,7 @@ impl Fixture {
         self.store
             .authorized(&self.workspace, &self.key, "read", |db, p| {
                 let repository = repo(db, p, &self.repo)?;
-                query::snapshot(db, &repository, p)
+                query::snapshot(db, &self.store.graph(), &repository, p)
             })
             .unwrap()
     }
