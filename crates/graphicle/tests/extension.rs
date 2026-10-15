@@ -65,8 +65,10 @@ impl Extension for Probe {
         // Ignored: the edition is the declared one.
         capabilities.insert("edition".into(), json!("probe"));
     }
-    fn migrate(&self, db: &Connection) -> Result<()> {
-        db.execute_batch("CREATE TABLE IF NOT EXISTS probe_rows (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE);")?;
+    fn migrate(&self, store: &graphicle_runtime::store_graph::GraphStore) -> Result<()> {
+        store.connection()?.query(
+            "CREATE INDEX probe_rows_id IF NOT EXISTS FOR (n:ProbeRow) ON (n.workspace_id)",
+        )?;
         Ok(())
     }
     fn operations(&self) -> &'static [&'static str] {
@@ -175,9 +177,11 @@ impl Extension for Probe {
         usage["probe"] = json!("usage");
         Ok(())
     }
-    fn scrub_backup(&self, db: &Connection) -> Result<()> {
-        db.execute("DELETE FROM probe_rows", [])?;
-        Ok(())
+    fn scrub_backup(&self, store: &graphicle_runtime::store_graph::GraphStore) -> Result<()> {
+        store.transaction(|db| {
+            db.query("MATCH (n:ProbeRow) DETACH DELETE n")?;
+            Ok(())
+        })
     }
     fn job_kinds(&self) -> &'static [JobKind] {
         const KINDS: &[JobKind] = &[
@@ -631,20 +635,30 @@ fn usage_reports_the_extension_allowance_and_details() {
 
 #[test]
 fn backups_are_scrubbed_by_the_extension_too() {
+    use graphicle_runtime::store_graph::{GraphStore, Params, json_to_value, one};
     let f = Fixture::new();
-    f.store
-        .connect()
-        .unwrap()
-        .execute("INSERT INTO probe_rows VALUES('row',?)", [&f.workspace])
-        .unwrap();
-    let file = f.store.directory.join("backup.sqlite3");
-    f.store.backup(&file).unwrap();
-    let count = |db: &Connection| -> i64 {
-        db.query_row("SELECT count(*) FROM probe_rows", [], |r| r.get(0))
+    let live = GraphStore::open(f.store.directory.join("reviews.graph")).unwrap();
+    let mut params = Params::new();
+    params.insert("ws".into(), json_to_value(&json!(f.workspace)));
+    live.transaction(|db| {
+        db.query_with_params("CREATE (:ProbeRow {id: 'row', workspace_id: $ws})", params.clone())?;
+        Ok(())
+    })
+    .unwrap();
+    drop(live);
+    let dir = f.store.directory.join("backup.graph");
+    f.store.backup(&dir).unwrap();
+    let count = |store: &GraphStore| -> i64 {
+        store
+            .read(|db| {
+                Ok(one(db, "MATCH (n:ProbeRow) RETURN count(n) AS n", Params::new())?
+                    .and_then(|r| r["n"].as_i64())
+                    .unwrap_or(0))
+            })
             .unwrap()
     };
-    assert_eq!(count(&Connection::open(&file).unwrap()), 0);
-    assert_eq!(count(&f.store.connect().unwrap()), 1);
+    assert_eq!(count(&GraphStore::open(&dir).unwrap()), 0);
+    assert_eq!(count(&GraphStore::open(f.store.directory.join("reviews.graph")).unwrap()), 1);
 }
 
 #[tokio::test]

@@ -148,6 +148,10 @@ impl GraphStore {
         for ddl in INDEXES {
             db.query(ddl)?;
         }
+        drop(db);
+        // Extension structures last: they may reference core labels. Stores
+        // keep every label, so an edition without an extension ignores them.
+        crate::extension::installed().migrate(self)?;
         Ok(())
     }
     /// Create the vector indexes for `dimensions`, idempotently. Embedding
