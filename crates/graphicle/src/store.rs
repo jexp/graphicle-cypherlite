@@ -330,11 +330,6 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
         return Ok(graph);
     }
-    eprintln!(
-        "DIAG registry miss {:?} (registered: {:?})",
-        key,
-        registry.keys().collect::<Vec<_>>()
-    );
     // Another process (a server, a background sync) may hold the engine's
     // writer lease; retry briefly, as SQLite's busy_timeout did.
     let mut attempts = 0;

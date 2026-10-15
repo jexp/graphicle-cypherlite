@@ -64,14 +64,6 @@ enum StoreLocation {
     Path(PathBuf),
 }
 
-impl Drop for StoreInner {
-    fn drop(&mut self) {
-        if let StoreLocation::Path(p) = &self.location {
-            eprintln!("DIAG store-inner drop {}", p.display());
-        }
-    }
-}
-
 /// A contended engine open retries this long before failing (the SQL store's
 /// busy timeout was 10 s; a projection commit can outlast that).
 const LEASE_WAIT: Duration = Duration::from_secs(30);
@@ -84,7 +76,6 @@ impl GraphStore {
     /// is a no-op.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        eprintln!("DIAG GraphStore::open {}", path.display());
         if path.is_symlink() {
             return Err(Error::bad("Graph store cannot be a symlink"));
         }
