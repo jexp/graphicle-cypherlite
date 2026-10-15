@@ -689,7 +689,7 @@ impl Store {
             let scan=id();
             crate::connectors::stage(db,&connector,&scan,&json!({"id":source_id,"title":name,"content":parsed["text"],"source_timestamp":args["source_timestamp"],"metadata":{"original_sha256":parsed["original_sha256"],"parser":parsed["parser"],"original_bytes":bytes.len(),"coordinates":parsed["coordinates"]}}))?;
             crate::connectors::activate(db,&self.graph(),&connector,&scan,false)?;
-            crate::doc_links::after_sync(db,s(&repository,"id"),s(&connector,"id"),p)?;
+            crate::doc_links::after_sync(self,db,s(&repository,"id"),s(&connector,"id"),p)?;
             db.execute("INSERT OR IGNORE INTO am_original_documents VALUES(?,?,?,?,?,?,?,?,?)",params![s(&repository,"id"),s(&connector,"id"),full_id,s(&parsed,"original_sha256"),name,s(&parsed,"parser"),s(&parsed,"text_sha256"),bytes,now()])?;
             Ok(json!({"source_id":full_id,"original_sha256":parsed["original_sha256"],"text_sha256":parsed["text_sha256"],"parser":parsed["parser"],"original_retained":true}))
         })

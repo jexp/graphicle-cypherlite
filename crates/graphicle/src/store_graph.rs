@@ -12,18 +12,12 @@ use crate::{Error, Result};
 use cypherlite::{Connection, Database, Value};
 use serde_json::{Map, Value as Json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError, Weak},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-
-/// Live durable stores of this process, by the path they were opened with
-/// (see [`GraphStore::open`]): a second open of the same path shares the
-/// engine instead of failing on its exclusive writer lease.
-static OPEN_DURABLE: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
-    LazyLock::new(Default::default);
 
 /// Write-write conflict retries of [`GraphStore::transaction`] (optimistic
 /// commit; the whole closure reruns).
@@ -31,93 +25,128 @@ pub const MAX_WRITE_ATTEMPTS: u32 = 3;
 /// A write transaction held longer than this is logged with its call site.
 const SLOW_HOLD: Duration = Duration::from_secs(2);
 
-/// An open graph store. Cheap to clone; all clones share the one engine.
+/// An open graph store. Cheap to clone; clones share one handle.
+///
+/// A durable store does NOT hold its engine open: the engine takes an
+/// exclusive writer lease on the directory, and holding it would lock out
+/// the other processes the SQL store always allowed beside an open store
+/// (a `graphicle sync` next to a running `graphicle mcp`). Instead the
+/// engine is open only while an operation holds it (`Weak`, upgraded per
+/// use), and a contended (re)open waits behind the holder's lease, the
+/// graph counterpart of the SQL store's busy timeout. An in-memory store
+/// holds its engine for good — dropping it would lose the data.
 #[derive(Clone)]
 pub struct GraphStore {
-    database: Arc<Database>,
-    /// Where the store lives (`:memory:` for tests and scratch graphs).
-    location: Arc<StoreLocation>,
+    inner: Arc<StoreInner>,
 }
 
-#[derive(Debug)]
+struct StoreInner {
+    location: StoreLocation,
+    /// The open engine while at least one operation holds it; dropped (and
+    /// the writer lease released) when idle.
+    engine: Mutex<std::sync::Weak<Database>>,
+}
+
 enum StoreLocation {
-    Memory,
+    Memory(Arc<Database>),
     Path(PathBuf),
 }
+
+/// A contended engine open retries this long before failing (the SQL store's
+/// busy timeout was 10 s; a projection commit can outlast that).
+const LEASE_WAIT: Duration = Duration::from_secs(30);
+/// Backoff between contended open attempts.
+const LEASE_RETRY: Duration = Duration::from_millis(50);
 
 impl GraphStore {
     /// Open (or create) the directory store at `path` and apply the schema
     /// (graph type + indexes) idempotently: a second open of the same store
     /// is a no-op.
-    ///
-    /// The engine takes an exclusive writer lease on a durable store, so a
-    /// second `Database::open` of the same path fails while the first is
-    /// alive. One process opening the same store twice (a reopened `Store`
-    /// beside the one a test still holds) therefore shares the live engine
-    /// through a per-process registry keyed by the path as given.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.is_symlink() {
             return Err(Error::bad("Graph store cannot be a symlink"));
         }
-        let location = Arc::new(StoreLocation::Path(path.to_path_buf()));
-        {
-            let mut open = OPEN_DURABLE.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(database) = open.get(path).and_then(Weak::upgrade) {
-                return Ok(Self { database, location });
-            }
-            let uri = path
-                .to_str()
-                .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
-            // A second process opening the same store finds the writer
-            // lease taken: follow the store read-only (reads pin snapshots;
-            // writes fail with a clear error) rather than fail the open —
-            // graphicle runs one server per store, but CLI invocations are
-            // their own processes and read beside it.
-            let (database, writable) = match Database::open(uri) {
-                Ok(database) => (Arc::new(database), true),
-                Err(cypherlite::Error::Locked(_)) => {
-                    (Arc::new(Database::open_read_only(uri)?), false)
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let store = Self { database, location };
-            // A read-only follower applies no schema: the writer's open did.
-            if writable {
-                store.apply_schema()?;
-            }
-            if open.len() >= 64 {
-                open.retain(|_, weak| weak.strong_count() > 0);
-            }
-            open.insert(path.to_path_buf(), Arc::downgrade(&store.database));
-            Ok(store)
-        }
-    }
-    /// An ephemeral in-memory store (tests, transient processing). Applies
-    /// the same schema as [`GraphStore::open`].
-    pub fn open_in_memory() -> Result<Self> {
         let store = Self {
-            database: Arc::new(Database::open(":memory:")?),
-            location: Arc::new(StoreLocation::Memory),
+            inner: Arc::new(StoreInner {
+                location: StoreLocation::Path(path.to_path_buf()),
+                engine: Mutex::new(std::sync::Weak::new()),
+            }),
         };
         store.apply_schema()?;
         Ok(store)
     }
+    /// An ephemeral in-memory store (tests, transient processing). Applies
+    /// the same schema as [`GraphStore::open`]. The engine is held for the
+    /// handle's lifetime: dropping it would lose the data.
+    pub fn open_in_memory() -> Result<Self> {
+        let store = Self {
+            inner: Arc::new(StoreInner {
+                location: StoreLocation::Memory(Arc::new(Database::open(":memory:")?)),
+                engine: Mutex::new(std::sync::Weak::new()),
+            }),
+        };
+        store.apply_schema()?;
+        Ok(store)
+    }
+    /// The engine, open: the live one, else a fresh open. A durable store's
+    /// open waits behind another process's (or handle's) writer lease for up
+    /// to [`LEASE_WAIT`].
+    fn engine(&self) -> Result<Arc<Database>> {
+        match &self.inner.location {
+            StoreLocation::Memory(database) => Ok(database.clone()),
+            StoreLocation::Path(path) => {
+                let uri = path
+                    .to_str()
+                    .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
+                let deadline = Instant::now() + LEASE_WAIT;
+                loop {
+                    {
+                        let mut slot = self
+                            .inner
+                            .engine
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(database) = slot.upgrade() {
+                            return Ok(database);
+                        }
+                        match Database::open(uri) {
+                            Ok(database) => {
+                                let database = Arc::new(database);
+                                *slot = Arc::downgrade(&database);
+                                return Ok(database);
+                            }
+                            Err(cypherlite::Error::Locked(_))
+                                if Instant::now() < deadline =>
+                            {
+                                drop(slot);
+                                std::thread::sleep(LEASE_RETRY);
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+        }
+    }
     /// The store's directory, or `None` for an in-memory store.
     pub fn path(&self) -> Option<&Path> {
-        match &*self.location {
-            StoreLocation::Memory => None,
+        match &self.inner.location {
+            StoreLocation::Memory(_) => None,
             StoreLocation::Path(path) => Some(path),
         }
     }
-    /// The shared engine handle (checkpoint, snapshot, clone).
-    pub fn database(&self) -> &Database {
-        &self.database
+    /// The engine handle while the returned `Arc` is held (checkpoint,
+    /// snapshot, clone). Idle stores hold no engine, so the caller's work
+    /// keeps the lease until the `Arc` drops.
+    pub fn database(&self) -> Arc<Database> {
+        self.engine()
+            .unwrap_or_else(|error| panic!("graph store engine unavailable: {}", error.message))
     }
     /// A connection for the calling thread. Keep it for the thread's
     /// lifetime; each connection spawns its query worker lazily.
     pub fn connection(&self) -> Result<Connection> {
-        Ok(self.database.connect()?)
+        Ok(self.engine()?.connect()?)
     }
     /// A write transaction: `begin`, run `f`, `commit`. A write-write
     /// conflict at commit reruns the whole closure, up to
@@ -165,7 +194,7 @@ impl GraphStore {
     }
     /// Flush the write-ahead log into a snapshot (maintenance/backup paths).
     pub fn checkpoint(&self) -> Result<()> {
-        Ok(self.database.checkpoint()?)
+        Ok(self.engine()?.checkpoint()?)
     }
     /// Apply the graph type and indexes. Runs at every open; safe to call
     /// again. Vector indexes are NOT created here — see
@@ -376,6 +405,20 @@ fn properties_to_json(properties: &BTreeMap<String, Value>) -> Map<String, Json>
         .collect()
 }
 
+/// Query parameters from a JSON object: each field becomes a parameter via
+/// [`json_to_value`]. The convenient way to build [`Params`] at a call site
+/// (`params(&json!({"id": id, "rows": rows}))`).
+pub fn params(value: &Json) -> Params {
+    value
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Run `cypher` and return its rows as JSON objects keyed by column name
 /// (the Cypher counterpart of `store::rows`). An empty `params` is fine;
 /// pass `Params::new()`.
@@ -407,20 +450,6 @@ pub fn one(db: &mut Connection, cypher: &str, params: Params) -> Result<Option<J
 /// counterpart of `store::s`.
 pub fn s<'a>(value: &'a Json, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
-}
-
-/// Query parameters from a JSON object (`{"id": …}` → `$id`). Modules build
-/// their parameter maps as JSON and convert here, keeping the
-/// serde_json-in/out boundary.
-pub fn params(value: &Json) -> Params {
-    value
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// A `RETURN n` node column as a plain record: its properties without the

@@ -4,10 +4,9 @@
 //! start one folder further up), and every test keeps its name under its
 //! module: `cargo test --test it workflows::` runs one file's tests.
 //!
-//! Two suites stay binaries of their own, because they change state the
-//! whole process shares: `tests/extension.rs` installs a probe extension in
-//! the process-wide registry, and `tests/embedding_cache.rs` sets
-//! `GRAPHICLE_EMBEDDING_CACHE` for the process.
+//! One suite stays a binary of its own, because it changes state the whole
+//! process shares: `tests/extension.rs` installs a probe extension in the
+//! process-wide registry.
 
 /// Installs the edition under test before a fixture is built: nothing in
 /// Graphicle Core. An extension crate can compile these suites into its own

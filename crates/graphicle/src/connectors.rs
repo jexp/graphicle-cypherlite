@@ -191,13 +191,13 @@ impl Store {
         let provider_sync = provider_permission_sync();
         self.transaction(|db| {
             let mut count=scheduled;
-            for mut connector in rows(db,"SELECT c.*,w.capability_hash FROM am_connectors c JOIN repo_projects p ON p.id=c.repository_id JOIN workspaces w ON w.id=p.workspace_id WHERE c.state='active' AND c.kind!='jsonl'",[])? {
+            for mut connector in rows(db,"SELECT c.*,w.capability_hash,p.workspace_id FROM am_connectors c JOIN repo_projects p ON p.id=c.repository_id JOIN workspaces w ON w.id=p.workspace_id WHERE c.state='active' AND c.kind!='jsonl'",[])? {
                 decode(&mut connector,"config")?;
                 let interval=connector["config"]["sync_every_seconds"].as_i64().unwrap_or(0);
                 if interval<300 {continue;}
                 // Without provider-permission sync such a connector cannot sync here.
                 if connector["config"]["permission_mode"]=="provider" && !provider_sync {continue;}
-                let recent=one(db,"SELECT state,updated_at,result FROM am_jobs WHERE repository_id=? AND kind='connector' AND json_extract(payload,'$.connector_id')=? ORDER BY created_at DESC LIMIT 1",params![s(&connector,"repository_id"),s(&connector,"id")])?;
+                let recent=self.graph().read(|g|crate::store_graph::one(g,"MATCH (j:Job {repository_id: $repo, kind: 'connector', connector_id: $cid}) RETURN j.state AS state, j.updated_at AS updated_at, j.result AS result ORDER BY j.created_at DESC, j.id DESC LIMIT 1",crate::store_graph::params(&json!({"repo": s(&connector, "repository_id"), "cid": s(&connector, "id")}))))?;
                 let waiting=connector["cursor"].as_str().is_some_and(|s|s!="null");
                 if let Some(recent)=&recent {
                     if ["queued","running","retry"].contains(&s(recent,"state")){continue;}
@@ -206,12 +206,19 @@ impl Store {
                     if since<backoff {continue;}
                 }
                 if !waiting && connector["last_sync"].as_str().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).is_some_and(|t|chrono::Utc::now().signed_duration_since(t).num_seconds()<interval){continue;}
-                let queued:i64=db.query_row("SELECT count(*) FROM am_jobs WHERE repository_id=? AND state IN ('queued','retry','running')",[s(&connector,"repository_id")],|r|r.get(0))?;
+                let queued=self.graph().read(|g|crate::store_graph::one(g,"MATCH (j:Job {repository_id: $repo}) WHERE j.state IN ['queued','retry','running'] RETURN count(j) AS count",crate::store_graph::params(&json!({"repo": s(&connector, "repository_id")}))))?.and_then(|row|row["count"].as_i64()).unwrap_or(0);
                 if queued>=100 {continue;}
                 let payload=json!({"kind":"connector","repository_id":connector["repository_id"],"connector_id":connector["id"],"max_requests":64,"max_calls":0,"max_input_tokens":0,"max_output_tokens":0,"scheduled":true,"interval_seconds":interval});
                 let input=digest(&json!({"payload":payload,"generation":connector["generation"],"cursor":connector["cursor"],"slot":chrono::Utc::now().timestamp()/60}));
-                let stamp=now();
-                count+=db.execute("INSERT OR IGNORE INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,max_attempts,not_before,created_at,updated_at) VALUES(?,?,'connector',?,?,?,'queued',1,?,?,?)",params![id(),s(&connector,"repository_id"),input,payload.to_string(),s(&connector,"capability_hash"),stamp,stamp,stamp])?;
+                // INSERT OR IGNORE: MERGE on the idempotence key creates nothing when present.
+                let created=self.graph().transaction(|g| {
+                    let created=crate::store_graph::rows(g,"MERGE (j:Job {repository_id: $repo, kind: 'connector', input_hash: $input}) ON CREATE SET j += $job RETURN j.id AS id",crate::store_graph::params(&json!({
+                        "repo": s(&connector, "repository_id"), "input": input,
+                        "job": crate::jobs::scheduled_node(&connector, &payload),
+                    })))?;
+                    Ok(created.len())
+                })?;
+                count+=created;
             }
             Ok(count)
         })
@@ -335,10 +342,7 @@ impl Store {
                 [s(&connector, "id")],
             )?;
             // Cached model input and output may include now-private data.
-            db.execute(
-                "DELETE FROM am_model_cache WHERE repository_id=?",
-                [s(args, "repository_id")],
-            )?;
+            crate::jobs::clear_model_cache(&self.graph(), s(args, "repository_id"))?;
             store::invalidate(db, s(args, "repository_id"))?;
             let sources: Vec<String> = rows(
                 db,
@@ -378,7 +382,7 @@ impl Store {
             if let Some(removed)=args["deleted_ids"].as_array(){for doc in removed {let doc=doc.as_str().ok_or_else(||Error::bad("Invalid deleted source ID"))?;db.execute("UPDATE am_connector_docs SET present=0 WHERE connector_id=? AND id=?",params![s(&connector,"id"),doc])?;
                 crate::invalidation::document_changed(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
                 crate::observer::forget_document(db,&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;}}
-            crate::doc_links::after_sync(db,s(&repository,"id"),s(&connector,"id"),p)?;
+            crate::doc_links::after_sync(self,db,s(&repository,"id"),s(&connector,"id"),p)?;
             Ok(json!({"imported":documents.len()-skipped,"forgotten_skipped":skipped,"generation":generation,"mode":mode}))
         })
     }
@@ -591,10 +595,7 @@ pub(crate) fn activate(
         "DELETE FROM am_connector_stage WHERE connector_id=? AND scan_id=?",
         params![identifier, scan],
     )?;
-    db.execute(
-        "DELETE FROM am_model_cache WHERE repository_id=?",
-        [s(connector, "repository_id")],
-    )?;
+    crate::jobs::clear_model_cache(graph, s(connector, "repository_id"))?;
     store::invalidate(db, s(connector, "repository_id"))?;
     Ok(generation)
 }
@@ -623,8 +624,9 @@ impl Remote<'_> {
                 "Connector request budget reached; staged progress can be resumed",
             ));
         }
-        jobs::guarded(&self.worker.store, self.job, |db, _, _| {
-            jobs::renew(db, self.job)
+        let graph = self.worker.store.graph().clone();
+        jobs::guarded(&self.worker.store, self.job, |_, _, _| {
+            jobs::renew(&graph, self.job)
         })?;
         self.calls += 1;
         let secret = crate::oauth::for_connector(
@@ -742,8 +744,9 @@ impl Remote<'_> {
                 "Connector request budget reached; resume the staged sync",
             ));
         }
-        jobs::guarded(&self.worker.store, self.job, |db, _, _| {
-            jobs::renew(db, self.job)
+        let graph = self.worker.store.graph().clone();
+        jobs::guarded(&self.worker.store, self.job, |_, _, _| {
+            jobs::renew(&graph, self.job)
         })?;
         self.calls += 1;
         let token = crate::oauth::for_connector(
@@ -1139,7 +1142,7 @@ pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
         Some(jobs::guarded(&worker.store, job, |db, p, _| {
             ensure_connector(db, &connector)?;
             let generation = activate(db, &worker.store.graph(), &connector, s(&cursor, "scan_id"), true)?;
-            crate::doc_links::after_sync(db, &job.repository, s(&connector, "id"), p)?;
+            crate::doc_links::after_sync(&worker.store, db, &job.repository, s(&connector, "id"), p)?;
             Ok(generation)
         })?)
     } else {

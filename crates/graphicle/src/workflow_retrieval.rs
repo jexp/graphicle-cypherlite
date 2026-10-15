@@ -8,9 +8,8 @@ use crate::{
     Error, Result, digest, id, integer,
     jobs::{self, Job, Worker},
     model, now, query,
-    store::one,
 };
-use rusqlite::params;
+use crate::store_graph::{self as graph};
 use serde_json::{Value, json};
 
 const PROFILES: [&str; 1] = ["local_reranker_profile"];
@@ -152,6 +151,7 @@ pub(crate) fn context(
             let question = crate::string(&args, "question", 8000)?;
             // `doc_links: false` leaves document nodes out of the arm too.
             Ok(crate::code_graph_arm::arm_with(
+                &worker.store.graph(),
                 db,
                 &job.repository,
                 snapshot,
@@ -217,43 +217,34 @@ pub(crate) fn context(
     let active = usize::from(candidates > 0) * selected.len();
     let reserved: usize = selected.iter().map(|(_, _, _, tokens, _)| *tokens).sum();
     if active > 0 {
-        jobs::guarded(&worker.store, job, |db, _, _| {
-            jobs::renew(db, job)?;
-            let totals = one(db, "SELECT count(*) AS calls,coalesce(sum(input_reserved),0) AS input FROM am_call_reservations WHERE job_id=?", [&job.id])?.unwrap();
-            if totals["calls"].as_u64().unwrap_or(0) + (active + reserve) as u64
-                > job.payload["max_calls"].as_u64().unwrap_or(4)
-                || totals["input"].as_u64().unwrap_or(0) + reserved as u64
-                    > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
-            {
-                return Err(Error::bad(
-                    "Local retrieval budget exhausted; keep room for the answer",
-                ));
-            }
-            for (field, profile, key, tokens, call) in &selected {
-                let hash = digest(
-                    &json!({"kind":field,"profile":key,"source_state":snapshot.state,
-                    "principal":job.principal_hash,"repository":job.repository,"arguments":args,"rankings":rankings}),
-                );
-                db.execute("INSERT INTO am_call_reservations(id,job_id,request_hash,state,input_reserved,output_reserved,created_at) VALUES(?,?,?,'started',?,0,?)",
-                    params![call,job.id,hash,tokens,now()])?;
-                db.execute(
-                    "INSERT INTO am_model_calls VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    params![
-                        call,
-                        job.repository,
-                        job.id,
-                        profile.protocol,
-                        profile.model,
-                        hash,
-                        0,
-                        0,
-                        0,
-                        0,
-                        now()
-                    ],
-                )?;
-            }
-            Ok(())
+        let graph = worker.store.graph().clone();
+        jobs::guarded(&worker.store, job, |_, _, _| {
+            graph.transaction(|db| {
+                jobs::renew_in(db, job)?;
+                let totals = jobs::reservation_totals_in(db, &job.id)?;
+                if totals["calls"].as_u64().unwrap_or(0) + (active + reserve) as u64
+                    > job.payload["max_calls"].as_u64().unwrap_or(4)
+                    || totals["input"].as_u64().unwrap_or(0) + reserved as u64
+                        > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
+                {
+                    return Err(Error::bad(
+                        "Local retrieval budget exhausted; keep room for the answer",
+                    ));
+                }
+                for (field, profile, key, tokens, call) in &selected {
+                    let hash = digest(
+                        &json!({"kind":field,"profile":key,"source_state":snapshot.state,
+                        "principal":job.principal_hash,"repository":job.repository,"arguments":args,"rankings":rankings}),
+                    );
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {id: $job}) CREATE (r:Reservation {id: $id, job_id: $job, request_hash: $hash, state: 'started', input_reserved: $input, output_reserved: 0, created_at: $now})-[:FOR]->(j)",
+                        graph::params(&json!({"id": call, "job": job.id, "hash": hash, "input": tokens, "now": now()})),
+                    )?;
+                    jobs::record_call(db, call, &job.repository, &job.id, profile, &hash, 0, 0, 0, 0)?;
+                }
+                Ok(())
+            })
         })?;
     }
     let profile = |field: &str| {
@@ -273,20 +264,23 @@ pub(crate) fn context(
         lookup.as_ref(),
     );
     if active > 0 {
-        worker.store.transaction(|db| {
+        worker.store.graph().transaction(|db| {
             for (_, _, _, _, call) in &selected {
                 match &result {
                     Ok(packet) => {
                         let usage = &packet["local_reranker"];
                         let tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                         let elapsed = usage["elapsed_ms"].as_f64().unwrap_or(0.0);
-                        db.execute("UPDATE am_call_reservations SET state='finished',input_reserved=?,usage_reported=1,finished_at=? WHERE id=?",
-                            params![tokens,now(),call])?;
-                        db.execute("UPDATE am_model_calls SET input_tokens=?,elapsed_ms=? WHERE id=?",params![tokens,elapsed,call])?;
+                        graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='finished', r.input_reserved=$input, r.usage_reported=1, r.finished_at=$now",
+                            graph::params(&json!({"id": call, "input": tokens, "now": now()})))?;
+                        graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.input_tokens=$input, c.elapsed_ms=$elapsed",
+                            graph::params(&json!({"id": call, "input": tokens, "elapsed": elapsed})))?;
                     }
                     Err(error) => {
-                        db.execute("UPDATE am_call_reservations SET state='unknown_usage',error=?,finished_at=? WHERE id=?",params![error.message,now(),call])?;
-                        db.execute("UPDATE am_model_calls SET elapsed_ms=? WHERE id=?",params![started.elapsed().as_millis() as u64,call])?;
+                        graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='unknown_usage', r.error=$error, r.finished_at=$now",
+                            graph::params(&json!({"id": call, "error": error.message, "now": now()})))?;
+                        graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.elapsed_ms=$elapsed",
+                            graph::params(&json!({"id": call, "elapsed": started.elapsed().as_millis() as u64})))?;
                     }
                 }
             }

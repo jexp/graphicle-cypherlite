@@ -236,6 +236,7 @@ impl Reading {
 /// code-graph arm reads it). A project with no episode is refused with the
 /// state of its projection.
 fn reading(
+    graph: &crate::store_graph::GraphStore,
     db: &Connection,
     p: &Principal,
     repository: &str,
@@ -255,7 +256,7 @@ fn reading(
         )? {
             Some(row) => s(&row, "episode").to_string(),
             None => {
-                let state = crate::jobs::projection_state(db, repository, &current)?;
+                let state = crate::jobs::projection_state(graph, repository, &current)?;
                 return Err(Error::bad(format!(
                     "This project's code graph is not built yet (projection: {state}). graphicle mcp builds it when it starts and graphicle sync builds it in the foreground; call again once it is built."
                 )));
@@ -401,7 +402,7 @@ pub fn call(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
             None | Some(Value::Null) => None,
             Some(_) => Some(string(args, "as_of", 128)?),
         };
-        let reading = reading(db, p, identifier, as_of)?;
+        let reading = reading(&store.graph(), db, p, identifier, as_of)?;
         let resident = resident(db, identifier, &reading.episode)?;
         let text = graphicle::serve::call_graph_tool(&resident.context, tool, &engine, None)?;
         let named = named_nodes(&resident, tool, &engine, &text);
@@ -574,7 +575,7 @@ pub fn pull_request(
             if !impact {
                 return Ok((identifier, None, None));
             }
-            let reading = reading(db, p, &identifier, None)?;
+            let reading = reading(&store.graph(), db, p, &identifier, None)?;
             let resident = resident(db, &identifier, &reading.episode)?;
             Ok((identifier, Some(reading.episode), Some(resident)))
         })?;
@@ -613,7 +614,7 @@ pub fn read_resource(
     store.authorized_read(workspace, token, "read", |db, p| {
         let repository = repo(db, p, repository)?;
         let identifier = s(&repository, "id");
-        let reading = reading(db, p, identifier, None)?;
+        let reading = reading(&store.graph(), db, p, identifier, None)?;
         let resident = resident(db, identifier, &reading.episode)?;
         let ctx = &resident.context;
         let g = &ctx.graph;

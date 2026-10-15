@@ -122,26 +122,34 @@ impl Fixture {
             project: None,
         }
     }
-    /// One column of a job's row.
+    /// One column of a job's row (the queue lives in the store's graph).
     fn job_field(&self, id: &str, column: &str) -> Value {
         self.store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    &format!("MATCH (j:Job {{id: $id}}) RETURN j.{column} AS value"),
+                    graphicle_runtime::store_graph::params(&json!({"id": id})),
+                )
+            })
             .unwrap()
-            .query_row(
-                &format!("SELECT {column} FROM am_jobs WHERE id=?"),
-                [id],
-                |r| {
-                    Ok(match r.get_ref(0)? {
-                        rusqlite::types::ValueRef::Null => Value::Null,
-                        rusqlite::types::ValueRef::Integer(n) => json!(n),
-                        rusqlite::types::ValueRef::Text(t) => {
-                            json!(String::from_utf8_lossy(t).into_owned())
-                        }
-                        other => json!(format!("{other:?}")),
-                    })
-                },
-            )
-            .unwrap()
+            .map(|row| row["value"].clone())
+            .unwrap_or(Value::Null)
+    }
+    /// Run a write against the job queue.
+    fn update_job(&self, cypher: &str, params: Value) {
+        self.store
+            .graph()
+            .transaction(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    cypher,
+                    graphicle_runtime::store_graph::params(&params),
+                )?;
+                Ok(())
+            })
+            .unwrap();
     }
     fn drain(&self) -> Vec<Value> {
         jobs::drain_projection(&self.store, &self.repo).unwrap()
@@ -159,8 +167,7 @@ impl Fixture {
     }
     fn projection(&self) -> String {
         let episode = self.current();
-        self.store
-            .read(|db| jobs::projection_state(db, &self.repo, &episode))
+        jobs::projection_state(&self.store.graph(), &self.repo, &episode)
             .unwrap()
             .to_string()
     }
@@ -183,17 +190,18 @@ impl Fixture {
             .unwrap();
     }
     fn project_job(&self) -> String {
-        let row: String = self
-            .store
-            .connect()
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: 'project'}) RETURN j.id AS id ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
+                    graphicle_runtime::store_graph::params(&json!({"repo": self.repo})),
+                )
+            })
             .unwrap()
-            .query_row(
-                "SELECT id FROM am_jobs WHERE repository_id=? AND kind='project' ORDER BY created_at DESC LIMIT 1",
-                [&self.repo],
-                |r| r.get(0),
-            )
-            .unwrap();
-        row
+            .map(|row| s(&row, "id").to_string())
+            .unwrap()
     }
 }
 
@@ -398,13 +406,16 @@ fn draining_twice_or_beside_a_worker_does_the_work_once() {
     assert_eq!(f.episodes(), 3);
     let attempts: i64 = f
         .store
-        .connect()
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {repository_id: $repo, kind: 'project'}) RETURN max(j.attempt) AS attempt",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo})),
+            )
+        })
         .unwrap()
-        .query_row(
-            "SELECT max(attempt) FROM am_jobs WHERE repository_id=? AND kind='project'",
-            [&f.repo],
-            |r| r.get(0),
-        )
+        .and_then(|row| row["attempt"].as_i64())
         .unwrap();
     assert_eq!(attempts, 1, "every projection ran once");
 }
@@ -439,14 +450,10 @@ fn a_foreground_build_takes_over_a_projection_whose_lease_expired() {
     // again a projection that one of its first two drains leaves queued.
     // So the takeover does not depend on how fast this machine runs.
     let until = lease_in(0.4);
-    f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE am_jobs SET lease_until=? WHERE id=?",
-            [until.clone(), held.id.clone()],
-        )
-        .unwrap();
+    f.update_job(
+        "MATCH (j:Job {id: $id}) SET j.lease_until=$until",
+        json!({"id": held.id, "until": until.clone()}),
+    );
     let report = local::build_graph(&f.store, &f.session(), &f.repo, false).unwrap();
     assert_eq!(report["status"], "built", "{report}");
     // It waited for the lease to end, judged by the store's own clock.
@@ -483,14 +490,10 @@ fn a_running_projection_renews_its_lease() {
         .unwrap();
     let soon = lease_in(2.0);
     let set_lease = |until: &str| {
-        f.store
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE am_jobs SET lease_until=? WHERE id=?",
-                [until, held.id.as_str()],
-            )
-            .unwrap();
+        f.update_job(
+            "MATCH (j:Job {id: $id}) SET j.lease_until=$until",
+            json!({"id": held.id.as_str(), "until": until}),
+        );
     };
     set_lease(&soon);
     let value = jobs::with_lease_heartbeat(&f.store, &held, Duration::from_millis(100), || {
@@ -560,14 +563,10 @@ fn a_sync_retries_a_failed_projection_and_the_skip_reason_follows_a_retry() {
     let f = Fixture::new(&[("a.py", A_V1), ("b.py", B)]);
     let original = f.project_job();
     let fail = |id: &str| {
-        f.store
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE am_jobs SET state='failed',attempt=max_attempts,error='parser crashed' WHERE id=?",
-                [id],
-            )
-            .unwrap();
+        f.update_job(
+            "MATCH (j:Job {id: $id}) SET j.state='failed', j.attempt=j.max_attempts, j.error='parser crashed'",
+            json!({"id": id}),
+        );
     };
     fail(&original);
     let skipped = f.context("where is beta defined");
@@ -633,14 +632,10 @@ fn a_sync_restarts_a_cancelled_projection_and_runs_a_waiting_retry_now() {
 
     // Waiting to retry, an hour from now: a drain leaves it.
     let later = lease_in(3600.0);
-    f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE am_jobs SET state='retry',attempt=1,not_before=? WHERE id=?",
-            [later.as_str(), job.as_str()],
-        )
-        .unwrap();
+    f.update_job(
+        "MATCH (j:Job {id: $id}) SET j.state='retry', j.attempt=1, j.not_before=$not_before",
+        json!({"id": job.as_str(), "not_before": later.as_str()}),
+    );
     assert!(f.drain().is_empty());
     assert_eq!(f.projection(), "queued");
     // A sync of the same tree lets it run now.
@@ -1359,14 +1354,17 @@ impl Session {
 
 fn running_jobs(store: &Store) -> i64 {
     store
-        .connect()
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {state: 'running'}) RETURN count(j) AS count",
+                graphicle_runtime::store_graph::Params::new(),
+            )
+        })
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM am_jobs WHERE state='running'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
+        .and_then(|row| row["count"].as_i64())
+        .unwrap_or(0)
 }
 
 /// After `sync --no-graph`, a `graphicle mcp`
@@ -1440,13 +1438,16 @@ fn mcp_on_sigterm_finishes_the_job_in_hand_and_leaves_none_running() {
     let store = Store::open(&data).unwrap();
     let state = |store: &Store| -> String {
         store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: 'project'}) RETURN j.state AS state ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
+                    graphicle_runtime::store_graph::params(&json!({"repo": project})),
+                )
+            })
             .unwrap()
-            .query_row(
-                "SELECT state FROM am_jobs WHERE repository_id=? AND kind='project' ORDER BY created_at DESC LIMIT 1",
-                [&project],
-                |r| r.get(0),
-            )
+            .map(|row| graphicle_runtime::store::s(&row, "state").to_string())
             .unwrap()
     };
 

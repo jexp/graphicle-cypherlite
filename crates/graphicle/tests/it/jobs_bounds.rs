@@ -77,35 +77,62 @@ impl Fixture {
         self.store
             .enqueue(&self.workspace, &self.key, &args, &self.config)
     }
-    fn db(&self) -> rusqlite::Connection {
-        self.store.connect().unwrap()
+    /// The job queue lives in the store's graph now; these helpers read and
+    /// adjust it there.
+    fn graph(&self) -> std::sync::Arc<graphicle_runtime::store_graph::GraphStore> {
+        self.store.graph()
     }
     fn row(&self, id: &str) -> Value {
-        let (state, attempt, not_before): (String, i64, String) = self
-            .db()
-            .query_row(
-                "SELECT state,attempt,not_before FROM am_jobs WHERE id=?",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        json!({"state":state,"attempt":attempt,"not_before":not_before})
+        self.graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {id: $id}) RETURN j.state AS state, j.attempt AS attempt, j.not_before AS not_before",
+                    graphicle_runtime::store_graph::params(&json!({"id": id})),
+                )
+            })
+            .unwrap()
+            .unwrap()
     }
     fn count(&self, repo: &str, kind: &str) -> i64 {
-        self.db()
-            .query_row(
-                "SELECT count(*) FROM am_jobs WHERE repository_id=? AND kind=?",
-                [repo, kind],
-                |r| r.get(0),
-            )
+        self.graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN count(j) AS count",
+                    graphicle_runtime::store_graph::params(&json!({"repo": repo, "kind": kind})),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["count"].as_i64())
             .unwrap()
     }
     fn make_ready(&self, id: &str) {
-        self.db()
-            .execute(
-                "UPDATE am_jobs SET not_before='1970-01-01T00:00:00.000000Z' WHERE id=?",
-                [id],
-            )
+        self.graph()
+            .transaction(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $id}) SET j.not_before='1970-01-01T00:00:00.000000Z'",
+                    graphicle_runtime::store_graph::params(&json!({"id": id})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    fn expire_lease(&self, id: &str, exhaust_attempts: bool) {
+        self.graph()
+            .transaction(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    if exhaust_attempts {
+                        "MATCH (j:Job {id: $id}) SET j.attempt=j.max_attempts, j.lease_until='1970-01-01T00:00:00.000000Z'"
+                    } else {
+                        "MATCH (j:Job {id: $id}) SET j.lease_until='1970-01-01T00:00:00.000000Z'"
+                    },
+                    graphicle_runtime::store_graph::params(&json!({"id": id})),
+                )?;
+                Ok(())
+            })
             .unwrap();
     }
 }
@@ -401,12 +428,7 @@ fn lease_filters_apply_before_the_candidate_limit() {
 fn idle_workers_notice_expired_leases_without_another_queued_job() {
     let f = Fixture::new(config(None));
     let expired = f.store.lease_job().unwrap().unwrap();
-    f.db()
-        .execute(
-            "UPDATE am_jobs SET lease_until='1970-01-01T00:00:00.000000Z' WHERE id=?",
-            [&expired.id],
-        )
-        .unwrap();
+    f.expire_lease(&expired.id, false);
     assert_eq!(
         f.store.peek_ready_kind().unwrap().as_deref(),
         Some("project")
@@ -414,7 +436,7 @@ fn idle_workers_notice_expired_leases_without_another_queued_job() {
     let retry = f.store.lease_job().unwrap().unwrap();
     assert_eq!(retry.id, expired.id);
     assert_ne!(retry.lease, expired.lease);
-    f.db().execute("UPDATE am_jobs SET attempt=max_attempts,lease_until='1970-01-01T00:00:00.000000Z' WHERE id=?", [&retry.id]).unwrap();
+    f.expire_lease(&retry.id, true);
     assert!(f.store.peek_ready_kind().unwrap().is_none());
     assert_eq!(f.row(&retry.id)["state"], "failed");
 }
@@ -492,7 +514,7 @@ fn queued_payload_bytes_are_bounded_per_repository() {
 
     let first = f.enqueue(&f.repo, padding('a')).unwrap();
     assert_eq!(first["replayed"], false);
-    let queued = ingestion::queued_bytes(&f.db(), &f.repo).unwrap();
+    let queued = ingestion::queued_bytes(&f.store.graph(), &f.repo).unwrap();
     assert!(
         queued > 40_000 && queued < ingestion::MIN_QUEUED_BYTES,
         "{queued}"

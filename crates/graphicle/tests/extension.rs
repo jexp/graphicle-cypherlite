@@ -204,6 +204,7 @@ impl Extension for Probe {
     /// fails, which must roll the row back and leave the projection alone.
     fn after_projection(
         &self,
+        graph: &mut cypherlite::Connection,
         db: &Connection,
         principal: &graphicle_runtime::store::Principal,
         repository: &str,
@@ -219,9 +220,23 @@ impl Extension for Probe {
         }
         let stamp = graphicle_runtime::now();
         let id = format!("{FOLLOW}-{episode}");
-        db.execute(
-            "INSERT OR IGNORE INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',-1,3,?,?,?)",
-            rusqlite::params![id, repository, FOLLOW, id, json!({"episode":episode}).to_string(), principal.hash, stamp, stamp, stamp],
+        // INSERT OR IGNORE: MERGE on the idempotence key creates nothing the
+        // second time.
+        let payload = json!({"episode":episode}).to_string();
+        graphicle_runtime::store_graph::rows(
+            graph,
+            "MERGE (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) ON CREATE SET j += $job RETURN j.id AS id",
+            graphicle_runtime::store_graph::params(&json!({
+                "repo": repository, "kind": FOLLOW, "hash": id,
+                "job": {
+                    "id": id, "repository_id": repository, "workspace_id": principal.workspace,
+                    "kind": FOLLOW, "input_hash": id, "payload": payload,
+                    "payload_bytes": payload.len(), "principal_hash": principal.hash,
+                    "state": "queued", "priority": -1, "attempt": 0, "max_attempts": 3,
+                    "not_before": stamp, "created_at": stamp, "updated_at": stamp,
+                    "episode": episode,
+                },
+            })),
         )?;
         if name == "Probe fails" {
             return Err(Error::bad("probe hook failed"));
@@ -679,15 +694,26 @@ async fn declared_job_kinds_are_leased_and_unknown_kinds_wait() {
     let f = Fixture::new();
     let stamp = graphicle_runtime::now();
     let principal = graphicle_memory::text::sha256(f.owner.as_bytes());
-    let db = f.store.connect().unwrap();
     // The unknown kind is first in line.
-    for (id, kind, priority) in [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)] {
-        db.execute(
-            "INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,'{}',?,'queued',?,3,?,?,?)",
-            rusqlite::params![id, f.repo, kind, id, principal, priority, stamp, stamp, stamp],
-        )
+    f.store
+        .graph()
+        .transaction(|db| {
+            for (id, kind, priority) in [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)] {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "CREATE (j:Job {id: $id}) SET j += $job",
+                    graphicle_runtime::store_graph::params(&json!({"id": id, "job": {
+                        "id": id, "repository_id": f.repo, "workspace_id": f.workspace,
+                        "kind": kind, "input_hash": id, "payload": "{}", "payload_bytes": 2,
+                        "principal_hash": principal, "state": "queued", "priority": priority,
+                        "attempt": 0, "max_attempts": 3, "not_before": stamp,
+                        "created_at": stamp, "updated_at": stamp,
+                    }})),
+                )?;
+            }
+            Ok(())
+        })
         .unwrap();
-    }
     let worker = Worker::new(f.store.clone(), model::Config::default()).unwrap();
     assert!(worker.once().await.unwrap(), "the probe job runs");
     let status = |id: &str| {
@@ -786,13 +812,24 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
     let ran = graphicle_runtime::jobs::drain_projection(&f.store, &follows).unwrap();
     assert_eq!(kinds(&ran), ["project", "link", FOLLOW], "{ran:?}");
     assert!(ran.iter().all(|job| job["ok"] == true), "{ran:?}");
-    let (state, result): (String, String) = db
-        .query_row(
-            "SELECT state,result FROM am_jobs WHERE repository_id=? AND kind=?",
-            rusqlite::params![follows, FOLLOW],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+    let (state, result): (String, String) = {
+        let row = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::one(
+                    g,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.state AS state, j.result AS result",
+                    graphicle_runtime::store_graph::params(&json!({"repo": follows, "kind": FOLLOW})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        (
+            row["state"].as_str().unwrap().to_string(),
+            row["result"].as_str().unwrap().to_string(),
         )
-        .unwrap();
+    };
     assert_eq!(state, "complete");
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &follows).unwrap();
     assert_eq!(
@@ -808,20 +845,32 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
     let fails = synced("Probe fails");
     let ran = graphicle_runtime::jobs::drain_projection(&f.store, &fails).unwrap();
     assert_eq!(kinds(&ran), ["project", "link"], "{ran:?}");
-    let queued: i64 = db
-        .query_row(
-            "SELECT count(*) FROM am_jobs WHERE repository_id=? AND kind=?",
-            rusqlite::params![fails, FOLLOW],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let queued: i64 = f
+        .store
+        .graph()
+        .read(|g| {
+            graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN count(j) AS count",
+                graphicle_runtime::store_graph::params(&json!({"repo": fails, "kind": FOLLOW})),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["count"].as_i64())
+        .unwrap_or(0);
     assert_eq!(queued, 0, "the failed hook's row was kept");
-    let projected: String = db
-        .query_row(
-            "SELECT result FROM am_jobs WHERE repository_id=? AND kind='project'",
-            [&fails],
-            |r| r.get(0),
-        )
+    let projected: String = f
+        .store
+        .graph()
+        .read(|g| {
+            graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (j:Job {repository_id: $repo, kind: 'project'}) RETURN j.result AS result",
+                graphicle_runtime::store_graph::params(&json!({"repo": fails})),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["result"].as_str().map(str::to_string))
         .unwrap();
     let projected: Value = serde_json::from_str(&projected).unwrap();
     assert_eq!(

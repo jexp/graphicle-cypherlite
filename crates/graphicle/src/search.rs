@@ -191,12 +191,9 @@ fn v3_instructions(notes: bool, period: bool, premise: bool) -> String {
 
 /// Input tokens this job may still reserve.
 pub(crate) fn remaining_input(worker: &Worker, job: &Job) -> Result<usize> {
-    jobs::guarded_read(&worker.store, job, |db, _, _| {
-        let used: i64 = db.query_row(
-            "SELECT coalesce(sum(input_reserved),0) FROM am_call_reservations WHERE job_id=?",
-            [&job.id],
-            |r| r.get(0),
-        )?;
+    jobs::guarded_read(&worker.store, job, |_, _, _| {
+        let totals = crate::jobs::reservation_totals(&worker.store.graph(), &job.id)?;
+        let used = totals["input"].as_i64().unwrap_or(0);
         Ok(
             (job.payload["max_input_tokens"].as_u64().unwrap_or(64000) as usize)
                 .saturating_sub(used.max(0) as usize),

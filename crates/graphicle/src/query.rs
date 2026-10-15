@@ -1387,12 +1387,12 @@ impl Store {
                     return Err(Error::bad("max_projects applies only with scope workspace"));
                 }
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                Ok(project_packet(db, &self.graph(), p, &repository, args, embedding, reranker)?.1)
+                Ok(project_packet(&self.graph(), db, p, &repository, args, embedding, reranker)?.1)
             }
             // Every project of the workspace the principal may read, each
             // read as this project is above.
             crate::workspace::Scope::Workspace => {
-                crate::workspace::context(db, &self.graph(), p, args, embedding, reranker)
+                crate::workspace::context(&self.graph(), db, p, args, embedding, reranker)
             }
         })
     }
@@ -1404,8 +1404,8 @@ impl Store {
 /// scope through this function, so a workspace read is authorized and
 /// ranked exactly as a single-project read.
 pub fn project_packet(
-    db: &Connection,
     graph_store: &crate::store_graph::GraphStore,
+    db: &Connection,
     p: &Principal,
     repository: &Value,
     args: &Value,
@@ -1531,6 +1531,7 @@ pub fn project_packet(
     } else {
         crate::phase::phase("context_arm", || {
             crate::code_graph_arm::arm_with(
+                graph_store,
                 db,
                 s(repository, "id"),
                 &snap,

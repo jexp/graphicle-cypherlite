@@ -167,7 +167,11 @@ pub fn migrate(db: &Connection) -> Result<()> {
         "DROP TABLE IF EXISTS gf_doc_links; DROP TABLE IF EXISTS gf_doc_link_sources;
          DROP TABLE IF EXISTS gf_doc_link_checkpoints; DROP TABLE IF EXISTS gf_doc_link_state;",
     )?;
-    let current: HashSet<String> = graph_of(db)?
+    // The queue lives in the graph store now; `link` jobs carry
+    // `workspace_id` (stamped at enqueue) for the workspace-wide lookups
+    // below.
+    let graph = graph_of(db)?;
+    let current: HashSet<String> = graph
         .read(|db| {
             store_graph::rows(
                 db,
@@ -183,28 +187,34 @@ pub fn migrate(db: &Connection) -> Result<()> {
         if current.contains(workspace) {
             continue;
         }
-        let jobs = "FROM am_jobs j JOIN repo_projects r ON r.id=j.repository_id \
-                    WHERE r.workspace_id=? AND j.kind='link'";
-        if one(
-            db,
-            &format!("SELECT 1 AS yes {jobs} AND j.state IN ('queued','retry','running') LIMIT 1"),
-            [workspace],
-        )?
-        .is_some()
-        {
+        let waiting = graph
+            .read(|g| {
+                crate::store_graph::one(
+                    g,
+                    "MATCH (j:Job {kind: 'link', workspace_id: $ws}) WHERE j.state IN ['queued','retry','running'] RETURN j.id AS id LIMIT 1",
+                    crate::store_graph::params(&json!({"ws": workspace})),
+                )
+            })?
+            .is_some();
+        if waiting {
             continue;
         }
-        if let Some(latest) = one(
-            db,
-            &format!("SELECT j.id {jobs} ORDER BY j.updated_at DESC,j.id LIMIT 1"),
-            [workspace],
-        )? {
+        if let Some(latest) = graph.read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (j:Job {kind: 'link', workspace_id: $ws}) RETURN j.id AS id ORDER BY j.updated_at DESC, j.id LIMIT 1",
+                crate::store_graph::params(&json!({"ws": workspace})),
+            )
+        })? {
             let stamp = now();
-            db.execute(
-                "UPDATE am_jobs SET state='queued',attempt=0,not_before=?,updated_at=?,error=NULL,\
-                 lease_token=NULL,lease_until=NULL WHERE id=?",
-                params![stamp, stamp, s(&latest, "id")],
-            )?;
+            graph.transaction(|g| {
+                crate::store_graph::rows(
+                    g,
+                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
+                    crate::store_graph::params(&json!({"id": s(&latest, "id"), "now": stamp})),
+                )?;
+                Ok(())
+            })?;
         }
     }
     Ok(())
@@ -2066,6 +2076,7 @@ fn write(db: &mut cypherlite::Connection, computed: &Computed) -> Result<usize> 
 /// SDK's conversation sessions) queues nothing, unless links of its
 /// documents remain to be removed.
 pub fn after_sync(
+    store: &crate::store::Store,
     db: &Connection,
     repository: &str,
     connector: &str,
@@ -2101,7 +2112,7 @@ pub fn after_sync(
         return Ok(json!({"skipped":"no documents read for links"}));
     }
     let episode = graph_projection::current_episode(db, repository)?;
-    crate::jobs::enqueue_link(db, repository, p, &episode)
+    crate::jobs::enqueue_link(store, db, repository, p, &episode)
 }
 
 /// What a `link` job's document step did, counted for the projects its
@@ -2262,7 +2273,7 @@ fn write_all(
                 )? {
                     let first = s(&first, "id");
                     let episode = graph_projection::current_episode(db, first)?;
-                    crate::jobs::enqueue_link(db, first, &p, &episode)?;
+                    crate::jobs::enqueue_link(store, db, first, &p, &episode)?;
                 }
                 return Ok(false);
             }
@@ -3834,8 +3845,13 @@ mod tests {
         ]);
         unit.project();
         unit.store
+            .graph()
             .transaction(|db| {
-                db.execute("UPDATE am_jobs SET state='complete' WHERE kind='link'", [])?;
+                crate::store_graph::rows(
+                    db,
+                    "MATCH (j:Job {kind: 'link'}) SET j.state='complete'",
+                    crate::store_graph::Params::new(),
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -3857,7 +3873,16 @@ mod tests {
             0
         );
         assert_eq!(
-            unit.count("SELECT count(*) FROM am_jobs WHERE kind='link' AND state='queued'"),
+            unit.store
+                .graph()
+                .read(|db| crate::store_graph::one(
+                    db,
+                    "MATCH (j:Job {kind: 'link', state: 'queued'}) RETURN count(j) AS count",
+                    crate::store_graph::Params::new(),
+                ))
+                .unwrap()
+                .and_then(|row| row["count"].as_i64())
+                .unwrap(),
             1
         );
         // That job reads the new episode: both pages link to the edited code.

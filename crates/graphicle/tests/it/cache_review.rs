@@ -1,73 +1,58 @@
+//! The passage-embedding cache lives in the store's graph
+//! (`:Embedding` nodes); a malformed entry is a miss, never a failure.
+
 use graphicle_runtime::embedding_cache::Cache;
-use rusqlite::{Connection, params};
+use graphicle_runtime::store_graph::{GraphStore, params, rows};
+use serde_json::json;
 
 #[test]
-fn malformed_sqlite_values_are_cache_misses() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("vectors.sqlite");
-    let cache = Cache::open(&path, "model").unwrap();
-    let db = Connection::open(&path).unwrap();
+fn malformed_graph_values_are_cache_misses() {
+    let graph = GraphStore::open_in_memory().unwrap();
+    let cache = Cache::new(graph.clone(), "model");
     let text = "private source";
-    db.execute(
-        "INSERT INTO am_embedding_cache(model_key,text_sha256,vector) VALUES(?,?,?)",
-        params![
-            "passage:model",
-            graphicle_memory::text::sha256(text.as_bytes()),
-            "not a vector"
-        ],
-    )
-    .unwrap();
-    assert_eq!(cache.get(text).unwrap(), None);
-}
-
-#[cfg(unix)]
-#[test]
-fn an_existing_cache_and_its_sidecars_are_owner_only() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("vectors.sqlite");
-    let db = Connection::open(&path).unwrap();
-    db.pragma_update(None, "journal_mode", "WAL").unwrap();
-    db.execute_batch("CREATE TABLE retained(value); INSERT INTO retained VALUES(1)")
+    // A vector stored as a string (or anything but a list of finite numbers)
+    // is a miss, as a malformed blob was in the SQLite cache.
+    graph
+        .transaction(|db| {
+            rows(
+                db,
+                "CREATE (e:Embedding {model_key: 'passage:model', text_sha256: $sha, vector: 'not a vector'})",
+                params(&json!({"sha": graphicle_memory::text::sha256(text.as_bytes())})),
+            )?;
+            Ok(())
+        })
         .unwrap();
-    let paths = [
-        path.clone(),
-        path.with_extension("sqlite-wal"),
-        path.with_extension("sqlite-shm"),
-    ];
-    for path in &paths {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    }
-    let _cache = Cache::open(&path, "model").unwrap();
-    for path in &paths {
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
-            0,
-            "cache artifact is readable by other users: {}",
-            path.display()
-        );
-    }
-    assert_eq!(
-        db.query_row("SELECT value FROM retained", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        1
+    assert_eq!(cache.get(text).unwrap(), None);
+    // A mixed-type list is not even storable: the engine rejects it.
+    assert!(
+        graph
+            .transaction(|db| {
+                rows(
+                    db,
+                    "CREATE (e:Embedding {model_key: 'passage:model', text_sha256: $sha, vector: [1.0, 'x']})",
+                    params(&json!({"sha": graphicle_memory::text::sha256(b"other")})),
+                )?;
+                Ok(())
+            })
+            .is_err()
     );
+    assert_eq!(cache.get("other").unwrap(), None);
 }
 
-#[cfg(unix)]
 #[test]
-fn a_symlinked_sidecar_is_rejected_without_changing_its_target() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+fn entries_are_scoped_by_model_key_and_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("unrelated");
-    std::fs::write(&target, b"keep this file").unwrap();
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let path = directory.path().join("cache");
-    symlink(&target, directory.path().join("cache-wal")).unwrap();
-    assert!(Cache::open(&path, "model").is_err());
-    assert_eq!(std::fs::read(&target).unwrap(), b"keep this file");
+    let path = directory.path().join("graph");
+    {
+        let graph = GraphStore::open(&path).unwrap();
+        Cache::new(graph, "model-a")
+            .put([("passage", [1.0, 2.0].as_slice())])
+            .unwrap();
+    }
+    let graph = GraphStore::open(&path).unwrap();
     assert_eq!(
-        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-        0o644
+        Cache::new(graph.clone(), "model-a").get("passage").unwrap(),
+        Some(vec![1.0, 2.0])
     );
+    assert_eq!(Cache::new(graph, "model-b").get("passage").unwrap(), None);
 }

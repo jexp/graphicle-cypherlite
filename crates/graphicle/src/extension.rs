@@ -390,8 +390,12 @@ pub trait Extension: Send + Sync + 'static {
     /// error is reported in the projection's result and rolls back only this
     /// hook's writes; it never fails the projection. The default queues
     /// nothing.
+    /// The hook receives the projection's SQL transaction (`db`, for
+    /// un-migrated tables) and the open graph transaction (`graph`) the queue
+    /// lives in; both roll back when the hook errors.
     fn after_projection(
         &self,
+        _graph: &mut cypherlite::Connection,
         _db: &Connection,
         _principal: &Principal,
         _repository: &str,
@@ -819,6 +823,7 @@ impl Extensions {
     /// and the projection still commits.
     pub fn after_projection(
         &self,
+        graph: &crate::store_graph::GraphStore,
         db: &Connection,
         principal: &Principal,
         repository: &str,
@@ -826,10 +831,12 @@ impl Extensions {
     ) -> Vec<Value> {
         let mut queued = Vec::new();
         for extension in &self.list {
-            let outcome = db
-                .execute_batch("SAVEPOINT after_projection")
-                .map_err(Error::from)
-                .and_then(|()| extension.after_projection(db, principal, repository, episode));
+            // The hook's SQL writes sit in a savepoint; its graph (queue)
+            // writes in a graph transaction. An error rolls back both.
+            let outcome = graph.transaction(|g| {
+                db.execute_batch("SAVEPOINT after_projection")?;
+                extension.after_projection(g, db, principal, repository, episode)
+            });
             match outcome {
                 Ok(jobs) => {
                     let _ = db.execute_batch("RELEASE after_projection");

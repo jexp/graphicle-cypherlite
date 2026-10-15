@@ -122,10 +122,24 @@ async fn provider_permission_work_waits_for_graphicle_pro() {
     // Work the commercial edition's program queued in this store.
     let owner = graphicle_memory::text::sha256(key.as_bytes());
     let stamp = graphicle_runtime::now();
-    for kind in ["permissions", "connector"] {
-        let payload = json!({"kind":kind,"repository_id":r,"connector_id":connector,"max_requests":64,"max_calls":0,"scheduled":true});
-        store.connect().unwrap().execute("INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',10,1,?,?,?)",rusqlite::params![format!("pro-{kind}"),r,kind,format!("input-{kind}"),payload.to_string(),owner,stamp,stamp,stamp]).unwrap();
-    }
+    store.graph().transaction(|db| {
+        for kind in ["permissions", "connector"] {
+            let payload = json!({"kind":kind,"repository_id":r,"connector_id":connector,"max_requests":64,"max_calls":0,"scheduled":true});
+            let encoded = payload.to_string();
+            graphicle_runtime::store_graph::rows(
+                db,
+                "CREATE (j:Job {id: $id}) SET j += $job",
+                graphicle_runtime::store_graph::params(&json!({"id": format!("pro-{kind}"), "job": {
+                    "id": format!("pro-{kind}"), "repository_id": r, "workspace_id": w,
+                    "kind": kind, "input_hash": format!("input-{kind}"), "payload": encoded,
+                    "payload_bytes": encoded.len(), "principal_hash": owner, "state": "queued",
+                    "priority": 10, "attempt": 0, "max_attempts": 1, "not_before": stamp,
+                    "created_at": stamp, "updated_at": stamp, "connector_id": connector,
+                }})),
+            )?;
+        }
+        Ok(())
+    }).unwrap();
     let worker = Worker::new(store.clone(), config).unwrap();
     assert!(!worker.once().await.unwrap(), "nothing is leased");
     let status = store

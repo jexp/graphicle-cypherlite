@@ -225,12 +225,17 @@ fn a_skipped_arm_reports_projection_state_and_episode_lag() {
     let status = |f: &Fixture| f.context("where is beta defined")["code_graph"].clone();
     let set_job = |state: &str| {
         f.store
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE am_jobs SET state=? WHERE kind='project' AND repository_id=?",
-                rusqlite::params![state, f.repo],
-            )
+            .graph()
+            .transaction(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "MATCH (j:Job {kind: 'project', repository_id: $repo}) SET j.state=$state",
+                    graphicle_runtime::store_graph::params(
+                        &json!({"state": state, "repo": f.repo}),
+                    ),
+                )?;
+                Ok(())
+            })
             .unwrap();
     };
     // Synced, never projected: the sync queued the projection. The job is

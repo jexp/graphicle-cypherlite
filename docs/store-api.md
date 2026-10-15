@@ -28,9 +28,15 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
   snapshots; writes fail with a clear error) instead of failing.
 - `GraphStore::open_in_memory()` is the `:memory:` mode that replaces
   rusqlite's `open_in_memory` in tests and transient processing (staging,
-  expansion scratch).
-- `GraphStore` is cheap to clone; clones share one engine. The engine takes
-  a single-process writer lease on a durable store.
+  expansion scratch). An in-memory store holds its engine for good (dropping
+  it would lose the data).
+- `GraphStore` is cheap to clone; clones share one handle. The engine takes
+  an exclusive writer lease on a durable store, so a durable `GraphStore`
+  holds the engine open **only while an operation runs** (a `Weak` upgraded
+  per use): idle stores hold no lease, so a second process — a `graphicle
+  sync` beside a running `graphicle mcp`, a reopened store in-process — can
+  work the same store, as it could with SQLite. A contended (re)open waits
+  behind the holder for up to 30 s (the SQL store's busy timeout was 10 s).
 - `store.checkpoint()` flushes the WAL into a snapshot (maintenance/backup
   paths); `store.database()` exposes the raw `cypherlite::Database` for
   snapshot/clone work.
@@ -162,6 +168,39 @@ graph type is inert).
   resolved (the resolved links are the pin's `symbols` property, stringified
   JSON: the engine has no map/list-of-map properties). Read paths still
   threaded by SQL connections resolve the store with `store::graph_for`.
+## Landed domains
+
+### Jobs and caches (`jobs.rs`, `embedding_cache.rs`, §2.5)
+
+- `(:Job)-[:OF]->(:Project)` (the `OF` edge attaches when the graph knows the
+  project — `MATCH (j), (p) CREATE (j)-[:OF]->(p)` is a no-op until the
+  content-store node lands). Job properties: the SQL columns plus
+  `workspace_id` (denormalized at enqueue; the SQL schema read it through a
+  `repo_projects` join) and `payload_bytes`. The payload is a **string**
+  property (the engine cannot store maps as property values); fields the
+  queue itself queries are duplicated as first-class properties (`episode`,
+  `connector_id`, `auto_connector`, `auto_generation`, `parallel_sources`,
+  `include`), which keeps the ready-queue's source-conflict rule
+  (`STARTS WITH` prefix disjointness over `include` lists) expressible in
+  Cypher. Readers `store::decode` the payload as before.
+- The ready-queue query orders by `j.priority DESC, j.created_at`;
+  **leasing is a single-statement CAS** (`MATCH (j:Job {id}) WHERE j.state IN
+  [...] AND <not blocked> SET j.state='running', j.lease_token=$lease, …`);
+  heartbeat renewal is the same shape. Expired leases flip to `retry`/`failed`
+  with a `CASE` in one `SET`.
+- `(:ModelCall)-[:FOR]->(:Job)` and `(:Reservation)-[:FOR]->(:Job)` (same
+  `id` per pair, joined on `c.id = r.id` as before), `:ModelCache`
+  (keyed `repository_id + request_hash`, `MERGE … SET`, trimmed to the newest
+  500 per repository) and `:QueryCache` (same shape).
+- The embedding cache folded in from its own SQLite file: `:Embedding
+  {model_key, text_sha256, vector}` with the vector a list of floats; the
+  `GRAPHICLE_EMBEDDING_CACHE` file configuration is gone and
+  `Store::embedding_cache(model_key)` hands out a handle on the store's own
+  graph.
+- Modules that still read SQL tables take both handles where they need them
+  (`fn …(graph: &GraphStore, db: &Connection, …)`); jobs code inside a
+  `store.transaction`/`guarded` closure uses the graph through
+  `store.graph()` while the closure's `db` keeps serving un-migrated domains.
 
 ## Value-mapping conventions
 

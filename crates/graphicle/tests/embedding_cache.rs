@@ -1,5 +1,7 @@
-//! Opt-in passage-vector cache: a second store holding the same passages reuses
-//! the cached vectors instead of calling the provider again.
+//! Passage-vector cache: a second project of the same store holding the same
+//! passages reuses the cached vectors instead of calling the provider again.
+//! (The cache lives in the store's graph since the CypherLite migration; the
+//! `GRAPHICLE_EMBEDDING_CACHE` file configuration is gone.)
 use axum::{Json, Router, extract::State, routing::post};
 use graphicle_memory::text;
 use graphicle_runtime::{
@@ -52,16 +54,18 @@ fn expected(contents: &[&str]) -> Vec<Vec<f64>> {
     )
 }
 
-/// Import `contents` into a fresh store, run one embed job, and return the
-/// job result and the stored vectors in sorted order.
-async fn embed(configuration: &model::Config, contents: &[&str]) -> (Value, Vec<Vec<f64>>) {
-    let directory = tempfile::TempDir::new().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let workspace = store.create_workspace("Embedding cache").unwrap();
-    let ws = s(&workspace, "id");
-    let key = s(&workspace, "capability");
+/// Import `contents` into a fresh project of `store`, run one embed job, and
+/// return the job result and the stored vectors in sorted order.
+async fn embed(
+    store: &Store,
+    ws: &str,
+    key: &str,
+    configuration: &model::Config,
+    name: &str,
+    contents: &[&str],
+) -> (Value, Vec<Vec<f64>>) {
     let project = store
-        .register(ws, key, &json!({"project_key":"fixture","name":"Fixture"}))
+        .register(ws, key, &json!({"project_key":name,"name":name}))
         .unwrap();
     let project_id = s(&project, "id");
     let connector = store
@@ -121,15 +125,12 @@ async fn embed(configuration: &model::Config, contents: &[&str]) -> (Value, Vec<
 }
 
 #[tokio::test]
-async fn a_second_store_reuses_cached_vectors_and_embeds_only_new_passages() {
-    let cache_directory = tempfile::TempDir::new().unwrap();
-    // This test binary holds a single test, so the variable cannot leak.
-    unsafe {
-        std::env::set_var(
-            graphicle_runtime::embedding_cache::ENV,
-            cache_directory.path().join("vectors.sqlite"),
-        );
-    }
+async fn a_second_project_reuses_cached_vectors_and_embeds_only_new_passages() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let workspace = store.create_workspace("Embedding cache").unwrap();
+    let ws = s(&workspace, "id").to_string();
+    let key = s(&workspace, "capability").to_string();
     let requests = Requests::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -147,12 +148,12 @@ async fn a_second_store_reuses_cached_vectors_and_embeds_only_new_passages() {
     }))
     .unwrap();
 
-    let (first, first_vectors) = embed(&configuration, &["route", "worker", "queue"]).await;
+    let (first, first_vectors) = embed(&store, &ws, &key, &configuration, "first", &["route", "worker", "queue"]).await;
     assert_eq!(first["embedded_passages"], 3, "{first}");
     assert_eq!(first["cached_passages"], 0, "{first}");
     assert_eq!(requests.lock().unwrap().len(), 1);
 
-    let (second, second_vectors) = embed(&configuration, &["route", "worker", "queue"]).await;
+    let (second, second_vectors) = embed(&store, &ws, &key, &configuration, "second", &["route", "worker", "queue"]).await;
     assert_eq!(second["embedded_passages"], 0, "{second}");
     assert_eq!(second["cached_passages"], 3, "{second}");
     assert_eq!(second["complete"], true, "{second}");
@@ -164,7 +165,7 @@ async fn a_second_store_reuses_cached_vectors_and_embeds_only_new_passages() {
     assert_eq!(first_vectors, expected(&["route", "worker", "queue"]));
     assert_eq!(second_vectors, first_vectors);
 
-    let (third, third_vectors) = embed(&configuration, &["route", "changed", "queue"]).await;
+    let (third, third_vectors) = embed(&store, &ws, &key, &configuration, "third", &["route", "changed", "queue"]).await;
     assert_eq!(third["embedded_passages"], 1, "{third}");
     assert_eq!(third["cached_passages"], 2, "{third}");
     let requests = requests.lock().unwrap();
