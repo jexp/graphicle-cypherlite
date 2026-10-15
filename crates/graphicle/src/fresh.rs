@@ -426,8 +426,8 @@ fn check_at(
         None => instant_ns(&baseline.synced_at).unwrap_or(0),
     };
     let heads =
-        store.authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-            crate::store::heads(db, project)
+        store.authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+            crate::store_content::heads(&store.graph(), project)
         })?;
     check.method = "scan";
     check.record = record;
@@ -1324,8 +1324,8 @@ pub fn absorb_own_writes(
         return Ok(false);
     }
     let heads =
-        store.authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-            crate::store::heads(db, project)
+        store.authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+            crate::store_content::heads(&store.graph(), project)
         })?;
     for relative in &check.sample {
         if !written.contains(relative) {

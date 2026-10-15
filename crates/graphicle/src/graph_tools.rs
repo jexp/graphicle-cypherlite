@@ -51,7 +51,7 @@ use graphicle::{
     serve_search::{label, neighbors},
 };
 use graphicle_memory::graph::span;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -1104,13 +1104,9 @@ fn citation(
     let content = match contents.get(&path) {
         Some(content) => content.clone(),
         None => {
-            let content = one(
-                db,
-                "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                params![repository, sha],
-            )?
-            .map(|row| s(&row, "content").to_string())
-            .filter(|content| graphicle_memory::text::sha256(content.as_bytes()) == sha);
+            let graph = crate::store::graph_for(db)?;
+            let content = crate::store_content::object_content(&graph, repository, &sha)?
+                .filter(|content| graphicle_memory::text::sha256(content.as_bytes()) == sha);
             contents.insert(path.clone(), content.clone());
             content
         }

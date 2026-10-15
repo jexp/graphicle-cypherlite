@@ -1247,7 +1247,8 @@ fn readings(db: &Connection, workspace: &str) -> Result<BTreeMap<String, String>
         if scratch.contains(id) {
             continue;
         }
-        let heads = crate::store::heads(db, id)?;
+        let graph = graph_of(db)?;
+        let heads = crate::store_content::heads(&graph, id)?;
         let current = graph_projection::episode_of(&heads);
         if let Some(reading) = crate::code_graph_arm::reading(db, id, &heads, &current)? {
             out.insert(id.to_string(), reading.episode);
@@ -1293,12 +1294,8 @@ struct Plan {
 }
 
 fn object(db: &Connection, repository: &str, sha: &str) -> Result<Option<String>> {
-    Ok(one(
-        db,
-        "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-        params![repository, sha],
-    )?
-    .map(|row| s(&row, "content").to_string()))
+    let graph = graph_of(db)?;
+    crate::store_content::object_content(&graph, repository, sha)
 }
 
 /// Whether a `.txt` page is a Sphinx source: a `conf.py` in one of its
@@ -1539,7 +1536,8 @@ fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
         if scratch.contains(&id) {
             continue;
         }
-        let heads = crate::store::heads(db, &id)?;
+        let graph = graph_of(db)?;
+        let heads = crate::store_content::heads(&graph, &id)?;
         let current = graph_projection::episode_of(&heads);
         let episode = crate::code_graph_arm::reading(db, &id, &heads, &current)?
             .map(|reading| reading.episode);
@@ -1929,11 +1927,11 @@ fn target_window(
 /// The document's current sha256: its head, or its present connector copy.
 fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
     let row = match (&document.path, &document.connector) {
-        (Some(path), _) => one(
-            db,
-            "SELECT sha256 FROM repo_heads WHERE repository_id=? AND path=?",
-            params![document.project, path],
-        )?,
+        (Some(path), _) => {
+            let graph = graph_of(db)?;
+            crate::store_content::head_sha(&graph, &document.project, path)?
+                .map(|sha256| json!({"sha256":sha256}))
+        }
         (None, Some((connector, id))) => one(
             db,
             "SELECT d.sha256 FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id \

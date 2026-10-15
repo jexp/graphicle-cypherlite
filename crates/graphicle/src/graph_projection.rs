@@ -297,16 +297,13 @@ pub fn episode_heads(
     if let Some(heads) = stored_episode_heads(db, repository, episode)? {
         return Ok(Some(heads));
     }
-    let current = crate::store::heads(db, repository)?;
+    let graph = crate::store::graph_for(db)?;
+    let current = crate::store_content::heads(&graph, repository)?;
     if episode_of(&current) == episode {
         return Ok(Some(current));
     }
-    for snapshot in rows(
-        db,
-        "SELECT manifest FROM repo_snapshots WHERE repository_id=? ORDER BY created_at DESC",
-        [repository],
-    )? {
-        let manifest: BTreeMap<String, Value> = serde_json::from_str(s(&snapshot, "manifest"))?;
+    for manifest in crate::store_content::snapshot_manifests(&graph, repository)? {
+        let manifest: BTreeMap<String, Value> = serde_json::from_str(&manifest)?;
         let heads: BTreeMap<String, String> = manifest
             .into_iter()
             .map(|(path, entry)| (path, s(&entry, "sha256").to_string()))
@@ -1563,12 +1560,8 @@ pub fn set_repo_access(
 }
 
 fn blob(db: &Connection, repository: &str, sha: &str) -> Result<Option<String>> {
-    Ok(one(
-        db,
-        "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-        params![repository, sha],
-    )?
-    .map(|row| s(&row, "content").to_string()))
+    let graph = crate::store::graph_for(db)?;
+    crate::store_content::object_content(&graph, repository, sha)
 }
 
 fn is_manifest(relpath: &str) -> bool {

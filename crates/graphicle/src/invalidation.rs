@@ -22,7 +22,7 @@
 use crate::store_graph::{GraphStore, Params, json_to_value, one, rows, s};
 use crate::{Result, now};
 use cypherlite::Connection as GraphConnection;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -703,25 +703,20 @@ pub fn record_graph_nodes<'a>(
 }
 
 /// Record `chunk → file` dependencies for the chunks of one committed file and
-/// clear their stale markers (the chunks were just rebuilt). (`repo_chunks`
-/// is still a SQL table until the content store migrates.)
+/// clear their stale markers (the chunks were just rebuilt). The chunk lines
+/// come from the caller — the content store's `chunk_lines_for`
+/// (`repo_chunks` has migrated there).
 pub fn record_file_chunks(
-    db: &Connection,
     graph: &GraphStore,
     workspace: &str,
     repository: &str,
     path: &str,
-    sha256: &str,
+    lines: &[i64],
 ) -> Result<usize> {
-    let mut statement =
-        db.prepare("SELECT line FROM repo_chunks WHERE repository_id=? AND path=? AND sha256=?")?;
-    let lines = statement
-        .query_map(params![repository, path, sha256], |r| r.get::<_, i64>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     let file = file_id(repository, path);
     let stamp = now();
     graph.transaction(|g| {
-        for line in &lines {
+        for line in lines {
             let chunk = chunk_id(repository, path, *line);
             record_in(g, workspace, (CHUNK, &chunk), (FILE, &file), &stamp)?;
             clear_in(g, workspace, CHUNK, &chunk)?;

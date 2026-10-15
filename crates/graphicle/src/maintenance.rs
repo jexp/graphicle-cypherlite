@@ -55,6 +55,9 @@ fn delete_project(
     db.execute("DELETE FROM repo_projects WHERE id=?", [identifier])?;
     // The project's document links live in the graph store: no cascade there.
     crate::doc_links::drop_project(db, identifier)?;
+    // The content store's project data lives in the graph too.
+    let content_graph = crate::store::graph_for(db)?;
+    crate::store_content::delete_project(&content_graph, identifier)?;
     graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
     deletion::project_receipt(db, p, identifier, &connectors, removed)
 }
@@ -195,13 +198,14 @@ impl Store {
                 },
                 "storage.prune"=>{
                     let keep=integer(args,"keep_snapshots",20,1000)?.max(1);
-                    let snapshots=rows(db,"SELECT sha256,manifest FROM repo_snapshots WHERE repository_id=? ORDER BY created_at DESC,sha256",[identifier])?;
+                    let graph=self.graph();
+                    let snapshots=crate::store_content::prune_snapshot_rows(&graph,identifier)?;
                     let mut keep_snapshots:BTreeSet<String>=snapshots.iter().take(keep).map(|r|s(r,"sha256").to_string()).collect();
                     keep_snapshots.insert(s(&repository,"snapshot").to_string());
                     for run in rows(db,"SELECT start_snapshot,end_snapshot FROM repo_runs WHERE repository_id=?",[identifier])? {
                         for key in ["start_snapshot","end_snapshot"] {if let Some(v)=run[key].as_str(){keep_snapshots.insert(v.to_string());}}
                     }
-                    let mut objects:BTreeSet<String>=store::heads(db,identifier)?.into_values().collect();
+                    let mut objects:BTreeSet<String>=crate::store_content::heads(&graph,identifier)?.into_values().collect();
                     let mut pruned:Vec<String>=Vec::new();
                     let (mut snapshots_removed,mut objects_removed,mut originals_removed)=(Vec::new(),Vec::new(),Vec::new());
                     for snapshot in &snapshots {
@@ -209,7 +213,7 @@ impl Store {
                             let manifest:Value=serde_json::from_str(s(snapshot,"manifest"))?;
                             for value in manifest.as_object().into_iter().flat_map(|o|o.values()) {if let Some(sha)=value["sha256"].as_str(){objects.insert(sha.to_string());}}
                         } else {
-                            db.execute("DELETE FROM repo_snapshots WHERE repository_id=? AND sha256=?",params![identifier,s(snapshot,"sha256")])?;
+                            crate::store_content::snapshot_delete(&graph,identifier,s(snapshot,"sha256"))?;
                             snapshots_removed.push(s(snapshot,"sha256").to_string());
                         }
                     }
@@ -220,10 +224,10 @@ impl Store {
                         for sha in memory["data"]["dependencies"].as_object().into_iter().flat_map(|o|o.values()).filter_map(Value::as_str){objects.insert(sha.to_string());}
                     }
                     let mut freed=0;
-                    for object in rows(db,"SELECT sha256,bytes FROM repo_objects WHERE repository_id=?",[identifier])? {
-                        if !objects.contains(s(&object,"sha256")){freed+=object["bytes"].as_u64().unwrap_or(0);db.execute("DELETE FROM repo_objects WHERE repository_id=? AND sha256=?",params![identifier,s(&object,"sha256")])?;objects_removed.push(s(&object,"sha256").to_string());}
+                    for object in crate::store_content::object_list(&graph,identifier)? {
+                        if !objects.contains(s(&object,"sha256")){freed+=object["bytes"].as_u64().unwrap_or(0);crate::store_content::object_delete(&graph,identifier,s(&object,"sha256"))?;objects_removed.push(s(&object,"sha256").to_string());}
                     }
-                    let syncs_removed=db.execute("DELETE FROM repo_syncs WHERE repository_id=? AND state NOT IN ('pending','preparing')",[identifier])?;
+                    let syncs_removed=crate::store_content::syncs_prune_finished(&graph,identifier)?;
                     let mut originals_freed=0;
                     for original in rows(db,"SELECT source_id,sha256,text_sha256,length(bytes) AS bytes FROM am_original_documents WHERE repository_id=?",[identifier])? {
                         // Keep originals referenced by any retained source object, including snapshots.
@@ -237,8 +241,8 @@ impl Store {
                     if !(snapshots_removed.is_empty() && objects_removed.is_empty() && originals_removed.is_empty()) {
                         // Re-count what was pruned, then sign: no silent deletion.
                         let remaining=json!({
-                            "repo_snapshots":still_present(db,"SELECT count(*) FROM repo_snapshots WHERE repository_id=? AND sha256=?",identifier,snapshots_removed.iter().map(|k|vec![k.clone()]))?,
-                            "repo_objects":still_present(db,"SELECT count(*) FROM repo_objects WHERE repository_id=? AND sha256=?",identifier,objects_removed.iter().map(|k|vec![k.clone()]))?,
+                            "repo_snapshots":snapshots_removed.iter().map(|k|crate::store_content::snapshot_count(&graph,identifier,k)).sum::<Result<i64>>()?,
+                            "repo_objects":objects_removed.iter().map(|k|crate::store_content::object_count(&graph,identifier,k)).sum::<Result<i64>>()?,
                             "am_original_documents":still_present(db,"SELECT count(*) FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",identifier,originals_removed.iter().map(|(a,b)|vec![a.clone(),b.clone()]))?,
                         });
                         pruned.extend(snapshots_removed.iter().map(|k|format!("snapshot:{k}")));
@@ -296,12 +300,23 @@ impl Store {
             if check != "ok" {
                 return Err(Error::bad("Backup integrity verification failed"));
             }
+            // The content store lives in the graph: it travels as a sidecar
+            // directory the restore puts back beside reviews.sqlite3.
+            let graph = self.directory.join("reviews.graph");
+            let graph_sidecar = crate::store_graph::backup_sidecar(path);
+            let graph_copied = if graph.exists() {
+                crate::store_graph::clone_store(&graph, &graph_sidecar)?;
+                true
+            } else {
+                false
+            };
             Ok(
-                json!({"path":path,"created_at":now(),"integrity":"ok","contains_private_sources":true,"provider_credentials_included":false,"reconnect_accounts_after_restore":true}),
+                json!({"path":path,"graph":graph_copied.then_some(graph_sidecar),"created_at":now(),"integrity":"ok","contains_private_sources":true,"provider_credentials_included":false,"reconnect_accounts_after_restore":true}),
             )
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir_all(crate::store_graph::backup_sidecar(path));
         }
         result
     }

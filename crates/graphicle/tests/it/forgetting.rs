@@ -550,15 +550,22 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
         "repo_memory_revisions",
         "am_claims",
         "am_document_reads",
-        "repo_objects",
-        // gf_dependencies moved to the graph store; its edges are removed
-        // there and no longer counted in the SQL catalog.
+        // gf_dependencies and repo_objects moved to the graph store
+        // (invalidation, content store); neither is a SQL table with rows.
     ] {
         assert!(
             covered["tables"][table]["rows"].as_u64().unwrap_or(0) > 0,
             "{table}: {covered:#}"
         );
     }
+    // The content store lives in the graph (`repo_objects` is no longer a
+    // SQL table the state dump counts).
+    assert!(
+        !graphicle_runtime::store_content::object_list(&a.store.graph(), &a.repo)
+            .unwrap()
+            .is_empty(),
+        "graph content store holds the synced objects"
+    );
     assert_eq!(answers, work(&b, &m, &[&chat]).await);
     assert!(
         !answers

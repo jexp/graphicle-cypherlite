@@ -217,13 +217,9 @@ impl Store {
             let sha = heads
                 .get(path)
                 .ok_or_else(|| Error::bad("File absent from the cited graph episode"))?;
-            let original = one(
-                db,
-                "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                params![identifier, sha],
-            )?
-            .ok_or_else(|| Error::bad("The cited original was removed"))?;
-            let content = s(&original, "content");
+            let graph = crate::store::graph_for(db)?;
+            let content = crate::store_content::object_content(&graph, identifier, sha)?
+                .ok_or_else(|| Error::bad("The cited original was removed"))?;
             if graphicle_memory::text::sha256(content.as_bytes()) != *sha {
                 return Err(Error::bad("Historical source integrity check failed"));
             }

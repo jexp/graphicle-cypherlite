@@ -1245,13 +1245,19 @@ fn pin_pending_in(db: &Connection, g: &mut GraphConnection, repository: &str) ->
                 let described =
                     describe(db, g, repository, episode.as_deref(), &mut manifest, path, sha)?;
                 let content = match described {
-                    Some(_) => crate::store::rows(
-                        db,
-                        "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                        rusqlite::params![repository, sha],
+                    // The object lives in the content store; read it through
+                    // this transaction's own connection (`g`), not a second
+                    // store handle.
+                    Some(_) => sg::one(
+                        g,
+                        "MATCH (o:Object {repository_id: $repo, sha256: $sha}) \
+                         RETURN o.content AS content",
+                        Params::from([
+                            ("repo".to_string(), json_to_value(&json!(repository))),
+                            ("sha".to_string(), json_to_value(&json!(sha))),
+                        ]),
                     )?
-                    .first()
-                    .map(|r| s(r, "content").to_string()),
+                    .map(|row| sg::s(&row, "content").to_string()),
                     None => None,
                 };
                 entry.insert(

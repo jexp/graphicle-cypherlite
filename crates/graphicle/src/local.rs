@@ -324,21 +324,30 @@ fn converted(
         if !crate::fresh::converted_here(db, &p.workspace, root, s(&project, "snapshot"))? {
             return Ok(found);
         }
+        // Binary conversions are SQL (`am_binary_heads`); the heads and
+        // object contents they join against live in the graph content store.
+        let heads = crate::store_content::heads(&store.graph(), s(&project, "id"))?;
         let mut rows = db.prepare(
-            "SELECT b.path,b.original_sha,b.source_sha,b.parser,o.content FROM am_binary_heads b \
-             JOIN repo_heads h ON h.repository_id=b.repository_id AND h.path=b.path AND h.sha256=b.source_sha \
-             JOIN repo_objects o ON o.repository_id=b.repository_id AND o.sha256=b.source_sha \
-             WHERE b.repository_id=?",
+            "SELECT path,original_sha,source_sha,parser FROM am_binary_heads WHERE repository_id=?",
         )?;
         let mut rows = rows.query([s(&project, "id")])?;
         while let Some(row) = rows.next()? {
+            let (path, source_sha): (String, String) = (row.get(0)?, row.get(2)?);
+            if heads.get(&path) != Some(&source_sha) {
+                continue;
+            }
+            let Some(text) =
+                crate::store_content::object_content(&store.graph(), s(&project, "id"), &source_sha)?
+            else {
+                continue;
+            };
             found.insert(
-                row.get::<_, String>(0)?,
+                path,
                 Converted {
                     original: row.get(1)?,
-                    text_sha256: row.get(2)?,
+                    text_sha256: source_sha,
                     parser: row.get(3)?,
-                    text: row.get(4)?,
+                    text,
                 },
             );
         }
@@ -671,7 +680,7 @@ pub fn sync_folder(
     let (limited, not_analysed) =
         store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
             let current = crate::store::repo(db, p, &repository)?;
-            crate::store::analysis_report(db, s(&current, "id"))
+            crate::store::analysis_report(&store.graph(), s(&current, "id"))
         })?;
     skipped.extend(not_analysed);
     skipped.sort_by(|a, b| s(a, "path").cmp(s(b, "path")));
@@ -997,7 +1006,7 @@ pub fn build_graph(
         let files =
             store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
                 let repository = crate::store::repo(db, p, repository)?;
-                Ok(crate::store::heads(db, s(&repository, "id"))?.len())
+                Ok(crate::store_content::heads(&store.graph(), s(&repository, "id"))?.len())
             })?;
         eprintln!("graphicle: building the code graph of {files} files...");
     }
@@ -1153,6 +1162,11 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
         let _ = std::fs::remove_file(&destination);
         return Err(error.into());
+    }
+    // The content store's graph travels as a sidecar of the backup.
+    let sidecar = crate::store_graph::backup_sidecar(backup);
+    if sidecar.exists() {
+        crate::store_graph::clone_store(&sidecar, &directory.join("reviews.graph"))?;
     }
     Ok(
         json!({"restored":true,"data_dir":directory,"next":"Use graphicle login with your saved workspace access key. Reconnect source accounts and model API keys in Connections; device credentials are excluded from portable backups."}),

@@ -11,7 +11,7 @@
 //! - `symbol_calls` (caller → callee by path and name) are identical.
 
 use graphicle_runtime::query::{self, Snapshot};
-use graphicle_runtime::store::{Store, decode, repo, rows, s};
+use graphicle_runtime::store::{Store, decode, repo, s};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use tempfile::TempDir;
@@ -212,14 +212,9 @@ impl Fixture {
     /// `(relpath, symbol name)` for every legacy analysis symbol, plus
     /// `(relpath, "")` per analysed file.
     fn legacy_nodes(&self) -> BTreeSet<(String, String)> {
-        let db = self.store.connect().unwrap();
         let mut out = BTreeSet::new();
-        for mut row in rows(
-            &db,
-            "SELECT p.path,p.data FROM repo_parses p JOIN repo_heads h ON h.repository_id=p.repository_id AND h.path=p.path AND h.sha256=p.sha256 WHERE p.repository_id=?",
-            [&self.repo],
-        )
-        .unwrap()
+        for mut row in
+            graphicle_runtime::store_content::head_parses(&self.store.graph(), &self.repo).unwrap()
         {
             decode(&mut row, "data").unwrap();
             let path = s(&row, "path").to_string();

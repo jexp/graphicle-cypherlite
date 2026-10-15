@@ -63,13 +63,6 @@ impl Fixture {
         )
         .unwrap()
     }
-    fn count(&self, sql: &str) -> i64 {
-        self.store
-            .connect()
-            .unwrap()
-            .query_row(sql, [&self.repo], |r| r.get(0))
-            .unwrap()
-    }
 }
 
 #[test]
@@ -142,7 +135,12 @@ fn storage_prune_signs_a_receipt_for_removed_snapshots_and_objects() {
     )
     .unwrap();
     local::sync(&f.store, &mut session, &root, Some(&f.repo)).unwrap();
-    assert!(f.count("SELECT count(*) FROM repo_snapshots WHERE repository_id=?") >= 2);
+    assert!(
+        graphicle_runtime::store_content::snapshots(&f.store.graph(), &f.repo, 1000)
+            .unwrap()
+            .len()
+            >= 2
+    );
 
     let pruned = f
         .store

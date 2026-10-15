@@ -44,8 +44,9 @@ impl Fixture {
     fn episode(&self, content: &str) -> String {
         self.store.transaction(|db| {
             let sha=graphicle_memory::text::sha256(content.as_bytes());
-            db.execute("INSERT OR IGNORE INTO repo_objects VALUES(?,?,?,?)",params![self.repo,sha,content,content.len() as i64])?;
-            db.execute("INSERT OR REPLACE INTO repo_heads VALUES(?,?,?)",params![self.repo,"a.py",sha])?;
+            let project=graphicle_runtime::store::rows(db,"SELECT * FROM repo_projects WHERE id=?",params![self.repo])?.pop().unwrap();
+            graphicle_runtime::store_content::put_objects(&self.store.graph(),&project,&json!([{"sha256":sha,"content":content,"bytes":content.len()}]))?;
+            graphicle_runtime::store_content::put_head(&self.store.graph(),&project,"a.py",&sha)?;
             let episode=graph_projection::current_episode(db,&self.repo)?;
             let graph=Graph::from_node_link(&json!({"directed":true,"multigraph":true,"nodes":[{"id":"a","label":content,"stable_id":"a"},{"id":"b","label":"b","stable_id":"b"}],"links":[{"source":"a","target":"b","key":"calls","relation":"calls"}]}),"links")?;
             graph_projection::persist(db,&self.store.graph(),&self.repo,&episode,&graph)?;Ok(episode)

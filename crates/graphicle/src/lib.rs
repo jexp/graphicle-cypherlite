@@ -58,6 +58,7 @@ pub mod settings;
 pub mod setup;
 pub mod store;
 pub mod store_compat;
+pub mod store_content;
 pub mod store_graph;
 pub mod structured_memory;
 pub mod symbols;

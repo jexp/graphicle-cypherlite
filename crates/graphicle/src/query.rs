@@ -1,8 +1,8 @@
 use crate::memory;
-use crate::store::{Principal, Store, decode, one, repo, rows, s};
+use crate::store::{Principal, Store, decode, repo, s};
 use crate::{Error, Result, digest, graph_projection, integer, native, string};
 use graphicle::graph::Graph;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,13 +52,11 @@ pub struct Snapshot {
 /// episode (`episode_graph`); retained only as the fallback for repositories
 /// without a recorded episode and for the B10 equivalence test.
 pub fn legacy_graph(db: &Connection, repository: &Value, _p: &Principal) -> Result<Value> {
+    let _ = db;
+    let graph_store = crate::store::graph_for(db)?;
     // Past the adapter's file limit (a project larger than earlier builds
     // allowed), file relationships come from the projected episode only.
-    let files: i64 = db.query_row(
-        "SELECT count(*) FROM repo_heads WHERE repository_id=?",
-        [s(repository, "id")],
-        |r| r.get(0),
-    )?;
+    let files = crate::store_content::file_count(&graph_store, s(repository, "id"))?;
     if usize::try_from(files).unwrap_or(usize::MAX) > graphicle_memory::structure::GRAPH_FILE_LIMIT
     {
         return Ok(
@@ -69,11 +67,7 @@ pub fn legacy_graph(db: &Connection, repository: &Value, _p: &Principal) -> Resu
         );
     }
     let mut analyses = BTreeMap::new();
-    for mut row in rows(
-        db,
-        "SELECT p.path,p.data FROM repo_parses p JOIN repo_heads h ON h.repository_id=p.repository_id AND h.path=p.path AND h.sha256=p.sha256 WHERE p.repository_id=? ORDER BY p.path",
-        [s(repository, "id")],
-    )? {
+    for mut row in crate::store_content::head_parses(&graph_store, s(repository, "id"))? {
         decode(&mut row, "data")?;
         analyses.insert(s(&row, "path").to_string(), row["data"].clone());
     }
@@ -1600,13 +1594,13 @@ impl Store {
                 .ok_or_else(|| Error::bad("Select a source ID or file path"))?;
             if let Some(snapshot)=args["snapshot"].as_str().filter(|v|*v!=s(&repository,"snapshot")) {
                 let path=identifier.strip_prefix("file:").ok_or_else(||Error::bad("Repository snapshots only apply to repository files"))?;
-                let saved=one(db,"SELECT manifest,created_at FROM repo_snapshots WHERE repository_id=? AND sha256=?",params![s(&repository,"id"),snapshot])?.ok_or_else(||Error::bad("Snapshot unavailable"))?;
+                let saved=crate::store_content::snapshot_get(&self.graph(),s(&repository,"id"),snapshot)?.ok_or_else(||Error::bad("Snapshot unavailable"))?;
                 let manifest:Value=serde_json::from_str(s(&saved,"manifest"))?;
                 let sha=manifest[path]["sha256"].as_str().ok_or_else(||Error::bad("File was absent from this snapshot"))?;
-                let original=one(db,"SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",params![s(&repository,"id"),sha])?.ok_or_else(||Error::bad("Historical source was removed"))?;
+                let content=crate::store_content::object_content(&self.graph(),s(&repository,"id"),sha)?.ok_or_else(||Error::bad("Historical source was removed"))?;
                 if args["sha256"].as_str().is_some_and(|expected|expected!=sha) {return Err(Error::conflict("Hash does not match the requested snapshot"));}
-                if graphicle_memory::text::sha256(s(&original,"content").as_bytes())!=sha {return Err(Error::bad("Historical source integrity check failed"));}
-                let doc=json!({"id":identifier,"path":path,"title":path,"sha256":sha,"version":sha,"snapshot":snapshot,"source_kind":"repository_file","content":original["content"],"recorded_at":null,"observed_at":saved["created_at"],"authority":"historical_original_source"});
+                if graphicle_memory::text::sha256(content.as_bytes())!=sha {return Err(Error::bad("Historical source integrity check failed"));}
+                let doc=json!({"id":identifier,"path":path,"title":path,"sha256":sha,"version":sha,"snapshot":snapshot,"source_kind":"repository_file","content":content,"recorded_at":null,"observed_at":saved["created_at"],"authority":"historical_original_source"});
                 return memory::read_source(&doc,args);
             }
             let source = docs
@@ -1961,7 +1955,6 @@ mod tests {
         // `graph_local` reads reviewed claims and entity links: a store's schema.
         let dir = tempfile::TempDir::new().unwrap();
         let store = crate::store::Store::open(dir.path()).unwrap();
-        let db = store.connect().unwrap();
         let principal = crate::store::Principal {
             workspace: "w".into(),
             credential: "c".into(),
@@ -1969,6 +1962,7 @@ mod tests {
             role: "owner".into(),
         };
         let args = json!({"question":"refresh token","graph_retrieval":true});
+        let db = store.connect().unwrap();
         let graph = crate::graph::for_query(
             &db,
             &store.graph(),
