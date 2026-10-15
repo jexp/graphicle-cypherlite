@@ -156,3 +156,7 @@ graph type is inert).
 - Numbers: JSON integers → `Int`, other numbers → `Float`; floats JSON
   cannot carry (NaN/∞ ) read back as `null`. Temporal/point values read as
   their display strings; vectors read as number lists.
+
+## Engine limitation: no map property values (verified on v0.12.2)
+
+cypherlite cannot store a **map** as a property value (`InvalidPropertyType`; only scalars and lists of scalars). `SET n += $map` works as a property-set *merge*. Consequence: JSON-object payloads (`data`/`metadata`/`attributes` columns) must stay stringified JSON in a `String` property or be flattened to scalar properties — never push a `Value::Map` into one property (so `json_to_value` is for lists/scalars only). Lists of scalars (e.g. ACLs) are fine and preferred for membership checks.
