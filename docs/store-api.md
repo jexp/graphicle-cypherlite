@@ -160,3 +160,7 @@ graph type is inert).
 ## Engine limitation: no map property values (verified on v0.12.2)
 
 cypherlite cannot store a **map** as a property value (`InvalidPropertyType`; only scalars and lists of scalars). `SET n += $map` works as a property-set *merge*. Consequence: JSON-object payloads (`data`/`metadata`/`attributes` columns) must stay stringified JSON in a `String` property or be flattened to scalar properties — never push a `Value::Map` into one property (so `json_to_value` is for lists/scalars only). Lists of scalars (e.g. ACLs) are fine and preferred for membership checks.
+
+### Flattening JSON objects into dotted properties (verified on v0.12.2)
+
+A map cannot be a property *value*, but property *names* may be dotted: `SET n.`+chr(96)+`attributes.foo`+chr(96)+` = $v`, `MATCH (n) WHERE n.`+chr(96)+`attributes.foo`+chr(96)+` = $v`, and `CREATE INDEX i FOR (n) ON (n.`+chr(96)+`attributes.foo`+chr(96)+`)` all work (backtick-quote the key). Preferred mapping for JSON-object columns (`attributes`, `data`, `metadata`): **flatten to dotted properties** so subfields stay queryable and indexable. Keep a single stringified-JSON String property only for genuinely dynamic/unbounded keys or arrays of objects.
