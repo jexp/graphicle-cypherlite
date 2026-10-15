@@ -148,7 +148,7 @@ impl Store {
             let n=db.execute("DELETE FROM am_secrets WHERE workspace_id=? AND id=?",params![workspace,identifier])?;
             // A removed secret immediately stops every connector referencing it.
             db.execute("UPDATE am_connectors SET state='paused',last_sync=NULL,generation=generation+1 WHERE repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?) AND credential_env=?",params![workspace,reference])?;
-            for project in projects{db.execute("DELETE FROM am_model_cache WHERE repository_id=?",[s(&project,"repository_id")])?;crate::store::invalidate(db,s(&project,"repository_id"))?;}
+            for project in projects{crate::jobs::clear_model_cache(self.graph(),s(&project,"repository_id"))?;crate::store::invalidate(db,s(&project,"repository_id"))?;}
             Ok(json!({"removed":n>0}))
         })
     }

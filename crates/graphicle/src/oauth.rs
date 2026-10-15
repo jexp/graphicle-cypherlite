@@ -441,7 +441,7 @@ pub fn disconnect(
         db.execute("UPDATE am_connectors SET state='paused',last_sync=NULL,generation=generation+1 WHERE credential_env=? AND repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?)",params![reference,workspace])?;
         db.execute("DELETE FROM am_oauth_accounts WHERE id=?",[identifier])?;
         db.execute("DELETE FROM am_secrets WHERE id IN (?,?)",params![s(&account,"token_secret"),s(&account,"refresh_secret")])?;
-        for p in projects{db.execute("DELETE FROM am_model_cache WHERE repository_id=?",[s(&p,"repository_id")])?;crate::store::invalidate(db,s(&p,"repository_id"))?;}
+        for p in projects{crate::jobs::clear_model_cache(store.graph(),s(&p,"repository_id"))?;crate::store::invalidate(db,s(&p,"repository_id"))?;}
         Ok(json!({"disconnected":true,"provider_token_revoked":false}))
     })
 }

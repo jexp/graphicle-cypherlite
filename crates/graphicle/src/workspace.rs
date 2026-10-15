@@ -194,6 +194,7 @@ fn project_args(args: &Value, repository: &str) -> Value {
 /// `context` with `scope: "workspace"` for `p` (see the module comment).
 /// `repository_id`, when given, names the project read first.
 pub fn context(
+    graph_store: &crate::store_graph::GraphStore,
     db: &Connection,
     p: &Principal,
     args: &Value,
@@ -217,6 +218,7 @@ pub fn context(
     for (position, repository) in repositories.into_iter().enumerate() {
         let id = s(&repository, "id").to_string();
         match query::project_packet(
+            graph_store,
             db,
             p,
             &repository,

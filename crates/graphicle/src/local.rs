@@ -925,7 +925,7 @@ pub fn graph_report(store: &Store, session: &Session, repository: &str) -> Resul
                     json!({"status":"current","episode":episode,"nodes":row["node_count"],"edges":row["edge_count"]})
                 }
                 None => {
-                    json!({"status":crate::jobs::projection_state(db, id, &episode)?,"episode":episode})
+                    json!({"status":crate::jobs::projection_state(store.graph(), id, &episode)?,"episode":episode})
                 }
             },
         )

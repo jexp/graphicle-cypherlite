@@ -167,7 +167,8 @@ pub async fn generate(
         .map_err(queue_error)?;
     let start = Instant::now();
     loop {
-        if let Err(error) = jobs::guarded(&worker.store, job, |db, _, _| jobs::renew(db, job)) {
+        let graph = worker.store.graph().clone();
+        if let Err(error) = jobs::guarded(&worker.store, job, |_, _, _| jobs::renew(&graph, job)) {
             let _: std::result::Result<usize, _> = conn.del(&task_key).await;
             return Err(error);
         }

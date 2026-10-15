@@ -356,17 +356,19 @@ async fn grounded_v3_notes_budget_is_validated_when_queued() {
         )
         .unwrap();
     assert!(queued["id"].is_string(), "{queued}");
-    let payload: String = f
+    let payload = f
         .store
-        .connect()
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {id: $id}) RETURN j.payload AS payload",
+                graphicle_runtime::store_graph::params(&json!({"id": s(&queued, "id")})),
+            )
+        })
         .unwrap()
-        .query_row(
-            "SELECT payload FROM am_jobs WHERE id=?",
-            [s(&queued, "id")],
-            |r| r.get(0),
-        )
         .unwrap();
-    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let payload: Value = serde_json::from_str(s(&payload, "payload")).unwrap();
     assert_eq!(payload["observer_notes"], true);
     assert!(payload["notes_state"].is_string(), "{payload}");
 }

@@ -149,7 +149,7 @@ impl Store {
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     // The memory, its dependents and everything naming them go in one transaction, with a hash-chained receipt.
                     let (deleted,counts)=crate::deletion::delete_memories(db,&p.workspace,identifier,&memories,memory_id)?;
-                    purge_derived_cache(db,identifier)?;
+                    purge_derived_cache(self.graph(),db,identifier)?;
                     let keys:Vec<String>=deleted.iter().cloned().collect();
                     let remaining=crate::deletion::memory_rows(db,identifier,&keys)?;
                     let receipt=crate::deletion::rows_receipt(db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining,true)?;
@@ -236,10 +236,32 @@ impl Store {
         Ok(result)
     }
 }
-pub fn purge_derived_cache(db: &rusqlite::Connection, repository: &str) -> Result<()> {
+pub fn purge_derived_cache(
+    graph: &crate::store_graph::GraphStore,
+    db: &rusqlite::Connection,
+    repository: &str,
+) -> Result<()> {
+    // Jobs and the model/query caches live in the graph store now; the rest
+    // is still SQL until its own migration node lands.
+    graph.transaction(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (j:Job {repository_id: $repo}) DETACH DELETE j",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (c:ModelCache {repository_id: $repo}) DELETE c",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (q:QueryCache {repository_id: $repo}) DELETE q",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        Ok(())
+    })?;
     for table in [
-        "am_model_cache",
-        "am_query_cache",
         "am_vectors",
         "am_document_reads",
         "am_preparation_steps",
@@ -251,7 +273,6 @@ pub fn purge_derived_cache(db: &rusqlite::Connection, repository: &str) -> Resul
             [repository],
         )?;
     }
-    db.execute("DELETE FROM am_jobs WHERE repository_id=?", [repository])?;
     store::invalidate(db, repository)
 }
 pub fn redact(value: &str) -> String {

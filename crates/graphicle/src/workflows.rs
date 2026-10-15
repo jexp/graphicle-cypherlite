@@ -516,12 +516,9 @@ pub async fn refresh(worker: &Worker, job: &Job) -> Result<Value> {
     })
 }
 pub(crate) fn remaining_calls(worker: &Worker, job: &Job) -> Result<usize> {
-    jobs::guarded_read(&worker.store, job, |db, _, _| {
-        let used: usize = db.query_row(
-            "SELECT count(*) FROM am_call_reservations WHERE job_id=?",
-            [&job.id],
-            |r| r.get(0),
-        )?;
+    jobs::guarded_read(&worker.store, job, |_, _, _| {
+        let totals = crate::jobs::reservation_totals(worker.store.graph(), &job.id)?;
+        let used = totals["calls"].as_u64().unwrap_or(0) as usize;
         Ok((job.payload["max_calls"].as_u64().unwrap_or(4) as usize).saturating_sub(used))
     })
 }
@@ -642,7 +639,9 @@ async fn semantic_rankings_role(
     };
     let hashes:Vec<_>=questions.iter().map(|question|digest(&json!({"kind":role,"profile":key,"question":question,"principal":job.principal_hash,"source_state":job.payload["source_state"]}))).collect();
     // Writes a cached-call record, so it takes the write path.
-    let (vectors, mut query_vectors) = jobs::guarded(&worker.store, job, |db, _, _| {
+    let (vectors, mut query_vectors) = {
+        let graph = worker.store.graph().clone();
+        jobs::guarded(&worker.store, job, |db, _, _| {
         let mut vectors = BTreeMap::new();
         for row in rows(
             db,
@@ -656,38 +655,27 @@ async fn semantic_rankings_role(
                 );
             }
         }
-        let mut queries = Vec::new();
-        for hash in &hashes {
-            let cached = one(
-                db,
-                "SELECT result FROM am_query_cache WHERE repository_id=? AND request_hash=?",
-                params![job.repository, hash],
-            )?;
-            let vector = if let Some(value) = cached {
-                db.execute(
-                    "INSERT INTO am_model_calls VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    params![
-                        id(),
-                        job.repository,
-                        job.id,
-                        profile.protocol,
-                        profile.model,
-                        hash,
-                        0,
-                        0,
-                        0,
-                        1,
-                        now()
-                    ],
+        let queries = graph.transaction(|db| {
+            let mut queries = Vec::new();
+            for hash in &hashes {
+                let cached = crate::store_graph::one(
+                    db,
+                    "MATCH (q:QueryCache {repository_id: $repo, request_hash: $hash}) RETURN q.result AS result",
+                    crate::store_graph::params(&json!({"repo": job.repository, "hash": hash})),
                 )?;
-                Some(serde_json::from_str::<Vec<f64>>(s(&value, "result"))?)
-            } else {
-                None
-            };
-            queries.push(vector);
-        }
+                let vector = if let Some(value) = cached {
+                    jobs::record_call(db, &id(), &job.repository, &job.id, profile, hash, 0, 0, 0, 1)?;
+                    Some(serde_json::from_str::<Vec<f64>>(s(&value, "result"))?)
+                } else {
+                    None
+                };
+                queries.push(vector);
+            }
+            Ok(queries)
+        })?;
         Ok((vectors, queries))
-    })?;
+    })?
+    };
     if vectors.is_empty() {
         return Ok(empty());
     }
@@ -706,17 +694,29 @@ async fn semantic_rankings_role(
         } else {
             worker.query_embeddings(job, profile, &inputs).await?
         };
-        jobs::guarded(&worker.store, job, |db, _, _| {
-            for (i, vector) in pending.iter().zip(batch.iter()) {
-                db.execute(
-                    "INSERT OR REPLACE INTO am_query_cache VALUES(?,?,?)",
-                    params![job.repository, hashes[*i], serde_json::to_string(vector)?],
+        let graph = worker.store.graph().clone();
+        let embedded = jobs::guarded(&worker.store, job, |_, _, _| {
+            graph.transaction(|db| {
+                let mut embedded = Vec::new();
+                for (i, vector) in pending.iter().zip(batch.iter()) {
+                    crate::store_graph::rows(
+                        db,
+                        "MERGE (q:QueryCache {repository_id: $repo, request_hash: $hash}) SET q.result=$result, q.created_at=$now",
+                        crate::store_graph::params(&json!({"repo": job.repository, "hash": hashes[*i], "result": serde_json::to_string(vector)?, "now": now()})),
+                    )?;
+                    embedded.push((*i, vector.clone()));
+                }
+                crate::store_graph::rows(
+                    db,
+                    "MATCH (q:QueryCache {repository_id: $repo}) WITH q ORDER BY q.created_at DESC SKIP 500 DELETE q",
+                    crate::store_graph::params(&json!({"repo": job.repository})),
                 )?;
-                query_vectors[*i] = Some(vector.clone());
-            }
-            db.execute("DELETE FROM am_query_cache WHERE repository_id=? AND rowid IN (SELECT rowid FROM am_query_cache WHERE repository_id=? ORDER BY rowid DESC LIMIT -1 OFFSET 500)",params![job.repository,job.repository])?;
-            Ok(())
+                Ok(embedded)
+            })
         })?;
+        for (i, vector) in embedded {
+            query_vectors[i] = Some(vector);
+        }
     }
     let mut result = Vec::new();
     for vector in query_vectors {
@@ -1093,7 +1093,7 @@ pub async fn embed(worker: &Worker, job: &Job) -> Result<Value> {
     let cache = if profile.protocol != "local_onnx"
         || crate::local_inference::fingerprint(profile).is_ok()
     {
-        crate::embedding_cache::Cache::from_env(&key)?
+        Some(worker.store.embedding_cache(&key))
     } else {
         None
     };

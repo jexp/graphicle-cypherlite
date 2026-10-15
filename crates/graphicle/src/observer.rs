@@ -481,7 +481,7 @@ pub fn context(
     documents: &[Value],
     args: &Value,
 ) -> Result<Value> {
-    context_with(db, repository, documents, args, None)
+    context_with(db, repository, documents, args, None, None)
 }
 
 /// [`context`] with a local embedding profile: `ranked` then fuses each note's
@@ -492,6 +492,7 @@ pub fn context_with(
     documents: &[Value],
     args: &Value,
     embedding: Option<&crate::model::Profile>,
+    cache: Option<&crate::embedding_cache::Cache>,
 ) -> Result<Value> {
     crate::archived::check(crate::archived::Surface::ObserverContext, args)?;
     let question = string(args, "question", 8000)?;
@@ -540,7 +541,7 @@ pub fn context_with(
         };
         let dense = match embedding {
             Some(profile) if !available.is_empty() => {
-                Some(dense_scores(profile, &available, question)?)
+                Some(dense_scores(profile, &available, question, cache)?)
             }
             _ => None,
         };
@@ -655,15 +656,15 @@ fn keyed_text(note: &Value) -> String {
 
 /// Cosine similarity of each note (with its quotes) to the question under a
 /// local embedding profile. Note vectors are read from and recorded in the
-/// shared embedding cache when `GRAPHICLE_EMBEDDING_CACHE` is set, so notes
+/// store's embedding cache when one is passed, so notes
 /// are embedded once; the question is embedded on every call.
 pub fn dense_scores(
     profile: &crate::model::Profile,
     notes: &[Value],
     question: &str,
+    cache: Option<&crate::embedding_cache::Cache>,
 ) -> Result<Vec<f64>> {
     let texts: Vec<String> = notes.iter().map(keyed_text).collect();
-    let cache = crate::embedding_cache::Cache::from_env(&crate::model::key(profile))?;
     let mut vectors: Vec<Option<Vec<f64>>> = Vec::with_capacity(texts.len());
     for text in &texts {
         vectors.push(match &cache {

@@ -1405,7 +1405,18 @@ fn imports_take_code_spans_and_queue_the_link_job() {
     }
     import(json!([[11, 23]])).unwrap();
     assert_eq!(
-        f.count("SELECT count(*) AS n FROM am_jobs WHERE kind='link' AND state='queued'"),
+        f.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {kind: 'link', state: 'queued'}) RETURN count(j) AS n",
+                    graphicle_runtime::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap(),
         1
     );
     f.drain(&repo);
@@ -1456,7 +1467,18 @@ impl Fixture {
             .unwrap()
     }
     fn queued_links(&self) -> i64 {
-        self.count("SELECT count(*) AS n FROM am_jobs WHERE kind='link' AND state='queued'")
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {kind: 'link', state: 'queued'}) RETURN count(j) AS n",
+                    graphicle_runtime::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap_or(0)
     }
     fn jsonl(&self, repo: &str, name: &str) -> String {
         let connector = self

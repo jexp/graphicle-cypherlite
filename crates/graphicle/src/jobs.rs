@@ -1,8 +1,16 @@
-//! Leased, bounded jobs. Network calls never hold a SQLite transaction.
+//! Leased, bounded jobs. Network calls never hold a graph write transaction.
+//!
+//! The queue lives in the store's graph ([`crate::store_graph::GraphStore`])
+//! as `(:Job)-[:OF]->(:Project)` nodes with `(:ModelCall)-[:FOR]->(:Job)` and
+//! `(:Reservation)-[:FOR]->(:Job)` accounting and `:ModelCache` /
+//! `:QueryCache` / `:Embedding` cache nodes (migration plan §2.5). Other
+//! domains (sources, memory, connectors) are still read through the SQL
+//! connection until their own migration nodes land.
 use crate::{Error, Result, digest, id, integer, now, string};
 use crate::{
     memory, model,
-    store::{self, Principal, Store, authorize_hash, decode, one, repo, rows, s},
+    store::{self, Principal, Store, authorize_hash, decode, one, repo, s},
+    store_graph::{self as graph, GraphStore},
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -10,49 +18,158 @@ use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
+/// A graph-store connection (cypherlite), as handed out by
+/// [`GraphStore::connection`].
+use cypherlite::Connection as GConnection;
 
 // All work is serialized by repository unless both jobs explicitly opt into
 // independent observer sources. Prefix intersection is conservative: even a
-// newly ingested source cannot belong to both groups. Compare bytes, matching
-// Rust's starts_with (including non-ASCII and embedded-NUL prefixes).
+// newly ingested source cannot belong to both groups. `STARTS WITH` compares
+// strings; UTF-8 prefixes of valid strings agree with the byte-prefix
+// comparison the SQL queue used.
 const RUNNING_CONFLICT: &str = r#"
-EXISTS (
-    SELECT 1 FROM am_jobs r
-    WHERE r.repository_id=j.repository_id AND r.state='running'
+NOT EXISTS {
+    MATCH (r:Job {repository_id: j.repository_id})
+    WHERE r.state='running'
     AND NOT coalesce(
         j.kind='observer_notes' AND r.kind='observer_notes'
-        AND json_type(j.payload,'$.parallel_sources')='true'
-        AND json_type(r.payload,'$.parallel_sources')='true'
-        AND json_type(j.payload,'$.include')='array'
-        AND json_type(r.payload,'$.include')='array'
-        AND json_array_length(j.payload,'$.include')>0
-        AND json_array_length(r.payload,'$.include')>0
-        AND NOT EXISTS (
-            SELECT 1 FROM json_each(j.payload,'$.include') a
-            CROSS JOIN json_each(r.payload,'$.include') b
-            WHERE substr(CAST(a.value AS BLOB),1,length(CAST(b.value AS BLOB)))=CAST(b.value AS BLOB)
-               OR substr(CAST(b.value AS BLOB),1,length(CAST(a.value AS BLOB)))=CAST(a.value AS BLOB)
-        ), 0
+        AND j.parallel_sources = true
+        AND r.parallel_sources = true
+        AND size(j.include) > 0
+        AND size(r.include) > 0
+        AND NONE(a IN j.include WHERE ANY(b IN r.include
+            WHERE a STARTS WITH b OR b STARTS WITH a)),
+        false
     )
-)"#;
+}"#;
 
 static READY_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT kind FROM am_jobs j WHERE j.state IN ('queued','retry') AND j.not_before<=?1 AND NOT {RUNNING_CONFLICT} ORDER BY j.priority DESC,j.created_at LIMIT 1"
+        "MATCH (j:Job) WHERE j.state IN ['queued','retry'] AND j.not_before <= $now AND {RUNNING_CONFLICT} RETURN j.kind AS kind ORDER BY j.priority DESC, j.created_at LIMIT 1"
     )
 });
 
-// ?5 is false when this program cannot sync provider permissions: then the
-// sync of a connector in provider permission mode is left queued (as are
-// `permissions` jobs, through the excluded kinds) for a program that can.
-// ?6 lists the job kinds this program knows: a job of any other kind (queued
-// by an extension this program lacks) is left queued for a program that runs
-// it, and never hides known work behind the candidate cap.
+// The candidate list for leasing. The provider-permission filter of the old
+// SQL query (a `connector` job whose connector syncs provider permissions
+// waits for a program that can run it) is applied in Rust against the SQL
+// store: `am_connectors` has not migrated yet, so it cannot join here.
 static LEASE_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT j.*,p.workspace_id FROM am_jobs j JOIN repo_projects p ON p.id=j.repository_id WHERE j.state IN ('queued','retry') AND j.not_before<=?1 AND j.kind NOT IN (SELECT value FROM json_each(?2)) AND j.kind IN (SELECT value FROM json_each(?6)) AND (?3 IS NULL OR (j.repository_id=?3 AND j.kind=?4)) AND (?5 OR j.kind!='connector' OR NOT EXISTS (SELECT 1 FROM am_connectors c WHERE c.repository_id=j.repository_id AND c.id=json_extract(j.payload,'$.connector_id') AND json_extract(c.config,'$.permission_mode')='provider')) AND NOT {RUNNING_CONFLICT} ORDER BY j.priority DESC,j.created_at LIMIT 100"
+        "MATCH (j:Job) WHERE j.state IN ['queued','retry'] AND j.not_before <= $now AND NOT j.kind IN $excluded AND j.kind IN $known AND ($repo IS NULL OR (j.repository_id = $repo AND j.kind = $kind)) AND {RUNNING_CONFLICT} RETURN j.id AS id, j.repository_id AS repository_id, j.workspace_id AS workspace_id, j.kind AS kind, j.principal_hash AS principal_hash, j.payload AS payload ORDER BY j.priority DESC, j.created_at LIMIT 100"
     )
 });
+
+/// Lease CAS: take `id` only while it is still ready and unblocked, setting
+/// the lease in the same statement (migration plan §2.5).
+static LEASE_CAS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "MATCH (j:Job {{id: $id}}) WHERE j.state IN ['queued','retry'] AND j.not_before <= $now AND {RUNNING_CONFLICT} SET j.state='running', j.attempt=j.attempt+1, j.lease_token=$lease, j.lease_until=$until, j.updated_at=$now RETURN j.id AS id"
+    )
+});
+
+/// A `Job` row as plain job properties (no node envelope).
+const JOB_FIELDS: &str = "j.id AS id, j.repository_id AS repository_id, j.workspace_id AS workspace_id, j.kind AS kind, j.input_hash AS input_hash, j.payload AS payload, j.principal_hash AS principal_hash, j.state AS state, j.priority AS priority, j.attempt AS attempt, j.max_attempts AS max_attempts, j.not_before AS not_before, j.lease_token AS lease_token, j.lease_until AS lease_until, j.result AS result, j.error AS error, j.created_at AS created_at, j.updated_at AS updated_at";
+
+/// Drop every cached model result of one repository (a connector's scope or
+/// credential changed; its cached answers may include now-private data).
+pub(crate) fn clear_model_cache(graph: &GraphStore, repository: &str) -> Result<()> {
+    graph.transaction(|db| {
+        graph::rows(
+            db,
+            "MATCH (c:ModelCache {repository_id: $repo}) DELETE c",
+            graph::params(&json!({"repo": repository})),
+        )?;
+        Ok(())
+    })
+}
+
+/// The `:Job` node properties of a scheduled connector sync
+/// (`connectors::schedule_connectors` MERGEs on the idempotence key and sets
+/// these on create).
+pub(crate) fn scheduled_node(connector: &Value, payload: &Value) -> Value {
+    let stamp = now();
+    let encoded = payload.to_string();
+    json!({
+        "id": id(), "repository_id": s(connector, "repository_id"),
+        "workspace_id": s(connector, "workspace_id"),
+        "kind": "connector", "payload": encoded, "payload_bytes": encoded.len(),
+        "principal_hash": s(connector, "capability_hash"), "state": "queued",
+        "priority": 0, "attempt": 0, "max_attempts": 1, "not_before": stamp,
+        "created_at": stamp, "updated_at": stamp,
+        "connector_id": s(connector, "id"),
+    })
+}
+
+/// Read one job by id, or `None` (`SELECT * FROM am_jobs WHERE id=?`). The
+/// payload comes back decoded (it is stored as a string property).
+fn job_row(db: &mut GConnection, job_id: &str) -> Result<Option<Value>> {
+    let mut row = graph::one(
+        db,
+        &format!("MATCH (j:Job {{id: $id}}) RETURN {JOB_FIELDS}"),
+        graph::params(&json!({"id": job_id})),
+    )?;
+    if let Some(row) = &mut row {
+        decode(row, "payload")?;
+    }
+    Ok(row)
+}
+
+/// Insert a queued job node and, when the graph knows the project, its
+/// `[:OF]` edge (the content-store node migrates `Project` later; the edge
+/// attaches from then on).
+fn insert_job(
+    db: &mut GConnection,
+    repository: &str,
+    workspace: &str,
+    kind: &str,
+    input_hash: &str,
+    payload: &Value,
+    principal_hash: &str,
+    priority: i64,
+    max_attempts: i64,
+) -> Result<String> {
+    let job_id = id();
+    let stamp = now();
+    let encoded = payload.to_string();
+    // The payload is an opaque string property (the engine cannot store maps
+    // as property values); the two fields the ready-queue's source-conflict
+    // rule needs are duplicated as scalar/list properties.
+    let mut node = json!({
+        "id": job_id, "repository_id": repository, "workspace_id": workspace,
+        "kind": kind, "input_hash": input_hash, "payload": encoded,
+        "payload_bytes": encoded.len(), "principal_hash": principal_hash,
+        "state": "queued", "priority": priority, "attempt": 0,
+        "max_attempts": max_attempts, "not_before": stamp,
+        "created_at": stamp, "updated_at": stamp,
+    });
+    if let Some(episode) = payload["episode"].as_str() {
+        node["episode"] = json!(episode);
+    }
+    if let Some(connector) = payload["connector_id"].as_str() {
+        node["connector_id"] = json!(connector);
+    }
+    if let Some(auto) = payload["auto"].as_object() {
+        if let Some(connector) = auto["connector_id"].as_str() {
+            node["auto_connector"] = json!(connector);
+        }
+        if let Some(generation) = auto["generation"].as_i64() {
+            node["auto_generation"] = json!(generation);
+        }
+    }
+    if let Some(flag) = payload["parallel_sources"].as_bool() {
+        node["parallel_sources"] = json!(flag);
+    }
+    if let Some(include) = payload["include"].as_array() {
+        node["include"] = json!(include.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>());
+    }
+    graph::rows(db, "CREATE (j:Job {id: $id}) SET j += $job", graph::params(&json!({"id": job_id, "job": node})))?;
+    graph::rows(
+        db,
+        "MATCH (j:Job {id: $id}), (p:Project {id: $repo}) CREATE (j)-[:OF]->(p)",
+        graph::params(&json!({"id": job_id, "repo": repository})),
+    )?;
+    Ok(job_id)
+}
 
 /// Digest of the code job results depend on, recorded in job payloads (a
 /// queued workflow's replay key includes it). Only files of this crate and
@@ -182,15 +299,23 @@ pub fn projection_input_hash(episode: &str) -> String {
 /// `failed` when the newest one failed, else `none`: no job, a job that
 /// finished without recording the head set (the heads had moved on), or a
 /// cancelled one. Nothing will then project it until the next sync.
-pub fn projection_state(db: &Connection, repository: &str, episode: &str) -> Result<&'static str> {
-    let states: Vec<String> = rows(
-        db,
-        "SELECT state FROM am_jobs WHERE repository_id=? AND kind='project' AND json_extract(payload,'$.episode')=? ORDER BY created_at DESC,rowid DESC",
-        params![repository, episode],
-    )?
-    .iter()
-    .map(|row| s(row, "state").to_string())
-    .collect();
+pub fn projection_state(
+    graph: &GraphStore,
+    repository: &str,
+    episode: &str,
+) -> Result<&'static str> {
+    let states: Vec<String> = graph
+        .read(|db| {
+            graph::rows(
+                db,
+                "MATCH (j:Job {repository_id: $repo, kind: 'project', episode: $episode}) \
+                 RETURN j.state AS state ORDER BY j.created_at DESC, j.id DESC",
+                graph::params(&json!({"repo": repository, "episode": episode})),
+            )
+        })?
+        .iter()
+        .map(|row| s(row, "state").to_string())
+        .collect();
     Ok(if states.iter().any(|state| state == "running") {
         "running"
     } else if states
@@ -215,6 +340,7 @@ pub fn projection_state(db: &Connection, repository: &str, episode: &str) -> Res
 /// waiting one whose principal can no longer read the project (a revoked or
 /// expired key would have it cancelled when leased).
 pub fn enqueue_projection(
+    store: &Store,
     db: &Connection,
     repository: &str,
     p: &Principal,
@@ -236,11 +362,16 @@ pub fn enqueue_projection(
         labels.push(snapshot.to_string());
     }
     let input_hash = projection_input_hash(&episode);
-    if let Some(mut existing) = one(
-        db,
-        "SELECT id,state,result,payload,principal_hash FROM am_jobs WHERE repository_id=? AND kind='project' AND input_hash=?",
-        params![repository, input_hash],
-    )? {
+    let graph = store.graph().clone();
+    let existing = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: 'project', input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state, j.result AS result, j.payload AS payload, j.principal_hash AS principal_hash",
+            graph::params(&json!({"repo": repository, "hash": input_hash})),
+        )
+    })?;
+    if let Some(mut existing) = existing {
         // Fold in any new label so a later commit of identical content is still named.
         decode(&mut existing, "payload")?;
         let mut payload = existing["payload"].clone();
@@ -262,10 +393,14 @@ pub fn enqueue_projection(
         }
         if grew {
             payload["labels"] = json!(known);
-            db.execute(
-                "UPDATE am_jobs SET payload=?,updated_at=? WHERE id=?",
-                params![payload.to_string(), now(), s(&existing, "id")],
-            )?;
+            graph.transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $id}) SET j.payload = $payload, j.updated_at = $now",
+                    graph::params(&json!({"id": s(&existing, "id"), "payload": payload.to_string(), "now": now()})),
+                )?;
+                Ok(())
+            })?;
         }
         if crate::graph_projection::is_recorded(db, repository, &episode)? {
             // A sync back to a recorded head set queues no
@@ -310,26 +445,38 @@ pub fn enqueue_projection(
                 // moved on before it ran) runs again, with every label, now the
                 // tree is current again. It runs as this sync's principal.
                 "failed" | "cancelled" | "complete" => {
-                    db.execute(
-                        "UPDATE am_jobs SET state='queued',attempt=0,not_before=?,updated_at=?,error=NULL,lease_token=NULL,lease_until=NULL,principal_hash=? WHERE id=?",
-                        params![now(), now(), p.hash, s(&existing, "id")],
-                    )?;
+                    graph.transaction(|db| {
+                        graph::rows(
+                            db,
+                            "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL, j.principal_hash=$principal",
+                            graph::params(&json!({"id": s(&existing, "id"), "now": now(), "principal": p.hash})),
+                        )?;
+                        Ok(())
+                    })?;
                     state = json!("queued");
                 }
                 // One that waits to retry may run at once.
                 "retry" => {
-                    db.execute(
-                        "UPDATE am_jobs SET not_before=?,updated_at=?,principal_hash=? WHERE id=?",
-                        params![now(), now(), waiting_principal()?, s(&existing, "id")],
-                    )?;
+                    graph.transaction(|db| {
+                        graph::rows(
+                            db,
+                            "MATCH (j:Job {id: $id}) SET j.not_before=$now, j.updated_at=$now, j.principal_hash=$principal",
+                            graph::params(&json!({"id": s(&existing, "id"), "now": now(), "principal": waiting_principal()?})),
+                        )?;
+                        Ok(())
+                    })?;
                 }
                 "queued" => {
                     let principal = waiting_principal()?;
                     if principal != s(&existing, "principal_hash") {
-                        db.execute(
-                            "UPDATE am_jobs SET updated_at=?,principal_hash=? WHERE id=?",
-                            params![now(), principal, s(&existing, "id")],
-                        )?;
+                        graph.transaction(|db| {
+                            graph::rows(
+                                db,
+                                "MATCH (j:Job {id: $id}) SET j.updated_at=$now, j.principal_hash=$principal",
+                                graph::params(&json!({"id": s(&existing, "id"), "now": now(), "principal": principal})),
+                            )?;
+                            Ok(())
+                        })?;
                     }
                 }
                 _ => {}
@@ -339,23 +486,19 @@ pub fn enqueue_projection(
             json!({"id":existing["id"],"state":state,"kind":"project","episode":episode,"replayed":true}),
         );
     }
-    let job_id = id();
-    let stamp = now();
     let repository_row = repo(db, p, repository)?;
     let source_state = memory::state(&memory::documents(db, &repository_row, p)?);
     let payload = json!({"kind":"project","episode":episode,"labels":labels,"snapshot":snapshot,"runtime_revision":runtime_revision(),"source_state":source_state});
-    let encoded = payload.to_string();
     crate::ingestion::check_queue_bytes(
-        db,
+        &graph,
         repository,
-        encoded.len(),
+        payload.to_string().len(),
         crate::ingestion::DEFAULT_QUEUED_BYTES,
     )?;
     // Background derivation: never ahead of work a caller is waiting on.
-    db.execute(
-        "INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,'project',?,?,?,'queued',-1,3,?,?,?)",
-        params![job_id, repository, input_hash, encoded, p.hash, stamp, stamp, stamp],
-    )?;
+    let job_id = graph.transaction(|db| {
+        insert_job(db, repository, &p.workspace, "project", &input_hash, &payload, &p.hash, -1, 3)
+    })?;
     store::event(
         db,
         repository,
@@ -382,13 +525,11 @@ pub fn with_lease_heartbeat<T>(
     work: impl FnOnce() -> T,
 ) -> T {
     let (done, beats) = std::sync::mpsc::channel::<()>();
+    let graph = store.graph().clone();
     std::thread::scope(|scope| {
         scope.spawn(move || {
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = beats.recv_timeout(every) {
-                if let Ok(db) = store.connect() {
-                    let _ = db.busy_timeout(std::time::Duration::from_secs(1));
-                    let _ = renew(&db, job);
-                }
+                let _ = renew(&graph, job);
             }
         });
         let value = work();
@@ -405,6 +546,29 @@ pub fn run_projection(store: &Store, job: &Job) -> Result<Value> {
     with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || project_job(store, job))
 }
 
+/// The job's current lease fields, or `None` when the job is gone.
+fn lease_row(graph: &GraphStore, job_id: &str) -> Result<Option<Value>> {
+    graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {id: $id}) RETURN j.state AS state, j.lease_token AS lease_token, j.lease_until AS lease_until",
+            graph::params(&json!({"id": job_id})),
+        )
+    })
+}
+
+/// The job still holds `lease` (checked against the graph store).
+fn check_lease(graph: &GraphStore, job_id: &str, lease: &str) -> Result<()> {
+    let row = lease_row(graph, job_id)?.ok_or_else(|| Error::conflict("Job was removed"))?;
+    if row["state"] != "running"
+        || s(&row, "lease_token") != lease
+        || s(&row, "lease_until") < now().as_str()
+    {
+        return Err(Error::conflict("Job lease expired or was cancelled"));
+    }
+    Ok(())
+}
+
 fn project_job(store: &Store, job: &Job) -> Result<Value> {
     let expected = s(&job.payload, "episode").to_string();
     let labels: Vec<String> = job.payload["labels"]
@@ -416,18 +580,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         })
         .unwrap_or_default();
     let scope = |db: &Connection| -> Result<(Principal, String, String)> {
-        let row = one(
-            db,
-            "SELECT state,lease_token,lease_until FROM am_jobs WHERE id=?",
-            [&job.id],
-        )?
-        .ok_or_else(|| Error::conflict("Job was removed"))?;
-        if row["state"] != "running"
-            || s(&row, "lease_token") != job.lease
-            || s(&row, "lease_until") < now().as_str()
-        {
-            return Err(Error::conflict("Job lease expired or was cancelled"));
-        }
+        check_lease(store.graph(), &job.id, &job.lease)?;
         let p = authorize_hash(db, &job.workspace, &job.principal_hash, "read")?;
         let identifier = s(&repo(db, &p, &job.repository)?, "id").to_string();
         let current = crate::graph_projection::current_episode(db, &identifier)?;
@@ -469,7 +622,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         // `link` job so the workspace's `gf_cross_edges` track the new episode
         // without extending the projection transaction; a failure to queue it
         // must not fail the projection itself.
-        out["cross_repo_link"] = match enqueue_link(db, identifier, &p, &info.episode) {
+        out["cross_repo_link"] = match enqueue_link(store, db, identifier, &p, &info.episode) {
             Ok(queued) => queued,
             Err(error) => json!({"error": error.message}),
         };
@@ -477,7 +630,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         // drain runs next. Listed only when an
         // extension queued something, so Core's result is unchanged.
         let followed =
-            crate::extension::installed().after_projection(db, &p, identifier, &info.episode);
+            crate::extension::installed().after_projection(store.graph(), db, &p, identifier, &info.episode);
         if !followed.is_empty() {
             out["after_projection"] = json!(followed);
         }
@@ -530,17 +683,21 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
 /// change. A running job with this very input (a connector sync leaves the
 /// episode as it was) gets a follow-up job of its own, which waits for it.
 pub fn enqueue_link(
+    store: &Store,
     db: &Connection,
     repository: &str,
     p: &Principal,
     episode: &str,
 ) -> Result<Value> {
-    if let Some(waiting) = one(
-        db,
-        "SELECT j.id,j.state FROM am_jobs j JOIN repo_projects r ON r.id=j.repository_id \
-         WHERE r.workspace_id=? AND j.kind='link' AND j.state IN ('queued','retry') ORDER BY j.created_at LIMIT 1",
-        [&p.workspace],
-    )? {
+    let graph = store.graph().clone();
+    if let Some(waiting) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {kind: 'link', workspace_id: $ws}) WHERE j.state IN ['queued','retry'] \
+             RETURN j.id AS id, j.state AS state ORDER BY j.created_at LIMIT 1",
+            graph::params(&json!({"ws": p.workspace})),
+        )
+    })? {
         return Ok(
             json!({"id":waiting["id"],"state":waiting["state"],"kind":"link","replayed":true}),
         );
@@ -553,11 +710,13 @@ pub fn enqueue_link(
     // cannot be running while the first is (one job runs per project).
     for _ in 0..2 {
         let input_hash = digest(&input);
-        let Some(existing) = one(
-            db,
-            "SELECT id,state FROM am_jobs WHERE repository_id=? AND kind='link' AND input_hash=?",
-            params![repository, input_hash],
-        )?
+        let Some(existing) = graph.read(|db| {
+            graph::one(
+                db,
+                "MATCH (j:Job {repository_id: $repo, kind: 'link', input_hash: $hash}) RETURN j.id AS id, j.state AS state",
+                graph::params(&json!({"repo": repository, "hash": input_hash})),
+            )
+        })?
         else {
             break;
         };
@@ -566,22 +725,24 @@ pub fn enqueue_link(
             input["after"] = existing["id"].clone();
             continue;
         }
-        db.execute(
-            "UPDATE am_jobs SET state='queued',not_before=?,updated_at=?,error=NULL,attempt=0 WHERE id=?",
-            params![stamp, stamp, s(&existing, "id")],
-        )?;
+        graph.transaction(|db| {
+            graph::rows(
+                db,
+                "MATCH (j:Job {id: $id}) SET j.state='queued', j.not_before=$now, j.updated_at=$now, j.error=NULL, j.attempt=0",
+                graph::params(&json!({"id": s(&existing, "id"), "now": stamp})),
+            )?;
+            Ok(())
+        })?;
         return Ok(json!({"id":existing["id"],"state":"queued","kind":"link","replayed":true}));
     }
     let input_hash = digest(&input);
-    let job_id = id();
     let mut payload = json!({"kind":"link","workspace":p.workspace,"trigger":repository,"episode":episode,"runtime_revision":runtime_revision()});
     if let Some(running) = &follows {
         payload["after"] = json!(running);
     }
-    db.execute(
-        "INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,'link',?,?,?,'queued',-1,3,?,?,?)",
-        params![job_id, repository, input_hash, payload.to_string(), p.hash, stamp, stamp, stamp],
-    )?;
+    let job_id = graph.transaction(|db| {
+        insert_job(db, repository, &p.workspace, "link", &input_hash, &payload, &p.hash, -1, 3)
+    })?;
     store::event(
         db,
         repository,
@@ -604,21 +765,9 @@ pub fn run_link(store: &Store, job: &Job) -> Result<Value> {
     with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || link_job(store, job))
 }
 
-/// The job still holds its lease (checked inside a write transaction).
-fn leased(db: &Connection, job: &Job) -> Result<()> {
-    let row = one(
-        db,
-        "SELECT state,lease_token,lease_until FROM am_jobs WHERE id=?",
-        [&job.id],
-    )?
-    .ok_or_else(|| Error::conflict("Job was removed"))?;
-    if row["state"] != "running"
-        || s(&row, "lease_token") != job.lease
-        || s(&row, "lease_until") < now().as_str()
-    {
-        return Err(Error::conflict("Job lease expired or was cancelled"));
-    }
-    Ok(())
+/// The job still holds its lease (checked against the graph store).
+pub(crate) fn leased(graph: &GraphStore, job: &Job) -> Result<()> {
+    check_lease(graph, &job.id, &job.lease)
 }
 
 fn link_job(store: &Store, job: &Job) -> Result<Value> {
@@ -626,9 +775,10 @@ fn link_job(store: &Store, job: &Job) -> Result<Value> {
     // graph cannot be read fails the import step for the workspace, but
     // leaves the other projects' documents linking.
     let imports = import_link_job(store, job);
+    let graph = store.graph().clone();
     let documents =
-        match crate::doc_links::relink(store, &job.workspace, &job.principal_hash, |db| {
-            leased(db, job)
+        match crate::doc_links::relink(store, &job.workspace, &job.principal_hash, move |_| {
+            leased(&graph, job)
         }) {
             Ok(summary) => summary,
             Err(error) => json!({"error": error.message}),
@@ -640,7 +790,7 @@ fn link_job(store: &Store, job: &Job) -> Result<Value> {
 
 fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
     store.transaction(|db| {
-        leased(db, job)?;
+        leased(store.graph(), job)?;
         let p = authorize_hash(db, &job.workspace, &job.principal_hash, "read")?;
         let summary = crate::graph_projection::link_workspace(db, &p)?;
         let mut result = json!({
@@ -713,11 +863,8 @@ pub fn drain_projection_until(
             return Err(Error::bad(format!("Graph projection failed: {error}")));
         }
         if let Some(link) = link
-            && let Some(owner) = store.read(|db| {
-                Ok(
-                    one(db, "SELECT repository_id FROM am_jobs WHERE id=?", [&link])?
-                        .map(|row| s(&row, "repository_id").to_string()),
-                )
+            && let Some(owner) = store.graph().read(|db| {
+                Ok(job_row(db, &link)?.map(|row| s(&row, "repository_id").to_string()))
             })?
             && !linked.contains(&owner)
         {
@@ -802,7 +949,7 @@ pub fn guarded<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.transaction(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(store, db, job)?;
         f(db, &p, &repository)
     })
 }
@@ -814,25 +961,14 @@ pub fn guarded_read<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.read(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(store, db, job)?;
         f(db, &p, &repository)
     })
 }
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
-fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
-    let row = one(
-        db,
-        "SELECT state,lease_token,lease_until FROM am_jobs WHERE id=?",
-        [&job.id],
-    )?
-    .ok_or_else(|| Error::conflict("Job was removed"))?;
-    if row["state"] != "running"
-        || s(&row, "lease_token") != job.lease
-        || s(&row, "lease_until") < now().as_str()
-    {
-        return Err(Error::conflict("Job lease expired or was cancelled"));
-    }
+fn still_valid(store: &Store, db: &Connection, job: &Job) -> Result<(Principal, Value)> {
+    check_lease(store.graph(), &job.id, &job.lease)?;
     let p = authorize_hash(
         db,
         &job.workspace,
@@ -858,8 +994,15 @@ fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
     Ok((p, repository))
 }
 
-fn expire_leases(db: &Connection, stamp: &str) -> Result<()> {
-    db.execute("UPDATE am_jobs SET state=CASE WHEN attempt<max_attempts THEN 'retry' ELSE 'failed' END,error='Worker lease expired; inference billing may be unknown',lease_token=NULL,lease_until=NULL,updated_at=? WHERE state='running' AND lease_until<?",params![stamp,stamp])?;
+fn expire_leases(db: &mut GConnection, stamp: &str) -> Result<()> {
+    graph::rows(
+        db,
+        "MATCH (j:Job) WHERE j.state='running' AND j.lease_until < $now \
+         SET j.state = CASE WHEN j.attempt < j.max_attempts THEN 'retry' ELSE 'failed' END, \
+             j.error = 'Worker lease expired; inference billing may be unknown', \
+             j.lease_token = NULL, j.lease_until = NULL, j.updated_at = $now",
+        graph::params(&json!({"now": stamp})),
+    )?;
     Ok(())
 }
 
@@ -983,8 +1126,11 @@ pub fn check(args: &Value, config: &model::Config) -> Result<&'static str> {
     Ok(permission)
 }
 
-/// Queue a checked workflow for `p` inside the caller's transaction.
+/// Queue a checked workflow for `p`: source state and authorization read
+/// inside the caller's (SQL) transaction, the job itself created in the
+/// store's graph.
 pub fn queue(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     args: &Value,
@@ -1047,14 +1193,23 @@ pub fn queue(
     }
     // A source scan owns its cursor until completion or cancellation.
     // Idempotence alone is insufficient when two callers use different budgets.
+    let graph = store.graph().clone();
     if source_task(kind) {
         let connector_id = string(args, "connector_id", 100)?;
-        for mut active in rows(
-            db,
-            "SELECT id,state,payload FROM am_jobs WHERE repository_id=? AND kind=? AND state IN ('queued','retry','running')",
-            params![identifier, kind],
-        )? {
-            decode(&mut active, "payload")?;
+        for active in graph.read(|db| {
+            graph::rows(
+                db,
+                "MATCH (j:Job {repository_id: $repo, kind: $kind}) WHERE j.state IN ['queued','retry','running'] \
+                 RETURN j.id AS id, j.state AS state, j.payload AS payload",
+                graph::params(&json!({"repo": identifier, "kind": kind})),
+            )
+        })?
+        .into_iter()
+        .map(|mut active| {
+            decode(&mut active, "payload").map(|_| active)
+        })
+        .collect::<Result<Vec<_>>>()?
+        {
             if active["payload"]["connector_id"] == connector_id {
                 return Ok(
                     json!({"id":active["id"],"state":active["state"],"kind":kind,"replayed":true}),
@@ -1101,29 +1256,49 @@ pub fn queue(
         payload["requested_at"] = json!(now());
     }
     let input_hash = digest(&json!({"payload":payload,"principal":p.hash}));
-    if let Some(mut old) = one(
-        db,
-        "SELECT id,state,result,error FROM am_jobs WHERE repository_id=? AND kind=? AND input_hash=?",
-        params![identifier, kind, input_hash],
-    )? {
+    if let Some(mut old) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state, j.result AS result, j.error AS error",
+            graph::params(&json!({"repo": identifier, "kind": kind, "hash": input_hash})),
+        )
+    })? {
         decode(&mut old, "result")?;
         old["replayed"] = json!(true);
         return Ok(old);
     }
-    let active:i64=db.query_row("SELECT count(*) FROM am_jobs WHERE repository_id=? AND state IN ('queued','retry','running')",[identifier],|r|r.get(0))?;
+    let active = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo}) WHERE j.state IN ['queued','retry','running'] RETURN count(j) AS count",
+            graph::params(&json!({"repo": identifier})),
+        )
+    })?
+    .and_then(|row| row["count"].as_i64())
+    .unwrap_or(0);
     if active >= 100 {
         return Err(Error::bad("Project queue is full"));
     }
-    let encoded = payload.to_string();
     crate::ingestion::check_queue_bytes(
-        db,
+        &graph,
         identifier,
-        encoded.len(),
+        payload.to_string().len(),
         bounds.max_queued_bytes_per_repository,
     )?;
-    let identifier_job = id();
-    let stamp = now();
-    db.execute("INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,?,?,?)",params![identifier_job,identifier,kind,input_hash,encoded,p.hash,max_attempts,stamp,stamp,stamp])?;
+    let identifier_job = graph.transaction(|db| {
+        insert_job(
+            db,
+            identifier,
+            &p.workspace,
+            kind,
+            &input_hash,
+            &payload,
+            &p.hash,
+            0,
+            max_attempts as i64,
+        )
+    })?;
     store::event(
         db,
         identifier,
@@ -1150,7 +1325,7 @@ impl Store {
         }
         let permission = check(args, &config)?;
         self.authorized(workspace, token, permission, |db, p| {
-            queue(db, p, args, &config)
+            queue(self, db, p, args, &config)
         })
         .inspect(|job| {
             if job["replayed"] == false {
@@ -1162,11 +1337,15 @@ impl Store {
         self.authorized_read(workspace,token,"read",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;
             let mut result=Vec::new();
+            let graph = self.graph().clone();
+            let jobs = graph.read(|gdb| {
+                graph::rows(gdb,&format!("MATCH (j:Job {{repository_id: $repo}}) RETURN {JOB_FIELDS} ORDER BY j.created_at DESC LIMIT 100"),graph::params(&json!({"repo": s(&repository, "id")})))
+            })?;
             // The caller's source view and reviewed memory, read once per call.
             let mut documents:Option<Vec<Value>>=None;
             let mut sources:Option<String>=None;
             let mut reviewed:Option<String>=None;
-            for mut row in rows(db,"SELECT id,kind,state,payload,principal_hash,attempt,result,error,created_at,updated_at FROM am_jobs WHERE repository_id=? ORDER BY created_at DESC LIMIT 100",[s(&repository,"id")])? {
+            for mut row in jobs {
                 if p.role!="owner" && s(&row,"principal_hash")!=p.hash {continue;}
                 if args["job_id"].as_str().is_some_and(|j|s(&row,"id")!=j) {continue;}
                 decode(&mut row,"result")?;decode(&mut row,"payload")?;
@@ -1190,7 +1369,16 @@ impl Store {
                         }
                     }
                 }
-                let calls=rows(db,"SELECT c.*,r.state AS call_state,r.usage_reported,r.error FROM am_model_calls c LEFT JOIN am_call_reservations r ON r.id=c.id WHERE c.job_id=? ORDER BY c.created_at",[s(&row,"id")])?;
+                let calls=graph.read(|gdb| {
+                    graph::rows(gdb,
+                        "MATCH (c:ModelCall {job_id: $job}) OPTIONAL MATCH (r:Reservation {id: c.id}) \
+                         RETURN c.id AS id, c.repository_id AS repository_id, c.job_id AS job_id, c.provider AS provider, c.model AS model, \
+                                c.request_hash AS request_hash, c.input_tokens AS input_tokens, c.output_tokens AS output_tokens, \
+                                c.elapsed_ms AS elapsed_ms, c.cached AS cached, c.created_at AS created_at, \
+                                r.state AS call_state, r.usage_reported AS usage_reported, r.error AS error \
+                         ORDER BY c.created_at",
+                        graph::params(&json!({"job": s(&row, "id")})))
+                })?;
                 row["calls"]=json!(calls);row.as_object_mut().unwrap().remove("principal_hash");row.as_object_mut().unwrap().remove("payload");result.push(row);
             }
             if args["job_id"].is_string() {result.into_iter().next().ok_or_else(||Error::bad("Job unavailable"))}else{Ok(json!({"jobs":result}))}
@@ -1207,12 +1395,13 @@ impl Store {
     ) -> Result<Value> {
         let retry = self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let mut old = one(
-                db,
-                "SELECT * FROM am_jobs WHERE repository_id=? AND id=?",
-                params![s(&repository, "id"), string(args, "job_id", 100)?],
-            )?
-            .ok_or_else(|| Error::bad("Job unavailable"))?;
+            let old = self
+                .graph()
+                .read(|gdb| {
+                    job_row(gdb, string(args, "job_id", 100)?)
+                })?
+                .filter(|old| s(old, "repository_id") == s(&repository, "id"))
+                .ok_or_else(|| Error::bad("Job unavailable"))?;
             if p.role != "owner" && s(&old, "principal_hash") != p.hash {
                 return Err(Error::denied());
             }
@@ -1224,7 +1413,6 @@ impl Store {
                     "Only failed or cancelled work can be retried",
                 ));
             }
-            decode(&mut old, "payload")?;
             let mut payload = old["payload"].clone();
             payload["retry_of"] = old["id"].clone();
             payload["kind"] = old["kind"].clone();
@@ -1251,20 +1439,24 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             repo(db, p, string(args, "repository_id", 100)?)?;
             let job_id = string(args, "job_id", 100)?;
-            let job = one(
-                db,
-                "SELECT * FROM am_jobs WHERE repository_id=? AND id=?",
-                params![s(args, "repository_id"), job_id],
-            )?
-            .ok_or_else(|| Error::bad("Job unavailable"))?;
+            let job = self
+                .graph()
+                .read(|gdb| job_row(gdb, job_id))?
+                .filter(|job| s(job, "repository_id") == s(args, "repository_id"))
+                .ok_or_else(|| Error::bad("Job unavailable"))?;
             if p.role != "owner" && s(&job, "principal_hash") != p.hash {
                 return Err(Error::denied());
             }
             if ["queued", "retry", "running"].contains(&s(&job, "state")) {
-                db.execute(
-                    "UPDATE am_jobs SET state='cancelled',updated_at=?,lease_token=NULL WHERE id=?",
-                    params![now(), job_id],
-                )?;
+                self.graph().transaction(|gdb| {
+                    graph::rows(
+                        gdb,
+                        "MATCH (j:Job {id: $id}) WHERE j.state IN ['queued','retry','running'] \
+                         SET j.state='cancelled', j.updated_at=$now, j.lease_token=NULL",
+                        graph::params(&json!({"id": job_id, "now": now()})),
+                    )?;
+                    Ok(())
+                })?;
             }
             Ok(json!({"id":job_id,"cancelled":true,"in_flight_provider_request_may_finish":true}))
         })
@@ -1275,21 +1467,26 @@ impl Store {
     /// Kind of the job `lease_job` would offer next (priority order, honouring
     /// `not_before` and source/repository serialization), without leasing it.
     pub fn peek_ready_kind(&self) -> Result<Option<String>> {
-        let db = self.connect()?;
+        let graph = self.graph().clone();
         let stamp = now();
         // A crashed worker may leave the only job running. Recover it before
         // admission checks, or an otherwise idle queue never retries it.
         // Ordinary idle polls remain reads and do not take the write lock.
-        if one(
-            &db,
-            "SELECT 1 AS expired FROM am_jobs WHERE state='running' AND lease_until<? LIMIT 1",
-            [&stamp],
-        )?
-        .is_some()
+        if graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (j:Job) WHERE j.state='running' AND j.lease_until < $now RETURN j.id AS id LIMIT 1",
+                    graph::params(&json!({"now": stamp})),
+                )
+            })?
+            .is_some()
         {
-            self.transaction(|db| expire_leases(db, &stamp))?;
+            graph.transaction(|db| expire_leases(db, &stamp))?;
         }
-        Ok(one(&db, &READY_JOB_QUERY, [&stamp])?.map(|row| s(&row, "kind").to_string()))
+        Ok(graph
+            .read(|db| graph::one(db, &READY_JOB_QUERY, graph::params(&json!({"now": stamp}))))?
+            .map(|row| s(&row, "kind").to_string()))
     }
     /// Lease the next ready job whose kind is not in `excluded` (G08 admission).
     /// Running work blocks other jobs in the same repository. Only explicitly
@@ -1310,49 +1507,209 @@ impl Store {
     ) -> Result<Option<Job>> {
         // Work only an extension runs stays queued while none is installed.
         let provider_sync = crate::connectors::provider_permission_sync();
-        let mut excluded = excluded.to_vec();
+        let mut excluded: Vec<&str> = excluded.to_vec();
         if !provider_sync {
             excluded.push(PERMISSIONS);
         }
-        self.transaction(|db| {
-            let stamp=now();
-            expire_leases(db, &stamp)?;
-            // Apply admission/repository filters before the candidate cap so
-            // unrelated ready jobs cannot hide all eligible work.
-            for mut row in rows(db,&LEASE_JOB_QUERY,params![stamp,json!(excluded).to_string(),only.map(|v|v.0),only.map(|v|v.1),provider_sync,json!(known_kinds()).to_string()])? {
-                // Known kinds only (?6); a kind unknown here stays queued.
-                let Ok(permission)=permission(s(&row,"kind")) else {continue};
-                if authorize_hash(db,s(&row,"workspace_id"),s(&row,"principal_hash"),permission).is_err() {
-                    db.execute("UPDATE am_jobs SET state='cancelled',error='Credential unavailable',updated_at=? WHERE id=?",params![stamp,s(&row,"id")])?;continue;
-                }
-                decode(&mut row,"payload")?;let lease=id();
-                let until=(chrono::Utc::now()+chrono::Duration::seconds(240)).to_rfc3339_opts(chrono::SecondsFormat::Micros,true);
-                db.execute("UPDATE am_jobs SET state='running',attempt=attempt+1,lease_token=?,lease_until=?,updated_at=? WHERE id=?",params![lease,until,stamp,s(&row,"id")])?;
-                return Ok(Some(Job{id:s(&row,"id").into(),repository:s(&row,"repository_id").into(),workspace:s(&row,"workspace_id").into(),principal_hash:s(&row,"principal_hash").into(),lease,kind:s(&row,"kind").into(),payload:row["payload"].clone()}));
+        let graph = self.graph().clone();
+        let stamp = now();
+        graph.transaction(|db| expire_leases(db, &stamp))?;
+        // Apply admission/repository filters before the candidate cap so
+        // unrelated ready jobs cannot hide all eligible work.
+        let candidates = graph.read(|db| {
+            graph::rows(
+                db,
+                &LEASE_JOB_QUERY,
+                graph::params(&json!({
+                    "now": stamp,
+                    "excluded": excluded,
+                    "known": known_kinds(),
+                    "repo": only.map(|v| v.0),
+                    "kind": only.map(|v| v.1),
+                })),
+            )
+        })?;
+        for mut row in candidates {
+            // Known kinds only; a kind unknown here stays queued.
+            let Ok(permission) = permission(s(&row, "kind")) else {
+                continue;
+            };
+            decode(&mut row, "payload")?;
+            // The connector table is still SQL: a provider-permission
+            // connector sync waits for a program that can run it.
+            if !provider_sync
+                && s(&row, "kind") == "connector"
+                && self.read(|db| {
+                    Ok(one(
+                        db,
+                        "SELECT 1 AS provider FROM am_connectors WHERE repository_id=? AND id=? AND json_extract(config,'$.permission_mode')='provider'",
+                        params![s(&row, "repository_id"), s(&row["payload"], "connector_id")],
+                    )?
+                    .is_some())
+                })?
+            {
+                continue;
             }
-            Ok(None)
-        })
+            let authorized = self
+                .read(|db| {
+                    authorize_hash(db, s(&row, "workspace_id"), s(&row, "principal_hash"), permission)
+                        .map(|_| ())
+                })
+                .is_ok();
+            if !authorized {
+                graph.transaction(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {id: $id}) WHERE j.state IN ['queued','retry'] \
+                         SET j.state='cancelled', j.error='Credential unavailable', j.updated_at=$now",
+                        graph::params(&json!({"id": s(&row, "id"), "now": stamp})),
+                    )?;
+                    Ok(())
+                })?;
+                continue;
+            }
+            let lease = id();
+            let until = (chrono::Utc::now() + chrono::Duration::seconds(240))
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            // Single-statement CAS: the lease is taken only if the job is
+            // still ready and unblocked at write time.
+            let taken = graph.transaction(|db| {
+                graph::one(
+                    db,
+                    &LEASE_CAS,
+                    graph::params(&json!({"id": s(&row, "id"), "now": stamp, "lease": lease, "until": until})),
+                )
+            })?;
+            if taken.is_some() {
+                return Ok(Some(Job {
+                    id: s(&row, "id").into(),
+                    repository: s(&row, "repository_id").into(),
+                    workspace: s(&row, "workspace_id").into(),
+                    principal_hash: s(&row, "principal_hash").into(),
+                    lease,
+                    kind: s(&row, "kind").into(),
+                    payload: row["payload"].clone(),
+                }));
+            }
+        }
+        Ok(None)
     }
     pub fn finish_job(&self, job: &Job, result: Result<Value>) -> Result<()> {
+        let outcome = self.graph().transaction(|db| {
+            let Some(current) = job_row(db, &job.id)? else {
+                return Ok(None);
+            };
+            if s(&current, "lease_token") != job.lease || current["state"] != "running" {
+                return Ok(None);
+            }
+            let (state, value, error, refund) = match &result {
+                Ok(value) => ("complete", Some(value.to_string()), None, false),
+                Err(error) => {
+                    graph::rows(
+                        db,
+                        "MATCH (c:ModelCall {job_id: $job}) WITH collect(c.request_hash) AS hashes \
+                         MATCH (m:ModelCache {repository_id: $repo}) WHERE m.request_hash IN hashes DELETE m",
+                        graph::params(&json!({"job": job.id, "repo": job.repository})),
+                    )?;
+                    // The store was busy (another process held the write
+                    // lock): the work itself did not fail, so the job goes
+                    // straight back to the queue, its attempt refunded —
+                    // before the graph queue, such a job was never leased at
+                    // all (leasing waited on the lock).
+                    if busy(error) {
+                        ("queued", None, Some(error.message.clone()), true)
+                    } else {
+                        let retry = current["attempt"].as_u64() < current["max_attempts"].as_u64()
+                            && error.status != axum::http::StatusCode::CONFLICT
+                            && error.status != axum::http::StatusCode::FORBIDDEN;
+                        (if retry { "retry" } else { "failed" }, None, Some(error.message.clone()), false)
+                    }
+                }
+            };
+            // Exponential backoff per attempt (G08): 30 s, 60 s, 120 s, ... capped;
+            // a refunded busy attempt runs again at once.
+            let later = if refund {
+                now()
+            } else {
+                crate::ingestion::backoff_stamp(current["attempt"].as_u64().unwrap_or(1))
+            };
+            graph::rows(
+                db,
+                "MATCH (j:Job {id: $id}) SET j.state=$state, j.result=$result, j.error=$error, \
+                 j.not_before=$later, j.lease_token=NULL, j.lease_until=NULL, j.updated_at=$now, \
+                 j.attempt = CASE WHEN $refund AND j.attempt > 0 THEN j.attempt - 1 ELSE j.attempt END",
+                graph::params(&json!({"id": job.id, "state": state, "result": value, "error": error, "later": later, "now": now(), "refund": refund})),
+            )?;
+            Ok(Some(state))
+        })?;
+        let Some(state) = outcome else {
+            return Ok(());
+        };
         self.transaction(|db| {
-            let Some(current)=one(db,"SELECT * FROM am_jobs WHERE id=?",[&job.id])? else{return Ok(())};
-            if s(&current,"lease_token")!=job.lease || current["state"]!="running" {return Ok(());}
-            let (state,value,error)=match result {Ok(value)=>("complete",Some(value.to_string()),None),Err(error)=>{
-                db.execute("DELETE FROM am_model_cache WHERE repository_id=? AND request_hash IN (SELECT request_hash FROM am_model_calls WHERE job_id=?)",params![job.repository,job.id])?;
-                let retry=current["attempt"].as_u64()<current["max_attempts"].as_u64() && error.status!=axum::http::StatusCode::CONFLICT && error.status!=axum::http::StatusCode::FORBIDDEN;
-                (if retry {"retry"}else{"failed"},None,Some(error.message))
-            }};
-            // Exponential backoff per attempt (G08): 30 s, 60 s, 120 s, ... capped.
-            let later=crate::ingestion::backoff_stamp(current["attempt"].as_u64().unwrap_or(1));
-            db.execute("UPDATE am_jobs SET state=?,result=?,error=?,not_before=?,lease_token=NULL,lease_until=NULL,updated_at=? WHERE id=?",params![state,value,error,later,now(),job.id])?;
-            store::event(db,&job.repository,"workflow_finished",json!({"id":job.id,"state":state}))?;Ok(())
+            store::event(db, &job.repository, "workflow_finished", json!({"id": job.id, "state": state}))
         })
     }
 }
-pub fn renew(db: &Connection, job: &Job) -> Result<()> {
+/// Renew `job`'s lease: only while it is still `running` under this lease, so
+/// a job that was cancelled or taken over is left alone.
+pub fn renew(graph: &GraphStore, job: &Job) -> Result<()> {
+    graph.transaction(|db| renew_in(db, job))
+}
+
+/// [`renew`] inside an open graph transaction.
+pub(crate) fn renew_in(db: &mut GConnection, job: &Job) -> Result<()> {
     let until = (chrono::Utc::now() + chrono::Duration::seconds(240))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    db.execute("UPDATE am_jobs SET lease_until=?,updated_at=? WHERE id=? AND lease_token=? AND state='running'",params![until,now(),job.id,job.lease])?;
+    graph::rows(
+        db,
+        "MATCH (j:Job {id: $id}) WHERE j.lease_token=$lease AND j.state='running' \
+         SET j.lease_until=$until, j.updated_at=$now",
+        graph::params(&json!({"id": job.id, "lease": job.lease, "until": until, "now": now()})),
+    )?;
+    Ok(())
+}
+
+/// Call reservations so far for `job`: `{calls, input, output}`.
+pub(crate) fn reservation_totals_in(db: &mut GConnection, job_id: &str) -> Result<Value> {
+    Ok(graph::one(
+        db,
+        "MATCH (r:Reservation {job_id: $job}) \
+         RETURN count(r) AS calls, coalesce(sum(r.input_reserved),0) AS input, coalesce(sum(r.output_reserved),0) AS output",
+        graph::params(&json!({"job": job_id})),
+    )?
+    .unwrap_or(json!({"calls": 0, "input": 0, "output": 0})))
+}
+
+pub(crate) fn reservation_totals(graph: &GraphStore, job_id: &str) -> Result<Value> {
+    graph.read(|db| reservation_totals_in(db, job_id))
+}
+
+/// Record a model call (`am_model_calls`), linked to its job.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_call(
+    db: &mut GConnection,
+    call_id: &str,
+    repository: &str,
+    job_id: &str,
+    profile: &model::Profile,
+    request_hash: &str,
+    input_tokens: usize,
+    output_tokens: usize,
+    elapsed_ms: u64,
+    cached: i64,
+) -> Result<()> {
+    graph::rows(
+        db,
+        "MATCH (j:Job {id: $job}) \
+         CREATE (c:ModelCall {id: $id, repository_id: $repo, job_id: $job, provider: $provider, model: $model, \
+            request_hash: $hash, input_tokens: $input, output_tokens: $output, elapsed_ms: $elapsed, cached: $cached, \
+            created_at: $now})-[:FOR]->(j)",
+        graph::params(&json!({
+            "id": call_id, "repo": repository, "job": job_id, "provider": profile.protocol,
+            "model": profile.model, "hash": request_hash, "input": input_tokens,
+            "output": output_tokens, "elapsed": elapsed_ms, "cached": cached, "now": now(),
+        })),
+    )?;
     Ok(())
 }
 #[derive(Clone)]
@@ -1413,8 +1770,8 @@ impl Worker {
     /// Whether `infer` would accept one more uncached call of this size, so a
     /// batch workflow can stop cleanly instead of failing on its budget.
     pub fn fits(&self, job: &Job, input_tokens: usize) -> Result<bool> {
-        guarded_read(&self.store, job, |db, _, _| {
-            let totals=one(db,"SELECT count(*) AS calls,coalesce(sum(input_reserved),0) AS input,coalesce(sum(output_reserved),0) AS output FROM am_call_reservations WHERE job_id=?",[&job.id])?.unwrap();
+        guarded_read(&self.store, job, |_, _, _| {
+            let totals = reservation_totals(self.store.graph(), &job.id)?;
             let used = |key: &str| totals[key].as_u64().unwrap_or(0);
             Ok(
                 used("calls") < job.payload["max_calls"].as_u64().unwrap_or(4)
@@ -1450,71 +1807,54 @@ impl Worker {
         );
         let reservation = id();
         let input_tokens = model::request_tokens(instructions, input, schema);
-        let mut output_limit = profile.output_limit;
-        let cached = guarded(&self.store, job, |db, _, _| {
-            renew(db, job)?;
-            if let Some(row) = one(
-                db,
-                "SELECT result FROM am_model_cache WHERE repository_id=? AND request_hash=? AND source_state=?",
-                params![
-                    job.repository,
-                    request_hash,
-                    s(&job.payload, "source_state")
-                ],
-            )? {
-                db.execute(
-                    "INSERT INTO am_model_calls VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    params![
-                        reservation,
-                        job.repository,
-                        job.id,
-                        profile.protocol,
-                        profile.model,
-                        request_hash,
-                        0,
-                        0,
-                        0,
-                        1,
-                        now()
-                    ],
+        let output_limit = std::cell::Cell::new(profile.output_limit);
+        let graph = self.store.graph().clone();
+        let cached = guarded(&self.store, job, |_, _, _| {
+            graph.transaction(|db| {
+                renew_in(db, job)?;
+                if let Some(row) = graph::one(
+                    db,
+                    "MATCH (c:ModelCache {repository_id: $repo, request_hash: $hash, source_state: $source}) RETURN c.result AS result",
+                    graph::params(&json!({
+                        "repo": job.repository,
+                        "hash": request_hash,
+                        "source": s(&job.payload, "source_state"),
+                    })),
+                )? {
+                    record_call(
+                        db, &reservation, &job.repository, &job.id, profile, &request_hash,
+                        0, 0, 0, 1,
+                    )?;
+                    return Ok(Some(
+                        serde_json::from_str::<model::Reply>(s(&row, "result"))
+                            .map_err(|_| Error::bad("Invalid model cache"))?,
+                    ));
+                }
+                let totals = reservation_totals_in(db, &job.id)?;
+                let remaining = (job.payload["max_output_tokens"].as_u64().unwrap_or(8192) as usize)
+                    .saturating_sub(totals["output"].as_u64().unwrap_or(0) as usize);
+                output_limit.set(output_limit.get().min(remaining));
+                if totals["calls"].as_u64().unwrap_or(0)
+                    >= job.payload["max_calls"].as_u64().unwrap_or(4)
+                    || totals["input"].as_u64().unwrap_or(0) + input_tokens as u64
+                        > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
+                    || output_limit.get() < 64
+                {
+                    return Err(Error::bad(
+                        "Workflow inference budget exhausted; completed work is retained",
+                    ));
+                }
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $job}) CREATE (r:Reservation {id: $id, job_id: $job, request_hash: $hash, state: 'started', input_reserved: $input, output_reserved: $output, created_at: $now})-[:FOR]->(j)",
+                    graph::params(&json!({"id": reservation, "job": job.id, "hash": request_hash, "input": input_tokens, "output": output_limit, "now": now()})),
                 )?;
-                return Ok(Some(
-                    serde_json::from_str::<model::Reply>(s(&row, "result"))
-                        .map_err(|_| Error::bad("Invalid model cache"))?,
-                ));
-            }
-            let totals=one(db,"SELECT count(*) AS calls,coalesce(sum(input_reserved),0) AS input,coalesce(sum(output_reserved),0) AS output FROM am_call_reservations WHERE job_id=?",[&job.id])?.unwrap();
-            let remaining = (job.payload["max_output_tokens"].as_u64().unwrap_or(8192) as usize)
-                .saturating_sub(totals["output"].as_u64().unwrap_or(0) as usize);
-            output_limit = output_limit.min(remaining);
-            if totals["calls"].as_u64().unwrap_or(0)
-                >= job.payload["max_calls"].as_u64().unwrap_or(4)
-                || totals["input"].as_u64().unwrap_or(0) + input_tokens as u64
-                    > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
-                || output_limit < 64
-            {
-                return Err(Error::bad(
-                    "Workflow inference budget exhausted; completed work is retained",
-                ));
-            }
-            db.execute("INSERT INTO am_call_reservations(id,job_id,request_hash,state,input_reserved,output_reserved,created_at) VALUES(?,?,?,'started',?,?,?)",params![reservation,job.id,request_hash,input_tokens,output_limit,now()])?;
-            db.execute(
-                "INSERT INTO am_model_calls VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                params![
-                    reservation,
-                    job.repository,
-                    job.id,
-                    profile.protocol,
-                    profile.model,
-                    request_hash,
-                    input_tokens,
-                    output_limit,
-                    0,
-                    0,
-                    now()
-                ],
-            )?;
-            Ok(None)
+                record_call(
+                    db, &reservation, &job.repository, &job.id, profile, &request_hash,
+                    input_tokens, output_limit.get(), 0, 0,
+                )?;
+                Ok(None)
+            })
         })?;
         if let Some(reply) = cached {
             let value = reply.json_for(schema)?;
@@ -1529,7 +1869,7 @@ impl Worker {
                 instructions,
                 input,
                 schema,
-                output_limit,
+                output_limit.get(),
             )
             .await
         } else {
@@ -1539,31 +1879,38 @@ impl Worker {
                 instructions,
                 input,
                 schema,
-                output_limit,
+                output_limit.get(),
                 credential.as_deref(),
             )
             .await
         };
         // Record even a failed/unknown provider call independently of job access.
-        self.store.transaction(|db| {
+        graph.transaction(|db| {
             match &reply {
                 Ok(reply)=>{
-                    db.execute("UPDATE am_call_reservations SET state='finished',input_reserved=?,output_reserved=?,usage_reported=?,finished_at=? WHERE id=?",params![reply.input_tokens,reply.output_tokens,reply.usage_reported,now(),reservation])?;
-                    db.execute("UPDATE am_model_calls SET input_tokens=?,output_tokens=?,elapsed_ms=?,model=? WHERE id=?",params![reply.input_tokens,reply.output_tokens,reply.elapsed_ms,reply.model,reservation])?;
+                    graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='finished', r.input_reserved=$input, r.output_reserved=$output, r.usage_reported=$reported, r.finished_at=$now",
+                        graph::params(&json!({"id": reservation, "input": reply.input_tokens, "output": reply.output_tokens, "reported": reply.usage_reported as i64, "now": now()})))?;
+                    graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.input_tokens=$input, c.output_tokens=$output, c.elapsed_ms=$elapsed, c.model=$model",
+                        graph::params(&json!({"id": reservation, "input": reply.input_tokens, "output": reply.output_tokens, "elapsed": reply.elapsed_ms, "model": reply.model})))?;
                 },Err(error)=>{
                     let reported = error.provider_failure.as_ref().and_then(|failure|
                         failure.input_tokens.zip(failure.output_tokens));
                     if let Some((input, output)) = reported {
-                        db.execute("UPDATE am_call_reservations SET state='failed',input_reserved=?,output_reserved=?,usage_reported=1,error=?,finished_at=? WHERE id=?",params![input,output,error.message,now(),reservation])?;
-                        db.execute("UPDATE am_model_calls SET input_tokens=?,output_tokens=? WHERE id=?",params![input,output,reservation])?;
+                        graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='failed', r.input_reserved=$input, r.output_reserved=$output, r.usage_reported=1, r.error=$error, r.finished_at=$now",
+                            graph::params(&json!({"id": reservation, "input": input, "output": output, "error": error.message, "now": now()})))?;
+                        graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.input_tokens=$input, c.output_tokens=$output",
+                            graph::params(&json!({"id": reservation, "input": input, "output": output})))?;
                     } else {
-                        db.execute("UPDATE am_call_reservations SET state='unknown_usage',error=?,finished_at=? WHERE id=?",params![error.message,now(),reservation])?;
+                        graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='unknown_usage', r.error=$error, r.finished_at=$now",
+                            graph::params(&json!({"id": reservation, "error": error.message, "now": now()})))?;
                     }
                     if let Some(failure) = &error.provider_failure {
-                        db.execute("UPDATE am_model_calls SET elapsed_ms=?,model=? WHERE id=?",params![failure.elapsed_ms,failure.model,reservation])?;
+                        graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.elapsed_ms=$elapsed, c.model=$model",
+                            graph::params(&json!({"id": reservation, "elapsed": failure.elapsed_ms, "model": failure.model})))?;
                     }
                 }
-            }Ok(())
+            }
+            Ok(())
         })?;
         let reply = reply?;
         let raw = reply.json()?;
@@ -1578,17 +1925,26 @@ impl Worker {
                     json!({"job_id":job.id,"request_hash":request_hash,"semantic_fields_changed":false}),
                 )?;
             }
-            db.execute(
-                "INSERT OR REPLACE INTO am_model_cache VALUES(?,?,?,?,?)",
-                params![
-                    job.repository,
-                    request_hash,
-                    s(&job.payload, "source_state"),
-                    serde_json::to_string(&reply)?,
-                    now()
-                ],
-            )?;
-            db.execute("DELETE FROM am_model_cache WHERE repository_id=? AND request_hash IN (SELECT request_hash FROM am_model_cache WHERE repository_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 500)",params![job.repository,job.repository])?;
+            graph.transaction(|db| {
+                graph::rows(
+                    db,
+                    "MERGE (c:ModelCache {repository_id: $repo, request_hash: $hash}) \
+                     SET c.source_state=$source, c.result=$result, c.created_at=$now",
+                    graph::params(&json!({
+                        "repo": job.repository,
+                        "hash": request_hash,
+                        "source": s(&job.payload, "source_state"),
+                        "result": serde_json::to_string(&reply)?,
+                        "now": now(),
+                    })),
+                )?;
+                graph::rows(
+                    db,
+                    "MATCH (c:ModelCache {repository_id: $repo}) WITH c ORDER BY c.created_at DESC SKIP 500 DELETE c",
+                    graph::params(&json!({"repo": job.repository})),
+                )?;
+                Ok(())
+            })?;
             // A cached answer is only as current as the principal that produced it.
             crate::invalidation::record_dependency(
                 db,
@@ -1642,43 +1998,41 @@ impl Worker {
             request["role"] = json!("query");
         }
         let request_hash = digest(&request);
-        guarded(&self.store, job, |db, _, _| {
-            renew(db, job)?;
-            let totals=one(db,"SELECT count(*) AS calls,coalesce(sum(input_reserved),0) AS input FROM am_call_reservations WHERE job_id=?",[&job.id])?.unwrap();
-            if totals["calls"].as_u64().unwrap_or(0)
-                >= job.payload["max_calls"].as_u64().unwrap_or(4)
-                || totals["input"].as_u64().unwrap_or(0) + input as u64
-                    > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
-            {
-                return Err(Error::bad("Embedding budget exhausted"));
-            }
-            db.execute("INSERT INTO am_call_reservations(id,job_id,request_hash,state,input_reserved,output_reserved,created_at) VALUES(?,?,?,'started',?,0,?)",params![call_id,job.id,request_hash,input,now()])?;
-            db.execute(
-                "INSERT INTO am_model_calls VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                params![
-                    call_id,
-                    job.repository,
-                    job.id,
-                    profile.protocol,
-                    profile.model,
-                    request_hash,
-                    input,
-                    0,
-                    0,
-                    0,
-                    now()
-                ],
-            )?;
-            Ok(())
+        let graph = self.store.graph().clone();
+        guarded(&self.store, job, |_, _, _| {
+            graph.transaction(|db| {
+                renew_in(db, job)?;
+                let totals = reservation_totals_in(db, &job.id)?;
+                if totals["calls"].as_u64().unwrap_or(0)
+                    >= job.payload["max_calls"].as_u64().unwrap_or(4)
+                    || totals["input"].as_u64().unwrap_or(0) + input as u64
+                        > job.payload["max_input_tokens"].as_u64().unwrap_or(64000)
+                {
+                    return Err(Error::bad("Embedding budget exhausted"));
+                }
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $job}) CREATE (r:Reservation {id: $id, job_id: $job, request_hash: $hash, state: 'started', input_reserved: $input, output_reserved: 0, created_at: $now})-[:FOR]->(j)",
+                    graph::params(&json!({"id": call_id, "job": job.id, "hash": request_hash, "input": input, "now": now()})),
+                )?;
+                record_call(db, &call_id, &job.repository, &job.id, profile, &request_hash, input, 0, 0, 0)?;
+                Ok(())
+            })
         })?;
         let start = std::time::Instant::now();
         let result =
             model::embed_role(&self.client, profile, texts, credential.as_deref(), query).await;
-        self.store.transaction(|db| {
+        graph.transaction(|db| {
             match &result {Ok((_,tokens,reported))=>{
-                db.execute("UPDATE am_call_reservations SET state='finished',input_reserved=?,usage_reported=?,finished_at=? WHERE id=?",params![tokens,reported,now(),call_id])?;
-                db.execute("UPDATE am_model_calls SET input_tokens=?,elapsed_ms=? WHERE id=?",params![tokens,start.elapsed().as_millis() as u64,call_id])?;
-            },Err(error)=>{db.execute("UPDATE am_call_reservations SET state='unknown_usage',error=?,finished_at=? WHERE id=?",params![error.message,now(),call_id])?;}}Ok(())
+                graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='finished', r.input_reserved=$input, r.usage_reported=$reported, r.finished_at=$now",
+                    graph::params(&json!({"id": call_id, "input": tokens, "reported": i64::from(*reported), "now": now()})))?;
+                graph::rows(db,"MATCH (c:ModelCall {id: $id}) SET c.input_tokens=$input, c.elapsed_ms=$elapsed",
+                    graph::params(&json!({"id": call_id, "input": tokens, "elapsed": start.elapsed().as_millis() as u64})))?;
+            },Err(error)=>{
+                graph::rows(db,"MATCH (r:Reservation {id: $id}) SET r.state='unknown_usage', r.error=$error, r.finished_at=$now",
+                    graph::params(&json!({"id": call_id, "error": error.message, "now": now()})))?;
+            }}
+            Ok(())
         })?;
         let (vectors, _, _) = result?;
         guarded_read(&self.store, job, |_, _, _| Ok(()))?;

@@ -150,20 +150,26 @@ impl Fixture {
         }
     }
     fn jobs(&self, kind: &str) -> Vec<Value> {
-        let db = self.store.connect().unwrap();
-        let mut statement = db
-            .prepare("SELECT state,payload,result FROM am_jobs WHERE repository_id=? AND kind=? ORDER BY created_at,rowid")
-            .unwrap();
-        statement
-            .query_map([self.repo.as_str(), kind], |r| {
-                let payload: String = r.get(1)?;
-                let result: Option<String> = r.get(2)?;
-                Ok(json!({"state":r.get::<_, String>(0)?,
-                    "payload":serde_json::from_str::<Value>(&payload).unwrap(),
-                    "result":result.map(|text| serde_json::from_str::<Value>(&text).unwrap())}))
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) \
+                     RETURN j.state AS state, j.payload AS payload, j.result AS result \
+                     ORDER BY j.created_at, j.id",
+                    graphicle_runtime::store_graph::params(
+                        &json!({"repo": self.repo.as_str(), "kind": kind}),
+                    ),
+                )
             })
             .unwrap()
-            .map(Result::unwrap)
+            .iter()
+            .map(|row| {
+                json!({"state":row["state"],
+                    "payload":serde_json::from_str::<Value>(row["payload"].as_str().unwrap()).unwrap(),
+                    "result":row["result"].as_str().map(|text| serde_json::from_str::<Value>(text).unwrap())})
+            })
             .collect()
     }
     fn noted_sources(&self) -> Vec<String> {

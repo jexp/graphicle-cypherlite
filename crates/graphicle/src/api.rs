@@ -1091,7 +1091,10 @@ pub fn command(
             store.authorized_read(workspace, capability, "read", |db, p| {
                 let repo = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
                 let documents = crate::memory::documents(db, &repo, p)?;
-                crate::observer::context_with(db, crate::store::s(&repo, "id"), &documents, args, embedding.as_ref())
+                let cache = embedding.as_ref().map(|profile| {
+                    store.embedding_cache(&crate::model::key(profile))
+                });
+                crate::observer::context_with(db, crate::store::s(&repo, "id"), &documents, args, embedding.as_ref(), cache.as_ref())
             })
         }
         "deletion.verify" => crate::deletion::verify(store, workspace, capability, args),

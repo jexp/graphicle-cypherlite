@@ -1046,13 +1046,15 @@ async fn basic_answers_use_configured_semantic_search_and_can_disable_it() {
     assert_eq!(remote.state.count.load(Ordering::SeqCst), 3);
     let job=f.store.enqueue(&f.workspace,&f.key,&f.args(json!({"kind":"basic","question":"peaceful place","semantic_retrieval":false,"max_calls":1})),&remote.config).unwrap();
     f.store
-        .transaction(|db| {
-            let payload: String = db.query_row(
-                "SELECT payload FROM am_jobs WHERE id=?",
-                [s(&job, "id")],
-                |r| r.get(0),
+        .graph()
+        .read(|db| {
+            let payload = graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {id: $id}) RETURN j.payload AS payload",
+                graphicle_runtime::store_graph::params(&json!({"id": s(&job, "id")})),
             )?;
-            let payload: Value = serde_json::from_str(&payload)?;
+            let payload: Value =
+                serde_json::from_str(s(&payload.unwrap(), "payload"))?;
             assert!(payload["embedding_key"].is_null());
             Ok(())
         })

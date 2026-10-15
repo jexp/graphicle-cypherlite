@@ -101,6 +101,11 @@ pub struct Store {
     /// Signalled when a job is queued, so an idle worker in this process
     /// starts it at once instead of at its next poll.
     pub wake: Arc<tokio::sync::Notify>,
+    /// The CypherLite graph store beside `reviews.sqlite3`. Migrated domains
+    /// (jobs, model-call accounting, the model/query/embedding caches) live
+    /// here; the rest of the modules move to it node by node
+    /// (`docs/store-api.md`).
+    graph: crate::store_graph::GraphStore,
     /// The size limits of whoever runs this program ([`Store::with_limits`]);
     /// without them, the environment's over Graphicle Core's defaults.
     limits: Option<Arc<crate::limits::Limits>>,
@@ -327,6 +332,7 @@ impl Store {
             directory: Arc::new(directory.to_path_buf()),
             database: Arc::new(database),
             wake: Arc::new(tokio::sync::Notify::new()),
+            graph: crate::store_graph::GraphStore::open(directory.join("reviews.graph"))?,
             limits: None,
         };
         let db = store.connect()?;
@@ -344,7 +350,7 @@ impl Store {
         // Each folder's freshness record.
         crate::fresh::migrate(&db)?;
         // Documents' mention links to code symbols.
-        crate::doc_links::migrate(&db)?;
+        crate::doc_links::migrate(&db, &store.graph)?;
         ensure_column(
             &db,
             "gf_cross_unresolved",
@@ -390,6 +396,17 @@ impl Store {
             Some(limits) => Ok(**limits),
             None => crate::limits::Limits::from_environment(&BTreeMap::new()),
         }
+    }
+    /// The graph store holding the migrated domains (jobs, model-call
+    /// accounting, caches).
+    pub fn graph(&self) -> &crate::store_graph::GraphStore {
+        &self.graph
+    }
+    /// This store's passage-embedding cache for `model_key`
+    /// ([`crate::embedding_cache`]); vectors live in the graph store, so no
+    /// second database file is involved.
+    pub fn embedding_cache(&self, model_key: &str) -> crate::embedding_cache::Cache {
+        crate::embedding_cache::Cache::new(self.graph.clone(), model_key)
     }
     pub fn connect(&self) -> Result<Connection> {
         let db = Connection::open(self.database.as_ref())?;
@@ -511,9 +528,17 @@ impl Store {
             crate::store_compat::credential_revoked(db,workspace,credential)?;
             crate::extension::installed().credential_revoked(db,workspace,credential)?;
             // A queued job never retains the authority of a revoked credential.
-            db.execute("UPDATE am_jobs SET state='cancelled',updated_at=? WHERE principal_hash IN (SELECT capability_hash FROM credentials WHERE id=?) AND state IN ('queued','retry','running')",params![now(),credential])?;
-            // Cached answers produced under the revoked credential are no longer current.
             let hash:String=db.query_row("SELECT capability_hash FROM credentials WHERE id=?",[credential],|r|r.get(0))?;
+            self.graph.transaction(|g| {
+                crate::store_graph::rows(
+                    g,
+                    "MATCH (j:Job {principal_hash: $hash}) WHERE j.state IN ['queued','retry','running'] \
+                     SET j.state='cancelled', j.updated_at=$now",
+                    crate::store_graph::params(&json!({"hash": hash, "now": now()})),
+                )?;
+                Ok(())
+            })?;
+            // Cached answers produced under the revoked credential are no longer current.
             let revoked_sources=credential_sources(db,workspace,credential)?;
             crate::invalidation::permissions_changed(db,workspace,Some(&hash),&revoked_sources,"credential_revoked")?;
             Ok(json!({"revoked":true,"sources":revoked_sources}))
@@ -630,7 +655,7 @@ impl Store {
                 // Identical tree, possibly a new commit identity: the existing
                 // episode still gains the sha from this sync's metadata.
                 let metadata:Value=serde_json::from_str(&metadata)?;
-                let projection=crate::jobs::enqueue_projection(db,identifier,p,&snapshot,&metadata)?;
+                let projection=crate::jobs::enqueue_projection(self,db,identifier,p,&snapshot,&metadata)?;
                 return Ok(json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}));
             }
             let mut missing=Vec::new();
@@ -882,7 +907,7 @@ impl Store {
             event(db,identifier,"synced",json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed}))?;
             // Every commit yields a graph episode labelled with its commit identity.
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
-            let projection=crate::jobs::enqueue_projection(db,identifier,p,s(&sync,"snapshot"),&metadata)?;
+            let projection=crate::jobs::enqueue_projection(self,db,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
             crate::graph_projection::clear_stale_when_current(db,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
@@ -1051,10 +1076,9 @@ pub fn event(db: &Connection, repository: &str, kind: &str, value: Value) -> Res
 pub fn invalidate(db: &Connection, repository: &str) -> Result<()> {
     crate::projection::enqueue(db, repository, "source_or_permission_state_changed")?;
     graphicle_memory::cache::clear(repository).map_err(Error::bad)?;
-    db.execute(
-        "DELETE FROM am_query_cache WHERE repository_id=?",
-        [repository],
-    )?;
+    // The query cache lives in the graph store now, and its request hashes
+    // embed the source state, so a changed source view can never hit a stale
+    // entry; nothing to delete here (the 500-entry trim bounds growth).
     Ok(())
 }
 

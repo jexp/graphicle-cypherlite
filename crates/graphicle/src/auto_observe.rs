@@ -27,7 +27,7 @@ use crate::{
     store::{Principal, Store, authorize_hash, decode, repo, rows, s},
     string,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -117,7 +117,7 @@ impl Store {
                 s(&connector, "workspace_id"),
                 config,
             )
-            .and_then(|config| self.transaction(|db| decide(db, &connector, &config)))
+            .and_then(|config| self.transaction(|db| decide(self, db, &connector, &config)))
             .unwrap_or_else(
                 |e| json!({"connector_id":connector["id"],"queued":false,"reason":e.message}),
             );
@@ -137,7 +137,7 @@ fn unfinished(rounds: &[&Value]) -> bool {
         .is_some_and(|r| r["state"] == "complete" && r["result"]["complete"] == false)
 }
 
-fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
+fn decide(store: &Store, db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
     let id = s(connector, "id");
     let repository_id = s(connector, "repository_id");
     let generation = connector["generation"].as_i64().unwrap_or(0);
@@ -160,20 +160,28 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
     // One automatic round at a time per connector, across generations. A
     // reflection round queued before the archive stays queued (no edition
     // runs it) and is not waited for.
-    let active: i64 = db.query_row(
-        "SELECT count(*) FROM am_jobs WHERE repository_id=? AND kind=? AND state IN ('queued','retry','running') AND json_extract(payload,'$.auto.connector_id')=?",
-        params![repository_id, observer::KIND, id],
-        |r| r.get(0),
-    )?;
+    let graph = store.graph().clone();
+    let active = graph
+        .read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (j:Job {repository_id: $repo, kind: $kind, auto_connector: $cid})                  WHERE j.state IN ['queued','retry','running'] RETURN count(j) AS count",
+                crate::store_graph::params(&json!({"repo": repository_id, "kind": observer::KIND, "cid": id})),
+            )
+        })?
+        .and_then(|row| row["count"].as_i64())
+        .unwrap_or(0);
     if active > 0 {
         decision["reason"] = json!("round in progress");
         return Ok(decision);
     }
-    let mut rounds = rows(
-        db,
-        "SELECT kind,state,result FROM am_jobs WHERE repository_id=? AND kind=? AND json_extract(payload,'$.auto.connector_id')=? AND json_extract(payload,'$.auto.generation')=? ORDER BY created_at,rowid",
-        params![repository_id, observer::KIND, id, generation],
-    )?;
+    let mut rounds = graph.read(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, auto_connector: $cid, auto_generation: $gen})              RETURN j.kind AS kind, j.state AS state, j.result AS result ORDER BY j.created_at, j.id",
+            crate::store_graph::params(&json!({"repo": repository_id, "kind": observer::KIND, "cid": id, "gen": generation})),
+        )
+    })?;
     for round in &mut rounds {
         decode(round, "result")?;
     }
@@ -222,7 +230,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
     };
     if unobserved > 0 && (unobserved >= threshold || unfinished(&observing)) {
         if observing.len() < max_rounds {
-            return enqueue(db, &p, args, config, decision, generation);
+            return enqueue(store, db, &p, args, config, decision, generation);
         }
         idle = "observation rounds exhausted for this generation";
     }
@@ -231,6 +239,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
 }
 
 fn enqueue(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     mut args: Value,
@@ -240,7 +249,7 @@ fn enqueue(
 ) -> Result<Value> {
     jobs::check(&args, config)?;
     args["auto"] = json!({"connector_id":decision["connector_id"],"generation":generation});
-    let job = jobs::queue(db, p, &args, config)?;
+    let job = jobs::queue(store, db, p, &args, config)?;
     decision["kind"] = args["kind"].clone();
     decision["job_id"] = job["id"].clone();
     if job["replayed"] == true {
