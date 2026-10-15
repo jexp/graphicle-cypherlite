@@ -606,6 +606,7 @@ fn a_retained_answer_links_only_windows_of_live_code_symbols() {
     // Retained, it stays current through an edit of beta.
     let saved = graphicle_runtime::memory::save(
         &db,
+        &f.store.graph(),
         &f.repo,
         None,
         None,
@@ -1649,12 +1650,12 @@ fn a_historical_revision_is_judged_by_its_own_symbols() {
         &[("file:b.py", "    return alpha() + beta()")],
         json!({"memory_id":first["id"],"expected_revision":1,"recall":recall}),
     );
-    let db = f.store.connect().unwrap();
-    db.execute(
-        "UPDATE repo_memory_revisions SET created_at=CASE revision WHEN 1 THEN '2026-01-01T00:00:00Z' ELSE '2026-03-01T00:00:00Z' END WHERE memory_id=?",
-        [s(&first, "id")],
-    )
-    .unwrap();
+    f.store.graph().transaction(|g| {
+        graphicle_runtime::store_graph::rows(g,
+            "MATCH (r:MemoryRevision {memory_id: $id})              SET r.created_at = CASE r.revision WHEN 1 THEN '2026-01-01T00:00:00Z' ELSE '2026-03-01T00:00:00Z' END              RETURN count(r) AS n",
+            graphicle_runtime::store_graph::params(&json!({"id": s(&first, "id")})))?;
+        Ok(())
+    }).unwrap();
     let search = |known: Option<&str>| {
         let mut args = json!({"question":"duty owner","scopes":["project:larch"]});
         if let Some(known) = known {

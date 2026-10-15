@@ -657,6 +657,7 @@ fn index_markers(
 /// Rows derived from or naming the forgotten documents, by kind.
 fn source_rows(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -687,16 +688,11 @@ fn source_rows(
         )?;
         out.insert(name, found.len());
     }
-    let per_repository: [(&'static str, &str, Matches); 12] = [
+    let per_repository: [(&'static str, &str, Matches); 10] = [
         (
             "originals",
             "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
             |v, sc| sc.source(v),
-        ),
-        (
-            "memories",
-            "SELECT rowid,data FROM repo_memories WHERE repository_id=?",
-            cites,
         ),
         (
             "observer_notes",
@@ -707,11 +703,6 @@ fn source_rows(
             "observer_reflections",
             "SELECT rowid,sources FROM am_observer_reflections WHERE repository_id=?",
             lists,
-        ),
-        (
-            "vectors",
-            "SELECT rowid,identity FROM am_vectors WHERE repository_id=?",
-            |v, sc| sc.passage(v),
         ),
         (
             "document_reads",
@@ -755,6 +746,18 @@ fn source_rows(
         let found = select_rowids(db, sql, [repository], |v| keep(v, scope))?;
         out.insert(name, found.len());
     }
+    // Memory and embeddings live in the graph store now (migration plan
+    // §2.3/§2.7): the same counts, read there.
+    let memories = crate::memory::memory_rows(graph, repository)?
+        .iter()
+        .filter(|m| cites(&m["data"].to_string(), scope))
+        .count();
+    out.insert("memories", memories);
+    let vectors = crate::vector::graph_vector_identities(graph, repository)?
+        .iter()
+        .filter(|identity| scope.passage(identity))
+        .count();
+    out.insert("vectors", vectors);
     out.insert(
         "dependency_edges",
         index_edges(db, workspace, repository, scope)?.len(),
@@ -822,7 +825,13 @@ impl Plan {
     }
 }
 
-pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
+pub fn plan(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    workspace: &str,
+    repository: &str,
+    scope: &Scope,
+) -> Result<Plan> {
     let prefix = scope.prefix();
     let mut sources = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
@@ -883,7 +892,7 @@ pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -
         sources_digest: digest(&json!(sources)),
         texts: texts.len(),
         fingerprints,
-        rows: source_rows(db, workspace, repository, scope)?,
+        rows: source_rows(db, graph, workspace, repository, scope)?,
         visible_since: since_visible(db, repository, since.as_deref(), None)?,
         since,
     })
@@ -902,38 +911,97 @@ fn drafted_while_visible(record: &Value, since: &str) -> bool {
             .contains(&s(&record["data"], "authority"))
 }
 
+/// Delete one memory with everything its SQL row's FOREIGN KEY cascades
+/// removed: its revisions, its claims with their events, and the claim's
+/// entity links (the entities themselves stay; [`forget`] drops orphans).
+/// The memory's own embedding goes with the node. Returns
+/// `(revisions, claims, vectors)` removed, for receipts.
+fn memory_cascade(
+    graph: &crate::store_graph::GraphStore,
+    repository: &str,
+    identifier: &str,
+) -> Result<(usize, usize, usize)> {
+    use crate::store_graph::{one, params, rows};
+    graph.transaction(|db| {
+        let arguments = || params(&json!({"repo": repository, "id": identifier}));
+        let revisions = one(
+            db,
+            "MATCH (r:MemoryRevision {memory_id: $id}) RETURN count(r) AS n",
+            arguments(),
+        )?
+        .and_then(|r| r["n"].as_u64())
+        .unwrap_or(0) as usize;
+        let claims: Vec<String> = rows(
+            db,
+            "MATCH (c:Claim {repository_id: $repo, memory_id: $id}) RETURN c.id AS id",
+            arguments(),
+        )?
+        .iter()
+        .map(|c| s(c, "id").to_string())
+        .collect();
+        let vectors = one(
+            db,
+            "MATCH (m:Memory {id: $id, repository_id: $repo})              RETURN m.embedding IS NOT NULL AS embedded",
+            arguments(),
+        )?
+        .map(|r| r["embedded"].as_bool().unwrap_or(false) as usize)
+        .unwrap_or(0);
+        if !claims.is_empty() {
+            rows(
+                db,
+                "UNWIND $ids AS cid MATCH (e:ClaimEvent {claim_id: cid}) DETACH DELETE e                  RETURN count(*) AS n",
+                params(&json!({"ids": claims})),
+            )?;
+            rows(
+                db,
+                "UNWIND $ids AS cid MATCH (c:Claim {id: cid}) DETACH DELETE c                  RETURN count(*) AS n",
+                params(&json!({"ids": claims})),
+            )?;
+        }
+        rows(
+            db,
+            "MATCH (r:MemoryRevision {memory_id: $id}) DETACH DELETE r RETURN 1 AS ok",
+            arguments(),
+        )?;
+        rows(
+            db,
+            "MATCH (m:Memory {id: $id, repository_id: $repo}) DETACH DELETE m RETURN 1 AS ok",
+            arguments(),
+        )?;
+        Ok((revisions, claims.len(), vectors))
+    })
+}
+
 /// Memories citing the documents in any revision, model drafts written while
 /// they were visible, and memories that depend on either.
 fn forget_memories(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
     since: Option<&str>,
 ) -> Result<BTreeSet<String>> {
     use crate::invalidation::{self, EMBEDDING, MEMORY};
-    let mut records = rows(
-        db,
-        "SELECT * FROM repo_memories WHERE repository_id=?",
-        [repository],
-    )?;
+    let records = crate::memory::memory_rows(graph, repository)?;
     let mut removed = BTreeSet::new();
     let direct = |data: &Value| {
         data["native_sources"]
             .as_object()
             .is_some_and(|d| d.keys().any(|k| scope.source(k)))
     };
-    for record in &mut records {
-        decode(record, "data")?;
+    for record in &records {
         let identifier = s(record, "id").to_string();
         if direct(&record["data"]) || since.is_some_and(|t| drafted_while_visible(record, t)) {
             removed.insert(identifier.clone());
         }
-        for revision in rows(
-            db,
-            "SELECT data FROM repo_memory_revisions WHERE memory_id=?",
-            [&identifier],
-        )? {
+        for revision in graph.read(|g| {
+            crate::store_graph::rows(
+                g,
+                "MATCH (r:MemoryRevision {memory_id: $id}) RETURN r.data AS data",
+                crate::store_graph::params(&json!({"id": identifier})),
+            )
+        })? {
             let mut prior: Value = serde_json::from_str(s(&revision, "data"))?;
             decode(&mut prior, "data")?;
             if direct(&prior["data"]) {
@@ -958,18 +1026,15 @@ fn forget_memories(
         }
     }
     for identifier in &removed {
+        // The SQL cascade from repo_memories removed these; explicit now.
         db.execute(
-            "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
+            "DELETE FROM gf_symbol_pins WHERE repository_id=? AND memory_id=?",
             params![repository, identifier],
         )?;
+        memory_cascade(graph, repository, identifier)?;
         invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
         invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
-        let passage = format!("memory:{identifier}");
-        db.execute(
-            "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
-            params![repository, passage],
-        )?;
-        let key = format!("{repository}:{passage}");
+        let key = format!("{repository}:memory:{identifier}");
         invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
         invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
     }
@@ -994,6 +1059,7 @@ const NAMES_MEMORIES: &[&str] = &[
 /// ids and per-table counts; the caller signs [`rows_receipt`].
 pub fn delete_memories(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     memories: &[Value],
@@ -1024,34 +1090,21 @@ pub fn delete_memories(
     let mut vectors = 0usize;
     let mut pins = 0usize;
     for identifier in &removed {
-        revisions += count(
-            db,
-            "SELECT count(*) FROM repo_memory_revisions WHERE memory_id=?",
-            [identifier],
-        )?;
-        // The memory's pinned or pending quotes go with it.
-        pins += count(
-            db,
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=? AND memory_id=?",
+        // The memory's pinned or pending quotes go with it. The SQL
+        // cascade from repo_memories is gone with the table's rows: delete
+        // the pins explicitly.
+        pins += db.execute(
+            "DELETE FROM gf_symbol_pins WHERE repository_id=? AND memory_id=?",
             params![repository, identifier],
         )?;
-        claims += count(
-            db,
-            "SELECT count(*) FROM am_claims WHERE repository_id=? AND memory_id=?",
-            params![repository, identifier],
-        )?;
-        db.execute(
-            "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, identifier],
-        )?;
+        let (revisions_removed, claims_removed, vectors_removed) =
+            memory_cascade(graph, repository, identifier)?;
+        revisions += revisions_removed;
+        claims += claims_removed;
+        vectors += vectors_removed;
         invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
         invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
-        let passage = format!("memory:{identifier}");
-        vectors += db.execute(
-            "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
-            params![repository, passage],
-        )?;
-        let key = format!("{repository}:{passage}");
+        let key = format!("{repository}:memory:{identifier}");
         invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
         invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
     }
@@ -1087,39 +1140,72 @@ pub fn delete_memories(
 
 /// Rows still holding any of the deleted memories, per table (all zero after
 /// [`delete_memories`]).
-pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<Value> {
+pub fn memory_rows(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    repository: &str,
+    ids: &[String],
+) -> Result<Value> {
     let mut out = BTreeMap::new();
-    for (table, sql) in [
-        (
-            "repo_memories",
-            "SELECT count(*) FROM repo_memories WHERE repository_id=?1 AND id=?2",
-        ),
-        (
-            "repo_memory_revisions",
-            "SELECT count(*) FROM repo_memory_revisions WHERE memory_id=?2",
-        ),
-        (
-            "am_claims",
-            "SELECT count(*) FROM am_claims WHERE repository_id=?1 AND memory_id=?2",
-        ),
-        (
-            "am_vectors",
-            "SELECT count(*) FROM am_vectors WHERE repository_id=?1 AND identity='memory:'||?2",
-        ),
-        (
-            "gf_symbol_pins",
+    // Memory, revisions, claims and embeddings are graph nodes now; the
+    // counts below are the same rows the SQL verification counted.
+    let (mut memories, mut revisions, mut claims, mut vectors) = (0, 0, 0, 0);
+    for id in ids {
+        memories += graph
+            .read(|g| {
+                crate::store_graph::one(
+                    g,
+                    "MATCH (m:Memory {id: $id, repository_id: $repo}) RETURN count(m) AS n",
+                    crate::store_graph::params(&json!({"id": id, "repo": repository})),
+                )
+            })?
+            .and_then(|r| r["n"].as_u64())
+            .unwrap_or(0);
+        revisions += graph
+            .read(|g| {
+                crate::store_graph::one(
+                    g,
+                    "MATCH (r:MemoryRevision {memory_id: $id}) RETURN count(r) AS n",
+                    crate::store_graph::params(&json!({"id": id})),
+                )
+            })?
+            .and_then(|r| r["n"].as_u64())
+            .unwrap_or(0);
+        claims += graph
+            .read(|g| {
+                crate::store_graph::one(
+                    g,
+                    "MATCH (c:Claim {repository_id: $repo, memory_id: $id}) RETURN count(c) AS n",
+                    crate::store_graph::params(&json!({"id": id, "repo": repository})),
+                )
+            })?
+            .and_then(|r| r["n"].as_u64())
+            .unwrap_or(0);
+        vectors += graph.read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (m:Memory {id: $id, repository_id: $repo})                  WHERE m.embedding IS NOT NULL RETURN count(m) AS n",
+                crate::store_graph::params(&json!({"id": id, "repo": repository})),
+            )
+        })?
+        .and_then(|r| r["n"].as_u64())
+        .unwrap_or(0);
+    }
+    out.insert("repo_memories".to_string(), memories);
+    out.insert("repo_memory_revisions".to_string(), revisions);
+    out.insert("am_claims".to_string(), claims);
+    out.insert("am_vectors".to_string(), vectors);
+    let mut pins = 0;
+    for id in ids {
+        pins += count(
+            db,
             "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=?1 AND memory_id=?2",
-        ),
-    ] {
-        let mut total = 0;
-        for id in ids {
-            total += count(db, sql, params![repository, id])?;
-        }
-        // Listed only when a deleted memory's pin remains.
-        if table == "gf_symbol_pins" && total == 0 {
-            continue;
-        }
-        out.insert(table.to_string(), total);
+            params![repository, id],
+        )?;
+    }
+    // Listed only when a deleted memory's pin remains.
+    if pins > 0 {
+        out.insert("gf_symbol_pins".to_string(), pins as u64);
     }
     Ok(json!(out))
 }
@@ -1128,6 +1214,7 @@ pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<
 /// (see the module documentation). Originals are removed by [`erase`].
 pub fn forget(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -1135,14 +1222,17 @@ pub fn forget(
 ) -> Result<Value> {
     use crate::invalidation;
     let claims = || -> Result<BTreeSet<String>> {
-        Ok(rows(
-            db,
-            "SELECT id FROM am_claims WHERE repository_id=?",
-            [repository],
-        )?
-        .iter()
-        .map(|r| s(r, "id").to_string())
-        .collect())
+        Ok(graph
+            .read(|g| {
+                crate::store_graph::rows(
+                    g,
+                    "MATCH (c:Claim {repository_id: $repo}) RETURN c.id AS id",
+                    crate::store_graph::params(&json!({"repo": repository})),
+                )
+            })?
+            .iter()
+            .map(|r| s(r, "id").to_string())
+            .collect())
     };
     let claims_before = claims()?;
     let pins = || {
@@ -1153,7 +1243,7 @@ pub fn forget(
         )
     };
     let pins_before = pins()?;
-    let memories = forget_memories(db, workspace, repository, scope, since)?;
+    let memories = forget_memories(db, graph, workspace, repository, scope, since)?;
     // The forgotten memories' symbol pins went with them.
     let symbol_pins = pins_before.saturating_sub(pins()?);
     let lost: Vec<String> = claims_before
@@ -1181,13 +1271,11 @@ pub fn forget(
                 crate::observer::forget_source(db, workspace, repository, s(&row, "source_id"))?;
         }
     }
-    let vectors = select_rowids(
-        db,
-        "SELECT rowid,identity FROM am_vectors WHERE repository_id=?",
-        [repository],
-        |v| scope.passage(v),
-    )?;
-    let vectors = delete_rowids(db, "am_vectors", &vectors)?;
+    let vector_ids: Vec<String> = crate::vector::graph_vector_identities(graph, repository)?
+        .into_iter()
+        .filter(|identity| scope.passage(identity))
+        .collect();
+    let vectors = crate::vector::delete_embeddings(graph, repository, &vector_ids)?;
     // An extraction read whose drafts were just removed must run again.
     let reads = select_rowids(
         db,
@@ -1325,7 +1413,14 @@ pub fn forget(
         "gf_stale",
         &index_markers(db, workspace, repository, scope)?,
     )?;
-    db.execute("DELETE FROM am_entities WHERE repository_id=? AND id NOT IN (SELECT subject_id FROM am_entity_links UNION SELECT object_id FROM am_entity_links)",[repository])?;
+    graph.transaction(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (e:Entity {repository_id: $repo})              WHERE NOT (e)<-[:HAS_SUBJECT]-() AND NOT (e)<-[:HAS_OBJECT]-()              DELETE e RETURN 1 AS ok",
+            crate::store_graph::params(&json!({"repo": repository})),
+        )?;
+        Ok(())
+    })?;
     crate::store::invalidate(db, repository)?;
     let mut removed = json!({"memories":memories.len(),"observer_notes":notes,"observer_reflections":reflections,"vectors":vectors,"document_reads":reads,
         "since_visible":visible_since,"anchors":anchors,"hints":hints,"doc_links":doc_links,"served_records":stripped["gf_served"],
@@ -1384,6 +1479,7 @@ pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> 
 #[allow(clippy::too_many_arguments)]
 pub fn receipt(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1393,7 +1489,7 @@ pub fn receipt(
     erased: Value,
 ) -> Result<Value> {
     policy_receipt(
-        db, p, repository, operation, plan, started, forgotten, erased, None,
+        db, graph, p, repository, operation, plan, started, forgotten, erased, None,
     )
 }
 
@@ -1402,6 +1498,7 @@ pub fn receipt(
 #[allow(clippy::too_many_arguments)]
 pub fn policy_receipt(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1413,7 +1510,7 @@ pub fn policy_receipt(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let scope = &plan.scope;
-    let remaining = source_rows(db, &p.workspace, identifier, scope)?;
+    let remaining = source_rows(db, graph, &p.workspace, identifier, scope)?;
     let tainted = since_visible(db, identifier, plan.since(), Some(started))?;
     let catalog = tables(db)?;
     let ids = if scope.whole() {
@@ -1441,7 +1538,7 @@ pub fn policy_receipt(
         .iter()
         .filter(|d| scope.source(s(d, "id")))
         .count();
-    let snapshot = state(db, &p.workspace, identifier)?;
+    let snapshot = state(db, graph, &p.workspace, identifier)?;
     let cleanups = external(db, identifier)?;
     let clean = remaining.values().chain(tainted.values()).all(|n| *n == 0)
         && empty(&ids)
@@ -1589,8 +1686,20 @@ fn mask(value: &str) -> String {
 /// tables with no rows in the project's scope; identifiers and capability
 /// digests minted per store, clock readings and sync counters are masked. Two stores digest equally
 /// when they hold the same content, whichever edition created them.
-pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value> {
+pub fn state(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    workspace: &str,
+    repository: &str,
+) -> Result<Value> {
     let mut tables_out = BTreeMap::new();
+    // Memory-pipeline tables are graph nodes now (migration plan §2.3);
+    // they enter the canonical digest below, under their table names.
+    let memory_ids: Vec<String> = crate::memory::memory_rows(graph, repository)?
+        .iter()
+        .map(|m| s(m, "id").to_string())
+        .collect();
+    let memory_id_list = serde_json::to_string(&memory_ids)?;
     let history = history(db)?;
     let all = rows(
         db,
@@ -1641,8 +1750,8 @@ pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value
             )
         } else if has("memory_id") {
             (
-                "memory_id IN (SELECT id FROM repo_memories WHERE repository_id=?)",
-                repository,
+                "memory_id IN (SELECT value FROM json_each(?))",
+                memory_id_list.as_str(),
             )
         } else if has("workspace_id") {
             ("workspace_id=?", workspace)
@@ -1711,6 +1820,140 @@ pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value
             json!({"rows":canonical.len(),"digest":graphicle_memory::text::sha256(canonical.join("\n").as_bytes())}),
         );
     }
+    // The graph-held tables of the memory pipeline, in the same canonical
+    // shape: columns in their SQL order, text masked, empty tables absent.
+    let memories = crate::memory::memory_rows(graph, repository)?;
+    let mut revisions = Vec::new();
+    let mut claims = Vec::new();
+    let mut events = Vec::new();
+    let mut entities = Vec::new();
+    graph.read(|g| {
+        revisions = crate::store_graph::rows(
+            g,
+            "MATCH (r:MemoryRevision) WHERE r.memory_id IN $ids \
+             RETURN r.memory_id AS memory_id, r.revision AS revision, r.data AS data, \
+             r.created_at AS created_at",
+            crate::store_graph::params(&json!({"ids": memory_ids})),
+        )?;
+        claims = crate::store_graph::rows(
+            g,
+            "MATCH (c:Claim {repository_id: $repo}) RETURN c.id AS id, \
+             c.repository_id AS repository_id, c.memory_id AS memory_id, c.state AS state, \
+             c.data AS data, c.source_state AS source_state, c.created_at AS created_at, \
+             c.updated_at AS updated_at",
+            crate::store_graph::params(&json!({"repo": repository})),
+        )?;
+        events = crate::store_graph::rows(
+            g,
+            "MATCH (e:ClaimEvent {repository_id: $repo}) RETURN e.id AS id, \
+             e.repository_id AS repository_id, e.claim_id AS claim_id, e.action AS action, \
+             e.data AS data, e.created_at AS created_at",
+            crate::store_graph::params(&json!({"repo": repository})),
+        )?;
+        entities = crate::store_graph::rows(
+            g,
+            "MATCH (e:Entity {repository_id: $repo}) RETURN e.id AS id, \
+             e.repository_id AS repository_id, e.name AS name, e.kind AS kind, \
+             e.data AS data, e.created_at AS created_at",
+            crate::store_graph::params(&json!({"repo": repository})),
+        )?;
+        Ok(())
+    })?;
+    // `am_vectors` rows as the table held them, synthesized from the
+    // embedding properties of Memory and Chunk nodes.
+    let vectors = crate::vector::graph_vectors_all(graph, repository)?;
+    let graph_tables: Vec<(&str, Vec<&str>, Vec<Value>)> = vec![
+        (
+            "repo_memories",
+            vec![
+                "id",
+                "repository_id",
+                "kind",
+                "revision",
+                "state",
+                "title",
+                "body",
+                "data",
+                "created_at",
+                "updated_at",
+            ],
+            memories,
+        ),
+        (
+            "repo_memory_revisions",
+            vec!["memory_id", "revision", "data", "created_at"],
+            revisions,
+        ),
+        (
+            "am_claims",
+            vec![
+                "id",
+                "repository_id",
+                "memory_id",
+                "state",
+                "data",
+                "source_state",
+                "created_at",
+                "updated_at",
+            ],
+            claims,
+        ),
+        (
+            "am_claim_events",
+            vec![
+                "id",
+                "repository_id",
+                "claim_id",
+                "action",
+                "data",
+                "created_at",
+            ],
+            events,
+        ),
+        (
+            "am_entities",
+            vec!["id", "repository_id", "name", "kind", "data", "created_at"],
+            entities,
+        ),
+        (
+            "am_vectors",
+            vec![
+                "repository_id",
+                "identity",
+                "source_sha",
+                "model_key",
+                "dimensions",
+                "vector",
+            ],
+            vectors,
+        ),
+    ];
+    for (name, columns, table_rows) in graph_tables {
+        let mut canonical = Vec::new();
+        for row in &table_rows {
+            let values: Vec<Value> = columns
+                .iter()
+                .map(|c| match &row[*c] {
+                    Value::String(text) => json!(mask(text)),
+                    // A JSON payload column was TEXT in the SQL store:
+                    // render and mask it as one.
+                    other @ (Value::Object(_) | Value::Array(_)) => {
+                        json!(mask(&other.to_string()))
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            canonical.push(Value::Array(values).to_string());
+        }
+        if canonical.is_empty() {
+            continue;
+        }
+        canonical.sort();
+        tables_out.insert(
+            name.to_string(),
+            json!({"rows":canonical.len(),"digest":graphicle_memory::text::sha256(canonical.join("\n").as_bytes())}),
+        );
+    }
     Ok(
         json!({"contract":STATE_CONTRACT,"digest":digest(&json!(tables_out)),"tables":tables_out,
         "excluded":{"history":history,"caches":CACHES,"locations":LOCATIONS,"empty_tables":true},
@@ -1723,7 +1966,7 @@ pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value
 pub fn state_api(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
     store.authorized_read(workspace, token, "admin", |db, p| {
         let project = repo(db, p, string(args, "repository_id", 100)?)?;
-        state(db, &p.workspace, s(&project, "id"))
+        state(db, &store.graph(), &p.workspace, s(&project, "id"))
     })
 }
 
@@ -1958,7 +2201,7 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
         let current = match s(&receipt, "operation") {
             "connector.delete" => {
                 let scope = Scope::connector(s(&receipt, "target"));
-                let remaining = source_rows(db, workspace, &repository, &scope)?;
+                let remaining = source_rows(db, &store.graph(), workspace, &repository, &scope)?;
                 let ids = references(db, &catalog, &[scope.prefix()], (&repository, workspace), &[], false)?;
                 // Caches refill with unrelated work, so only the deleted
                 // sources' own rows and references are re-checked.
@@ -2038,7 +2281,7 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
                     .flatten()
                     .filter_map(Value::as_str)
                     .collect();
-                let reappeared = rows(db, "SELECT id FROM repo_memories WHERE repository_id=?", [&repository])?
+                let reappeared = crate::memory::memory_rows(&store.graph(), &repository)?
                     .iter()
                     .filter(|m| hashes.contains(key_hash("memory.delete", s(m, "id")).as_str()))
                     .count();

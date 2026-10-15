@@ -380,26 +380,20 @@ async fn real_qdrant_filters_fingerprints_and_authorized_candidate_ids() {
         .store
         .authorized(&f.ws, &f.key, "read", |db, p| {
             let r = repo(db, p, &f.project)?;
-            query::candidates(&query::snapshot(db, &r, p)?).map(|v| v.0)
+            query::candidates(&query::snapshot(db, &f.store.graph(), &r, p)?).map(|v| v.0)
         })
         .unwrap();
-    for row in &candidates {
-        f.store
-            .connect()
-            .unwrap()
-            .execute(
-                "INSERT INTO am_vectors VALUES(?,?,?,?,?,?)",
-                rusqlite::params![
-                    f.project,
-                    s(row, "identity"),
-                    s(row, "source_sha"),
-                    key,
-                    2,
-                    "[1.0,0.0]"
-                ],
+    let rows: Vec<(String, String, Vec<f64>)> = candidates
+        .iter()
+        .map(|row| {
+            (
+                s(row, "identity").to_string(),
+                s(row, "source_sha").to_string(),
+                vec![1.0, 0.0],
             )
-            .unwrap();
-    }
+        })
+        .collect();
+    vector::store_embeddings(&f.store.graph(), &f.project, &key, &rows).unwrap();
     let result = vector::publish(
         &f.store,
         &worker.client,

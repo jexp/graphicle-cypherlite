@@ -185,6 +185,7 @@ fn memory_search_applies_scope_to_indirect_evidence_and_reports_the_gap() {
     let db = f.store.connect().unwrap();
     let child = graphicle_runtime::memory::save(
         &db,
+        &f.store.graph(),
         &f.repo,
         None,
         None,
@@ -216,8 +217,12 @@ fn knowledge_time_uses_the_reviewed_revision_then_known() {
     let f = Fixture::new();
     let old = f.note("Mira owns the pager.", json!({}));
     f.store.note(&f.workspace,&f.key,&f.args(json!({"memory_id":old["id"],"expected_revision":1,"title":"Rotation","body":"Otto owns the pager."}))).unwrap();
-    let db = f.store.connect().unwrap();
-    db.execute("UPDATE repo_memory_revisions SET created_at=CASE revision WHEN 1 THEN '2026-01-01T00:00:00Z' ELSE '2026-03-01T00:00:00Z' END WHERE memory_id=?",[s(&old,"id")]).unwrap();
+    f.store.graph().transaction(|g| {
+        graphicle_runtime::store_graph::rows(g,
+            "MATCH (r:MemoryRevision {memory_id: $id})              SET r.created_at = CASE r.revision WHEN 1 THEN '2026-01-01T00:00:00Z' ELSE '2026-03-01T00:00:00Z' END              RETURN count(r) AS n",
+            graphicle_runtime::store_graph::params(&json!({"id": s(&old, "id")})))?;
+        Ok(())
+    }).unwrap();
     let before = f.search(json!({"known_at":"2026-02-01T00:00:00Z"}));
     assert_eq!(before["memories"][0]["body"], "Mira owns the pager.");
     assert_eq!(before["memories"][0]["revision"], 1);
@@ -237,13 +242,20 @@ fn knowledge_time_uses_the_reviewed_revision_then_known() {
 fn unreviewed_and_retired_memories_are_never_promoted_by_search() {
     let f = Fixture::new();
     let m = f.note("Mira owns the pager.", json!({}));
-    let db = f.store.connect().unwrap();
     for state in ["draft", "retired"] {
-        db.execute(
-            "UPDATE repo_memories SET state=? WHERE id=?",
-            [state, s(&m, "id")],
-        )
-        .unwrap();
+        f.store
+            .graph()
+            .transaction(|g| {
+                graphicle_runtime::store_graph::rows(
+                    g,
+                    "MATCH (m:Memory {id: $id}) SET m.state = $state RETURN m.id AS id",
+                    graphicle_runtime::store_graph::params(
+                        &json!({"id": s(&m, "id"), "state": state}),
+                    ),
+                )?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             f.search(json!({"include_history":true}))["memories"]
                 .as_array()
@@ -262,11 +274,12 @@ fn unreviewed_and_retired_memories_are_never_promoted_by_search() {
     }
     let mut data = m["data"].clone();
     data["dependencies"] = json!({"missing.txt":"a changed source"});
-    db.execute(
-        "UPDATE repo_memories SET state='reviewed',data=? WHERE id=?",
-        [data.to_string(), s(&m, "id").to_owned()],
-    )
-    .unwrap();
+    f.store.graph().transaction(|g| {
+        graphicle_runtime::store_graph::rows(g,
+            "MATCH (m:Memory {id: $id}) SET m.state = 'reviewed', m.data = $data RETURN m.id AS id",
+            graphicle_runtime::store_graph::params(&json!({"id": s(&m, "id"), "data": data.to_string()})))?;
+        Ok(())
+    }).unwrap();
     assert!(
         f.search(json!({"include_history":true,"known_at":graphicle_runtime::now()}))["memories"]
             .as_array()

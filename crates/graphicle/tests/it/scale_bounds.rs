@@ -106,37 +106,45 @@ fn memories_past_the_recall_bound_list_and_recall_the_newest() {
     let total = graphicle_memory::retrieval::MAX_RECALL_MEMORIES + extra;
     assert!(total > 10_000, "past the former listing cap");
     {
-        // The row shape `memory::save` writes; revision history is not read here.
-        let mut db = rusqlite::Connection::open(f.dir.path().join("reviews.sqlite3")).unwrap();
-        let tx = db.transaction().unwrap();
-        for i in 0..total {
-            let (title, body) = match i {
-                0 => (
-                    "Old aquarium".to_string(),
-                    "The aquarium tank holds nine guppies.".to_string(),
-                ),
-                7321 => (
-                    "Aquarium".to_string(),
-                    "The aquarium tank holds six neon tetras.".to_string(),
-                ),
-                _ => (
-                    format!("Garden note {i}"),
-                    format!("Bed {i} of the vegetable garden needs compost."),
-                ),
-            };
-            // The first `extra` are the least recently updated.
-            let updated = if i < extra {
-                "2020-01-01T00:00:00.000000Z"
-            } else {
-                "2026-09-30T00:00:00.000000Z"
-            };
-            tx.execute(
-                "INSERT INTO repo_memories(id,repository_id,kind,revision,state,title,body,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                rusqlite::params![format!("m{i:05}"), f.repo, "fact", 1, "reviewed", title, body, "{}", updated, updated],
-            )
+        // The node shape `memory::save` writes; revision history is not read here.
+        let rows: Vec<Value> = (0..total)
+            .map(|i| {
+                let (title, body) = match i {
+                    0 => (
+                        "Old aquarium".to_string(),
+                        "The aquarium tank holds nine guppies.".to_string(),
+                    ),
+                    7321 => (
+                        "Aquarium".to_string(),
+                        "The aquarium tank holds six neon tetras.".to_string(),
+                    ),
+                    _ => (
+                        format!("Garden note {i}"),
+                        format!("Bed {i} of the vegetable garden needs compost."),
+                    ),
+                };
+                // The first `extra` are the least recently updated.
+                let updated = if i < extra {
+                    "2020-01-01T00:00:00.000000Z"
+                } else {
+                    "2026-09-30T00:00:00.000000Z"
+                };
+                json!({"id":format!("m{i:05}"),"title":title,"body":body,"stamp":updated})
+            })
+            .collect();
+        f.store
+            .graph()
+            .transaction(|g| {
+                graphicle_runtime::store_graph::rows(
+                    g,
+                    "UNWIND $rows AS row                      CREATE (m:Memory {id: row.id, repository_id: $repo, kind: 'fact',                          revision: 1, state: 'reviewed', title: row.title, body: row.body,                          data: '{}', created_at: row.stamp, updated_at: row.stamp})                      RETURN count(m) AS n",
+                    graphicle_runtime::store_graph::params(
+                        &json!({"rows": rows, "repo": f.repo}),
+                    ),
+                )?;
+                Ok(())
+            })
             .unwrap();
-        }
-        tx.commit().unwrap();
     }
     let status = f
         .store

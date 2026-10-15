@@ -130,7 +130,7 @@ fn derive(f: &Fixture, source: &str) {
     let t = graphicle_runtime::now();
     f.store
         .authorized(ws, &f.key, "approve", |db, _| {
-            memory::save(db, repo, None, None, "note", "Migration window", SECRET, "reviewed",
+            memory::save(db, &f.store.graph(), repo, None, None, "note", "Migration window", SECRET, "reviewed",
                 &json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:sha}}))
         })
         .unwrap();
@@ -147,10 +147,13 @@ fn derive(f: &Fixture, source: &str) {
     let attributes = json!({"document_id":source,"excerpt":SECRET}).to_string();
     f.sql("INSERT INTO gf_anchor_edges(repository_id,episode,chunk_id,node_id,rung,confidence,attributes,created_at) VALUES(?1,'e1','chunk-plan',NULL,'lexical',0.5,?2,?3)", rusqlite::params![repo, attributes, t]);
     let passage = format!("{source}:0");
-    f.sql(
-        "INSERT INTO am_vectors VALUES(?1,?2,?3,'embedding-model',3,'[0.1,0.2,0.3]')",
-        rusqlite::params![repo, passage, sha],
-    );
+    graphicle_runtime::vector::store_embeddings(
+        &f.store.graph(),
+        repo,
+        "embedding-model",
+        &[(passage.clone(), sha.clone(), vec![0.1, 0.2, 0.3])],
+    )
+    .unwrap();
     for (kind, dependent) in [
         ("anchor", format!("{repo}:chunk-plan")),
         ("embedding", format!("{repo}:{passage}")),

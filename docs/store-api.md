@@ -142,10 +142,18 @@ graph type is inert).
 
 ## Value-mapping conventions
 
-- **JSON text columns ↔ maps/lists**: what SQL stored as a JSON `TEXT`
-  column becomes a `Value::Map`/`Value::List` property directly
-  (`json_to_value` at the boundary); `value_to_json` round-trips it. Only
-  payloads the module treats as opaque blobs stay stringified.
+- **JSON text columns — correction from the memory-pipeline node (verified
+  on v0.12.2): a property value cannot be a map** (`InvalidPropertyType`;
+  only scalars and lists of scalars store). `SET n += $map` works as a
+  property-set *merge*, and **dotted property names** work everywhere —
+  `SET n.`data.foo` = $v`, `WHERE n.`data.foo` = $v`, index declarations —
+  so a JSON column with a known, fixed shape flattens into `data.foo`
+  properties. Payloads with genuinely dynamic keys or arrays of objects
+  (memory/claim/entity `data`, revision journals) stay **stringified JSON
+  in a String property**, decoded at the module boundary exactly as
+  `store::decode` did for SQL. `json_to_value`/`value_to_json` remain the
+  parameter/result bridge (parameters and UNWIND rows may be maps; that is
+  not property storage).
 - **Ids are STRINGs.** A graph-type `UUID` declaration enforces *string*
   values and rejects `uuid()` results (spike E2 quirk), so ids are declared
   `IS STRING` and passed as strings — which is what graphicle's text ids
@@ -156,3 +164,22 @@ graph type is inert).
 - Numbers: JSON integers → `Int`, other numbers → `Float`; floats JSON
   cannot carry (NaN/∞ ) read back as `null`. Temporal/point values read as
   their display strings; vectors read as number lists.
+- **Vector properties are written with the `vector()` constructor**:
+  `SET n.embedding = vector(row.vec, $dim, FLOAT64)` — the coordinate type
+  is a bare keyword (a quoted `'FLOAT64'` parse-errors), and the index must
+  exist first (`ensure_vector_indexes`).
+
+## Migrated domains
+
+- **Memory pipeline** (`memory-pipeline-cypher`): `repo_memories` →
+  `:Memory` nodes (payload `data` stringified; `embedding` lives on the
+  node, kept out of listings), `repo_memory_revisions` → `:MemoryRevision
+  -[:REVISION_OF]->`, `am_claims`/`am_claim_events` → `:Claim` /
+  `:ClaimEvent-[:FOR]->`, `am_entities` → `:Entity` with `am_entity_links`
+  as `:Claim-[:HAS_SUBJECT|HAS_OBJECT]->(:Entity)`, `am_vectors` →
+  `Vector`-typed `embedding` properties on `:Memory`/`:Chunk` (+ stub
+  `:Chunk` nodes keyed by passage identity) searched through
+  `SEARCH … VECTOR INDEX …` — the load-all-and-cosine pass over
+  `am_vectors` in `query.rs` is gone. `Store` holds the `GraphStore`
+  (`store.graph()`, `reviews.graph` beside `reviews.sqlite3`); the SQL
+  tables remain in the schema files until the cleanup node drops them.

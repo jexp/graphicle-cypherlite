@@ -103,7 +103,15 @@ fn memory_delete_signs_a_receipt_without_the_memory_and_verifies() {
         "{deleted}"
     );
     assert_eq!(
-        f.count("SELECT count(*) FROM repo_memories WHERE repository_id=?"),
+        f.store
+            .graph()
+            .read(|g| graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (m:Memory {repository_id: $repo}) RETURN count(m) AS n",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo})),
+            ))
+            .unwrap()
+            .unwrap()["n"],
         1
     );
 

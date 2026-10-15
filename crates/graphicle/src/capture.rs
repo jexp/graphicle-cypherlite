@@ -1049,7 +1049,7 @@ impl Store {
                 )?;
                 let mut reviewed = Vec::new();
                 let mut stale = 0usize;
-                for memory in crate::memory::list(db, &repository, p, false)? {
+                for memory in crate::memory::list(db, &self.graph(), &repository, p, false)? {
                     if memory["state"] != "reviewed" {
                         continue;
                     }

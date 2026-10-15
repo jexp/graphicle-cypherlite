@@ -326,16 +326,13 @@ mod cpu {
                 .unwrap();
             assert_eq!(status["state"], "complete", "{status}");
             assert_eq!(status["result"]["embedded_passages"], notes + 1, "{status}");
-            let vector: String = store
-                .connect()
+            let vector = graphicle_runtime::vector::graph_vectors_all(&store.graph(), rid)
                 .unwrap()
-                .query_row(
-                    "SELECT vector FROM am_vectors WHERE repository_id=? AND identity LIKE ?",
-                    rusqlite::params![rid, "%:tank:%"],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            stored.push(serde_json::from_str::<Vec<f64>>(&vector).unwrap());
+                .into_iter()
+                .find(|row| row["identity"].as_str().unwrap().contains(":tank:"))
+                .expect("tank passage embedding")["vector"]
+                .clone();
+            stored.push(serde_json::from_value::<Vec<f64>>(vector).unwrap());
         }
         assert_eq!(stored[0], stored[1]);
         // The job embeds the title, a line break and the passage, and stores

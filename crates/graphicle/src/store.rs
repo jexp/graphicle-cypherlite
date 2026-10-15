@@ -307,6 +307,41 @@ pub fn analysis_report(db: &Connection, repository: &str) -> Result<(Vec<Value>,
     Ok((limited, skipped))
 }
 
+/// The open graph stores of this process, by directory: the engine's
+/// writer lease allows one open per directory, so concurrent operations
+/// share one engine ([`Store::graph`]). A `Weak` entry dies with the last
+/// operation holding it, releasing the lease between operations.
+static GRAPHS: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::GraphStore>>> =
+    Mutex::new(BTreeMap::new());
+
+fn graph_for(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
+    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    {
+        let registry = GRAPHS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(graph);
+        }
+    }
+    // Another process (a server, a background sync) may hold the engine's
+    // writer lease; retry briefly, as SQLite's busy_timeout did.
+    let mut attempts = 0;
+    let graph = loop {
+        match crate::store_graph::GraphStore::open(directory.join("reviews.graph")) {
+            Ok(graph) => break Arc::new(graph),
+            Err(error) if error.message.contains("storage locked") && attempts < 100 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    GRAPHS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, Arc::downgrade(&graph));
+    Ok(graph)
+}
+
 impl Store {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
@@ -329,6 +364,11 @@ impl Store {
             wake: Arc::new(tokio::sync::Notify::new()),
             limits: None,
         };
+        // Create (or share) the graph store now so a misconfigured directory
+        // fails at open, not at first use; the handle itself is not kept —
+        // holding it would hold the engine's writer lease for the store's
+        // lifetime and block every other process (see `graph_for`).
+        graph_for(directory)?;
         let db = store.connect()?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.execute_batch(include_str!("schema.sql"))?;
@@ -390,6 +430,19 @@ impl Store {
             Some(limits) => Ok(**limits),
             None => crate::limits::Limits::from_environment(&BTreeMap::new()),
         }
+    }
+    /// A handle to the CypherLite graph store (`reviews.graph` beside
+    /// `reviews.sqlite3`) the migrated domains read and write through (see
+    /// `docs/store-api.md`). Transient: within the process it shares the
+    /// engine via a per-directory registry (the engine takes a
+    /// single-process writer lease, so a second `Store::open` of one
+    /// directory must reuse it), and the handle is dropped — the lease
+    /// released — when no operation holds it, so another process (a CLI
+    /// beside a server, a background sync) can open the store; its open
+    /// busy-retries the lease briefly, as SQLite's busy_timeout did. Bind
+    /// the handle once per operation and pass `&GraphStore` down.
+    pub fn graph(&self) -> Arc<crate::store_graph::GraphStore> {
+        graph_for(&self.directory).expect("graph store opened at Store::open")
     }
     pub fn connect(&self) -> Result<Connection> {
         let db = Connection::open(self.database.as_ref())?;

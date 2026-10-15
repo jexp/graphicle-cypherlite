@@ -63,13 +63,15 @@ fn delete_project(
 /// documents are forgotten.
 fn apply_source_retention(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &store::Principal,
     repository: &Value,
     args: &Value,
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let policy = crate::retention::SourcePolicy::from_args(args)?;
-    let plan = crate::retention::source_plan(db, p, repository, &policy, chrono::Utc::now())?;
+    let plan =
+        crate::retention::source_plan(db, graph, p, repository, &policy, chrono::Utc::now())?;
     if args["plan_hash"].as_str() != Some(plan.plan_hash.as_str()) {
         return Err(Error::conflict(
             "The retention plan changed or was not previewed; run retention.preview and pass its plan_hash",
@@ -84,14 +86,20 @@ fn apply_source_retention(
             let scope =
                 Scope::document_set(connector, batch.iter().map(|d| (*d).clone()).collect());
             let started = now();
-            let forget_plan = deletion::plan(db, &p.workspace, identifier, &scope)?;
+            let forget_plan = deletion::plan(db, graph, &p.workspace, identifier, &scope)?;
             if forget_plan.sources() == 0 {
                 continue;
             }
             crate::projection::enqueue(db, identifier, "source_forgotten")?;
             let since = forget_plan.since().map(str::to_string);
-            let forgotten =
-                deletion::forget(db, &p.workspace, identifier, &scope, since.as_deref())?;
+            let forgotten = deletion::forget(
+                db,
+                graph,
+                &p.workspace,
+                identifier,
+                &scope,
+                since.as_deref(),
+            )?;
             let erased = deletion::erase(db, identifier, &scope)?;
             graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
             store::event(
@@ -103,6 +111,7 @@ fn apply_source_retention(
             forgotten_documents += batch.len();
             receipts.push(deletion::policy_receipt(
                 db,
+                graph,
                 p,
                 repository,
                 "retention.forget",
@@ -143,17 +152,17 @@ impl Store {
                         let scope=if operation=="connector.delete" {Scope::connector(connector)} else {Scope::documents(connector,&args["document_ids"])?};
                         // Capture coverage first; forget, erase, verify and sign in one transaction.
                         let started=now();
-                        let plan=deletion::plan(db,&p.workspace,identifier,&scope)?;
+                        let plan=deletion::plan(db,&self.graph(),&p.workspace,identifier,&scope)?;
                         if operation=="source.forget" && plan.sources()==0 {return Err(Error::bad("None of these documents exist in this connector"));}
                         crate::projection::enqueue(db,identifier,if operation=="connector.delete" {"connector_deleted"} else {"source_forgotten"})?;
                         let since=plan.since().map(str::to_string);
-                        let forgotten=deletion::forget(db,&p.workspace,identifier,&scope,since.as_deref())?;
+                        let forgotten=deletion::forget(db,&self.graph(),&p.workspace,identifier,&scope,since.as_deref())?;
                         let erased=deletion::erase(db,identifier,&scope)?;
                         // In-process features and layouts of forgotten text go now, not at expiry.
                         graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
                         let derived=forgotten["memories"].clone();
                         store::event(db,identifier,"source_forgotten",json!({"derived_records_removed":derived}))?;
-                        let receipt=deletion::receipt(db,p,&repository,operation,plan,&started,forgotten,erased)?;
+                        let receipt=deletion::receipt(db,&self.graph(),p,&repository,operation,plan,&started,forgotten,erased)?;
                         return Ok(json!({"deleted":true,"derived_records_removed":derived,"local_backups_are_separate":true,"receipt":receipt}));
                     }
                     let state=string(args,"state",20)?;
@@ -201,7 +210,9 @@ impl Store {
                             snapshots_removed.push(s(snapshot,"sha256").to_string());
                         }
                     }
-                    for revision in rows(db,"SELECT r.data FROM repo_memory_revisions r JOIN repo_memories m ON m.id=r.memory_id WHERE m.repository_id=?",[identifier])? {
+                    for revision in self.graph().read(|g| crate::store_graph::rows(g,
+                        "MATCH (r:MemoryRevision)-[:REVISION_OF]->(m:Memory {repository_id: $repo}) RETURN r.data AS data",
+                        crate::store_graph::params(&json!({"repo": identifier}))))? {
                         let mut memory:Value=serde_json::from_str(s(&revision,"data"))?;decode(&mut memory,"data")?;
                         for sha in memory["data"]["dependencies"].as_object().into_iter().flat_map(|o|o.values()).filter_map(Value::as_str){objects.insert(sha.to_string());}
                     }
@@ -237,7 +248,7 @@ impl Store {
                 },
                 "retention.apply"=>{
                     if args.get("sources").is_some_and(|v|!v.is_null()) {
-                        return apply_source_retention(db,p,&repository,args);
+                        return apply_source_retention(db,&self.graph(),p,&repository,args);
                     }
                     let retention=crate::retention::Retention::from_args(args)?;
                     let mut result=crate::retention::apply(db,identifier,&retention)?;

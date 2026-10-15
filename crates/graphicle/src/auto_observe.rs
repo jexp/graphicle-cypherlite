@@ -117,7 +117,9 @@ impl Store {
                 s(&connector, "workspace_id"),
                 config,
             )
-            .and_then(|config| self.transaction(|db| decide(db, &connector, &config)))
+            .and_then(|config| {
+                self.transaction(|db| decide(db, &self.graph(), &connector, &config))
+            })
             .unwrap_or_else(
                 |e| json!({"connector_id":connector["id"],"queued":false,"reason":e.message}),
             );
@@ -137,7 +139,12 @@ fn unfinished(rounds: &[&Value]) -> bool {
         .is_some_and(|r| r["state"] == "complete" && r["result"]["complete"] == false)
 }
 
-fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
+fn decide(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    connector: &Value,
+    config: &model::Config,
+) -> Result<Value> {
     let id = s(connector, "id");
     let repository_id = s(connector, "repository_id");
     let generation = connector["generation"].as_i64().unwrap_or(0);
@@ -222,7 +229,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
     };
     if unobserved > 0 && (unobserved >= threshold || unfinished(&observing)) {
         if observing.len() < max_rounds {
-            return enqueue(db, &p, args, config, decision, generation);
+            return enqueue(db, graph, &p, args, config, decision, generation);
         }
         idle = "observation rounds exhausted for this generation";
     }
@@ -232,6 +239,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
 
 fn enqueue(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     mut args: Value,
     config: &model::Config,
@@ -240,7 +248,7 @@ fn enqueue(
 ) -> Result<Value> {
     jobs::check(&args, config)?;
     args["auto"] = json!({"connector_id":decision["connector_id"],"generation":generation});
-    let job = jobs::queue(db, p, &args, config)?;
+    let job = jobs::queue(db, graph, p, &args, config)?;
     decision["kind"] = args["kind"].clone();
     decision["job_id"] = job["id"].clone();
     if job["replayed"] == true {

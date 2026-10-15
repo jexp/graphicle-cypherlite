@@ -802,7 +802,7 @@ pub fn guarded<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.transaction(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(db, &store.graph(), job)?;
         f(db, &p, &repository)
     })
 }
@@ -814,13 +814,17 @@ pub fn guarded_read<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.read(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(db, &store.graph(), job)?;
         f(db, &p, &repository)
     })
 }
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
-fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
+fn still_valid(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    job: &Job,
+) -> Result<(Principal, Value)> {
     let row = one(
         db,
         "SELECT state,lease_token,lease_until FROM am_jobs WHERE id=?",
@@ -849,7 +853,7 @@ fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
             ));
         }
         if job.payload["memory_state"].is_string()
-            && memory::reviewed_state_of(db, &repository, &documents)?
+            && memory::reviewed_state_of(db, graph, &repository, &documents)?
                 != s(&job.payload, "memory_state")
         {
             return Err(Error::conflict("Reviewed memory changed during the job"));
@@ -986,6 +990,7 @@ pub fn check(args: &Value, config: &model::Config) -> Result<&'static str> {
 /// Queue a checked workflow for `p` inside the caller's transaction.
 pub fn queue(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     args: &Value,
     config: &model::Config,
@@ -1025,7 +1030,12 @@ pub fn queue(
     crate::workflow_retrieval::pin(&mut payload, config)?;
     let documents = memory::documents(db, &repository, p)?;
     payload["source_state"] = json!(memory::state(&documents));
-    payload["memory_state"] = json!(memory::reviewed_state_of(db, &repository, &documents)?);
+    payload["memory_state"] = json!(memory::reviewed_state_of(
+        db,
+        graph,
+        &repository,
+        &documents
+    )?);
     if !source_task(kind) {
         let (name, profile) = config.profile(selected_model)?;
         payload["model"] = json!(name);
@@ -1079,11 +1089,7 @@ pub fn queue(
             "SELECT count(*) AS count,max(created_at) AS latest FROM am_document_reads WHERE repository_id=?",
             [identifier],
         )?,
-        "embed" => one(
-            db,
-            "SELECT count(*) AS count FROM am_vectors WHERE repository_id=?",
-            [identifier],
-        )?,
+        "embed" => Some(json!({"count": crate::vector::graph_vector_count(graph, identifier)?})),
         crate::observer::KIND => one(
             db,
             "SELECT count(*) AS count,max(created_at) AS latest FROM am_observer_notes WHERE repository_id=?",
@@ -1150,7 +1156,7 @@ impl Store {
         }
         let permission = check(args, &config)?;
         self.authorized(workspace, token, permission, |db, p| {
-            queue(db, p, args, &config)
+            queue(db, &self.graph(), p, args, &config)
         })
         .inspect(|job| {
             if job["replayed"] == false {
@@ -1184,7 +1190,7 @@ impl Store {
                         row["result"]=Value::Null;row["result_unavailable"]=json!("source_view_changed");
                     }
                     if row["payload"]["memory_state"].is_string() {
-                        if reviewed.is_none() {reviewed=Some(memory::reviewed_state_of(db,&repository,view)?);}
+                        if reviewed.is_none() {reviewed=Some(memory::reviewed_state_of(db,&self.graph(),&repository,view)?);}
                         if Some(s(&row["payload"],"memory_state"))!=reviewed.as_deref() {
                             row["result"]=Value::Null;row["result_unavailable"]=json!("reviewed_memory_changed");
                         }
