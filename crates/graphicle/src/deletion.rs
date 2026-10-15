@@ -609,46 +609,33 @@ fn derived(repository: &str, scope: &Scope, kind: &str, id: &str) -> bool {
 }
 
 fn index_edges(
-    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
-) -> Result<Vec<i64>> {
+) -> Result<Vec<crate::invalidation::Dependency>> {
     let mut out = Vec::new();
-    for row in rows(
-        db,
-        "SELECT rowid,dependent_kind,dependent_id,source_kind,source_id FROM gf_dependencies WHERE workspace=?",
-        [workspace],
-    )? {
-        if (row["source_kind"] == crate::invalidation::DOCUMENT
-            && scope.source(s(&row, "source_id")))
-            || derived(
-                repository,
-                scope,
-                s(&row, "dependent_kind"),
-                s(&row, "dependent_id"),
-            )
+    for edge in crate::invalidation::dependencies(graph, workspace)? {
+        if (edge.source_kind == crate::invalidation::DOCUMENT
+            && scope.source(&edge.source_id))
+            || derived(repository, scope, &edge.dependent_kind, &edge.dependent_id)
         {
-            out.push(row["rowid"].as_i64().unwrap_or_default());
+            out.push(edge);
         }
     }
     Ok(out)
 }
 
 fn index_markers(
-    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
-) -> Result<Vec<i64>> {
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    for row in rows(
-        db,
-        "SELECT rowid,kind,id FROM gf_stale WHERE workspace=?",
-        [workspace],
-    )? {
-        if derived(repository, scope, s(&row, "kind"), s(&row, "id")) {
-            out.push(row["rowid"].as_i64().unwrap_or_default());
+    for (kind, id) in crate::invalidation::stale_markers(graph, workspace)? {
+        if derived(repository, scope, &kind, &id) {
+            out.push((kind, id));
         }
     }
     Ok(out)
@@ -657,6 +644,7 @@ fn index_markers(
 /// Rows derived from or naming the forgotten documents, by kind.
 fn source_rows(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -757,11 +745,11 @@ fn source_rows(
     }
     out.insert(
         "dependency_edges",
-        index_edges(db, workspace, repository, scope)?.len(),
+        index_edges(graph, workspace, repository, scope)?.len(),
     );
     out.insert(
         "stale_markers",
-        index_markers(db, workspace, repository, scope)?.len(),
+        index_markers(graph, workspace, repository, scope)?.len(),
     );
     Ok(out)
 }
@@ -822,7 +810,13 @@ impl Plan {
     }
 }
 
-pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
+pub fn plan(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    workspace: &str,
+    repository: &str,
+    scope: &Scope,
+) -> Result<Plan> {
     let prefix = scope.prefix();
     let mut sources = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
@@ -883,7 +877,7 @@ pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -
         sources_digest: digest(&json!(sources)),
         texts: texts.len(),
         fingerprints,
-        rows: source_rows(db, workspace, repository, scope)?,
+        rows: source_rows(db, graph, workspace, repository, scope)?,
         visible_since: since_visible(db, repository, since.as_deref(), None)?,
         since,
     })
@@ -906,6 +900,7 @@ fn drafted_while_visible(record: &Value, since: &str) -> bool {
 /// they were visible, and memories that depend on either.
 fn forget_memories(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -962,16 +957,18 @@ fn forget_memories(
             "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
             params![repository, identifier],
         )?;
-        invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
-        invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
+        // The SQL store cascaded `gf_symbol_pins` on the memory's delete.
+        crate::symbols::forget_memory_pins(graph, repository, identifier)?;
+        invalidation::forget_dependent(graph, workspace, (MEMORY, identifier))?;
+        invalidation::clear_stale(graph, workspace, MEMORY, identifier)?;
         let passage = format!("memory:{identifier}");
         db.execute(
             "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
             params![repository, passage],
         )?;
         let key = format!("{repository}:{passage}");
-        invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
-        invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
+        invalidation::forget_dependent(graph, workspace, (EMBEDDING, &key))?;
+        invalidation::clear_stale(graph, workspace, EMBEDDING, &key)?;
     }
     Ok(removed)
 }
@@ -994,6 +991,7 @@ const NAMES_MEMORIES: &[&str] = &[
 /// ids and per-table counts; the caller signs [`rows_receipt`].
 pub fn delete_memories(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     memories: &[Value],
@@ -1030,11 +1028,7 @@ pub fn delete_memories(
             [identifier],
         )?;
         // The memory's pinned or pending quotes go with it.
-        pins += count(
-            db,
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=? AND memory_id=?",
-            params![repository, identifier],
-        )?;
+        pins += crate::symbols::pin_count(graph, repository, Some(identifier))?;
         claims += count(
             db,
             "SELECT count(*) FROM am_claims WHERE repository_id=? AND memory_id=?",
@@ -1044,16 +1038,19 @@ pub fn delete_memories(
             "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
             params![repository, identifier],
         )?;
-        invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
-        invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
+        // The SQL store cascaded `gf_symbol_pins` on the memory's delete;
+        // the pins live in the graph store now.
+        crate::symbols::forget_memory_pins(graph, repository, identifier)?;
+        invalidation::forget_dependent(graph, workspace, (MEMORY, identifier))?;
+        invalidation::clear_stale(graph, workspace, MEMORY, identifier)?;
         let passage = format!("memory:{identifier}");
         vectors += db.execute(
             "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
             params![repository, passage],
         )?;
         let key = format!("{repository}:{passage}");
-        invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
-        invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
+        invalidation::forget_dependent(graph, workspace, (EMBEDDING, &key))?;
+        invalidation::clear_stale(graph, workspace, EMBEDDING, &key)?;
     }
     counts.insert("repo_memories".to_string(), removed.len());
     counts.insert("repo_memory_revisions".to_string(), revisions);
@@ -1087,7 +1084,12 @@ pub fn delete_memories(
 
 /// Rows still holding any of the deleted memories, per table (all zero after
 /// [`delete_memories`]).
-pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<Value> {
+pub fn memory_rows(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    repository: &str,
+    ids: &[String],
+) -> Result<Value> {
     let mut out = BTreeMap::new();
     for (table, sql) in [
         (
@@ -1106,20 +1108,21 @@ pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<
             "am_vectors",
             "SELECT count(*) FROM am_vectors WHERE repository_id=?1 AND identity='memory:'||?2",
         ),
-        (
-            "gf_symbol_pins",
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=?1 AND memory_id=?2",
-        ),
     ] {
         let mut total = 0;
         for id in ids {
             total += count(db, sql, params![repository, id])?;
         }
-        // Listed only when a deleted memory's pin remains.
-        if table == "gf_symbol_pins" && total == 0 {
-            continue;
-        }
         out.insert(table.to_string(), total);
+    }
+    // Pins live in the graph store; listed only when a deleted memory's pin
+    // remains.
+    let mut pins = 0;
+    for id in ids {
+        pins += crate::symbols::pin_count(graph, repository, Some(id))?;
+    }
+    if pins > 0 {
+        out.insert("gf_symbol_pins".to_string(), pins);
     }
     Ok(json!(out))
 }
@@ -1128,6 +1131,7 @@ pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<
 /// (see the module documentation). Originals are removed by [`erase`].
 pub fn forget(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -1145,15 +1149,9 @@ pub fn forget(
         .collect())
     };
     let claims_before = claims()?;
-    let pins = || {
-        count(
-            db,
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=?",
-            [repository],
-        )
-    };
+    let pins = || crate::symbols::pin_count(graph, repository, None);
     let pins_before = pins()?;
-    let memories = forget_memories(db, workspace, repository, scope, since)?;
+    let memories = forget_memories(db, graph, workspace, repository, scope, since)?;
     // The forgotten memories' symbol pins went with them.
     let symbol_pins = pins_before.saturating_sub(pins()?);
     let lost: Vec<String> = claims_before
@@ -1177,8 +1175,13 @@ pub fn forget(
         [repository],
     )? {
         if scope.source(s(&row, "source_id")) {
-            notes +=
-                crate::observer::forget_source(db, workspace, repository, s(&row, "source_id"))?;
+            notes += crate::observer::forget_source(
+                db,
+                graph,
+                workspace,
+                repository,
+                s(&row, "source_id"),
+            )?;
         }
     }
     let vectors = select_rowids(
@@ -1203,19 +1206,15 @@ pub fn forget(
     let mut visible_since = BTreeMap::new();
     if let Some(since) = since {
         // Cached answers: their index entries go with them.
-        for row in rows(
-            db,
-            "SELECT dependent_id FROM gf_dependencies WHERE workspace=?1 AND dependent_kind=?2 AND substr(dependent_id,1,length(?3))=?3 AND recorded_at>=?4",
-            params![
-                workspace,
-                invalidation::ANSWER,
-                format!("{repository}:"),
-                since
-            ],
+        for key in invalidation::dependents_recorded_since(
+            graph,
+            workspace,
+            invalidation::ANSWER,
+            &format!("{repository}:"),
+            since,
         )? {
-            let key = s(&row, "dependent_id");
-            invalidation::forget_dependent(db, workspace, (invalidation::ANSWER, key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANSWER, key)?;
+            invalidation::forget_dependent(graph, workspace, (invalidation::ANSWER, &key))?;
+            invalidation::clear_stale(graph, workspace, invalidation::ANSWER, &key)?;
         }
         for (kind, table) in [
             (invalidation::REPORT, "am_reports"),
@@ -1227,8 +1226,8 @@ pub fn forget(
                 params![repository, since],
             )? {
                 let key = format!("{repository}:{}", s(&row, "id"));
-                invalidation::forget_dependent(db, workspace, (kind, &key))?;
-                invalidation::clear_stale(db, workspace, kind, &key)?;
+                invalidation::forget_dependent(graph, workspace, (kind, &key))?;
+                invalidation::clear_stale(graph, workspace, kind, &key)?;
             }
         }
         for row in rows(
@@ -1237,8 +1236,8 @@ pub fn forget(
             params![repository, since],
         )? {
             let key = invalidation::anchor_id(repository, s(&row, "chunk_id"));
-            invalidation::forget_dependent(db, workspace, (invalidation::ANCHOR, &key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANCHOR, &key)?;
+            invalidation::forget_dependent(graph, workspace, (invalidation::ANCHOR, &key))?;
+            invalidation::clear_stale(graph, workspace, invalidation::ANCHOR, &key)?;
         }
         for (name, table, column) in SINCE_VISIBLE {
             let n = db.execute(
@@ -1257,8 +1256,8 @@ pub fn forget(
     )? {
         if scope.source(s(&row, "document")) {
             let key = invalidation::anchor_id(repository, s(&row, "chunk_id"));
-            invalidation::forget_dependent(db, workspace, (invalidation::ANCHOR, &key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANCHOR, &key)?;
+            invalidation::forget_dependent(graph, workspace, (invalidation::ANCHOR, &key))?;
+            invalidation::clear_stale(graph, workspace, invalidation::ANCHOR, &key)?;
             anchors += db.execute(
                 "DELETE FROM gf_anchor_edges WHERE rowid=?",
                 [row["rowid"].as_i64()],
@@ -1315,15 +1314,15 @@ pub fn forget(
         stripped.insert(table, changed);
     }
     // The dependency index follows the artifacts.
-    let edges = delete_rowids(
-        db,
-        "gf_dependencies",
-        &index_edges(db, workspace, repository, scope)?,
+    let edges = invalidation::forget_dependencies(
+        graph,
+        workspace,
+        &index_edges(graph, workspace, repository, scope)?,
     )?;
-    let markers = delete_rowids(
-        db,
-        "gf_stale",
-        &index_markers(db, workspace, repository, scope)?,
+    let markers = invalidation::clear_stale_markers(
+        graph,
+        workspace,
+        &index_markers(graph, workspace, repository, scope)?,
     )?;
     db.execute("DELETE FROM am_entities WHERE repository_id=? AND id NOT IN (SELECT subject_id FROM am_entity_links UNION SELECT object_id FROM am_entity_links)",[repository])?;
     crate::store::invalidate(db, repository)?;
@@ -1384,6 +1383,7 @@ pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> 
 #[allow(clippy::too_many_arguments)]
 pub fn receipt(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1393,7 +1393,7 @@ pub fn receipt(
     erased: Value,
 ) -> Result<Value> {
     policy_receipt(
-        db, p, repository, operation, plan, started, forgotten, erased, None,
+        db, graph, p, repository, operation, plan, started, forgotten, erased, None,
     )
 }
 
@@ -1402,6 +1402,7 @@ pub fn receipt(
 #[allow(clippy::too_many_arguments)]
 pub fn policy_receipt(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1413,7 +1414,7 @@ pub fn policy_receipt(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let scope = &plan.scope;
-    let remaining = source_rows(db, &p.workspace, identifier, scope)?;
+    let remaining = source_rows(db, graph, &p.workspace, identifier, scope)?;
     let tainted = since_visible(db, identifier, plan.since(), Some(started))?;
     let catalog = tables(db)?;
     let ids = if scope.whole() {
@@ -1732,6 +1733,7 @@ pub fn state_api(store: &Store, workspace: &str, token: &str, args: &Value) -> R
 /// reach them.
 pub fn forget_project_references(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     connectors: &[String],
@@ -1739,11 +1741,8 @@ pub fn forget_project_references(
     let mut edges = 0;
     let mut stale = 0;
     for prefix in project_patterns(repository, connectors) {
-        edges += db.execute("DELETE FROM gf_dependencies WHERE workspace=?1 AND (substr(source_id,1,length(?2))=?2 OR substr(dependent_id,1,length(?2))=?2)", params![workspace, prefix])?;
-        stale += db.execute(
-            "DELETE FROM gf_stale WHERE workspace=?1 AND substr(id,1,length(?2))=?2",
-            params![workspace, prefix],
-        )?;
+        edges += crate::invalidation::forget_id_prefix(graph, workspace, &prefix)?;
+        stale += crate::invalidation::clear_stale_id_prefix(graph, workspace, &prefix)?;
     }
     // The names (commit, snapshot) of its recorded episodes (every
     // projected project has them, and they named its id).
@@ -1958,7 +1957,7 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
         let current = match s(&receipt, "operation") {
             "connector.delete" => {
                 let scope = Scope::connector(s(&receipt, "target"));
-                let remaining = source_rows(db, workspace, &repository, &scope)?;
+                let remaining = source_rows(db, &store.graph()?, workspace, &repository, &scope)?;
                 let ids = references(db, &catalog, &[scope.prefix()], (&repository, workspace), &[], false)?;
                 // Caches refill with unrelated work, so only the deleted
                 // sources' own rows and references are re-checked.

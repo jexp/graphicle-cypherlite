@@ -216,6 +216,7 @@ pub fn projection_state(db: &Connection, repository: &str, episode: &str) -> Res
 /// expired key would have it cancelled when leased).
 pub fn enqueue_projection(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &str,
     p: &Principal,
     snapshot: &str,
@@ -272,7 +273,7 @@ pub fn enqueue_projection(
             // projection, so the live-symbol table follows it here. A
             // failure only leaves the table behind, which the symbol check
             // reads as `projection_pending`; the sync goes on.
-            let _ = crate::symbols::ensure(db, repository, &episode);
+            let _ = crate::symbols::ensure(db, graph, repository, &episode);
             if grew {
                 // The episode already exists; attach the new labels directly.
                 for label in &labels {
@@ -453,7 +454,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         if current != expected {
             return Ok(skipped(&current));
         }
-        let info = crate::graph_projection::project_prebuilt(db, identifier, &p, built)?;
+        let info = crate::graph_projection::project_prebuilt(db, &store.graph()?, identifier, &p, built)?;
         for label in &labels {
             crate::graph_projection::label_episode(
                 db,
@@ -1591,7 +1592,7 @@ impl Worker {
             db.execute("DELETE FROM am_model_cache WHERE repository_id=? AND request_hash IN (SELECT request_hash FROM am_model_cache WHERE repository_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 500)",params![job.repository,job.repository])?;
             // A cached answer is only as current as the principal that produced it.
             crate::invalidation::record_dependency(
-                db,
+                &self.store.graph()?,
                 &job.workspace,
                 (
                     crate::invalidation::ANSWER,

@@ -12,12 +12,18 @@ use crate::{Error, Result};
 use cypherlite::{Connection, Database, Value};
 use serde_json::{Map, Value as Json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     panic::Location,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex, PoisonError, Weak},
     time::{Duration, Instant},
 };
+
+/// Live durable stores of this process, by the path they were opened with
+/// (see [`GraphStore::open`]): a second open of the same path shares the
+/// engine instead of failing on its exclusive writer lease.
+static OPEN_DURABLE: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
+    LazyLock::new(Default::default);
 
 /// Write-write conflict retries of [`GraphStore::transaction`] (optimistic
 /// commit; the whole closure reruns).
@@ -43,20 +49,49 @@ impl GraphStore {
     /// Open (or create) the directory store at `path` and apply the schema
     /// (graph type + indexes) idempotently: a second open of the same store
     /// is a no-op.
+    ///
+    /// The engine takes an exclusive writer lease on a durable store, so a
+    /// second `Database::open` of the same path fails while the first is
+    /// alive. One process opening the same store twice (a reopened `Store`
+    /// beside the one a test still holds) therefore shares the live engine
+    /// through a per-process registry keyed by the path as given.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.is_symlink() {
             return Err(Error::bad("Graph store cannot be a symlink"));
         }
-        let uri = path
-            .to_str()
-            .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
-        let store = Self {
-            database: Arc::new(Database::open(uri)?),
-            location: Arc::new(StoreLocation::Path(path.to_path_buf())),
-        };
-        store.apply_schema()?;
-        Ok(store)
+        let location = Arc::new(StoreLocation::Path(path.to_path_buf()));
+        {
+            let mut open = OPEN_DURABLE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(database) = open.get(path).and_then(Weak::upgrade) {
+                return Ok(Self { database, location });
+            }
+            let uri = path
+                .to_str()
+                .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
+            // A second process opening the same store finds the writer
+            // lease taken: follow the store read-only (reads pin snapshots;
+            // writes fail with a clear error) rather than fail the open —
+            // graphicle runs one server per store, but CLI invocations are
+            // their own processes and read beside it.
+            let (database, writable) = match Database::open(uri) {
+                Ok(database) => (Arc::new(database), true),
+                Err(cypherlite::Error::Locked(_)) => {
+                    (Arc::new(Database::open_read_only(uri)?), false)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let store = Self { database, location };
+            // A read-only follower applies no schema: the writer's open did.
+            if writable {
+                store.apply_schema()?;
+            }
+            if open.len() >= 64 {
+                open.retain(|_, weak| weak.strong_count() > 0);
+            }
+            open.insert(path.to_path_buf(), Arc::downgrade(&store.database));
+            Ok(store)
+        }
     }
     /// An ephemeral in-memory store (tests, transient processing). Applies
     /// the same schema as [`GraphStore::open`].
@@ -204,6 +239,11 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
                   title IS STRING, body IS STRING}),
     (r:Run => {id IS STRING, repository_id IS STRING NOT NULL, external_key IS STRING NOT NULL}),
     (d:DeletionReceipt => {workspace_id IS STRING NOT NULL, sequence IS INTEGER, digest IS STRING}),
+    (q:ConnectorDoc => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                        source_kind IS STRING, document_sha256 IS STRING, input IS STRING,
+                        connector IS STRING, updated_at IS STRING}),
+    (k:DocLinkCheckpoint => {repository_id IS STRING IS KEY, episode IS STRING, updated_at IS STRING}),
+    (t:DocLinkState => {workspace_id IS STRING IS KEY, rules IS STRING, updated_at IS STRING}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -211,6 +251,7 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (j:Job) REQUIRE (j.repository_id, j.kind, j.input_hash) IS KEY,
     CONSTRAINT FOR (r:Run) REQUIRE (r.repository_id, r.external_key) IS KEY,
     CONSTRAINT FOR (d:DeletionReceipt) REQUIRE (d.workspace_id, d.sequence) IS KEY,
+    CONSTRAINT FOR (q:ConnectorDoc) REQUIRE (q.repository_id, q.id) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -229,6 +270,11 @@ const INDEXES: &[&str] = &[
     "CREATE FULLTEXT INDEX chunk_text IF NOT EXISTS FOR (c:Chunk) ON EACH [c.index_text]",
     "CREATE FULLTEXT INDEX mem_text IF NOT EXISTS FOR (m:Memory) ON EACH [m.title, m.body]",
     "CREATE FULLTEXT INDEX doc_text IF NOT EXISTS FOR (d:ConnectorDoc) ON EACH [d.content]",
+    // Invalidation and symbol-link modules (invalidation.rs, symbols.rs).
+    "CREATE INDEX dep_artifact IF NOT EXISTS FOR (a:Artifact) ON (a.workspace)",
+    "CREATE INDEX sym_head_repo IF NOT EXISTS FOR (s:SymbolHead) ON (s.repository_id)",
+    "CREATE INDEX sym_head_file IF NOT EXISTS FOR (s:SymbolHead) ON (s.relpath)",
+    "CREATE INDEX sym_move_from IF NOT EXISTS FOR (m:SymbolMove) ON (m.from_stable_id)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:

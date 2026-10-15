@@ -160,11 +160,12 @@ pub struct GraphFolder {
 /// latest recorded code graph holds at least one code symbol
 /// ([`crate::code_graph_arm::code_symbol`]): a
 /// conversation or notes folder, whose graph holds no code, is not one. With
-/// `file`, also whether that graph has nodes in it. The live-symbol table
-/// (`gf_symbol_heads`, code symbols only, which a projection of the head set
-/// keeps) answers the first question with one indexed row, so a hook stays
-/// quick on a large project without code; a store whose table was never
-/// built reads the graph's open nodes (`valid_to_episode IS NULL`) instead.
+/// `file`, also whether that graph has nodes in it. The live-symbol nodes
+/// (`:SymbolHead`, code symbols only, which a projection of the head set
+/// keeps) answer the first question with one indexed lookup, so a hook stays
+/// quick on a large project without code; a store whose graph store is
+/// absent or held by a running server reads the open nodes
+/// (`valid_to_episode IS NULL`) instead.
 /// The second reads the open nodes through the index on each node's file
 /// (`owner`).
 pub fn project_with_graph(
@@ -174,20 +175,22 @@ pub fn project_with_graph(
 ) -> Option<GraphFolder> {
     let (db, principal) = read_only(directory)?;
     let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
-    let built = db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM gf_symbol_state WHERE repository_id=?)",
-            [&found.id],
-            |row| row.get::<_, bool>(0),
-        )
+    // The live-symbol nodes live in the graph store; a hook must not create
+    // it for a folder that never had one, and a store held by a running
+    // server refuses the open — both read the graph's open nodes instead.
+    let graph = directory
+        .join("reviews.graph")
+        .exists()
+        .then(|| crate::store_graph::GraphStore::open(directory.join("reviews.graph")).ok())
+        .flatten();
+    let built = graph
+        .as_ref()
+        .and_then(|graph| crate::symbols::has_symbol_state(graph, &found.id).ok())
         .unwrap_or(false);
     let symbol = if built {
-        db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gf_symbol_heads WHERE repository_id=?)",
-            [&found.id],
-            |row| row.get::<_, bool>(0),
-        )
-        .ok()?
+        graph
+            .as_ref()
+            .and_then(|graph| crate::symbols::has_symbol_heads(graph, &found.id).ok())?
     } else {
         let mut select = db
             .prepare(

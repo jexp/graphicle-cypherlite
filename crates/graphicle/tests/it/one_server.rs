@@ -1490,14 +1490,30 @@ fn the_guard_finds_code_with_and_without_the_live_symbol_table() {
         );
     };
     nudged("with the live-symbol table");
-    let db = rusqlite::Connection::open(data.join("reviews.sqlite3")).unwrap();
-    let symbols: i64 = db
-        .query_row("SELECT count(*) FROM gf_symbol_heads", [], |row| row.get(0))
+    // The live-symbol table lives in the graph store now.
+    let graph = graphicle_runtime::store_graph::GraphStore::open(data.join("reviews.graph"))
+        .unwrap();
+    let symbols = graph
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (s:SymbolHead) RETURN count(s) AS n",
+                graphicle_runtime::store_graph::Params::new(),
+            )
+        })
+        .unwrap()
+        .unwrap()["n"]
+        .as_u64()
         .unwrap();
     assert!(symbols >= 1, "{symbols}");
-    db.execute_batch("DELETE FROM gf_symbol_heads; DELETE FROM gf_symbol_state;")
+    graph
+        .transaction(|db| {
+            db.query("MATCH (s:SymbolHead) DETACH DELETE s")?;
+            db.query("MATCH (st:SymbolState) DELETE st")?;
+            Ok(())
+        })
         .unwrap();
-    drop(db);
+    drop(graph);
     nudged("without it");
 }
 
