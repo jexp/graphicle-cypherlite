@@ -54,12 +54,22 @@ struct StoreInner {
     /// `Arc<Database>` keeps the engine open exactly while the store handle
     /// is held), and a dropped-and-reopened store starts with an empty
     /// pool — no stale connection can pin the old engine's lease.
-    pool: Mutex<Vec<(Arc<Database>, Connection)>>,
+    /// Entries are `(Connection, Arc<Database>)` so drop order matches the
+    /// historical one: every connection first, the engine handle last.
+    pool: Mutex<Vec<(Connection, Arc<Database>)>>,
 }
 
 enum StoreLocation {
     Memory(Arc<Database>),
     Path(PathBuf),
+}
+
+impl Drop for StoreInner {
+    fn drop(&mut self) {
+        if let StoreLocation::Path(p) = &self.location {
+            eprintln!("DIAG store-inner drop {}", p.display());
+        }
+    }
 }
 
 /// A contended engine open retries this long before failing (the SQL store's
@@ -74,6 +84,7 @@ impl GraphStore {
     /// is a no-op.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        eprintln!("DIAG GraphStore::open {}", path.display());
         if path.is_symlink() {
             return Err(Error::bad("Graph store cannot be a symlink"));
         }
@@ -180,10 +191,10 @@ impl GraphStore {
             None => {
                 let engine = self.engine()?;
                 let connection = engine.connect()?;
-                (engine, connection)
+                (connection, engine)
             }
         };
-        let result = f(&mut entry.1);
+        let result = f(&mut entry.0);
         self.inner
             .pool
             .lock()

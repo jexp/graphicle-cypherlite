@@ -320,12 +320,21 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     // path as given, so every open of one store must spell it alike (a
     // second spelling opens a read-only follower on the taken lease).
     let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-    {
-        let registry = GRAPHS.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
-            return Ok(graph);
-        }
+    // The lock is held across the open: a live handle's connection pool
+    // pins the engine's writer lease, so a second opener that merely raced
+    // the registry insert would spin on the lease for as long as the live
+    // handle is held. Opening under the lock makes one handle per directory
+    // airtight. `GraphStore::open` only touches its own store (schema DDL),
+    // never `graph_in`, so this cannot re-enter.
+    let mut registry = GRAPHS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(graph);
     }
+    eprintln!(
+        "DIAG registry miss {:?} (registered: {:?})",
+        key,
+        registry.keys().collect::<Vec<_>>()
+    );
     // Another process (a server, a background sync) may hold the engine's
     // writer lease; retry briefly, as SQLite's busy_timeout did.
     let mut attempts = 0;
@@ -339,10 +348,7 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
             Err(error) => return Err(error),
         }
     };
-    GRAPHS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, Arc::downgrade(&graph));
+    registry.insert(key, Arc::downgrade(&graph));
     Ok(graph)
 }
 
