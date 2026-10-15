@@ -45,6 +45,16 @@ struct StoreInner {
     /// The open engine while at least one operation holds it; dropped (and
     /// the writer lease released) when idle.
     engine: Mutex<std::sync::Weak<Database>>,
+    /// Idle connections for reuse. A `Connection` spawns a 64 MiB query
+    /// worker on first use and dropping it tears down the engine's shared
+    /// state (`Arc<Shared>::drop_slow`), so `read`/`transaction` must never
+    /// create one per call — they check one out here and return it. The pool
+    /// lives and dies with the store handle, so the documented engine
+    /// lifetime is unchanged: an idle store holds no engine (the pooled
+    /// `Arc<Database>` keeps the engine open exactly while the store handle
+    /// is held), and a dropped-and-reopened store starts with an empty
+    /// pool — no stale connection can pin the old engine's lease.
+    pool: Mutex<Vec<(Arc<Database>, Connection)>>,
 }
 
 enum StoreLocation {
@@ -71,6 +81,7 @@ impl GraphStore {
             inner: Arc::new(StoreInner {
                 location: StoreLocation::Path(path.to_path_buf()),
                 engine: Mutex::new(std::sync::Weak::new()),
+                pool: Mutex::new(Vec::new()),
             }),
         };
         store.apply_schema()?;
@@ -84,6 +95,7 @@ impl GraphStore {
             inner: Arc::new(StoreInner {
                 location: StoreLocation::Memory(Arc::new(Database::open(":memory:")?)),
                 engine: Mutex::new(std::sync::Weak::new()),
+                pool: Mutex::new(Vec::new()),
             }),
         };
         store.apply_schema()?;
@@ -144,9 +156,40 @@ impl GraphStore {
             .unwrap_or_else(|error| panic!("graph store engine unavailable: {}", error.message))
     }
     /// A connection for the calling thread. Keep it for the thread's
-    /// lifetime; each connection spawns its query worker lazily.
+    /// lifetime; each connection spawns its query worker lazily. Prefer
+    /// [`GraphStore::read`]/[`GraphStore::transaction`], which reuse the
+    /// thread's pooled connection; this fresh handle is for callers that
+    /// hold a connection across calls themselves.
     pub fn connection(&self) -> Result<Connection> {
         Ok(self.engine()?.connect()?)
+    }
+    /// Run `f` on a pooled connection, checking one out (or opening the
+    /// engine and connecting, on an empty pool) and returning it to the pool
+    /// afterwards. The pool lock is NOT held across `f`, so `f` may use
+    /// other stores — or re-enter this one, getting a second pooled
+    /// connection — without deadlocking.
+    fn with_connection<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let mut entry = match self
+            .inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+        {
+            Some(entry) => entry,
+            None => {
+                let engine = self.engine()?;
+                let connection = engine.connect()?;
+                (engine, connection)
+            }
+        };
+        let result = f(&mut entry.1);
+        self.inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
+        result
     }
     /// A write transaction: `begin`, run `f`, `commit`. A write-write
     /// conflict at commit reruns the whole closure, up to
@@ -161,18 +204,31 @@ impl GraphStore {
         loop {
             attempt += 1;
             let started = Instant::now();
-            let mut db = self.connection()?;
-            db.begin()?;
-            let outcome = match f(&mut db) {
-                Ok(value) => match db.commit() {
-                    Ok(()) => Ok(value),
-                    Err(cypherlite::Error::Conflict) if attempt < MAX_WRITE_ATTEMPTS => continue,
-                    Err(error) => Err(error.into()),
-                },
-                Err(error) => {
-                    let _ = db.rollback();
-                    Err(error)
-                }
+            let outcome = match self.with_connection(|db| {
+                db.begin()?;
+                Ok(match f(db) {
+                    Ok(value) => match db.commit() {
+                        Ok(()) => Attempt::Done(value),
+                        Err(cypherlite::Error::Conflict) => {
+                            // The connection is reused across attempts, so
+                            // make sure no half-open transaction leaks into
+                            // the retry's `begin` (a no-op if the engine
+                            // already closed it).
+                            let _ = db.rollback();
+                            Attempt::Conflict
+                        }
+                        Err(error) => Attempt::Failed(error.into()),
+                    },
+                    Err(error) => {
+                        let _ = db.rollback();
+                        Attempt::Failed(error)
+                    }
+                })
+            })? {
+                Attempt::Conflict if attempt < MAX_WRITE_ATTEMPTS => continue,
+                Attempt::Conflict => Err(cypherlite::Error::Conflict.into()),
+                Attempt::Done(value) => Ok(value),
+                Attempt::Failed(error) => Err(error),
             };
             let held = started.elapsed();
             if held >= SLOW_HOLD && crate::phase::enabled() {
@@ -186,11 +242,11 @@ impl GraphStore {
             return outcome;
         }
     }
-    /// A read: runs `f` on a fresh connection without opening a write
-    /// transaction (reads pin a consistent snapshot in the engine).
+    /// A read: runs `f` on a pooled connection without
+    /// opening a write transaction (reads pin a consistent snapshot in the
+    /// engine).
     pub fn read<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        let mut db = self.connection()?;
-        f(&mut db)
+        self.with_connection(f)
     }
     /// Flush the write-ahead log into a snapshot (maintenance/backup paths).
     pub fn checkpoint(&self) -> Result<()> {
@@ -200,19 +256,20 @@ impl GraphStore {
     /// again. Vector indexes are NOT created here — see
     /// [`GraphStore::ensure_vector_indexes`].
     pub fn apply_schema(&self) -> Result<()> {
-        let mut db = self.connection()?;
-        // A store that earlier had the hand-written fallback constraints on
-        // a graph-type-managed label: the graph type wins (the mechanisms
-        // are either/or per label), so drop those first.
-        for name in FALLBACK_CONSTRAINTS {
-            db.query(&format!("DROP CONSTRAINT {name} IF EXISTS"))?;
-        }
-        db.query(GRAPH_TYPE)?;
-        db.query(PROMOTE_GRAPH_TYPE)?;
-        for ddl in INDEXES {
-            db.query(ddl)?;
-        }
-        Ok(())
+        self.with_connection(|db| {
+            // A store that earlier had the hand-written fallback constraints
+            // on a graph-type-managed label: the graph type wins (the
+            // mechanisms are either/or per label), so drop those first.
+            for name in FALLBACK_CONSTRAINTS {
+                db.query(&format!("DROP CONSTRAINT {name} IF EXISTS"))?;
+            }
+            db.query(GRAPH_TYPE)?;
+            db.query(PROMOTE_GRAPH_TYPE)?;
+            for ddl in INDEXES {
+                db.query(ddl)?;
+            }
+            Ok(())
+        })
     }
     /// Create the vector indexes for `dimensions`, idempotently. Embedding
     /// dimensions are a property of the embedding model, which is only known
@@ -221,16 +278,25 @@ impl GraphStore {
     /// dimension at creation). `dimensions` must be the model's; creating
     /// with a different dimension than an existing index is an engine error.
     pub fn ensure_vector_indexes(&self, dimensions: u32) -> Result<()> {
-        let mut db = self.connection()?;
-        for (name, label, property) in VECTOR_INDEXES {
-            db.query(&format!(
-                "CREATE VECTOR INDEX {name} IF NOT EXISTS FOR (n:{label}) ON (n.{property}) \
-                 OPTIONS {{indexConfig: {{`vector.dimensions`: {dimensions}, \
-                 `vector.similarity_function`: 'cosine'}}}}"
-            ))?;
-        }
-        Ok(())
+        self.with_connection(|db| {
+            for (name, label, property) in VECTOR_INDEXES {
+                db.query(&format!(
+                    "CREATE VECTOR INDEX {name} IF NOT EXISTS FOR (n:{label}) ON (n.{property}) \
+                     OPTIONS {{indexConfig: {{`vector.dimensions`: {dimensions}, \
+                     `vector.similarity_function`: 'cosine'}}}}"
+                ))?;
+            }
+            Ok(())
+        })
     }
+}
+
+/// The outcome of one [`GraphStore::transaction`] attempt: committed,
+/// write-write conflicted (retry), or failed.
+enum Attempt<T> {
+    Done(T),
+    Conflict,
+    Failed(Error),
 }
 
 /// Hand-written constraint names from the spike's fallback list that overlap

@@ -45,12 +45,16 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
 
 `store.connection()` checks out a `cypherlite::Connection`. A connection is
 `Send` but `!Sync`, every query takes `&mut self`, and the first query
-spawns a 64 MiB-stack worker thread (migration doc §6 item 6). **Check one
-out per worker thread and keep it for the thread's lifetime.** The
-`transaction`/`read` helpers below check out a connection per call and are
-the right granularity for request handlers; code with its own long-lived
-worker (the job runner) should hold one `Connection` and pass `&mut` to the
-query helpers directly.
+spawns a 64 MiB-stack worker thread (migration doc §6 item 6); dropping one
+tears down the engine's shared state, which is ruinously expensive per call.
+**Never create one per request.** The `transaction`/`read` helpers below
+check a connection out of the store handle's pool and return it afterwards
+(the pool lives and dies with the handle, so an idle store still holds no
+engine and releases the writer lease exactly as before); they are the right
+granularity for request handlers. Code with its own long-lived worker (the
+job runner) should hold one `Connection` and pass `&mut` to the query
+helpers directly. A closure that re-enters `transaction`/`read` on the same
+store simply checks out a second pooled connection.
 
 ## Transactions and reads
 
@@ -73,7 +77,7 @@ let rows = store.read(|db| store_graph::rows(db, "MATCH (m:Memory) RETURN m", Pa
   outside the transaction and safe to rerun. Holds over 2 s are logged with
   the caller's location when `GRAPHICLE_PHASE_TIMINGS=1`, mirroring the SQL
   store's slow-hold reporting.
-- `read(f)` runs `f` on a fresh connection with **no write transaction** —
+- `read(f)` runs `f` on the thread's cached connection with **no write transaction** —
   the engine pins a consistent snapshot per statement/connection. Do not
   write inside `read`.
 - Errors convert into the crate's `Error` (`From<cypherlite::Error>`):
