@@ -27,6 +27,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) mod legacy;
+
 pub const DEFAULT_COVERAGE_EPISODES: usize = 20;
 pub const DEFAULT_CROSS_EDGE_EPISODES: usize = 20;
 pub const DEFAULT_UNRESOLVED_EPISODES: usize = 2;
@@ -479,6 +481,19 @@ impl Store {
         let graph = crate::maintenance::graph_store(self)?;
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
+            // The plan runs where the connector documents live: the graph
+            // store, or the legacy SQL store of a project mid-migration.
+            let on_graph = graph.read(|g| {
+                one(
+                    g,
+                    "MATCH (c:Connector {repository_id: $repo}) RETURN 1 AS x LIMIT 1",
+                    params(&[("repo", json!(store_graph::s(&repository, "id")))]),
+                )
+                .map(|r| r.is_some())
+            })?;
+            if !on_graph {
+                return legacy::retention_preview(db, p, &repository, &policy);
+            }
             graph.read(|g| {
                 let plan = source_plan(g, p, &repository, &policy, chrono::Utc::now())?;
                 let mut connectors = serde_json::Map::new();
@@ -685,6 +700,11 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = store_graph::s(&repository, "id").to_string();
+            // The report reads where the by-products live: the graph store,
+            // or the legacy SQL tables of a project mid-migration.
+            if !crate::maintenance::project_episodes_on_graph(&graph, &identifier)? {
+                return legacy::stats(db, &identifier);
+            }
             let snapshot_bytes = graph
                 .database()
                 .snapshot_data_bytes()

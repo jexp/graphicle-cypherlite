@@ -389,11 +389,19 @@ async fn an_extension_may_replace_the_product_page() {
 #[test]
 fn deletion_honours_the_extension_history_and_retained_tables() {
     let f = Fixture::new();
-    f.store
-        .connect()
-        .unwrap()
-        .execute("INSERT INTO probe_rows VALUES('kept',?)", [&f.workspace])
+    // Extension tables are graph labels now: the probe's retained history
+    // lives on the graph store.
+    let graph = graphicle_runtime::store_graph::GraphStore::open(
+        f.store.directory.join("reviews.graph"),
+    )
+    .unwrap();
+    graph
+        .transaction(|db| {
+            db.query("CREATE (:ProbeRow {id: 'kept', workspace_id: 'w'})")?;
+            Ok(())
+        })
         .unwrap();
+    drop(graph);
     let args = json!({"repository_id":f.repo});
     let state = api::command(&f.app(), &f.workspace, &f.owner, "deletion.state", &args).unwrap();
     assert_eq!(state["contract"], "graphicle.state.v2");
@@ -425,17 +433,24 @@ fn deletion_honours_the_extension_history_and_retained_tables() {
 #[test]
 fn store_open_runs_extension_migrations_after_the_core_schema() {
     let f = Fixture::new();
-    let tables: i64 = f
-        .store
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('probe_rows','workspaces')",
-            [],
-            |r| r.get(0),
-        )
+    // Extension migrations run on the graph store (`Extension::migrate`
+    // takes the `GraphStore`), after the core graph type and indexes.
+    let graph = graphicle_runtime::store_graph::GraphStore::open(
+        f.store.directory.join("reviews.graph"),
+    )
+    .unwrap();
+    let found = graph
+        .read(|db| {
+            Ok(graphicle_runtime::store_graph::rows(
+                db,
+                "SHOW INDEXES",
+                graphicle_runtime::store_graph::Params::new(),
+            )?
+            .iter()
+            .any(|index| index["name"] == "probe_rows_id"))
+        })
         .unwrap();
-    assert_eq!(tables, 2);
+    assert!(found, "the extension's index is created at store open");
     // Reopening is idempotent.
     Store::open(f.store.directory.as_ref()).unwrap();
 }

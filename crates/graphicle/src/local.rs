@@ -1116,25 +1116,46 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Restore a portable backup (the directory [`crate::maintenance`] wrote:
-/// the checkpointed snapshot files, already scrubbed) into a fresh data
-/// directory, as its `reviews.graph` store.
+/// Restore a portable backup into a fresh data directory. While the store
+/// is dual (docs/store-api.md: "beside, not instead of") a backup is the
+/// scrubbed SQL file at `backup` plus the graph snapshot directory beside
+/// it (`<backup>.graph`); a `backup` that *is* a directory restores the
+/// graph store alone (the snapshot [`crate::maintenance::backup_graph`]
+/// wrote, already scrubbed).
 pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<Value> {
-    use std::os::unix::fs::DirBuilderExt;
-    if directory.join("reviews.graph").exists() {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if directory.join("reviews.sqlite3").exists() || directory.join("reviews.graph").exists() {
         return Err(Error::bad(
             "Restore into a new --data-dir; an existing store cannot be replaced",
         ));
     }
-    // Validate before anything is written: the backup holds a snapshot, and
-    // the snapshot is a graph.
-    let snapshot = backup.join("graph.json");
-    let valid = std::fs::read(&snapshot)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|document| document.get("nodes").is_some() && document.get("relationships").is_some());
-    if !valid {
-        return Err(Error::bad("This is not a valid Graphicle store backup"));
+    if backup.is_dir() {
+        // Validate before anything is written: the backup holds a snapshot,
+        // and the snapshot is a graph.
+        let snapshot = backup.join("graph.json");
+        let valid = std::fs::read(&snapshot)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|document| {
+                document.get("nodes").is_some() && document.get("relationships").is_some()
+            });
+        if !valid {
+            return Err(Error::bad("This is not a valid Graphicle store backup"));
+        }
+    } else {
+        let source = rusqlite::Connection::open_with_flags(
+            backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let integrity: String = source.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let schema: bool = source.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='repo_projects')",
+            [],
+            |r| r.get(0),
+        )?;
+        if integrity != "ok" || !schema {
+            return Err(Error::bad("This is not a valid Graphicle store backup"));
+        }
     }
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1146,32 +1167,55 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     {
         return Err(Error::bad("Store directory must not be a symlink"));
     }
-    let destination = directory.join("reviews.graph");
-    let copied = (|| -> Result<()> {
-        std::fs::DirBuilder::new().mode(0o700).create(&destination)?;
-        for file in ["manifest.json", "graph.json"] {
-            let source = backup.join(file);
-            if source.is_file() {
-                std::fs::copy(&source, destination.join(file))?;
-            }
+    if !backup.is_dir() {
+        let source = rusqlite::Connection::open_with_flags(
+            backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let destination = directory.join("reviews.sqlite3");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&destination)?;
+        if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
+            let _ = std::fs::remove_file(&destination);
+            return Err(error.into());
         }
-        // The copied snapshot must open and answer; a store that does not is
-        // removed again.
-        let store = crate::store_graph::GraphStore::open(&destination)?;
-        store.read(|db| {
-            crate::store_graph::one(
-                db,
-                "MATCH (n) RETURN count(n) AS n",
-                crate::store_graph::Params::new(),
-            )?;
+    }
+    let graph_backup = if backup.is_dir() {
+        backup.to_path_buf()
+    } else {
+        std::path::PathBuf::from(format!("{}.graph", backup.display()))
+    };
+    if graph_backup.is_dir() {
+        let destination = directory.join("reviews.graph");
+        let copied = (|| -> Result<()> {
+            std::fs::DirBuilder::new().mode(0o700).create(&destination)?;
+            for file in ["manifest.json", "graph.json"] {
+                let source = graph_backup.join(file);
+                if source.is_file() {
+                    std::fs::copy(&source, destination.join(file))?;
+                }
+            }
+            // The copied snapshot must open and answer; a store that does
+            // not is removed again.
+            let store = crate::store_graph::GraphStore::open(&destination)?;
+            store.read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (n) RETURN count(n) AS n",
+                    crate::store_graph::Params::new(),
+                )?;
+                Ok(())
+            })?;
+            store.checkpoint()?;
             Ok(())
-        })?;
-        store.checkpoint()?;
-        Ok(())
-    })();
-    if let Err(error) = copied {
-        let _ = std::fs::remove_dir_all(&destination);
-        return Err(error);
+        })();
+        if let Err(error) = copied {
+            let _ = std::fs::remove_dir_all(&destination);
+            return Err(error);
+        }
     }
     Ok(
         json!({"restored":true,"data_dir":directory,"next":"Use graphicle login with your saved workspace access key. Reconnect source accounts and model API keys in Connections; device credentials are excluded from portable backups."}),

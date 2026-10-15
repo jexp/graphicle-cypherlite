@@ -47,7 +47,10 @@
 //! genuinely dynamic-keyed objects stay stringified JSON in a String
 //! property, parsed at the boundary.
 use crate::store::{Principal, Store, decode, repo, s};
-use crate::store_graph::{self, GraphStore};
+use crate::maintenance::graph_store;
+use crate::store_graph::{self};
+#[cfg(test)]
+use crate::store_graph::GraphStore;
 use crate::{Error, Result, digest, id, now, string};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -463,13 +466,6 @@ pub(crate) fn block(db: &rusqlite::Connection, connector: &str, document: &str) 
         rusqlite::params![connector, tombstone(connector, document), now()],
     )?;
     Ok(())
-}
-
-/// The graph store of this data directory (`<dir>/reviews.graph`), opened
-/// beside the SQLite store while the migration runs (docs/store-api.md:
-/// "beside, not instead of"). Opening applies the schema idempotently.
-pub(crate) fn graph_store(store: &Store) -> Result<GraphStore> {
-    GraphStore::open(store.directory.join("reviews.graph"))
 }
 
 /// Query parameters for one statement, from JSON pairs.

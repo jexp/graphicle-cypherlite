@@ -11,6 +11,7 @@ use crate::deletion::{self, Scope};
 use crate::store::{self, Store, decode, repo, s};
 use crate::store_graph::{GraphStore, Params, json_to_value, one, rows};
 use crate::{Error, Result, integer, now, string};
+use rusqlite::{Connection, params as sqlparams};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
@@ -19,6 +20,20 @@ use std::{collections::BTreeSet, path::Path};
 /// "beside, not instead of"). Opening applies the schema idempotently.
 pub(crate) fn graph_store(store: &Store) -> Result<GraphStore> {
     GraphStore::open(store.directory.join("reviews.graph"))
+}
+
+/// Whether this project's per-episode by-products live on the graph store
+/// yet (they migrate with the projection pipeline); until then the legacy
+/// SQL retention path serves the project.
+pub(crate) fn project_episodes_on_graph(graph: &GraphStore, repository: &str) -> Result<bool> {
+    graph.read(|g| {
+        one(
+            g,
+            "MATCH (e:Episode {repository_id: $repo}) RETURN 1 AS x LIMIT 1",
+            params(&[("repo", json!(repository))]),
+        )
+        .map(|r| r.is_some())
+    })
 }
 
 fn params(pairs: &[(&str, Value)]) -> Params {
@@ -371,6 +386,250 @@ fn storage_prune(
     Ok(result)
 }
 
+// ------------------------------------------------------ legacy SQL fallback
+//
+// A project whose rows have not migrated to the graph store yet
+// (docs/store-api.md: "beside, not instead of") is served by these SQL
+// paths; the receipt lands in the legacy SQL store, where
+// [`crate::deletion::verify`] and [`crate::deletion::list`] find it.
+
+/// Rows of `sql` still present for each key (the repository binds first,
+/// then the key's columns), summed.
+fn still_present(
+    db: &Connection,
+    sql: &str,
+    repository: &str,
+    keys: impl Iterator<Item = Vec<String>>,
+) -> Result<i64> {
+    let mut total = 0;
+    for key in keys {
+        total += db.query_row(
+            sql,
+            rusqlite::params_from_iter(std::iter::once(repository.to_string()).chain(key)),
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    Ok(total)
+}
+
+/// [`delete_project`] against the SQL store (see it for the contract).
+fn delete_project_sql(
+    db: &Connection,
+    p: &store::Principal,
+    identifier: &str,
+    mut removed: Value,
+) -> Result<Value> {
+    let connectors: Vec<String> = store::rows(
+        db,
+        "SELECT id FROM am_connectors WHERE repository_id=? ORDER BY id",
+        [identifier],
+    )?
+    .iter()
+    .map(|c| s(c, "id").to_string())
+    .collect();
+    crate::projection::enqueue(db, identifier, "project_deleted")?;
+    removed["references"] =
+        deletion::legacy::forget_project_references(db, &p.workspace, identifier, &connectors)?;
+    if let Some(cache) = crate::graph_projection::cache_root(db, identifier) {
+        crate::graph_materialize::purge(&cache)?;
+    }
+    db.execute("DELETE FROM repo_projects WHERE id=?", [identifier])?;
+    graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
+    deletion::legacy::project_receipt(db, p, identifier, &connectors, removed)
+}
+
+/// [`apply_source_retention`] against the SQL store.
+fn apply_source_retention_sql(
+    db: &Connection,
+    p: &store::Principal,
+    repository: &Value,
+    args: &Value,
+) -> Result<Value> {
+    let identifier = s(repository, "id");
+    let policy = crate::retention::SourcePolicy::from_args(args)?;
+    let plan =
+        crate::retention::legacy::source_plan(db, p, repository, &policy, chrono::Utc::now())?;
+    if args["plan_hash"].as_str() != Some(plan.plan_hash.as_str()) {
+        return Err(Error::conflict(
+            "The retention plan changed or was not previewed; run retention.preview and pass its plan_hash",
+        ));
+    }
+    let policy_value = json!(policy);
+    let mut receipts = Vec::new();
+    let mut forgotten_documents = 0usize;
+    for (connector, documents) in &plan.documents {
+        let listed: Vec<&String> = documents.iter().collect();
+        for batch in listed.chunks(deletion::MAX_SCOPE_DOCUMENTS) {
+            let scope =
+                Scope::document_set(connector, batch.iter().map(|d| (*d).clone()).collect());
+            let started = now();
+            let forget_plan = deletion::legacy::plan(db, &p.workspace, identifier, &scope)?;
+            if forget_plan.sources() == 0 {
+                continue;
+            }
+            crate::projection::enqueue(db, identifier, "source_forgotten")?;
+            let since = forget_plan.since().map(str::to_string);
+            let forgotten =
+                deletion::legacy::forget(db, &p.workspace, identifier, &scope, since.as_deref())?;
+            let erased = deletion::legacy::erase(db, identifier, &scope)?;
+            graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
+            store::event(
+                db,
+                identifier,
+                "source_forgotten",
+                json!({"derived_records_removed":forgotten["memories"],"retention":true}),
+            )?;
+            forgotten_documents += batch.len();
+            receipts.push(deletion::legacy::policy_receipt(
+                db,
+                p,
+                repository,
+                "retention.forget",
+                forget_plan,
+                &started,
+                forgotten,
+                erased,
+                Some(&policy_value),
+            )?);
+        }
+    }
+    Ok(json!({
+        "forgotten_documents": forgotten_documents,
+        "plan_hash": plan.plan_hash,
+        "cutoff": plan.cutoff,
+        "receipts": receipts,
+        "receipt": receipts.last().cloned().unwrap_or(Value::Null),
+        "local_backups_are_separate": true,
+    }))
+}
+
+/// [`storage_prune`] against the SQL store.
+fn storage_prune_sql(
+    db: &Connection,
+    p: &store::Principal,
+    repository: &Value,
+    args: &Value,
+) -> Result<Value> {
+    let identifier = s(repository, "id");
+    let keep = integer(args, "keep_snapshots", 20, 1000)?.max(1);
+    let snapshots = store::rows(
+        db,
+        "SELECT sha256,manifest FROM repo_snapshots WHERE repository_id=? ORDER BY created_at DESC,sha256",
+        [identifier],
+    )?;
+    let mut keep_snapshots: BTreeSet<String> = snapshots
+        .iter()
+        .take(keep)
+        .map(|r| s(r, "sha256").to_string())
+        .collect();
+    keep_snapshots.insert(s(repository, "snapshot").to_string());
+    for run in store::rows(
+        db,
+        "SELECT start_snapshot,end_snapshot FROM repo_runs WHERE repository_id=?",
+        [identifier],
+    )? {
+        for key in ["start_snapshot", "end_snapshot"] {
+            if let Some(v) = run[key].as_str() {
+                keep_snapshots.insert(v.to_string());
+            }
+        }
+    }
+    let mut objects: BTreeSet<String> = store::heads(db, identifier)?.into_values().collect();
+    let mut pruned: Vec<String> = Vec::new();
+    let (mut snapshots_removed, mut objects_removed, mut originals_removed) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for snapshot in &snapshots {
+        if keep_snapshots.contains(s(snapshot, "sha256")) {
+            let manifest: Value = serde_json::from_str(s(snapshot, "manifest"))?;
+            for value in manifest.as_object().into_iter().flat_map(|o| o.values()) {
+                if let Some(sha) = value["sha256"].as_str() {
+                    objects.insert(sha.to_string());
+                }
+            }
+        } else {
+            db.execute(
+                "DELETE FROM repo_snapshots WHERE repository_id=? AND sha256=?",
+                sqlparams![identifier, s(snapshot, "sha256")],
+            )?;
+            snapshots_removed.push(s(snapshot, "sha256").to_string());
+        }
+    }
+    for revision in store::rows(db,"SELECT r.data FROM repo_memory_revisions r JOIN repo_memories m ON m.id=r.memory_id WHERE m.repository_id=?",[identifier])? {
+        let mut memory: Value = serde_json::from_str(s(&revision, "data"))?;
+        decode(&mut memory, "data")?;
+        for sha in memory["data"]["dependencies"]
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.values())
+            .filter_map(Value::as_str)
+        {
+            objects.insert(sha.to_string());
+        }
+    }
+    let mut freed = 0;
+    for object in store::rows(
+        db,
+        "SELECT sha256,bytes FROM repo_objects WHERE repository_id=?",
+        [identifier],
+    )? {
+        if !objects.contains(s(&object, "sha256")) {
+            freed += object["bytes"].as_u64().unwrap_or(0);
+            db.execute(
+                "DELETE FROM repo_objects WHERE repository_id=? AND sha256=?",
+                sqlparams![identifier, s(&object, "sha256")],
+            )?;
+            objects_removed.push(s(&object, "sha256").to_string());
+        }
+    }
+    let syncs_removed = db.execute(
+        "DELETE FROM repo_syncs WHERE repository_id=? AND state NOT IN ('pending','preparing')",
+        [identifier],
+    )?;
+    let mut originals_freed = 0;
+    for original in store::rows(db,"SELECT source_id,sha256,text_sha256,length(bytes) AS bytes FROM am_original_documents WHERE repository_id=?",[identifier])? {
+        // Keep originals referenced by any retained source object, including snapshots.
+        let current = crate::store::one(db,"SELECT 1 AS yes FROM am_connector_docs WHERE connector_id IN (SELECT id FROM am_connectors WHERE repository_id=?) AND 'connector:'||connector_id||':'||id=? AND present=1 AND json_extract(metadata,'$.provider_metadata.original_sha256')=?",sqlparams![identifier,s(&original,"source_id"),s(&original,"sha256")])?.is_some();
+        if !current && !objects.contains(s(&original, "text_sha256")) {
+            originals_freed += original["bytes"].as_u64().unwrap_or(0);
+            db.execute(
+                "DELETE FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",
+                sqlparams![identifier, s(&original, "source_id"), s(&original, "sha256")],
+            )?;
+            originals_removed.push((
+                s(&original, "source_id").to_string(),
+                s(&original, "sha256").to_string(),
+            ));
+        }
+    }
+    let mut result = json!({"bytes_reclaimed":freed+originals_freed,"original_bytes_reclaimed":originals_freed,"kept_snapshots":keep_snapshots.len(),"memory_revisions_preserved":true});
+    if !(snapshots_removed.is_empty() && objects_removed.is_empty() && originals_removed.is_empty())
+    {
+        // Re-count what was pruned, then sign: no silent deletion.
+        let remaining = json!({
+            "repo_snapshots":still_present(db,"SELECT count(*) FROM repo_snapshots WHERE repository_id=? AND sha256=?",identifier,snapshots_removed.iter().map(|k|vec![k.clone()]))?,
+            "repo_objects":still_present(db,"SELECT count(*) FROM repo_objects WHERE repository_id=? AND sha256=?",identifier,objects_removed.iter().map(|k|vec![k.clone()]))?,
+            "am_original_documents":still_present(db,"SELECT count(*) FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",identifier,originals_removed.iter().map(|(a,b)|vec![a.clone(),b.clone()]))?,
+        });
+        pruned.extend(snapshots_removed.iter().map(|k| format!("snapshot:{k}")));
+        pruned.extend(objects_removed.iter().map(|k| format!("object:{k}")));
+        pruned.extend(originals_removed.iter().map(|(a, b)| format!("original:{a}@{b}")));
+        let removed = json!({"repo_snapshots":snapshots_removed.len(),"repo_objects":objects_removed.len(),"repo_syncs":syncs_removed,"am_original_documents":originals_removed.len(),"bytes":freed+originals_freed});
+        result["receipt"] = deletion::legacy::rows_receipt(
+            db,
+            p,
+            identifier,
+            "storage.prune",
+            "storage",
+            json!({"keep_snapshots": keep}),
+            removed,
+            &pruned,
+            remaining,
+            false,
+        )?;
+    }
+    Ok(result)
+}
+
 impl Store {
     pub fn maintain(
         &self,
@@ -386,8 +645,36 @@ impl Store {
             match operation {
                 "connector.state" | "connector.delete" | "source.forget"=>{
                     let connector=string(args,"connector_id",100)?;
-                    let present = graph.read(|g| one(g,"MATCH (c:Connector {repository_id: $repo, id: $id}) RETURN c.id AS id",params(&[("repo",json!(identifier)),("id",json!(connector))])))?.is_some();
-                    if !present {return Err(Error::bad("Connector unavailable"));}
+                    let present = graph.read(|g| one(g,"MATCH (c:Connector {repository_id: $repo, id: $id}) RETURN c.id AS id",params(&[("repo",json!(&identifier)),("id",json!(connector))])))?.is_some();
+                    if !present {
+                        // The connector lives in the legacy SQL store of a
+                        // project mid-migration: the legacy path serves it.
+                        crate::store::one(db,"SELECT id FROM am_connectors WHERE repository_id=? AND id=?",sqlparams![&identifier,connector])?.ok_or_else(||Error::bad("Connector unavailable"))?;
+                        if operation!="connector.state" {
+                            let scope=if operation=="connector.delete" {Scope::connector(connector)} else {Scope::documents(connector,&args["document_ids"])?};
+                            // Capture coverage first; forget, erase, verify and sign in one transaction.
+                            let started=now();
+                            let plan=deletion::legacy::plan(db,&p.workspace,&identifier,&scope)?;
+                            if operation=="source.forget" && plan.sources()==0 {return Err(Error::bad("None of these documents exist in this connector"));}
+                            crate::projection::enqueue(db,&identifier,if operation=="connector.delete" {"connector_deleted"} else {"source_forgotten"})?;
+                            let since=plan.since().map(str::to_string);
+                            let forgotten=deletion::legacy::forget(db,&p.workspace,&identifier,&scope,since.as_deref())?;
+                            let erased=deletion::legacy::erase(db,&identifier,&scope)?;
+                            // In-process features and layouts of forgotten text go now, not at expiry.
+                            graphicle_memory::cache::clear(&identifier).map_err(Error::bad)?;
+                            let derived=forgotten["memories"].clone();
+                            store::event(db,&identifier,"source_forgotten",json!({"derived_records_removed":derived}))?;
+                            let receipt=deletion::legacy::receipt(db,p,&repository,operation,plan,&started,forgotten,erased)?;
+                            return Ok(json!({"deleted":true,"derived_records_removed":derived,"local_backups_are_separate":true,"receipt":receipt}));
+                        }
+                        let state=string(args,"state",20)?;
+                        if !["active","paused"].contains(&state){return Err(Error::bad("Activate or pause this connector"));}
+                        db.execute("UPDATE am_connectors SET state=?,generation=generation+1,cursor=NULL,last_sync=NULL WHERE id=?",sqlparams![state,connector])?;
+                        db.execute("DELETE FROM am_connector_stage WHERE connector_id=?",[connector])?;
+                        db.execute("DELETE FROM am_model_cache WHERE repository_id=?",[&identifier])?;
+                        store::invalidate(db,&identifier)?;
+                        return Ok(json!({"state":state,"remote_sources_withheld_until_sync":state=="active"}));
+                    }
                     if operation!="connector.state" {
                         let scope=if operation=="connector.delete" {Scope::connector(connector)} else {Scope::documents(connector,&args["document_ids"])?};
                         // Capture coverage first; forget, erase, verify and sign in one transaction.
@@ -425,6 +712,19 @@ impl Store {
                     // first, each with its own receipt, and this project's
                     // receipt names them.
                     let copies=crate::folders::scratch_projects(db,&identifier)?;
+                    let on_graph = graph.read(|g| one(g,"MATCH (p:Project {id: $repo}) RETURN 1 AS x",params(&[("repo",json!(&identifier))])))?.is_some();
+                    if !on_graph {
+                        // Legacy SQL store (project mid-migration).
+                        let mut scratch=Vec::with_capacity(copies.len());
+                        for copy in &copies {
+                            scratch.push(delete_project_sql(db,p,copy,json!({}))?);
+                        }
+                        let removed=if copies.is_empty() {json!({})} else {json!({"pr_scratch_projects":copies})};
+                        let receipt=delete_project_sql(db,p,&identifier,removed)?;
+                        let mut result=json!({"deleted":true,"local_backups_are_separate":true,"receipt":receipt});
+                        if !scratch.is_empty() {result["pr_scratch_projects"]=json!(scratch);}
+                        return Ok(result);
+                    }
                     graph.transaction(|g| {
                         let mut scratch=Vec::with_capacity(copies.len());
                         for copy in &copies {
@@ -437,12 +737,34 @@ impl Store {
                         Ok(result)
                     })
                 },
-                "storage.prune"=>graph.transaction(|g| storage_prune(g,p,&repository,args)),
+                "storage.prune"=>{
+                    let on_graph = graph.read(|g| one(g,"MATCH (n {repository_id: $repo}) WHERE n:Snapshot OR n:Object OR n:OriginalDocument RETURN 1 AS x LIMIT 1",params(&[("repo",json!(&identifier))])))?.is_some();
+                    if on_graph {
+                        graph.transaction(|g| storage_prune(g,p,&repository,args))
+                    } else {
+                        storage_prune_sql(db,p,&repository,args)
+                    }
+                },
                 "retention.apply"=>{
                     if args.get("sources").is_some_and(|v|!v.is_null()) {
-                        return graph.transaction(|g| apply_source_retention(g,db,p,&repository,args));
+                        let on_graph = graph.read(|g| one(g,"MATCH (c:Connector {repository_id: $repo}) RETURN 1 AS x LIMIT 1",params(&[("repo",json!(&identifier))])))?.is_some();
+                        if on_graph {
+                            return graph.transaction(|g| apply_source_retention(g,db,p,&repository,args));
+                        }
+                        return apply_source_retention_sql(db,p,&repository,args);
                     }
                     let retention=crate::retention::Retention::from_args(args)?;
+                    let on_graph = graph.read(|g| one(g,"MATCH (e:Episode {repository_id: $repo}) RETURN 1 AS x LIMIT 1",params(&[("repo",json!(&identifier))])))?.is_some();
+                    if !on_graph {
+                        // Legacy SQL store (project mid-migration).
+                        let mut result=crate::retention::legacy::apply(db,&identifier,&retention)?;
+                        let removed=result["deleted"].clone();
+                        if removed.as_object().is_some_and(|counts|counts.values().any(|n|n.as_u64().unwrap_or(0)>0)) {
+                            let remaining=crate::retention::legacy::remaining(db,&identifier,&retention)?;
+                            result["receipt"]=deletion::legacy::rows_receipt(db,p,&identifier,"retention.graph","graph_by_products",json!(retention),removed,&[],remaining,false)?;
+                        }
+                        return Ok(result);
+                    }
                     graph.transaction(|g| {
                         let mut result=crate::retention::apply(g,&identifier,&retention)?;
                         let removed=result["deleted"].clone();
@@ -458,21 +780,72 @@ impl Store {
         })?;
         if result.get("receipt").is_some() {
             // After commit, flush the deleted nodes' old images into a
-            // snapshot so the write-ahead log no longer carries them.
+            // snapshot so the write-ahead log no longer carries them; the
+            // legacy SQL half's WAL is truncated too, while the store is
+            // dual. The graph checkpoint reuses this call's handle: the
+            // engine admits one writer per store.
             graph.checkpoint()?;
-            result["storage"] = json!({"snapshot_checkpoint":"ok"});
+            let mut storage = deletion::legacy::checkpoint(self)?;
+            storage["snapshot_checkpoint"] = json!("ok");
+            result["storage"] = storage;
         }
         Ok(result)
     }
 
-    /// A portable backup of the graph store at `path` (a directory the call
-    /// creates): checkpoint the live store, copy the snapshot files, then
-    /// scrub the copy — provider credentials, sessions and entitlements
-    /// never leave the device. The scrubbed copy is checkpointed again so
-    /// the removed data is not carried in its log either.
+    /// A portable backup at `path`. While the store is dual
+    /// (docs/store-api.md: "beside, not instead of") a backup carries both
+    /// halves: the SQL store as a single scrubbed file at `path`, and the
+    /// graph store as a scrubbed snapshot directory beside it
+    /// (`<path>.graph`). A `path` ending in `.graph` backs up the graph
+    /// store alone (a directory the call creates): checkpoint the live
+    /// store, copy its snapshot files, then scrub the copy — provider
+    /// credentials, sessions and entitlements never leave the device.
     pub fn backup(&self, path: &Path) -> Result<Value> {
-        let store = graph_store(self)?;
-        backup_graph(&store, path)
+        if path.extension().is_some_and(|e| e == "graph") {
+            let store = graph_store(self)?;
+            return backup_graph(&store, path);
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        drop(file);
+        let result = (|| {
+            self.connect()?.backup(rusqlite::MAIN_DB, path, None)?;
+            let backup = Connection::open(path)?;
+            // A portable source backup must not silently contain unusable encrypted
+            // credentials or require copying the device's master key beside it.
+            backup.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; BEGIN IMMEDIATE; UPDATE am_connectors SET state='paused',last_sync=NULL,cursor=NULL,generation=generation+1 WHERE credential_env LIKE 'secret:%' OR credential_env LIKE 'oauth:%'; UPDATE am_projection_cleanup SET state='paused',lease_token=NULL,lease_until=NULL WHERE state!='complete'; UPDATE am_jobs SET state='cancelled' WHERE state IN ('queued','retry','running'); DELETE FROM am_secrets; COMMIT;")?;
+            // Sessions, provisioning tokens and paid entitlements are scrubbed
+            // on any store that has the team and commerce tables, whichever
+            // edition takes the backup; then the copy is compacted.
+            crate::store_compat::scrub_backup(&backup)?;
+            backup.execute_batch("VACUUM;")?;
+            let check: String = backup.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            if check != "ok" {
+                return Err(Error::bad("Backup integrity verification failed"));
+            }
+            // The graph half, beside the SQL file.
+            let mut out =
+                json!({"path":path,"created_at":now(),"integrity":"ok","contains_private_sources":true,"provider_credentials_included":false,"reconnect_accounts_after_restore":true});
+            let graph = graph_store(self)?;
+            graph.checkpoint()?;
+            if graph
+                .path()
+                .is_some_and(|p| p.join("graph.json").is_file())
+            {
+                let graph_path = std::path::PathBuf::from(format!("{}.graph", path.display()));
+                backup_graph(&graph, &graph_path)?;
+                out["graph"] = json!(graph_path);
+            }
+            Ok(out)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 }
 
