@@ -687,7 +687,7 @@ fn source_rows(
         )?;
         out.insert(name, found.len());
     }
-    let per_repository: [(&'static str, &str, Matches); 12] = [
+    let per_repository: [(&'static str, &str, Matches); 10] = [
         (
             "originals",
             "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
@@ -728,18 +728,6 @@ fn source_rows(
             "SELECT rowid,target FROM gf_hints WHERE repository_id=?",
             |v, sc| sc.source(v),
         ),
-        // A forgotten document's mention links and what they
-        // were computed from.
-        (
-            "doc_links",
-            "SELECT rowid,document_id FROM gf_doc_links WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "doc_link_sources",
-            "SELECT rowid,document_id FROM gf_doc_link_sources WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
         (
             "served",
             "SELECT rowid,served FROM gf_served WHERE repository_id=?",
@@ -755,6 +743,11 @@ fn source_rows(
         let found = select_rowids(db, sql, [repository], |v| keep(v, scope))?;
         out.insert(name, found.len());
     }
+    // A forgotten document's mention links and what they were computed from
+    // live in the graph store now.
+    let (doc_links, doc_link_sources) = crate::doc_links::forget_counts(db, repository, scope)?;
+    out.insert("doc_links", doc_links);
+    out.insert("doc_link_sources", doc_link_sources);
     out.insert(
         "dependency_edges",
         index_edges(db, workspace, repository, scope)?.len(),
@@ -1272,17 +1265,8 @@ pub fn forget(
         |v| scope.source(v),
     )?;
     let hints = delete_rowids(db, "gf_hints", &hints)?;
-    // The documents' mention links and their inputs.
-    let mut doc_links = 0;
-    for table in ["gf_doc_links", "gf_doc_link_sources"] {
-        let found = select_rowids(
-            db,
-            &format!("SELECT rowid,document_id FROM {table} WHERE repository_id=?"),
-            [repository],
-            |v| scope.source(v),
-        )?;
-        doc_links += delete_rowids(db, table, &found)?;
-    }
+    // The documents' mention links and their inputs (in the graph store).
+    let doc_links = crate::doc_links::forget(db, repository, scope)?;
     let mut stripped = BTreeMap::new();
     for (table, column) in [("gf_served", "served"), ("gf_outcomes", "targets")] {
         let mut changed = 0;

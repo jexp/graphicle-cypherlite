@@ -177,7 +177,8 @@ pub(crate) fn context(
     };
     let lookup = links_db
         .as_ref()
-        .map(|db| crate::doc_links::Lookup::new(db, &job.repository));
+        .map(|db| crate::doc_links::Lookup::new(db, &job.repository))
+        .transpose()?;
     if scorer_count(&job.payload) == 0 {
         return query::context_on(
             snapshot,

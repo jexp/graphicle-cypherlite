@@ -52,6 +52,8 @@ fn delete_project(
         crate::graph_materialize::purge(&cache)?;
     }
     db.execute("DELETE FROM repo_projects WHERE id=?", [identifier])?;
+    // The project's document links live in the graph store: no cascade there.
+    crate::doc_links::drop_project(db, identifier)?;
     graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
     deletion::project_receipt(db, p, identifier, &connectors, removed)
 }

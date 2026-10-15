@@ -127,3 +127,30 @@ fn value_mapping_round_trips_json_maps_and_lists() {
     let value = json!({"a": [1, 2.5, "x", null, {"b": true}], "n": 7});
     assert_eq!(value_to_json(&json_to_value(&value)), value);
 }
+
+#[test]
+fn a_second_open_of_a_live_store_shares_the_engine() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("graph");
+    let first = GraphStore::open(&path).unwrap();
+    // The durable store's writer lease is exclusive; a second open of the
+    // same path in this process shares the live engine instead of failing.
+    let second = GraphStore::open(&path).unwrap();
+    first
+        .transaction(|db| {
+            db.query("CREATE (:Memory {id: 'm-shared'})")?;
+            Ok(())
+        })
+        .unwrap();
+    let row = second
+        .read(|db| {
+            one(
+                db,
+                "MATCH (m:Memory {id: 'm-shared'}) RETURN m.id AS id",
+                BTreeMap::new(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(s(&row, "id"), "m-shared");
+}

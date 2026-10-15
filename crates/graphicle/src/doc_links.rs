@@ -25,8 +25,9 @@
 //! project naming code in a code project). A name with
 //! several candidates links nothing and is recorded as ambiguous.
 //!
-//! The links are rows (`gf_doc_links`, rung `mention`, producer `core`),
-//! never nodes of the shared episode: the episode is read by every reader of
+//! The links are `LINKS_TO` edges of the store's graph (rung `mention`,
+//! producer `core`; see the "link store" section below), never nodes of the
+//! shared episode: the episode is read by every reader of
 //! a project, while connector documents are filtered per reader. The
 //! workspace's `link` job recomputes them after every
 //! projection and connector sync, and `graph.link` on request ([`relink`]),
@@ -49,6 +50,7 @@ use crate::{
     Error, Result, digest, graph_projection, now,
     query::Snapshot,
     store::{Principal, Store, one, rows, s},
+    store_graph::{self, GraphStore, Params, json_to_value},
 };
 use graphicle::graph::Graph;
 use graphicle_memory::graph::span;
@@ -58,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::Path,
     sync::{Arc, LazyLock, Mutex, PoisonError},
 };
 
@@ -84,64 +87,111 @@ pub const MAX_CODE_SPANS: usize = 1000;
 /// A lifted paragraph of a document that no passage covers.
 const PARAGRAPH_BYTES: usize = 1600;
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS gf_doc_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repository_id TEXT NOT NULL REFERENCES repo_projects(id) ON DELETE CASCADE,
-    document_id TEXT NOT NULL, document_sha256 TEXT NOT NULL, source_kind TEXT NOT NULL,
-    byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL,
-    mention TEXT NOT NULL, mark TEXT NOT NULL,
-    state TEXT NOT NULL, scope TEXT, candidates INTEGER NOT NULL,
-    target_repository_id TEXT REFERENCES repo_projects(id) ON DELETE CASCADE,
-    stable_id TEXT, target_relpath TEXT, target_sha256 TEXT,
-    target_start INTEGER, target_end INTEGER, target TEXT NOT NULL DEFAULT '{}',
-    rung TEXT NOT NULL, producer TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS gf_doc_links_document ON gf_doc_links(repository_id,document_id);
-CREATE INDEX IF NOT EXISTS gf_doc_links_file ON gf_doc_links(target_repository_id,target_relpath)
-    WHERE state='linked';
-CREATE INDEX IF NOT EXISTS gf_doc_links_symbol ON gf_doc_links(target_repository_id,stable_id)
-    WHERE state='linked';
-CREATE TABLE IF NOT EXISTS gf_doc_link_sources (
-    repository_id TEXT NOT NULL REFERENCES repo_projects(id) ON DELETE CASCADE,
-    document_id TEXT NOT NULL, source_kind TEXT NOT NULL, document_sha256 TEXT NOT NULL,
-    input TEXT NOT NULL, counts TEXT NOT NULL, updated_at TEXT NOT NULL,
-    dependencies TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY(repository_id,document_id));
-CREATE TABLE IF NOT EXISTS gf_doc_link_checkpoints (
-    repository_id TEXT PRIMARY KEY REFERENCES repo_projects(id) ON DELETE CASCADE,
-    episode TEXT, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS gf_doc_link_state (
-    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
-    rules TEXT NOT NULL, updated_at TEXT NOT NULL);
-";
+// ---------------------------------------------------------------------------
+// The link store (migration plan §2.5): `(:ConnectorDoc {repository_id, id})`
+// nodes — one per document read, carrying what its rows were computed from
+// (the SQL `gf_doc_link_sources` row as properties: `source_kind`,
+// `document_sha256`, `input`, `counts`, `dependencies`, `updated_at`, and
+// `connector` for a connector document) — with one `[:LINKS_TO]` edge per
+// mention (the SQL `gf_doc_links` row as edge properties, plus `seq`, the
+// mention's order in its document), from the document to the `(:Symbol)` a
+// linked mention resolved to, or back to the document itself when it did
+// not resolve to a recorded symbol. `(:DocLinkCheckpoint {repository_id})`
+// nodes hold the episode of each project the workspace's rows were last
+// checked against, and one `(:DocLinkState {workspace_id})` node per
+// workspace the rules its rows were computed under. The DDL is the graph
+// type applied at open ([`crate::store_graph`]); the rows stay out of the
+// shared episode, as before.
 
-/// The link tables (additive): one row per mention
-/// (`gf_doc_links`), one per document read (`gf_doc_link_sources`: what its
-/// rows were computed from, what they depend on and their counts), the
-/// episode of each project that the workspace's rows were last checked
-/// against (`gf_doc_link_checkpoints`) and the rules each workspace's rows
-/// were computed under (`gf_doc_link_state`). They go with their project or
-/// workspace, and a link row with the project it targets.
-///
+/// The store's graph store, found from a SQL connection's database file:
+/// the graph store sits beside it (`reviews.graph`), and opening the same
+/// path again shares this process's one engine ([`GraphStore::open`]).
+fn graph_of(db: &Connection) -> Result<GraphStore> {
+    let database = db
+        .path()
+        .ok_or_else(|| Error::bad("Document links need a durable store"))?;
+    GraphStore::open(
+        Path::new(database)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("reviews.graph"),
+    )
+}
+
+/// Graph query parameters from `(name, JSON)` pairs.
+fn gparams(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> Params {
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), json_to_value(&value)))
+        .collect()
+}
+
+/// The columns of one link row as readers expect them (the SQL rows'
+/// shape): the edge's properties plus its document's identity. The target's
+/// facts are fixed-key dotted properties (`target.node_id`, …), reassembled
+/// by [`target_facts`]; only genuinely dynamic payloads (`dependencies`)
+/// stay stringified JSON.
+#[doc(hidden)]
+pub const LINK_COLUMNS: &str = "d.repository_id AS repository_id, d.id AS document_id, \
+     l.document_sha256 AS document_sha256, l.source_kind AS source_kind, \
+     l.byte_start AS byte_start, l.byte_end AS byte_end, l.mention AS mention, l.mark AS mark, \
+     l.state AS state, l.scope AS scope, l.candidates AS candidates, \
+     l.target_repository_id AS target_repository_id, l.stable_id AS stable_id, \
+     l.target_relpath AS target_relpath, l.target_sha256 AS target_sha256, \
+     l.target_start AS target_start, l.target_end AS target_end, \
+     l.`target.node_id` AS target_node_id, l.`target.revision` AS target_revision, \
+     l.`target.qualified_name` AS target_qualified_name, l.`target.kind` AS target_kind, \
+     l.`target.label` AS target_label, l.`target.episode` AS target_episode, \
+     l.`target.confidence` AS target_confidence, l.`target.names` AS target_names, \
+     l.`target.line` AS target_line, l.`target.end_line` AS target_end_line, \
+     l.rung AS rung, l.producer AS producer";
+
+/// A link row's target facts as the SQL row's `target` JSON held them
+/// (`{}` when the mention never linked): the dotted properties
+/// reassembled.
+#[doc(hidden)]
+pub fn target_facts(row: &Value) -> Value {
+    if row["target_node_id"].is_null() {
+        return json!({});
+    }
+    let mut facts = json!({"node_id":row["target_node_id"],"revision":row["target_revision"],
+        "qualified_name":row["target_qualified_name"],"kind":row["target_kind"],
+        "label":row["target_label"],"episode":row["target_episode"],
+        "confidence":row["target_confidence"],"names":row["target_names"]});
+    if !row["target_line"].is_null() {
+        facts["line"] = row["target_line"].clone();
+        facts["end_line"] = row["target_end_line"].clone();
+    }
+    facts
+}
+
 /// A workspace whose rows were not computed under [`RULES`] (a store from
-/// before these tables, or from other rules) gets its latest `link` job
-/// queued again, unless one is waiting or running, so the next drain or
-/// worker computes them.
+/// before the links, from other rules, or from before the move to the graph
+/// store, which has no state node) gets its latest `link` job queued again,
+/// unless one is waiting or running, so the next drain or worker computes
+/// them. The SQL link tables of a store from before the move are dropped;
+/// the queued job recomputes the rows in the graph store.
 pub fn migrate(db: &Connection) -> Result<()> {
-    db.execute_batch(SCHEMA)?;
-    crate::store::ensure_column(
-        db,
-        "gf_doc_link_sources",
-        "dependencies",
-        "TEXT NOT NULL DEFAULT '{}'",
+    db.execute_batch(
+        "DROP TABLE IF EXISTS gf_doc_links; DROP TABLE IF EXISTS gf_doc_link_sources;
+         DROP TABLE IF EXISTS gf_doc_link_checkpoints; DROP TABLE IF EXISTS gf_doc_link_state;",
     )?;
-    for row in rows(
-        db,
-        "SELECT w.id FROM workspaces w WHERE NOT EXISTS \
-         (SELECT 1 FROM gf_doc_link_state s WHERE s.workspace_id=w.id AND s.rules=?)",
-        [RULES],
-    )? {
+    let current: HashSet<String> = graph_of(db)?
+        .read(|db| {
+            store_graph::rows(
+                db,
+                "MATCH (t:DocLinkState) WHERE t.rules = $rules RETURN t.workspace_id AS id",
+                gparams([("rules", json!(RULES))]),
+            )
+        })?
+        .iter()
+        .map(|row| s(row, "id").to_string())
+        .collect();
+    for row in rows(db, "SELECT w.id FROM workspaces w", [])? {
         let workspace = s(&row, "id");
+        if current.contains(workspace) {
+            continue;
+        }
         let jobs = "FROM am_jobs j JOIN repo_projects r ON r.id=j.repository_id \
                     WHERE r.workspace_id=? AND j.kind='link'";
         if one(
@@ -1509,31 +1559,46 @@ fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
         .enumerate()
         .map(|(index, project)| (project.id.clone(), index))
         .collect();
-    let checkpoints: HashMap<String, Option<String>> = rows(
-        db,
-        "SELECT c.repository_id,c.episode FROM gf_doc_link_checkpoints c \
-         JOIN repo_projects r ON r.id=c.repository_id WHERE r.workspace_id=?",
-        [workspace],
-    )?
-    .into_iter()
-    .map(|row| {
-        (
-            s(&row, "repository_id").to_string(),
-            row["episode"].as_str().map(str::to_string),
-        )
-    })
-    .collect();
+    let graph = graph_of(db)?;
+    // Every project of the workspace, scratch ones included: their
+    // checkpoints are read so a project that became scratch is retired.
+    let all: Vec<Value> = fingerprint
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| json!(s(row, "id")))
+        .collect();
+    let checkpoints: HashMap<String, Option<String>> = graph
+        .read(|db| {
+            store_graph::rows(
+                db,
+                "MATCH (c:DocLinkCheckpoint) WHERE c.repository_id IN $ids \
+                 RETURN c.repository_id AS repository_id, c.episode AS episode",
+                gparams([("ids", json!(all))]),
+            )
+        })?
+        .into_iter()
+        .map(|row| {
+            (
+                s(&row, "repository_id").to_string(),
+                row["episode"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
     let retired: Vec<String> = checkpoints
         .keys()
         .filter(|id| !by_id.contains_key(*id))
         .cloned()
         .collect();
-    let rules_current = one(
-        db,
-        "SELECT 1 AS yes FROM gf_doc_link_state WHERE workspace_id=? AND rules=?",
-        params![workspace, RULES],
-    )?
-    .is_some();
+    let rules_current = graph
+        .read(|db| {
+            store_graph::one(
+                db,
+                "MATCH (t:DocLinkState {workspace_id: $workspace, rules: $rules}) RETURN 1 AS yes",
+                gparams([("workspace", json!(workspace)), ("rules", json!(RULES))]),
+            )
+        })?
+        .is_some();
     let mut checker = Checker {
         db,
         projects: &projects,
@@ -1547,22 +1612,26 @@ fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
     let mut gone = Vec::new();
     for (index, project) in projects.iter().enumerate() {
         let found = documents_of(db, project)?;
-        let stored: HashMap<String, (String, String)> = rows(
-            db,
-            "SELECT document_id,input,dependencies FROM gf_doc_link_sources WHERE repository_id=?",
-            [&project.id],
-        )?
-        .into_iter()
-        .map(|row| {
-            (
-                s(&row, "document_id").to_string(),
+        let stored: HashMap<String, (String, String)> = graph
+            .read(|db| {
+                store_graph::rows(
+                    db,
+                    "MATCH (d:ConnectorDoc {repository_id: $repo}) \
+                     RETURN d.id AS document_id, d.input AS input, d.dependencies AS dependencies",
+                    gparams([("repo", json!(project.id))]),
+                )
+            })?
+            .into_iter()
+            .map(|row| {
                 (
-                    s(&row, "input").to_string(),
-                    s(&row, "dependencies").to_string(),
-                ),
-            )
-        })
-        .collect();
+                    s(&row, "document_id").to_string(),
+                    (
+                        s(&row, "input").to_string(),
+                        s(&row, "dependencies").to_string(),
+                    ),
+                )
+            })
+            .collect();
         let present: HashSet<&str> = found.iter().map(|d| d.id.as_str()).collect();
         for document in stored.keys().filter(|id| !present.contains(id.as_str())) {
             gone.push((project.id.clone(), document.clone()));
@@ -1886,20 +1955,41 @@ fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
 }
 
 /// Replace one document's rows (this program's only: an extension's rows
-/// are its own) and record what they were computed from.
-fn write(db: &Connection, computed: &Computed) -> Result<usize> {
+/// are its own) and record what they were computed from. The document's
+/// mentions are written as one batched `UNWIND` per outcome kind: edges to
+/// the resolved symbol, and edges back to the document for the rest.
+fn write(db: &mut cypherlite::Connection, computed: &Computed) -> Result<usize> {
     let document = &computed.document;
-    db.execute(
-        "DELETE FROM gf_doc_links WHERE repository_id=? AND document_id=? AND producer=?",
-        params![document.project, document.id, PRODUCER],
+    let key = [("repo", json!(document.project)), ("doc", json!(document.id))];
+    store_graph::rows(
+        db,
+        "MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc})-[l:LINKS_TO]->() \
+         WHERE l.producer = $producer DELETE l",
+        gparams(key.iter().cloned().chain([("producer", json!(PRODUCER))])),
     )?;
     let stamp = now();
-    let mut insert = db.prepare_cached(
-        "INSERT INTO gf_doc_links(repository_id,document_id,document_sha256,source_kind,byte_start,byte_end,\
-         mention,mark,state,scope,candidates,target_repository_id,stable_id,target_relpath,target_sha256,\
-         target_start,target_end,target,rung,producer,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // `counts` is stored as fixed-key dotted properties (`counts.mentions`,
+    // …: the engine stores no map values); `dependencies` is dynamic-keyed
+    // and stays stringified JSON.
+    let mut node = json!({"source_kind":document.kind,"document_sha256":document.sha,
+        "input":document.input,"updated_at":stamp,
+        "dependencies":serde_json::to_string(&computed.dependencies)?});
+    if let Some(counts) = computed.counts.as_object() {
+        for (key, value) in counts {
+            node[format!("counts.{key}")] = value.clone();
+        }
+    }
+    if let Some((connector, _)) = &document.connector {
+        node["connector"] = json!(connector);
+    }
+    store_graph::rows(
+        db,
+        "MERGE (d:ConnectorDoc {repository_id: $repo, id: $doc}) SET d += $props",
+        gparams(key.iter().cloned().chain([("props", node)])),
     )?;
-    for row in &computed.rows {
+    let mut symbols = Vec::new();
+    let mut plain = Vec::new();
+    for (seq, row) in computed.rows.iter().enumerate() {
         let (state, scope, candidates, target) = match &row.outcome {
             Outcome::Linked(target, scope) => {
                 ("linked", Some(*scope), 1usize, Some(target.as_ref()))
@@ -1917,47 +2007,61 @@ fn write(db: &Connection, computed: &Computed) -> Result<usize> {
             }
             facts
         });
-        let window = row.window.as_ref();
-        insert.execute(params![
-            document.project,
-            document.id,
-            document.sha,
-            document.kind,
-            row.mention.byte_start as i64,
-            row.mention.byte_end as i64,
-            row.text,
-            row.mention.mark,
-            state,
-            scope,
-            candidates as i64,
-            target.map(|t| t.repository.clone()),
-            target.and_then(|t| t.stable_id.clone()),
-            target.map(|t| t.relpath.clone()),
-            window.map(|w| w.0.clone()),
-            window.map(|w| w.1 as i64),
-            window.map(|w| w.2 as i64),
-            facts.to_string(),
-            RUNG,
-            PRODUCER,
-            stamp
-        ])?;
+        let mut props = json!({"seq":seq,"document_sha256":document.sha,"source_kind":document.kind,
+            "byte_start":row.mention.byte_start,"byte_end":row.mention.byte_end,
+            "mention":row.text,"mark":row.mention.mark,"state":state,"candidates":candidates,
+            "rung":RUNG,"producer":PRODUCER,"created_at":stamp});
+        // The target's facts as fixed-key dotted properties (map values are
+        // not storable; `names` is a list of scalars, which is).
+        if let Some(facts) = facts.as_object() {
+            for (key, value) in facts {
+                if !value.is_null() {
+                    props[format!("target.{key}")] = value.clone();
+                }
+            }
+        }
+        if let Some(scope) = scope {
+            props["scope"] = json!(scope);
+        }
+        if let Some(t) = target {
+            props["target_repository_id"] = json!(t.repository);
+            props["target_relpath"] = json!(t.relpath);
+            if let Some(stable) = &t.stable_id {
+                props["stable_id"] = json!(stable);
+            }
+            if let Some((sha, a, b, _, _)) = &row.window {
+                props["target_sha256"] = json!(sha);
+                props["target_start"] = json!(a);
+                props["target_end"] = json!(b);
+            }
+        }
+        if let Some(t) = target
+            && let Some(stable) = &t.stable_id
+        {
+            symbols.push(json!({"target_repo":t.repository,"stable_id":stable,"props":props}));
+        } else {
+            plain.push(json!({"props":props}));
+        }
     }
-    db.execute(
-        "INSERT INTO gf_doc_link_sources(repository_id,document_id,source_kind,document_sha256,input,counts,updated_at,dependencies) \
-         VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(repository_id,document_id) DO UPDATE SET source_kind=excluded.source_kind,\
-         document_sha256=excluded.document_sha256,input=excluded.input,counts=excluded.counts,updated_at=excluded.updated_at,\
-         dependencies=excluded.dependencies",
-        params![
-            document.project,
-            document.id,
-            document.kind,
-            document.sha,
-            document.input,
-            computed.counts.to_string(),
-            stamp,
-            serde_json::to_string(&computed.dependencies)?
-        ],
-    )?;
+    if !symbols.is_empty() {
+        store_graph::rows(
+            db,
+            "UNWIND $rows AS row \
+             MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc}) \
+             MERGE (t:Symbol {repository_id: row.target_repo, stable_id: row.stable_id}) \
+             CREATE (d)-[l:LINKS_TO]->(t) SET l += row.props",
+            gparams(key.iter().cloned().chain([("rows", json!(symbols))])),
+        )?;
+    }
+    if !plain.is_empty() {
+        store_graph::rows(
+            db,
+            "UNWIND $rows AS row \
+             MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc}) \
+             CREATE (d)-[l:LINKS_TO]->(d) SET l += row.props",
+            gparams(key.iter().cloned().chain([("rows", json!(plain))])),
+        )?;
+    }
     Ok(computed.rows.len())
 }
 
@@ -1992,13 +2096,16 @@ pub fn after_sync(
             params![connector, SDK_SESSION_SCHEMA],
         )?
         .is_some();
-    let prefix = format!("connector:{connector}:");
-    let linked = one(
-        db,
-        "SELECT 1 AS yes FROM gf_doc_link_sources WHERE repository_id=? AND substr(document_id,1,length(?2))=?2 LIMIT 1",
-        params![repository, prefix],
-    )?
-    .is_some();
+    let linked = graph_of(db)?
+        .read(|db| {
+            store_graph::one(
+                db,
+                "MATCH (d:ConnectorDoc {repository_id: $repo, connector: $connector}) \
+                 RETURN 1 AS yes LIMIT 1",
+                gparams([("repo", json!(repository)), ("connector", json!(connector))]),
+            )
+        })?
+        .is_some();
     if !read && !linked {
         return Ok(json!({"skipped":"no documents read for links"}));
     }
@@ -2080,6 +2187,33 @@ fn holds(db: &Connection, workspace: &str, plan: &Plan, expected: &mut Value) ->
     Ok(true)
 }
 
+/// Flag the stored rows of documents `(repo, doc)` for recomputation
+/// (`input='retry'`), one batched statement.
+fn mark_retry_in(db: &mut cypherlite::Connection, documents: &[(&str, &str)]) -> Result<()> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<Value> = documents
+        .iter()
+        .map(|(repo, doc)| json!({"repo":repo,"doc":doc}))
+        .collect();
+    store_graph::rows(
+        db,
+        "UNWIND $rows AS row \
+         MATCH (d:ConnectorDoc {repository_id: row.repo, id: row.doc}) SET d.input = 'retry'",
+        gparams([("rows", json!(listed))]),
+    )?;
+    Ok(())
+}
+
+/// [`mark_retry_in`] as its own transaction.
+fn mark_retry(graph: &GraphStore, documents: &[(&str, &str)]) -> Result<()> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    graph.transaction(|db| mark_retry_in(db, documents))
+}
+
 fn write_all(
     store: &Store,
     workspace: &str,
@@ -2088,6 +2222,7 @@ fn write_all(
     plan: &Plan,
     resolved: &Resolved,
 ) -> Result<Value> {
+    let graph = store.graph()?;
     let advance: Vec<(&str, Option<&str>)> = plan
         .projects
         .iter()
@@ -2128,12 +2263,7 @@ fn write_all(
                 // The plan read what has changed since: what this run wrote
                 // is read again whatever the checkpoints say, and so is the
                 // rest, by the job queued here.
-                for (project, document) in &written {
-                    db.execute(
-                        "UPDATE gf_doc_link_sources SET input='retry' WHERE repository_id=? AND document_id=?",
-                        params![project, document],
-                    )?;
-                }
+                mark_retry(&graph, &written)?;
                 if let Some(first) = one(
                     db,
                     "SELECT id FROM repo_projects WHERE workspace_id=? ORDER BY created_at,id LIMIT 1",
@@ -2157,78 +2287,134 @@ fn write_all(
                 readable.insert(project.to_string(), known);
                 Ok(known)
             };
+            let mut to_write: Vec<&Computed> = Vec::new();
             for item in *batch {
                 let kind = item.document.kind;
                 if current_sha(db, &item.document)?.as_deref() != Some(item.document.sha.as_str()) {
                     tally.changed += usize::from(visible(db, &item.document.project, kind)?);
                     continue;
                 }
-                let rows = write(db, item)?;
                 written.push((&item.document.project, &item.document.id));
                 if visible(db, &item.document.project, kind)? {
                     tally.relinked += 1;
-                    tally.mentions += rows;
+                    tally.mentions += item.rows.len();
+                }
+                to_write.push(item);
+            }
+            if last {
+                for (project, document) in &plan.gone {
+                    let kind = if document.starts_with("file:") {
+                        "repository_file"
+                    } else {
+                        "connector_source"
+                    };
+                    // A document in `gone` has a sources row by construction
+                    // (the plan read it), so its node goes: one row removed.
+                    if visible(db, project, kind)? {
+                        tally.removed += 1;
+                    }
+                }
+                // Documents that could not be resolved keep their rows and
+                // are read again by the next job, whatever the checkpoints
+                // say.
+                for (project, document) in &resolved.failed {
+                    let kind = if document.starts_with("file:") {
+                        "repository_file"
+                    } else {
+                        "connector_source"
+                    };
+                    tally.failed += usize::from(visible(db, project, kind)?);
+                }
+                for project in &resolved.unavailable {
+                    if visible(db, project, "repository_file")? {
+                        tally.unavailable.insert(project.clone());
+                    }
                 }
             }
-            if !last {
-                return Ok(true);
-            }
-            for (project, document) in &plan.gone {
-                db.execute(
-                    "DELETE FROM gf_doc_links WHERE repository_id=? AND document_id=? AND producer=?",
-                    params![project, document, PRODUCER],
-                )?;
-                let dropped = db.execute(
-                    "DELETE FROM gf_doc_link_sources WHERE repository_id=? AND document_id=?",
-                    params![project, document],
-                )?;
-                let kind = if document.starts_with("file:") {
-                    "repository_file"
-                } else {
-                    "connector_source"
-                };
-                if visible(db, project, kind)? {
-                    tally.removed += dropped;
-                }
-            }
-            // Documents that could not be resolved keep their rows and are
-            // read again by the next job, whatever the checkpoints say.
-            for (project, document) in &resolved.failed {
-                db.execute(
-                    "UPDATE gf_doc_link_sources SET input='retry' WHERE repository_id=? AND document_id=?",
-                    params![project, document],
-                )?;
-                let kind = if document.starts_with("file:") {
-                    "repository_file"
-                } else {
-                    "connector_source"
-                };
-                tally.failed += usize::from(visible(db, project, kind)?);
-            }
-            for project in &resolved.unavailable {
-                if visible(db, project, "repository_file")? {
-                    tally.unavailable.insert(project.clone());
-                }
-            }
+            // The batch's graph writes commit as one transaction, gated by
+            // the job's lease and the readings check above. A SQL commit
+            // failure after the graph commit leaves rows the next run
+            // recomputes from their recorded inputs.
             let stamp = now();
-            for (project, episode) in &advance {
-                db.execute(
-                    "INSERT INTO gf_doc_link_checkpoints(repository_id,episode,updated_at) VALUES(?,?,?) \
-                     ON CONFLICT(repository_id) DO UPDATE SET episode=excluded.episode,updated_at=excluded.updated_at",
-                    params![project, episode, stamp],
+            graph.transaction(|db| {
+                for item in &to_write {
+                    write(db, item)?;
+                }
+                if !last {
+                    return Ok(());
+                }
+                if !plan.gone.is_empty() {
+                    let gone: Vec<Value> = plan
+                        .gone
+                        .iter()
+                        .map(|(project, document)| json!({"repo":project,"doc":document}))
+                        .collect();
+                    store_graph::rows(
+                        db,
+                        "UNWIND $rows AS row \
+                         MATCH (d:ConnectorDoc {repository_id: row.repo, id: row.doc})-[l:LINKS_TO]->() \
+                         WHERE l.producer = $producer DELETE l",
+                        gparams([("rows", json!(gone)), ("producer", json!(PRODUCER))]),
+                    )?;
+                    // The document's node holds its sources row; a document
+                    // an extension still has rows for keeps its node.
+                    store_graph::rows(
+                        db,
+                        "UNWIND $rows AS row \
+                         MATCH (d:ConnectorDoc {repository_id: row.repo, id: row.doc}) \
+                         OPTIONAL MATCH (d)-[l:LINKS_TO]->() \
+                         WITH d, count(l) AS links WHERE links = 0 DELETE d",
+                        gparams([("rows", json!(gone))]),
+                    )?;
+                }
+                let failed: Vec<(&str, &str)> = resolved
+                    .failed
+                    .iter()
+                    .map(|(project, document)| (project.as_str(), document.as_str()))
+                    .collect();
+                mark_retry_in(db, &failed)?;
+                if !advance.is_empty() {
+                    let rows: Vec<Value> = advance
+                        .iter()
+                        .map(|(project, episode)| {
+                            let mut props =
+                                json!({"repository_id":project,"updated_at":stamp});
+                            if let Some(episode) = episode {
+                                props["episode"] = json!(episode);
+                            }
+                            json!({"project":project,"props":props})
+                        })
+                        .collect();
+                    store_graph::rows(
+                        db,
+                        "UNWIND $rows AS row \
+                         MATCH (c:DocLinkCheckpoint {repository_id: row.project}) DELETE c",
+                        gparams([("rows", json!(rows))]),
+                    )?;
+                    store_graph::rows(
+                        db,
+                        "UNWIND $rows AS row CREATE (c:DocLinkCheckpoint) SET c += row.props",
+                        gparams([("rows", json!(rows))]),
+                    )?;
+                }
+                if !plan.retired.is_empty() {
+                    store_graph::rows(
+                        db,
+                        "UNWIND $rows AS repo \
+                         MATCH (c:DocLinkCheckpoint {repository_id: repo}) DELETE c",
+                        gparams([("rows", json!(plan.retired))]),
+                    )?;
+                }
+                store_graph::rows(
+                    db,
+                    "MERGE (t:DocLinkState {workspace_id: $workspace}) SET t += $props",
+                    gparams([
+                        ("workspace", json!(workspace)),
+                        ("props", json!({"rules":RULES,"updated_at":stamp})),
+                    ]),
                 )?;
-            }
-            for project in &plan.retired {
-                db.execute(
-                    "DELETE FROM gf_doc_link_checkpoints WHERE repository_id=?",
-                    [project],
-                )?;
-            }
-            db.execute(
-                "INSERT INTO gf_doc_link_state(workspace_id,rules,updated_at) VALUES(?,?,?) \
-                 ON CONFLICT(workspace_id) DO UPDATE SET rules=excluded.rules,updated_at=excluded.updated_at",
-                params![workspace, RULES, stamp],
-            )?;
+                Ok(())
+            })?;
             Ok(true)
         })?;
         if !wrote {
@@ -2364,11 +2550,13 @@ pub fn producers() -> Vec<&'static str> {
         .collect()
 }
 
-/// The link rows of one project, read during a query.
+/// The link rows of one project, read during a query: they live in the
+/// graph store (found from the SQL connection's store), the connectors it
+/// checks a document against are still SQL.
 pub struct Lookup<'a> {
     db: &'a Connection,
+    graph: GraphStore,
     repository: String,
-    producers: String,
 }
 
 /// One link row as a query reads it.
@@ -2394,15 +2582,17 @@ struct Link {
 }
 
 impl<'a> Lookup<'a> {
-    pub fn new(db: &'a Connection, repository: &str) -> Self {
-        Self {
+    pub fn new(db: &'a Connection, repository: &str) -> Result<Self> {
+        Ok(Self {
             db,
+            graph: graph_of(db)?,
             repository: repository.to_string(),
-            producers: json!(producers()).to_string(),
-        }
+        })
     }
-    fn links(&self, sql: &str, arguments: impl rusqlite::Params) -> Result<Vec<Link>> {
-        let found = rows(self.db, sql, arguments)?;
+    fn links(&self, cypher: &str, params: Params) -> Result<Vec<Link>> {
+        let found = self
+            .graph
+            .read(|db| store_graph::rows(db, cypher, params))?;
         Ok(found
             .into_iter()
             .map(|row| {
@@ -2422,7 +2612,7 @@ impl<'a> Lookup<'a> {
                     target_sha256: s(&row, "target_sha256").to_string(),
                     target_start: number("target_start"),
                     target_end: number("target_end"),
-                    target: serde_json::from_str(s(&row, "target")).unwrap_or(Value::Null),
+                    target: target_facts(&row),
                     rung: s(&row, "rung").to_string(),
                     producer: s(&row, "producer").to_string(),
                 }
@@ -2432,30 +2622,58 @@ impl<'a> Lookup<'a> {
     /// Linked mentions inside `[a, b)` of one of the project's documents.
     fn mentions_in(&self, document: &str, a: usize, b: usize) -> Result<Vec<Link>> {
         self.links(
-            "SELECT * FROM gf_doc_links WHERE repository_id=?1 AND document_id=?2 AND state='linked' \
-             AND byte_start>=?3 AND byte_end<=?4 AND producer IN (SELECT value FROM json_each(?5)) \
-             ORDER BY byte_start,id",
-            params![self.repository, document, a as i64, b as i64, self.producers],
+            &format!(
+                "MATCH (d:ConnectorDoc {{repository_id: $repo, id: $doc}})-[l:LINKS_TO]->() \
+                 WHERE l.state = 'linked' AND l.byte_start >= $a AND l.byte_end <= $b \
+                 AND l.producer IN $producers \
+                 RETURN {LINK_COLUMNS} ORDER BY l.byte_start, l.seq"
+            ),
+            gparams([
+                ("repo", json!(self.repository)),
+                ("doc", json!(document)),
+                ("a", json!(a)),
+                ("b", json!(b)),
+                ("producers", json!(producers())),
+            ]),
         )
     }
     /// The project's own documents' linked mentions of definitions whose
     /// window in `relpath` overlaps `[a, b)`.
     fn mentions_of(&self, relpath: &str, a: usize, b: usize) -> Result<Vec<Link>> {
         self.links(
-            "SELECT * FROM gf_doc_links WHERE target_repository_id=?1 AND target_relpath=?2 AND state='linked' \
-             AND repository_id=?1 AND target_start<?4 AND target_end>?3 \
-             AND producer IN (SELECT value FROM json_each(?5)) ORDER BY document_id,byte_start,id",
-            params![self.repository, relpath, a as i64, b as i64, self.producers],
+            &format!(
+                "MATCH (d:ConnectorDoc {{repository_id: $repo}})-[l:LINKS_TO]->() \
+                 WHERE l.target_repository_id = $repo AND l.target_relpath = $path \
+                 AND l.state = 'linked' AND l.target_start < $b AND l.target_end > $a \
+                 AND l.producer IN $producers \
+                 RETURN {LINK_COLUMNS} ORDER BY d.id, l.byte_start, l.seq"
+            ),
+            gparams([
+                ("repo", json!(self.repository)),
+                ("path", json!(relpath)),
+                ("a", json!(a)),
+                ("b", json!(b)),
+                ("producers", json!(producers())),
+            ]),
         )
     }
     /// Whether the links of `document` were computed for its current bytes.
     fn computed_for(&self, document: &str, sha: &str) -> Result<bool> {
-        Ok(one(
-            self.db,
-            "SELECT 1 AS yes FROM gf_doc_link_sources WHERE repository_id=? AND document_id=? AND document_sha256=?",
-            params![self.repository, document, sha],
-        )?
-        .is_some())
+        Ok(self
+            .graph
+            .read(|db| {
+                store_graph::one(
+                    db,
+                    "MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc, document_sha256: $sha}) \
+                     RETURN 1 AS yes",
+                    gparams([
+                        ("repo", json!(self.repository)),
+                        ("doc", json!(document)),
+                        ("sha", json!(sha)),
+                    ]),
+                )
+            })?
+            .is_some())
     }
 }
 
@@ -2898,11 +3116,12 @@ impl<'a> Readable<'a> {
 /// for other bytes count as pending. Rows of producers this program does not
 /// run are not read.
 pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
+    let graph = store.graph()?;
     store.authorized_read(workspace, token, "read", |db, p| {
         let repository = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
         let project = s(&repository, "id").to_string();
         let mut readable = Readable::new(db, p);
-        let producers = json!(producers()).to_string();
+        let producers = json!(producers());
         let limit = crate::integer(args, "limit", 200, 2000)?.max(1);
         if let Some(stable) = args.get("stable_id").filter(|v| !v.is_null()) {
             let stable = stable
@@ -2910,12 +3129,23 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
                 .filter(|v| !v.is_empty() && v.len() <= 200)
                 .ok_or_else(|| Error::bad("stable_id must be 1–200 bytes"))?;
             let mut out = Vec::new();
-            for link in rows(
-                db,
-                "SELECT * FROM gf_doc_links WHERE target_repository_id=? AND stable_id=? AND state='linked' \
-                 AND producer IN (SELECT value FROM json_each(?)) ORDER BY repository_id,document_id,byte_start,id",
-                params![project, stable, producers],
-            )? {
+            for link in graph.read(|db| {
+                store_graph::rows(
+                    db,
+                    &format!(
+                        "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() \
+                         WHERE l.target_repository_id = $repo AND l.stable_id = $stable \
+                         AND l.state = 'linked' AND l.producer IN $producers \
+                         RETURN {LINK_COLUMNS} \
+                         ORDER BY d.repository_id, d.id, l.byte_start, l.seq"
+                    ),
+                    gparams([
+                        ("repo", json!(project)),
+                        ("stable", json!(stable)),
+                        ("producers", producers.clone()),
+                    ]),
+                )
+            })? {
                 let document = s(&link, "document_id");
                 if readable
                     .document(s(&link, "repository_id"), document)?
@@ -2943,12 +3173,21 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
                 .ok_or_else(|| Error::bad("Source unavailable"))?;
             let mut out = Vec::new();
             let mut pending = false;
-            for link in rows(
-                db,
-                "SELECT * FROM gf_doc_links WHERE repository_id=? AND document_id=? \
-                 AND producer IN (SELECT value FROM json_each(?)) ORDER BY byte_start,id",
-                params![project, document, producers],
-            )? {
+            for link in graph.read(|db| {
+                store_graph::rows(
+                    db,
+                    &format!(
+                        "MATCH (d:ConnectorDoc {{repository_id: $repo, id: $doc}})-[l:LINKS_TO]->() \
+                         WHERE l.producer IN $producers \
+                         RETURN {LINK_COLUMNS} ORDER BY l.byte_start, l.seq"
+                    ),
+                    gparams([
+                        ("repo", json!(project)),
+                        ("doc", json!(document)),
+                        ("producers", producers.clone()),
+                    ]),
+                )
+            })? {
                 if s(&link, "document_sha256") != listed.sha {
                     pending = true;
                     continue;
@@ -2957,7 +3196,7 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
                 let mut item = json!({"byte_start":link["byte_start"],"byte_end":link["byte_end"],
                     "mention":link["mention"],"mark":link["mark"],"state":state,"rung":link["rung"],"producer":link["producer"]});
                 if state == "linked" {
-                    let facts: Value = serde_json::from_str(s(&link, "target")).unwrap_or(Value::Null);
+                    let facts = target_facts(&link);
                     item["target"] = json!({"repository_id":link["target_repository_id"],"stable_id":link["stable_id"],
                         "relpath":link["target_relpath"],"qualified_name":facts["qualified_name"],
                         "revision":facts["revision"],"kind":facts["kind"],"line":facts["line"],
@@ -2971,25 +3210,33 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
             }
             // Pending: rows for other bytes, or a document the job reads that
             // it has not read at these bytes yet.
-            let computed = one(
-                db,
-                "SELECT 1 AS yes FROM gf_doc_link_sources WHERE repository_id=? AND document_id=? AND document_sha256=?",
-                params![project, document, listed.sha],
-            )?
-            .is_some();
+            let computed = graph
+                .read(|db| {
+                    store_graph::one(
+                        db,
+                        "MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc, document_sha256: $sha}) \
+                         RETURN 1 AS yes",
+                        gparams([
+                            ("repo", json!(project)),
+                            ("doc", json!(document)),
+                            ("sha", json!(listed.sha)),
+                        ]),
+                    )
+                })?
+                .is_some();
             let pending = pending || (!computed && linkable(db, document, listed.session)?);
             return Ok(json!({"repository_id":project,"document_id":document,"mentions":out,
                 "pending":pending,"rules":RULES}));
         }
-        coverage(db, &project, &mut readable, &producers)
+        coverage(&graph, db, &project, &mut readable)
     })
 }
 
 fn coverage(
+    graph: &GraphStore,
     db: &Connection,
     project: &str,
     readable: &mut Readable<'_>,
-    producers: &str,
 ) -> Result<Value> {
     let mut kinds: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     let bump = |kinds: &mut BTreeMap<String, Map<String, Value>>, kind: &str, key: &str, n: u64| {
@@ -3002,11 +3249,15 @@ fn coverage(
     let mut pending = 0u64;
     let mut read: HashSet<String> = HashSet::new();
     let mut computed: HashMap<String, String> = HashMap::new();
-    for source in rows(
-        db,
-        "SELECT document_id,source_kind,document_sha256,counts FROM gf_doc_link_sources WHERE repository_id=?",
-        [project],
-    )? {
+    for source in graph.read(|db| {
+        store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {repository_id: $repo}) \
+             RETURN d.id AS document_id, d.source_kind AS source_kind, \
+             d.document_sha256 AS document_sha256, d.`counts.omitted` AS omitted",
+            gparams([("repo", json!(project))]),
+        )
+    })? {
         let document = s(&source, "document_id").to_string();
         read.insert(document.clone());
         let Some(found) = listed.get(&document) else {
@@ -3016,14 +3267,13 @@ fn coverage(
             pending += 1;
             continue;
         }
-        let counts: Value = serde_json::from_str(s(&source, "counts")).unwrap_or(Value::Null);
         let kind = s(&source, "source_kind").to_string();
         bump(&mut kinds, &kind, "documents", 1);
         bump(
             &mut kinds,
             &kind,
             "omitted",
-            counts["omitted"].as_u64().unwrap_or(0),
+            source["omitted"].as_u64().unwrap_or(0),
         );
         computed.insert(document, kind);
     }
@@ -3052,12 +3302,16 @@ fn coverage(
     }
     let mut mentions: HashMap<String, u64> = HashMap::new();
     let mut rungs: BTreeMap<String, u64> = BTreeMap::new();
-    for link in rows(
-        db,
-        "SELECT document_id,document_sha256,state,scope,target_repository_id,rung FROM gf_doc_links \
-         WHERE repository_id=? AND producer IN (SELECT value FROM json_each(?))",
-        params![project, producers],
-    )? {
+    for link in graph.read(|db| {
+        store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {repository_id: $repo})-[l:LINKS_TO]->() \
+             WHERE l.producer IN $producers \
+             RETURN d.id AS document_id, l.document_sha256 AS document_sha256, l.state AS state, \
+             l.scope AS scope, l.target_repository_id AS target_repository_id, l.rung AS rung",
+            gparams([("repo", json!(project)), ("producers", json!(producers()))]),
+        )
+    })? {
         let document = s(&link, "document_id");
         let Some(kind) = computed.get(document) else {
             continue;
@@ -3095,6 +3349,109 @@ fn coverage(
         json!({"repository_id":project,"rules":RULES,"coverage":{"by_source_kind":kinds,"total":total,
         "by_rung":rungs,"pending_documents":pending}}),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting and project deletion (the link rows live in the graph store, so
+// `crate::deletion` reaches them through these, not through SQL tables).
+
+/// The documents of `repository` with stored rows that `scope` covers.
+fn scoped_documents(
+    graph: &GraphStore,
+    repository: &str,
+    scope: &crate::deletion::Scope,
+) -> Result<Vec<String>> {
+    Ok(graph
+        .read(|db| {
+            store_graph::rows(
+                db,
+                "MATCH (d:ConnectorDoc {repository_id: $repo}) RETURN d.id AS id",
+                gparams([("repo", json!(repository))]),
+            )
+        })?
+        .into_iter()
+        .map(|row| s(&row, "id").to_string())
+        .filter(|id| scope.source(id))
+        .collect())
+}
+
+/// The link rows of `repository`'s documents in `scope`, as the SQL rows
+/// counted: `(links, sources)`.
+pub fn forget_counts(
+    db: &Connection,
+    repository: &str,
+    scope: &crate::deletion::Scope,
+) -> Result<(usize, usize)> {
+    let graph = graph_of(db)?;
+    let documents = scoped_documents(&graph, repository, scope)?;
+    if documents.is_empty() {
+        return Ok((0, 0));
+    }
+    let links = graph
+        .read(|db| {
+            store_graph::one(
+                db,
+                "MATCH (d:ConnectorDoc {repository_id: $repo})-[l:LINKS_TO]->() \
+                 WHERE d.id IN $docs RETURN count(l) AS n",
+                gparams([("repo", json!(repository)), ("docs", json!(documents))]),
+            )
+        })?
+        .and_then(|row| row["n"].as_u64())
+        .unwrap_or(0) as usize;
+    Ok((links, documents.len()))
+}
+
+/// Delete the link rows and sources of `repository`'s documents in `scope`
+/// (every producer's: forgotten text leaves no trace); returns how many
+/// rows (links + sources) went.
+pub fn forget(db: &Connection, repository: &str, scope: &crate::deletion::Scope) -> Result<usize> {
+    let graph = graph_of(db)?;
+    let documents = scoped_documents(&graph, repository, scope)?;
+    if documents.is_empty() {
+        return Ok(0);
+    }
+    let (links, sources) = forget_counts(db, repository, scope)?;
+    graph.transaction(|db| {
+        let docs = json!(documents);
+        store_graph::rows(
+            db,
+            "UNWIND $docs AS doc \
+             MATCH (d:ConnectorDoc {repository_id: $repo, id: doc})-[l:LINKS_TO]->() DELETE l",
+            gparams([("repo", json!(repository)), ("docs", docs.clone())]),
+        )?;
+        store_graph::rows(
+            db,
+            "UNWIND $docs AS doc \
+             MATCH (d:ConnectorDoc {repository_id: $repo, id: doc}) DELETE d",
+            gparams([("repo", json!(repository)), ("docs", docs)]),
+        )?;
+        Ok(())
+    })?;
+    Ok(links + sources)
+}
+
+/// Delete a project's link rows, sources and checkpoint (the SQL store's
+/// `ON DELETE CASCADE` of the tables these replace), when the project is
+/// deleted.
+pub fn drop_project(db: &Connection, repository: &str) -> Result<()> {
+    graph_of(db)?.transaction(|db| {
+        store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {repository_id: $repo})-[l:LINKS_TO]->() DELETE l",
+            gparams([("repo", json!(repository))]),
+        )?;
+        store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {repository_id: $repo}) DELETE d",
+            gparams([("repo", json!(repository))]),
+        )?;
+        store_graph::rows(
+            db,
+            "MATCH (c:DocLinkCheckpoint {repository_id: $repo}) DELETE c",
+            gparams([("repo", json!(repository))]),
+        )?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -3423,6 +3780,17 @@ mod tests {
                 .read(|db| Ok(db.query_row(sql, [], |row| row.get(0))?))
                 .unwrap()
         }
+        fn graph_count(&self, cypher: &str) -> i64 {
+            self.store
+                .graph()
+                .unwrap()
+                .read(|db| {
+                    Ok(store_graph::one(db, cypher, Params::new())?.unwrap()["n"]
+                        .as_i64()
+                        .unwrap())
+                })
+                .unwrap()
+        }
         fn owner(&self) -> String {
             self.store
                 .read(|db| {
@@ -3449,7 +3817,7 @@ mod tests {
             ("docs/a.md", page),
         ]);
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.count("SELECT count(*) FROM gf_doc_link_sources"), 1);
+        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 1);
         unit.sync(&[
             ("wire.py", "def parse_header(line):\n    return line\n"),
             ("docs/a.md", page),
@@ -3493,8 +3861,8 @@ mod tests {
         assert_eq!(summary["requeued"], true, "{summary}");
         assert_eq!(summary["relinked"], 0);
         assert_eq!(
-            unit.count(
-                "SELECT count(*) FROM gf_doc_link_sources WHERE document_id='file:docs/b.md'"
+            unit.graph_count(
+                "MATCH (d:ConnectorDoc {id: 'file:docs/b.md'}) RETURN count(d) AS n"
             ),
             0
         );
@@ -3504,11 +3872,12 @@ mod tests {
         );
         // That job reads the new episode: both pages link to the edited code.
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.count("SELECT count(*) FROM gf_doc_link_sources"), 2);
+        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 2);
         let sha = graphicle_memory::text::sha256(edited.as_bytes());
         assert_eq!(
-            unit.count(&format!(
-                "SELECT count(*) FROM gf_doc_links WHERE state='linked' AND target_sha256='{sha}'"
+            unit.graph_count(&format!(
+                "MATCH ()-[l:LINKS_TO]->() WHERE l.state='linked' AND l.target_sha256='{sha}' \
+                 RETURN count(l) AS n"
             )),
             2
         );

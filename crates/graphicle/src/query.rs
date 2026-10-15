@@ -1525,7 +1525,7 @@ pub fn project_packet(
             arm
         })
     };
-    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"));
+    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))?;
     if crate::observer::KeyMode::parse(args.get("note_keys"))?.is_some() {
         rankings[crate::observer::NOTE_KEYS] = json!(crate::observer::notes_for(
             db,

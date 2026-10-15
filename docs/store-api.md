@@ -21,7 +21,11 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
 - `GraphStore::open(path)` opens (or creates) a CypherLite **directory
   store** (WAL + snapshots) at `path` — beside, not instead of,
   `reviews.sqlite3` until the migration completes. Symlink paths are
-  refused. `GraphStore::path()` returns it.
+  refused. `GraphStore::path()` returns it. The engine's writer lease is
+  exclusive, so a second open of the same path **in this process** shares
+  the live engine through a per-process registry, and an open that finds the
+  lease held by **another process** follows the store read-only (reads pin
+  snapshots; writes fail with a clear error) instead of failing.
 - `GraphStore::open_in_memory()` is the `:memory:` mode that replaces
   rusqlite's `open_in_memory` in tests and transient processing (staging,
   expansion scratch).
