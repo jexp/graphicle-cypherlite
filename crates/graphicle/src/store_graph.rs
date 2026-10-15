@@ -270,6 +270,11 @@ const INDEXES: &[&str] = &[
     "CREATE FULLTEXT INDEX chunk_text IF NOT EXISTS FOR (c:Chunk) ON EACH [c.index_text]",
     "CREATE FULLTEXT INDEX mem_text IF NOT EXISTS FOR (m:Memory) ON EACH [m.title, m.body]",
     "CREATE FULLTEXT INDEX doc_text IF NOT EXISTS FOR (d:ConnectorDoc) ON EACH [d.content]",
+    // Invalidation and symbol-link modules (invalidation.rs, symbols.rs).
+    "CREATE INDEX dep_artifact IF NOT EXISTS FOR (a:Artifact) ON (a.workspace)",
+    "CREATE INDEX sym_head_repo IF NOT EXISTS FOR (s:SymbolHead) ON (s.repository_id)",
+    "CREATE INDEX sym_head_file IF NOT EXISTS FOR (s:SymbolHead) ON (s.relpath)",
+    "CREATE INDEX sym_move_from IF NOT EXISTS FOR (m:SymbolMove) ON (m.from_stable_id)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:

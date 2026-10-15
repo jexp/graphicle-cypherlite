@@ -480,8 +480,9 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
         "repo_memory_revisions",
         "am_claims",
         "am_document_reads",
-        "gf_dependencies",
         "repo_objects",
+        // gf_dependencies moved to the graph store; its edges are removed
+        // there and no longer counted in the SQL catalog.
     ] {
         assert!(
             covered["tables"][table]["rows"].as_u64().unwrap_or(0) > 0,

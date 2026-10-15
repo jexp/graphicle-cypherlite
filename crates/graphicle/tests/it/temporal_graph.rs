@@ -48,7 +48,7 @@ impl Fixture {
             db.execute("INSERT OR REPLACE INTO repo_heads VALUES(?,?,?)",params![self.repo,"a.py",sha])?;
             let episode=graph_projection::current_episode(db,&self.repo)?;
             let graph=Graph::from_node_link(&json!({"directed":true,"multigraph":true,"nodes":[{"id":"a","label":content,"stable_id":"a"},{"id":"b","label":"b","stable_id":"b"}],"links":[{"source":"a","target":"b","key":"calls","relation":"calls"}]}),"links")?;
-            graph_projection::persist(db,&self.repo,&episode,&graph)?;Ok(episode)
+            graph_projection::persist(db,&self.store.graph().unwrap(),&self.repo,&episode,&graph)?;Ok(episode)
         }).unwrap()
     }
     fn view(&self, args: Value) -> Value {

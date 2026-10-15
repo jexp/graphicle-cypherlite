@@ -167,33 +167,43 @@ impl Fixture {
             )
             .unwrap()
     }
-    fn sql(&self, query: &str) -> Vec<Vec<Value>> {
-        let db = self.store.connect().unwrap();
-        let mut statement = db.prepare(query).unwrap();
-        let columns = statement.column_count();
-        statement
-            .query_map([], |row| {
-                (0..columns)
-                    .map(|i| {
-                        Ok(match row.get_ref(i)? {
-                            rusqlite::types::ValueRef::Null => Value::Null,
-                            rusqlite::types::ValueRef::Integer(n) => json!(n),
-                            rusqlite::types::ValueRef::Text(t) => {
-                                json!(String::from_utf8_lossy(t).into_owned())
-                            }
-                            other => json!(format!("{other:?}")),
-                        })
+    /// A graph read (rows of JSON objects): the live-symbol table, its
+    /// state, moves and pins are `:SymbolHead` / `:SymbolState` /
+    /// `:SymbolMove` nodes and `PINNED_TO` relationships now.
+    fn gsql(&self, query: &str) -> Vec<Vec<Value>> {
+        use graphicle_runtime::store_graph::{Params, rows};
+        self.store
+            .graph()
+            .unwrap()
+            .read(|db| {
+                Ok(rows(db, query, Params::new())?
+                    .iter()
+                    .map(|row| {
+                        row.as_object()
+                            .unwrap()
+                            .values()
+                            .cloned()
+                            .collect::<Vec<Value>>()
                     })
-                    .collect()
+                    .collect())
             })
             .unwrap()
-            .map(Result::unwrap)
-            .collect()
+    }
+    /// A graph write (the shift/twin rows the engine itself never writes).
+    fn gexec(&self, query: &str) {
+        self.store
+            .graph()
+            .unwrap()
+            .transaction(|db| {
+                db.query(query)?;
+                Ok(())
+            })
+            .unwrap();
     }
     /// The live symbol `qualified_name` of `relpath`: `(stable_id, revision)`.
     fn symbol_in(&self, repo: &str, relpath: &str, qualified: &str) -> (String, String) {
-        let found = self.sql(&format!(
-            "SELECT stable_id,revision FROM gf_symbol_heads WHERE repository_id='{repo}' AND relpath='{relpath}' AND qualified_name='{qualified}'"
+        let found = self.gsql(&format!(
+            "MATCH (s:SymbolHead {{repository_id: '{repo}', relpath: '{relpath}', qualified_name: '{qualified}'}}) RETURN s.stable_id AS stable_id, s.revision AS revision"
         ));
         assert_eq!(found.len(), 1, "{relpath} {qualified}: {found:?}");
         (
@@ -205,8 +215,8 @@ impl Fixture {
         self.symbol_in(&self.repo, relpath, qualified)
     }
     fn table_episode(&self, repo: &str) -> Value {
-        self.sql(&format!(
-            "SELECT episode FROM gf_symbol_state WHERE repository_id='{repo}'"
+        self.gsql(&format!(
+            "MATCH (st:SymbolState {{repository_id: '{repo}'}}) RETURN st.episode AS episode"
         ))
         .first()
         .map(|row| row[0].clone())
@@ -388,7 +398,9 @@ fn staleness_follows_the_cited_symbols_not_the_file() {
         if name == "unchanged file moved" {
             assert_eq!(listed["symbol_links"]["followed_move"], 1, "{listed:#}");
             let (moved, _) = f.symbol("pkg/moved.py", "alpha");
-            let at = f.sql("SELECT from_stable_id,to_stable_id FROM gf_symbol_moves");
+            let at = f.gsql(
+                "MATCH (mv:SymbolMove) RETURN mv.from_stable_id AS from_stable_id, mv.to_stable_id AS to_stable_id",
+            );
             assert!(at.iter().any(|row| row[1] == json!(moved)), "{at:?}");
             // The quote is found again where the symbol is now.
             assert_eq!(
@@ -494,7 +506,9 @@ fn a_quote_across_symbols_keeps_the_file_rule() {
     f.drain();
     let (alpha, _) = f.symbol("a.py", "alpha");
     let (beta, _) = f.symbol("a.py", "beta");
-    let pins = f.sql("SELECT state,covered,symbols FROM gf_symbol_pins");
+    let pins = f.gsql(
+        "MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state, p.covered AS covered, p.symbols AS symbols",
+    );
     assert_eq!((&pins[0][0], &pins[0][1]), (&json!("pinned"), &json!(0)));
     let pinned: Vec<Value> = serde_json::from_str(pins[0][2].as_str().unwrap()).unwrap();
     let pinned: Vec<&Value> = pinned.iter().map(|l| &l["stable_id"]).collect();
@@ -636,19 +650,14 @@ fn an_ordinal_shift_reads_as_a_missing_symbol() {
     f.sync(&[("a.py", &edited)]);
     f.drain();
     assert_eq!(f.memory(&memory["id"])["stale"], false);
-    let db = f.store.connect().unwrap();
-    db.execute(
-        "UPDATE gf_symbol_heads SET revision='another' WHERE stable_id=?",
-        [&alpha],
-    )
-    .unwrap();
+    f.gexec(&format!(
+        "MATCH (s:SymbolHead {{stable_id: '{alpha}'}}) SET s.revision = 'another'"
+    ));
     let changed = f.memory(&memory["id"]);
     assert_eq!(reasons(&changed), [format!("symbol_changed:{alpha}")]);
-    db.execute(
-        "INSERT INTO gf_symbol_heads(repository_id,stable_id,revision,relpath,qualified_name,kind,ordinal,node_id,line_start,line_next,sha256) SELECT repository_id,'shifted',?,relpath,qualified_name,kind,1,'a_alpha_1',line_start,line_next,sha256 FROM gf_symbol_heads WHERE stable_id=?",
-        [&revision, &alpha],
-    )
-    .unwrap();
+    f.gexec(&format!(
+        "MATCH (s:SymbolHead {{stable_id: '{alpha}'}})          CREATE (t:SymbolHead {{repository_id: s.repository_id, stable_id: 'shifted',             revision: '{revision}', relpath: s.relpath, qualified_name: s.qualified_name,             kind: s.kind, ordinal: 1, node_id: 'a_alpha_1', line_start: s.line_start,             sha256: s.sha256}})"
+    ));
     let missing = f.memory(&memory["id"]);
     assert_eq!(reasons(&missing), [format!("symbol_missing:{alpha}")]);
 }
@@ -695,7 +704,9 @@ fn quotes_written_before_the_projection_are_pinned_by_it() {
     // The projection pins it to alpha.
     f.drain();
     let (alpha, revision) = f.symbol("a.py", "alpha");
-    let pins = f.sql("SELECT state,covered,symbols FROM gf_symbol_pins");
+    let pins = f.gsql(
+        "MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state, p.covered AS covered, p.symbols AS symbols",
+    );
     assert_eq!(pins.len(), 1);
     assert_eq!((&pins[0][0], &pins[0][1]), (&json!("pinned"), &json!(1)));
     let pinned: Value = serde_json::from_str(pins[0][2].as_str().unwrap()).unwrap();
@@ -815,12 +826,9 @@ fn propose_memory_names_files_and_symbols() {
 
     // Ambiguity and a code graph that lags behind the file are refused.
     let g = Fixture::new(&[("a.py", A)]);
-    let db = g.store.connect().unwrap();
-    db.execute(
-        "INSERT INTO gf_symbol_heads(repository_id,stable_id,revision,relpath,qualified_name,kind,ordinal,node_id,line_start,line_next,sha256) SELECT repository_id,'twin',revision,relpath,qualified_name,'other',0,'twin',line_start,line_next,sha256 FROM gf_symbol_heads WHERE qualified_name='alpha'",
-        [],
-    )
-    .unwrap();
+    g.gexec(
+        "MATCH (s:SymbolHead {qualified_name: 'alpha'})          CREATE (t:SymbolHead {repository_id: s.repository_id, stable_id: 'twin',             revision: s.revision, relpath: s.relpath, qualified_name: s.qualified_name,             kind: 'other', ordinal: 0, node_id: 'twin', line_start: s.line_start,             sha256: s.sha256})",
+    );
     let note = |symbols: Value| {
         g.store.note(
             &g.workspace,
@@ -1053,7 +1061,10 @@ fn deleting_or_forgetting_a_memory_takes_its_symbol_pins() {
         ("file:a.py", "    return 1"),
     ]);
     let alone = f.note(&[("file:a.py", "    return 2")]);
-    assert_eq!(f.sql("SELECT state FROM gf_symbol_pins").len(), 2);
+    assert_eq!(
+        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state").len(),
+        2
+    );
 
     let deleted = f
         .store
@@ -1069,7 +1080,10 @@ fn deleting_or_forgetting_a_memory_takes_its_symbol_pins() {
         receipt["removed"]["rows"]["gf_symbol_pins"], 1,
         "{receipt:#}"
     );
-    assert_eq!(f.sql("SELECT state FROM gf_symbol_pins").len(), 1);
+    assert_eq!(
+        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state").len(),
+        1
+    );
 
     let forgot = f
         .store
@@ -1087,7 +1101,10 @@ fn deleting_or_forgetting_a_memory_takes_its_symbol_pins() {
         "{receipt:#}"
     );
     assert!(f.memories().iter().all(|m| m["id"] != cited["id"]));
-    assert!(f.sql("SELECT state FROM gf_symbol_pins").is_empty());
+    assert!(
+        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1174,8 +1191,11 @@ fn a_conversation_project_keeps_its_memories_as_before() {
                 "notes"
             ]
         );
-        assert!(f.sql("SELECT * FROM gf_symbol_heads").is_empty());
-        assert!(f.sql("SELECT * FROM gf_symbol_pins").is_empty());
+        assert!(f.gsql("MATCH (s:SymbolHead) RETURN s").is_empty());
+        assert!(
+            f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p")
+                .is_empty()
+        );
         f.sync(&[
             (
                 "session-1.txt",
@@ -1207,8 +1227,8 @@ fn the_live_symbol_table_follows_the_projected_head_set() {
     let f = Fixture::new(&[("a.py", A)]);
     let first = f.current_episode(&f.repo);
     assert_eq!(f.table_episode(&f.repo), json!(first));
-    let rows = f.sql(
-        "SELECT relpath,qualified_name,kind,ordinal,line_start,line_next FROM gf_symbol_heads ORDER BY line_start",
+    let rows = f.gsql(
+        "MATCH (s:SymbolHead) RETURN s.relpath AS relpath, s.qualified_name AS qualified_name, s.kind AS kind, s.ordinal AS ordinal, s.line_start AS line_start, s.line_next AS line_next ORDER BY s.line_start",
     );
     assert_eq!(
         rows,
@@ -1244,7 +1264,7 @@ fn the_live_symbol_table_follows_the_projected_head_set() {
     assert_eq!(f.current_episode(&f.repo), first);
     assert_eq!(f.table_episode(&f.repo), json!(first));
     assert!(
-        f.sql("SELECT * FROM gf_symbol_heads WHERE relpath='b.py'")
+        f.gsql("MATCH (s:SymbolHead {relpath: 'b.py'}) RETURN s")
             .is_empty()
     );
 }
@@ -1441,8 +1461,8 @@ fn a_refresh_keeps_the_symbol_links_of_the_files_it_does_not_cite() {
             .unwrap()
     };
     let pins = |id: &Value| {
-        f.sql(&format!(
-            "SELECT relpath,sha256,byte_start,byte_end,state,covered,symbols FROM gf_symbol_pins WHERE memory_id='{}' ORDER BY relpath",
+        f.gsql(&format!(
+            "MATCH (m:Memory {{id: '{}'}})-[p:PINNED_TO]->() RETURN p.relpath AS relpath, p.sha256 AS sha256, p.byte_start AS byte_start, p.byte_end AS byte_end, p.state AS state, p.covered AS covered, p.symbols AS symbols ORDER BY p.relpath",
             id.as_str().unwrap()
         ))
     };

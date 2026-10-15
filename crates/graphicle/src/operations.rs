@@ -148,10 +148,10 @@ impl Store {
                     let memories=memory::list(db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     // The memory, its dependents and everything naming them go in one transaction, with a hash-chained receipt.
-                    let (deleted,counts)=crate::deletion::delete_memories(db,&p.workspace,identifier,&memories,memory_id)?;
+                    let (deleted,counts)=crate::deletion::delete_memories(db,&self.graph()?,&p.workspace,identifier,&memories,memory_id)?;
                     purge_derived_cache(db,identifier)?;
                     let keys:Vec<String>=deleted.iter().cloned().collect();
-                    let remaining=crate::deletion::memory_rows(db,identifier,&keys)?;
+                    let remaining=crate::deletion::memory_rows(db,&self.graph()?,identifier,&keys)?;
                     let receipt=crate::deletion::rows_receipt(db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining,true)?;
                     Ok(json!({"deleted":deleted.len(),"transitive":true,"receipt":receipt}))
                 },

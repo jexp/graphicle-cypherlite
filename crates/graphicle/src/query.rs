@@ -1376,12 +1376,12 @@ impl Store {
                     return Err(Error::bad("max_projects applies only with scope workspace"));
                 }
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                Ok(project_packet(db, p, &repository, args, embedding, reranker)?.1)
+                Ok(project_packet(db, &self.graph()?, p, &repository, args, embedding, reranker)?.1)
             }
             // Every project of the workspace the principal may read, each
             // read as this project is above.
             crate::workspace::Scope::Workspace => {
-                crate::workspace::context(db, p, args, embedding, reranker)
+                crate::workspace::context(db, &self.graph()?, p, args, embedding, reranker)
             }
         })
     }
@@ -1394,6 +1394,7 @@ impl Store {
 /// ranked exactly as a single-project read.
 pub fn project_packet(
     db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
     p: &Principal,
     repository: &Value,
     args: &Value,
@@ -1550,7 +1551,7 @@ pub fn project_packet(
     }
     packet["model_calls"] = json!(packet["model_calls"].as_u64().unwrap_or(0) + dense_calls);
     packet["freshness"] = json!(crate::invalidation::repository_freshness(
-        db,
+        gstore,
         &p.workspace,
         s(repository, "id")
     )?);
@@ -1567,7 +1568,7 @@ impl Store {
                 "draft_memories":snap.memories.iter().filter(|m|m["state"]=="draft").count(),"source_state":snap.state,"native_runtime":{"enabled":true,"language":"rust","service_version":env!("CARGO_PKG_VERSION"),"core_version":graphicle_memory::VERSION},
                 "structural_revision":graphicle_memory::structure::REVISION,"graph":snap.graph,"automatic_model_calls":observed,
                 "write_lock":crate::store::lock_report(),
-                "freshness":crate::invalidation::repository_freshness(db,&p.workspace,s(&repository,"id"))?}))
+                "freshness":crate::invalidation::repository_freshness(&self.graph()?,&p.workspace,s(&repository,"id"))?}))
         })
     }
     pub fn read_project_source(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {

@@ -250,8 +250,14 @@ pub fn is_recorded(db: &Connection, repository: &str, episode: &str) -> Result<b
 
 /// Persist `graph` as `episode`: close live rows that disappeared or changed,
 /// insert new ones, never delete. Idempotent for an already recorded episode.
-pub fn persist(db: &Connection, repository: &str, episode: &str, graph: &Graph) -> Result<bool> {
-    persist_with_report(db, repository, episode, graph, None)
+pub fn persist(
+    db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
+    repository: &str,
+    episode: &str,
+    graph: &Graph,
+) -> Result<bool> {
+    persist_with_report(db, gstore, repository, episode, graph, None)
 }
 
 /// Episode attribute key holding the extraction run report; stripped on `load`.
@@ -314,6 +320,7 @@ pub fn episode_heads(
 
 pub fn persist_with_report(
     db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
     repository: &str,
     episode: &str,
     graph: &Graph,
@@ -602,6 +609,7 @@ pub fn persist_with_report(
     let workspace = crate::invalidation::workspace_of(db, repository)?;
     crate::invalidation::record_graph_nodes(
         db,
+        gstore,
         &workspace,
         repository,
         inserted_nodes.iter().map(|(index, node_id)| {
@@ -624,6 +632,7 @@ pub fn persist_with_report(
     if head_set {
         crate::symbols::record(
             db,
+            gstore,
             repository,
             episode,
             graph,
@@ -1160,14 +1169,18 @@ fn info(
 /// new projection would clear when its head set was already projected (a
 /// file edited and then restored) or when a projection job replays a
 /// recorded episode. Returns how many markers were cleared.
-pub fn clear_stale_when_current(db: &Connection, repository: &str) -> Result<usize> {
+pub fn clear_stale_when_current(
+    db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
+    repository: &str,
+) -> Result<usize> {
     let episode = current_episode(db, repository)?;
     if episode_row(db, repository, &episode)?.is_none() {
         return Ok(0);
     }
     let workspace = crate::invalidation::workspace_of(db, repository)?;
     crate::invalidation::clear_stale_prefix(
-        db,
+        gstore,
         &workspace,
         crate::invalidation::GRAPH_NODE,
         &format!("{repository}:"),
@@ -1177,6 +1190,7 @@ pub fn clear_stale_when_current(db: &Connection, repository: &str) -> Result<usi
 /// Build, persist and open the current head set inside one authorized transaction.
 pub fn project(
     db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
     repository: &str,
     _principal: &Principal,
 ) -> Result<ProjectionInfo> {
@@ -1184,14 +1198,14 @@ pub fn project(
     if episode_row(db, repository, &episode)?.is_some() {
         resident(db, repository, &episode)?;
         // A replayed head set's symbols become the live ones.
-        crate::symbols::ensure(db, repository, &episode)?;
-        clear_stale_when_current(db, repository)?;
+        crate::symbols::ensure(db, gstore, repository, &episode)?;
+        clear_stale_when_current(db, gstore, repository)?;
         return info(db, repository, &episode, true);
     }
     let (episode, graph, extraction) =
         crate::phase::phase("graph_build", || build_graph_with_report(db, repository))?;
     crate::phase::phase("graph_persist", || {
-        persist_with_report(db, repository, &episode, &graph, Some(&extraction))
+        persist_with_report(db, gstore, repository, &episode, &graph, Some(&extraction))
     })?;
     registry().open(
         GraphHandle::new(graph),
@@ -1225,6 +1239,7 @@ pub fn prebuild(db: &Connection, repository: &str) -> Result<Option<Built>> {
 /// graph (the rare race keeps the old single-phase behaviour).
 pub fn project_prebuilt(
     db: &Connection,
+    gstore: &crate::store_graph::GraphStore,
     repository: &str,
     principal: &Principal,
     built: Option<Built>,
@@ -1232,14 +1247,14 @@ pub fn project_prebuilt(
     let episode = current_episode(db, repository)?;
     if episode_row(db, repository, &episode)?.is_some() {
         resident(db, repository, &episode)?;
-        crate::symbols::ensure(db, repository, &episode)?;
-        clear_stale_when_current(db, repository)?;
+        crate::symbols::ensure(db, gstore, repository, &episode)?;
+        clear_stale_when_current(db, gstore, repository)?;
         return info(db, repository, &episode, true);
     }
     match built {
         Some((built_episode, graph, extraction)) if built_episode == episode => {
             crate::phase::phase("graph_persist", || {
-                persist_with_report(db, repository, &episode, &graph, Some(&extraction))
+                persist_with_report(db, gstore, repository, &episode, &graph, Some(&extraction))
             })?;
             registry().open(
                 GraphHandle::new(graph),
@@ -1247,7 +1262,7 @@ pub fn project_prebuilt(
             );
             info(db, repository, &episode, false)
         }
-        _ => project(db, repository, principal),
+        _ => project(db, gstore, repository, principal),
     }
 }
 
@@ -1278,7 +1293,7 @@ pub fn project_store(
         match built {
             Some((episode, graph, extraction)) if episode == current => {
                 let recorded = crate::phase::phase("graph_persist", || {
-                    persist_with_report(db, identifier, &episode, &graph, Some(&extraction))
+                    persist_with_report(db, &store.graph()?, identifier, &episode, &graph, Some(&extraction))
                 })?;
                 if recorded {
                     registry().open(
@@ -1287,14 +1302,14 @@ pub fn project_store(
                     );
                 } else {
                     resident(db, identifier, &episode)?;
-                    clear_stale_when_current(db, identifier)?;
+                    clear_stale_when_current(db, &store.graph()?, identifier)?;
                 }
                 info(db, identifier, &episode, !recorded)
             }
             Some(_) => Err(Error::conflict("Repository changed while projecting")),
             None => {
-                crate::symbols::ensure(db, identifier, &current)?;
-                clear_stale_when_current(db, identifier)?;
+                crate::symbols::ensure(db, &store.graph()?, identifier, &current)?;
+                clear_stale_when_current(db, &store.graph()?, identifier)?;
                 info(db, identifier, &current, true)
             }
         }
@@ -1488,7 +1503,7 @@ impl Store {
                 "truncated": truncated,
                 "contradictions": contradictions(db, identifier, Some(&episode))?,
                 "hyperedges": hyperedges,"hyperedges_truncated":hyperedges_truncated,
-                "freshness": crate::invalidation::repository_freshness(db, &p.workspace, identifier)?,
+                "freshness": crate::invalidation::repository_freshness(&self.graph()?, &p.workspace, identifier)?,
             }))
         })
     }

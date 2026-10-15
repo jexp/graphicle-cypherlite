@@ -144,6 +144,25 @@ graph type is inert).
   (parse error in v0.12.2 — writers set `created_at` and counters
   explicitly).
 
+## Migrated modules
+
+- **`invalidation.rs`** (dependency index + staleness): `(:Artifact
+  {workspace, kind, id})-[:DEPENDS_ON {recorded_at}]->(:Artifact)`; the
+  invalidation walk is one `[:DEPENDS_ON*1..]` MATCH; staleness is a `:Stale`
+  marker label (with `stale_reason`/`stale_since` properties) so freshness
+  scans are label filters and clearing is one `REMOVE` of label + properties.
+  Public functions take `&GraphStore`; the few that still read SQL tables
+  (`repo_chunks`, `gf_nodes`, `repo_projects`) take both connections.
+- **`symbols.rs`** (reviewed memory anchored to code symbols): live symbols
+  are `:SymbolHead` nodes (not `:Symbol`, so whole-table replacement never
+  touches the code graph), the table's episode is a `:SymbolState` node,
+  exact moves are `:SymbolMove` nodes, and pins are
+  `(:Memory)-[:PINNED_TO {relpath, sha256, byte_start, byte_end, state, …}]->(:SymbolHead)`
+  — a pending pin points at the repository's `stable_id: ""` anchor until
+  resolved (the resolved links are the pin's `symbols` property, stringified
+  JSON: the engine has no map/list-of-map properties). Read paths still
+  threaded by SQL connections resolve the store with `store::graph_for`.
+
 ## Value-mapping conventions
 
 - **JSON text columns ↔ maps/lists**: what SQL stored as a JSON `TEXT`

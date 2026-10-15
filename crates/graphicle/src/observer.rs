@@ -307,15 +307,16 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
                     data.to_string(), lost as i64, now()],
             )?;
             let artifact = artifact_id(&job.repository, s(doc, "id"));
-            invalidation::forget_dependent(db, &p.workspace, (NOTE, artifact.as_str()))?;
+            let graph = &worker.store.graph()?;
+            invalidation::forget_dependent(graph, &p.workspace, (NOTE, artifact.as_str()))?;
             invalidation::record_document_dependencies(
-                db,
+                graph,
                 &p.workspace,
                 &job.repository,
                 (NOTE, artifact.as_str()),
                 [s(doc, "id")],
             )?;
-            invalidation::clear_stale(db, &p.workspace, NOTE, &artifact)?;
+            invalidation::clear_stale(graph, &p.workspace, NOTE, &artifact)?;
             Ok(())
         })?;
         processed += 1;
@@ -1029,6 +1030,7 @@ pub fn support_windows(notes: &[Value], documents: &[Value]) -> Result<Vec<Value
 /// Delete notes derived from one source and their dependency edges.
 pub fn forget_source(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     source: &str,
@@ -1038,8 +1040,8 @@ pub fn forget_source(
         params![repository, source],
     )?;
     let artifact = artifact_id(repository, source);
-    invalidation::forget_dependent(db, workspace, (NOTE, &artifact))?;
-    invalidation::clear_stale(db, workspace, NOTE, &artifact)?;
+    invalidation::forget_dependent(graph, workspace, (NOTE, &artifact))?;
+    invalidation::clear_stale(graph, workspace, NOTE, &artifact)?;
     forget_reflection(db, repository, source)?;
     Ok(removed)
 }
@@ -1073,14 +1075,19 @@ fn forget_reflection(db: &Connection, repository: &str, source: &str) -> Result<
 
 /// A connector document changed or was removed: delete its notes wherever
 /// they were written (connector document ids are globally prefixed).
-pub fn forget_document(db: &Connection, workspace: &str, document: &str) -> Result<usize> {
+pub fn forget_document(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    workspace: &str,
+    document: &str,
+) -> Result<usize> {
     let mut removed = 0;
     for row in rows(
         db,
         "SELECT DISTINCT repository_id FROM am_observer_notes WHERE source_id=?",
         [document],
     )? {
-        removed += forget_source(db, workspace, s(&row, "repository_id"), document)?;
+        removed += forget_source(db, graph, workspace, s(&row, "repository_id"), document)?;
     }
     for row in rows(db, "SELECT repository_id FROM am_observer_reflections", [])? {
         forget_reflection(db, s(&row, "repository_id"), document)?;

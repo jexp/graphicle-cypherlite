@@ -105,6 +105,7 @@ pub struct Store {
     /// without them, the environment's over Graphicle Core's defaults.
     limits: Option<Arc<crate::limits::Limits>>,
 }
+
 #[derive(Clone)]
 pub struct Principal {
     pub workspace: String,
@@ -307,6 +308,27 @@ pub fn analysis_report(db: &Connection, repository: &str) -> Result<(Vec<Value>,
     Ok((limited, skipped))
 }
 
+/// The graph store paired with a SQL [`Connection`]: `reviews.graph` beside
+/// the connection's database file (shared through the registry in
+/// `GraphStore::open`). Errors for an in-memory connection.
+///
+/// Migration bridge: modules whose data moved onto CypherLite but whose
+/// callers still thread a SQL `&Connection` (read paths through
+/// `query::snapshot`, `memory::list`, …) resolve their [`GraphStore`] here
+/// instead of growing a parameter all the way up; new code should take a
+/// `&GraphStore` argument.
+pub(crate) fn graph_for(db: &Connection) -> Result<crate::store_graph::GraphStore> {
+    let path = db
+        .path()
+        .ok_or_else(|| Error::bad("An in-memory SQL connection has no paired graph store"))?;
+    let directory = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Error::bad("Database path has no parent directory"))?;
+    crate::store_graph::GraphStore::open(directory.join("reviews.graph"))
+}
+
 impl Store {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
@@ -403,6 +425,19 @@ impl Store {
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "secure_delete", true)?;
         Ok(db)
+    }
+    /// The store's graph store (`reviews.graph` beside the database).
+    /// Modules migrated onto CypherLite take it as an argument; see
+    /// `docs/store-api.md`. Opened per call (shared through the registry in
+    /// `GraphStore::open`): the engine holds an exclusive writer lease, so a
+    /// `Store` must not keep a graph store open for its own lifetime — a
+    /// `graphicle` command on the same folder would find the store locked.
+    /// The path is canonicalized so `graph_for`'s (SQLite-reported,
+    /// symlink-resolved) path keys the registry the same way.
+    pub fn graph(&self) -> Result<crate::store_graph::GraphStore> {
+        let path = std::fs::canonicalize(self.directory.as_ref())
+            .unwrap_or_else(|_| self.directory.as_ref().to_path_buf());
+        crate::store_graph::GraphStore::open(path.join("reviews.graph"))
     }
     /// A write transaction (`BEGIN IMMEDIATE`): it takes SQLite's single write
     /// lock up front, so a read-then-write never fails to upgrade. Keep the
@@ -521,7 +556,7 @@ impl Store {
             // Cached answers produced under the revoked credential are no longer current.
             let hash:String=db.query_row("SELECT capability_hash FROM credentials WHERE id=?",[credential],|r|r.get(0))?;
             let revoked_sources=credential_sources(db,workspace,credential)?;
-            crate::invalidation::permissions_changed(db,workspace,Some(&hash),&revoked_sources,"credential_revoked")?;
+            crate::invalidation::permissions_changed(&self.graph()?,workspace,Some(&hash),&revoked_sources,"credential_revoked")?;
             Ok(json!({"revoked":true,"sources":revoked_sources}))
         })
     }
@@ -636,7 +671,7 @@ impl Store {
                 // Identical tree, possibly a new commit identity: the existing
                 // episode still gains the sha from this sync's metadata.
                 let metadata:Value=serde_json::from_str(&metadata)?;
-                let projection=crate::jobs::enqueue_projection(db,identifier,p,&snapshot,&metadata)?;
+                let projection=crate::jobs::enqueue_projection(db,&self.graph()?,identifier,p,&snapshot,&metadata)?;
                 return Ok(json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}));
             }
             let mut missing=Vec::new();
@@ -882,15 +917,18 @@ impl Store {
             db.execute("UPDATE repo_projects SET snapshot=?,generation=generation+1,metadata=?,updated_at=? WHERE id=?",params![s(&sync,"snapshot"),s(&sync,"metadata"),now(),identifier])?;
             db.execute("UPDATE repo_syncs SET state='complete' WHERE id=?",[s(&sync,"id")])?;
             invalidate(db,identifier)?;
-            for path in changed.iter().chain(&removed) {crate::invalidation::file_changed(db,&p.workspace,identifier,path,"repository_commit")?;crate::observer::forget_source(db,&p.workspace,identifier,&format!("file:{path}"))?;}
+            // One engine open per commit: `Store::graph()` opens transiently
+            // (the writer lease is process-exclusive), so loops share it.
+            let gstore=&self.graph()?;
+            for path in changed.iter().chain(&removed) {crate::invalidation::file_changed(gstore,&p.workspace,identifier,path,"repository_commit")?;crate::observer::forget_source(db,gstore,&p.workspace,identifier,&format!("file:{path}"))?;}
             let changed_paths:BTreeSet<&str>=changed.iter().map(String::as_str).collect();
-            for document in documents.iter().filter(|d|changed_paths.contains(d.path.as_str())) {crate::invalidation::record_file_chunks(db,&p.workspace,identifier,&document.path,&document.sha)?;}
+            for document in documents.iter().filter(|d|changed_paths.contains(d.path.as_str())) {crate::invalidation::record_file_chunks(db,gstore,&p.workspace,identifier,&document.path,&document.sha)?;}
             event(db,identifier,"synced",json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed}))?;
             // Every commit yields a graph episode labelled with its commit identity.
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
-            let projection=crate::jobs::enqueue_projection(db,identifier,p,s(&sync,"snapshot"),&metadata)?;
+            let projection=crate::jobs::enqueue_projection(db,gstore,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
-            crate::graph_projection::clear_stale_when_current(db,identifier)?;
+            crate::graph_projection::clear_stale_when_current(db,gstore,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
             let (limited,skipped)=analysis_report(db,identifier)?;
             if !limited.is_empty() {result["limited"]=json!(limited);}
@@ -1161,5 +1199,42 @@ mod lock_site_tests {
             crate_relative("/home/ci/.cargo/registry/src/index.example-1/dep-1.0/src/lib.rs"),
             "src/lib.rs"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_pairing_tests {
+    #[test]
+    fn paired_graph_store_stays_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        // The Store's own handle writes.
+        store
+            .graph()
+            .unwrap()
+            .transaction(|db| {
+                db.query("CREATE (:Artifact {workspace: 'w', kind: 'k', id: 'a'})")?;
+                Ok(())
+            })
+            .unwrap();
+        // And so does the handle a SQL connection resolves to.
+        let db = store.connect().unwrap();
+        let g = super::graph_for(&db).unwrap();
+        g.transaction(|db| {
+            db.query("CREATE (:Artifact {workspace: 'w', kind: 'k', id: 'b'})")?;
+            Ok(())
+        })
+        .unwrap();
+        let n = g
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (a:Artifact) RETURN count(a) AS n",
+                    crate::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(n["n"], serde_json::json!(2));
     }
 }

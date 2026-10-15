@@ -360,7 +360,7 @@ fn projection_keeps_edge_identities_distinct_with_embedded_nul() {
     let second = graph(json!([first_edge]));
     let third = graph(json!([]));
     for (episode, current) in [("first", &first), ("second", &second), ("third", &third)] {
-        graph_projection::persist(&db, &f.repo, episode, current).unwrap();
+        graph_projection::persist(&db, &f.store.graph().unwrap(), &f.repo, episode, current).unwrap();
         assert_eq!(
             sorted_node_link(&graph_projection::load(&db, &f.repo, episode).unwrap()),
             sorted_node_link(current),
@@ -454,7 +454,7 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
         ("endpoint", &endpoint),
         ("remove", &removed),
     ] {
-        graph_projection::persist_with_report(&db, &f.repo, episode, graph, Some(&json!({})))
+        graph_projection::persist_with_report(&db, &f.store.graph().unwrap(), &f.repo, episode, graph, Some(&json!({})))
             .unwrap();
         assert_eq!(
             sorted_node_link(&graph_projection::load(&db, &f.repo, episode).unwrap()),
@@ -475,7 +475,7 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
     // Writes outside the projector invalidate fingerprints. An unchanged
     // authoritative graph must restore the altered live row.
     db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
-    graph_projection::persist_with_report(&db, &f.repo, "repair", &removed, Some(&json!({})))
+    graph_projection::persist_with_report(&db, &f.store.graph().unwrap(), &f.repo, "repair", &removed, Some(&json!({})))
         .unwrap();
     assert_eq!(stats("repair")["dirty_groups"], 1);
     assert_eq!(
@@ -511,7 +511,7 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         .unwrap()
     };
     let original = make("original", "b");
-    graph_projection::persist_with_report(&db, &f.repo, "one", &original, Some(&json!({})))
+    graph_projection::persist_with_report(&db, &f.store.graph().unwrap(), &f.repo, "one", &original, Some(&json!({})))
         .unwrap();
     assert!(db.is_autocommit());
     db.execute_batch(
@@ -528,6 +528,7 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         .unwrap();
     let error = graph_projection::persist_with_report(
         &outer,
+        &f.store.graph().unwrap(),
         &f.repo,
         "failed",
         &make("changed", "a"),
@@ -569,7 +570,7 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
     );
     // The failed projection must restore invalidation before an outer commit.
     db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
-    graph_projection::persist_with_report(&db, &f.repo, "repair", &original, Some(&json!({})))
+    graph_projection::persist_with_report(&db, &f.store.graph().unwrap(), &f.repo, "repair", &original, Some(&json!({})))
         .unwrap();
     assert_eq!(
         sorted_node_link(&graph_projection::load(&db, &f.repo, "repair").unwrap()),

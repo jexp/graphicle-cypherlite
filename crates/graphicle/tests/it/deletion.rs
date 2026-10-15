@@ -151,18 +151,27 @@ fn derive(f: &Fixture, source: &str) {
         "INSERT INTO am_vectors VALUES(?1,?2,?3,'embedding-model',3,'[0.1,0.2,0.3]')",
         rusqlite::params![repo, passage, sha],
     );
+    // The dependency index lives in the graph store now; these rows are
+    // what writers stored there.
     for (kind, dependent) in [
         ("anchor", format!("{repo}:chunk-plan")),
         ("embedding", format!("{repo}:{passage}")),
     ] {
-        f.sql(
-            "INSERT INTO gf_dependencies VALUES(?1,?2,?3,'document',?4,?5)",
-            rusqlite::params![ws, kind, dependent, source, t],
-        );
-        f.sql(
-            "INSERT INTO gf_stale VALUES(?1,?2,?3,'source_changed',?4)",
-            rusqlite::params![ws, kind, dependent, t],
-        );
+        graphicle_runtime::invalidation::record_dependency(
+            &f.store.graph().unwrap(),
+            ws,
+            (kind, &dependent),
+            ("document", source),
+        )
+        .unwrap();
+        graphicle_runtime::invalidation::mark_stale(
+            &f.store.graph().unwrap(),
+            ws,
+            kind,
+            &dependent,
+            "source_changed",
+        )
+        .unwrap();
     }
     let answer = json!({"answer":SECRET}).to_string();
     f.sql(
@@ -216,8 +225,19 @@ fn connector_deletion_returns_a_verified_receipt_covering_derived_state() {
     ] {
         assert_eq!(removed[kind], expected, "{kind}: {removed}");
     }
-    assert_eq!(f.count("SELECT count(*) FROM gf_stale", []), 0);
-    assert_eq!(f.count("SELECT count(*) FROM gf_dependencies WHERE dependent_kind IN ('anchor','embedding','memory')", []), 0);
+    assert!(
+        graphicle_runtime::invalidation::stale_markers(&f.store.graph().unwrap(), &f.workspace)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        graphicle_runtime::invalidation::dependencies(&f.store.graph().unwrap(), &f.workspace)
+            .unwrap()
+            .iter()
+            .filter(|e| ["anchor", "embedding", "memory"].contains(&e.dependent_kind.as_str()))
+            .count(),
+        0
+    );
     // Computed while the documents were visible, so removed whether or not
     // they name them: the cached answer, served record, outcome and hint.
     let since = &receipt["removed"]["since_visible"];
@@ -397,14 +417,20 @@ fn project_deletion_receipt_outlives_the_project_and_extends_the_chain() {
     let second = f.connector(json!([{"id":"memo","title":"Memo","content":MEMO}]));
     let memo = format!("connector:{second}:memo");
     let file = format!("{}:README.md", f.repo);
-    f.sql(
-        "INSERT INTO gf_dependencies VALUES(?1,'memory','m1','file',?2,'2026-01-01')",
-        rusqlite::params![f.workspace, file],
-    );
-    f.sql(
-        "INSERT INTO gf_dependencies VALUES(?1,'memory','m2','document',?2,'2026-01-01')",
-        rusqlite::params![f.workspace, memo],
-    );
+    graphicle_runtime::invalidation::record_dependency(
+        &f.store.graph().unwrap(),
+        &f.workspace,
+        ("memory", "m1"),
+        ("file", &file),
+    )
+    .unwrap();
+    graphicle_runtime::invalidation::record_dependency(
+        &f.store.graph().unwrap(),
+        &f.workspace,
+        ("memory", "m2"),
+        ("document", &memo),
+    )
+    .unwrap();
     let deleted = f
         .store
         .maintain(
@@ -424,7 +450,11 @@ fn project_deletion_receipt_outlives_the_project_and_extends_the_chain() {
             .unwrap()
             >= 2
     );
-    assert_eq!(f.count("SELECT count(*) FROM gf_dependencies", []), 0);
+    assert!(
+        graphicle_runtime::invalidation::dependencies(&f.store.graph().unwrap(), &f.workspace)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(receipt["sequence"], 2);
     assert_eq!(receipt["previous"], connector_receipt["digest"]);
     assert_eq!(f.count("SELECT count(*) FROM repo_projects", []), 0);
