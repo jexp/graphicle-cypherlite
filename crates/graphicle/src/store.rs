@@ -413,12 +413,6 @@ impl Store {
             None => crate::limits::Limits::from_environment(&BTreeMap::new()),
         }
     }
-    /// The store's graph store beside `reviews.sqlite3` (the migrated
-    /// domains' data; see [`crate::store_graph`]). Opening the same path
-    /// again shares the one engine of this process, so this is cheap.
-    pub fn graph(&self) -> Result<crate::store_graph::GraphStore> {
-        crate::store_graph::GraphStore::open(self.directory.join("reviews.graph"))
-    }
     pub fn connect(&self) -> Result<Connection> {
         let db = Connection::open(self.database.as_ref())?;
         db.busy_timeout(Duration::from_secs(10))?;
