@@ -26,7 +26,20 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
   rusqlite's `open_in_memory` in tests and transient processing (staging,
   expansion scratch).
 - `GraphStore` is cheap to clone; clones share one engine. The engine takes
-  a single-process writer lease on a durable store.
+  a single-process writer lease on a durable store. Because of the lease,
+  durable stores are opened through `GraphStore::shared(path)` (one instance
+  per canonical path per process — a second `Store::open` of the same
+  directory, or a re-opened test store, must not open the engine twice). A
+  process that finds the lease taken by *another* process (a CLI command
+  beside a running server or mcp session) gets a read-only WAL follower
+  instead (`OpenMode::Follow`, ADR-0137: reads tail the writer's WAL on a
+  50 ms poller; writes fail with "database is read-only").
+  `GraphStore::open_follower(path)` opens a follower explicitly.
+- `Store` (the SQL façade) holds the projection's `GraphStore` lazily —
+  `Store::graph() -> Result<&GraphStore>` opens it on first graph touch, so
+  a process that never touches the graph never takes the lease. Call sites
+  that still hold only a rusqlite `Connection` bridge with
+  `store_graph::shared_for(&connection)`.
 - `store.checkpoint()` flushes the WAL into a snapshot (maintenance/backup
   paths); `store.database()` exposes the raw `cypherlite::Database` for
   snapshot/clone work.

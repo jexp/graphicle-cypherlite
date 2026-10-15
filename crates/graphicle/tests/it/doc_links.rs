@@ -217,7 +217,7 @@ fn markdown_mentions_link_where_the_engine_resolves_them() {
         .store
         .read(|db| {
             let episode = graph_projection::current_episode(db, &repo)?;
-            let handle = graph_projection::resident(db, &repo, &episode)?;
+            let handle = graph_projection::resident(&crate::gstore(db), &repo, &episode)?;
             let graph: &graphicle::graph::Graph = &handle;
             let text = |i: usize, key: &str| {
                 graph.nodes()[i]
@@ -2001,7 +2001,7 @@ fn outcomes_across_projects_say_nothing_of_projects_a_reader_cannot_read() {
             .store
             .read(|db| {
                 let episode = graph_projection::current_episode(db, &shown)?;
-                let handle = graph_projection::resident(db, &shown, &episode)?;
+                let handle = graph_projection::resident(&crate::gstore(db), &shown, &episode)?;
                 let graph: &graphicle::graph::Graph = &handle;
                 Ok(graph
                     .nodes()

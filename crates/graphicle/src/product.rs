@@ -208,11 +208,12 @@ impl Store {
             let path = crate::store::path(crate::string(args, "path", 4096)?)?;
             let episode = crate::graph_projection::resolve_episode(
                 db,
+                &crate::store_graph::shared_for(db)?,
                 workspace,
                 identifier,
                 crate::string(args, "episode", 128)?,
             )?;
-            let heads = crate::graph_projection::episode_heads(db, identifier, &episode)?
+            let heads = crate::graph_projection::episode_heads(db, &crate::store_graph::shared_for(db)?, identifier, &episode)?
                 .ok_or_else(|| Error::bad("The cited episode has no retained source manifest"))?;
             let sha = heads
                 .get(path)
@@ -246,7 +247,7 @@ impl Store {
                 "SELECT episode,sequence,created_at,node_count,edge_count FROM gf_episodes WHERE repository_id=? ORDER BY sequence DESC LIMIT 1",
                 [identifier])?;
             let current_episode = crate::graph_projection::current_episode(db, identifier)?;
-            let recorded = crate::graph_projection::is_recorded(db, identifier, &current_episode)?;
+            let recorded = crate::graph_projection::is_recorded(&crate::store_graph::shared_for(db)?, identifier, &current_episode)?;
             let current = one(db, "SELECT episode,sequence,created_at,node_count,edge_count FROM gf_episodes WHERE repository_id=? AND episode=?",
                 params![identifier,current_episode])?;
             let counts = one(db,

@@ -48,7 +48,7 @@ impl Fixture {
             db.execute("INSERT OR REPLACE INTO repo_heads VALUES(?,?,?)",params![self.repo,"a.py",sha])?;
             let episode=graph_projection::current_episode(db,&self.repo)?;
             let graph=Graph::from_node_link(&json!({"directed":true,"multigraph":true,"nodes":[{"id":"a","label":content,"stable_id":"a"},{"id":"b","label":"b","stable_id":"b"}],"links":[{"source":"a","target":"b","key":"calls","relation":"calls"}]}),"links")?;
-            graph_projection::persist(db,&self.repo,&episode,&graph)?;Ok(episode)
+            graph_projection::persist(db,&crate::gstore(db),&self.repo,&episode,&graph)?;Ok(episode)
         }).unwrap()
     }
     fn view(&self, args: Value) -> Value {
@@ -189,7 +189,7 @@ fn historical_aliases_and_hyperedges_survive_retraction_without_future_leakage()
                     params![f.repo, "contract", episode, "requires", r#"["a","b"]"#, "{}", active, at, recorded],
                 )?;
             }
-            let graph = graph_projection::load(db, &f.repo, &episode)?;
+            let graph = graph_projection::load(&crate::gstore(db), &f.repo, &episode)?;
             let known = |recorded| temporal_graph::hyperedges_at(db, &f.repo, at, recorded, &graph);
             assert!(known(created - 1)?.0.is_empty());
             assert_eq!(known(created)?.0.len(), 1);

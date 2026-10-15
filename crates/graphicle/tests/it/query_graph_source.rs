@@ -236,7 +236,7 @@ impl Fixture {
         let db = self.store.connect().unwrap();
         let episode = self.episode();
         let handle =
-            graphicle_runtime::graph_projection::resident(&db, &self.repo, &episode).unwrap();
+            graphicle_runtime::graph_projection::resident(&crate::gstore(&db), &self.repo, &episode).unwrap();
         handle
             .nodes()
             .iter()

@@ -132,7 +132,7 @@ pub fn select(db: &Connection, workspace: &str, repository: &str, args: &Value) 
         })
     } else {
         let selector = args["as_of"].as_str().unwrap_or("latest");
-        let episode = graph_projection::resolve_episode(db, workspace, repository, selector)?;
+        let episode = graph_projection::resolve_episode(db, &crate::store_graph::shared_for(db)?, workspace, repository, selector)?;
         let row = one(
             db,
             "SELECT created_at FROM gf_episodes WHERE repository_id=? AND episode=?",

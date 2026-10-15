@@ -98,6 +98,13 @@ pub fn lock_report() -> Value {
 pub struct Store {
     pub directory: Arc<PathBuf>,
     pub database: Arc<PathBuf>,
+    /// The CypherLite store the graph-native domains (the bi-temporal code
+    /// projection first) keep their data in, beside `reviews.sqlite3`
+    /// (`docs/store-api.md`). Opened lazily on the first graph touch: the
+    /// engine takes a single-process writer lease, and a process that never
+    /// reads or writes the graph (a CLI command on the content store) must
+    /// not hold it.
+    graph: Arc<std::sync::OnceLock<crate::store_graph::GraphStore>>,
     /// Signalled when a job is queued, so an idle worker in this process
     /// starts it at once instead of at its next poll.
     pub wake: Arc<tokio::sync::Notify>,
@@ -326,6 +333,7 @@ impl Store {
         let store = Self {
             directory: Arc::new(directory.to_path_buf()),
             database: Arc::new(database),
+            graph: Arc::new(std::sync::OnceLock::new()),
             wake: Arc::new(tokio::sync::Notify::new()),
             limits: None,
         };
@@ -397,6 +405,17 @@ impl Store {
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "secure_delete", true)?;
         Ok(db)
+    }
+    /// The graph store the projection and other graph-native domains run
+    /// their Cypher against, opened on first use. Where another process owns
+    /// the writer lease this is a read-only follower (ADR-0137): reads tail
+    /// the writer's WAL, writes fail with "database is read-only".
+    pub fn graph(&self) -> Result<&crate::store_graph::GraphStore> {
+        if let Some(store) = self.graph.get() {
+            return Ok(store);
+        }
+        let store = crate::store_graph::GraphStore::shared(self.directory.join("reviews.graph"))?;
+        Ok(self.graph.get_or_init(|| store))
     }
     /// A write transaction (`BEGIN IMMEDIATE`): it takes SQLite's single write
     /// lock up front, so a read-then-write never fails to upgrade. Keep the
@@ -884,7 +903,7 @@ impl Store {
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
             let projection=crate::jobs::enqueue_projection(db,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
-            crate::graph_projection::clear_stale_when_current(db,identifier)?;
+            crate::graph_projection::clear_stale_when_current(db,self.graph()?,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
             let (limited,skipped)=analysis_report(db,identifier)?;
             if !limited.is_empty() {result["limited"]=json!(limited);}

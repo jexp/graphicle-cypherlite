@@ -189,23 +189,28 @@ pub fn project_with_graph(
         )
         .ok()?
     } else {
-        let mut select = db
-            .prepare(
-                "SELECT attributes FROM gf_nodes WHERE repository_id=? AND owner<>'' AND valid_to_episode IS NULL",
-            )
-            .ok()?;
-        let mut rows = select.query([&found.id]).ok()?;
-        let mut symbol = false;
-        while let Some(row) = rows.next().ok()? {
-            let text: String = row.get(0).ok()?;
-            if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-                .is_ok_and(|attributes| crate::code_graph_arm::code_symbol(&attributes))
-            {
-                symbol = true;
-                break;
-            }
-        }
-        symbol
+        // Live symbol versions of the projection (graph store).
+        let store = crate::store_graph::shared_for(&db).ok()?;
+        store
+            .read(|g| {
+                let mut symbol = false;
+                for row in crate::store_graph::rows(
+                    g,
+                    "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
+                     WHERE v.owner <> '' RETURN v.data AS data",
+                    crate::store_graph::Params::from([("r".to_string(), cypherlite::Value::String(found.id.as_str().into()))]),
+                )? {
+                    let text = crate::store::s(&row, "data");
+                    if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+                        .is_ok_and(|attributes| crate::code_graph_arm::code_symbol(&attributes))
+                    {
+                        symbol = true;
+                        break;
+                    }
+                }
+                Ok(symbol)
+            })
+            .ok()?
     };
     if !symbol {
         return None;
@@ -216,12 +221,23 @@ pub fn project_with_graph(
             let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
             file.strip_prefix(&found.folder).ok().is_some_and(|relative| {
                 let relative = relative.to_string_lossy().replace('\\', "/");
-                db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM gf_nodes WHERE repository_id=? AND owner=? AND valid_to_episode IS NULL)",
-                    [&found.id, &relative],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false)
+                crate::store_graph::shared_for(&db)
+                    .and_then(|store| {
+                        store.read(|g| {
+                            crate::store_graph::one(
+                                g,
+                                "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
+                                 WHERE v.owner = $owner RETURN v.data AS data LIMIT 1",
+                                crate::store_graph::Params::from([
+                                    ("r".to_string(), cypherlite::Value::String(found.id.as_str().into())),
+                                    ("owner".to_string(), cypherlite::Value::String(relative.as_str().into())),
+                                ]),
+                            )
+                        })
+                    })
+                    .ok()
+                    .flatten()
+                    .is_some()
             })
         }
     };

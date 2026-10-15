@@ -796,7 +796,7 @@ impl Index {
     /// The episode's manifest (path → sha256), read once.
     fn manifest(&self, db: &Connection) -> Result<Option<&BTreeMap<String, String>>> {
         if self.manifest.get().is_none() {
-            let loaded = graph_projection::episode_heads(db, &self.repository, &self.episode)?;
+            let loaded = graph_projection::episode_heads(db, &crate::store_graph::shared_for(db)?, &self.repository, &self.episode)?;
             let _ = self.manifest.set(loaded);
         }
         Ok(self.manifest.get().and_then(Option::as_ref))
@@ -1443,7 +1443,7 @@ impl Checker<'_> {
         if !self.manifests.contains_key(&index) {
             let project = &self.projects[index];
             let found = project.episode.as_ref().and_then(|episode| {
-                graph_projection::episode_heads(self.db, &project.id, episode)
+                graph_projection::episode_heads(self.db, &crate::store_graph::shared_for(self.db).ok()?, &project.id, episode)
                     .ok()
                     .flatten()
             });
@@ -1619,7 +1619,7 @@ fn open(db: &Connection, project: &Project, views: &mut HashMap<String, View>) {
         return;
     }
     let view = match &project.episode {
-        Some(episode) => match graph_projection::resident(db, &project.id, episode) {
+        Some(episode) => match crate::store_graph::shared_for(db).and_then(|store| graph_projection::resident(&store, &project.id, episode)) {
             Ok(graph) => View::Ready(Box::new(Index::new(&project.id, episode, graph))),
             Err(_) => View::Unavailable,
         },

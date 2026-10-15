@@ -496,15 +496,17 @@ fn linking_a_single_repository_workspace_is_skipped_and_records_nothing() {
     assert_eq!(direct["pairs"], json!([]));
     assert_eq!(direct["repositories"].as_array().unwrap().len(), 1);
     let db = f.store.connect().unwrap();
-    for table in ["gf_cross_edges", "gf_cross_packages", "gf_cross_unresolved"] {
-        let count: i64 = db
-            .query_row(
-                &format!("SELECT count(*) FROM {table} WHERE workspace_id=?"),
-                [&f.workspace],
-                |r| r.get(0),
-            )
+    // The cross-repository state is graph-native now: CROSS_CALL
+    // relationships, Package and UnresolvedCross nodes.
+    for (label, cypher) in [
+        ("gf_cross_edges", "MATCH (a:Symbol)-[r:CROSS_CALL]->(b:Symbol) WHERE r.workspace_id = $w RETURN count(r) AS n"),
+        ("gf_cross_packages", "MATCH (p:Package {workspace_id:$w}) RETURN count(p) AS n"),
+        ("gf_cross_unresolved", "MATCH (u:UnresolvedCross {workspace_id:$w}) RETURN count(u) AS n"),
+    ] {
+        let count = crate::grows(&db, cypher, &[("w", json!(f.workspace))])[0]["n"]
+            .as_i64()
             .unwrap();
-        assert_eq!(count, 0, "{table} must stay empty for one repository");
+        assert_eq!(count, 0, "{label} must stay empty for one repository");
     }
     // Once a second repository is projected the pair links as before.
     f.commit(&f.b, &b_files(), B_SHA1);
@@ -548,13 +550,15 @@ fn a_pr_scratch_copy_does_not_make_imports_ambiguous() {
     db.execute("DELETE FROM repo_project_roles", []).unwrap();
     let ambiguous = f.store.graph_link(&f.workspace, &f.key).unwrap();
     assert_eq!(ambiguous["edges"], 0, "{ambiguous}");
-    let reasons: Vec<String> = db
-        .prepare("SELECT reason FROM gf_cross_unresolved WHERE source_repository_id=? AND valid_to_episode IS NULL")
-        .unwrap()
-        .query_map([&f.b], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let reasons: Vec<String> = crate::grows(
+        &db,
+        "MATCH (u:UnresolvedCross {source_repository_id:$r}) \
+         WHERE u.valid_to_episode IS NULL RETURN u.reason AS reason",
+        &[("r", json!(f.b))],
+    )
+    .iter()
+    .map(|row| s(row, "reason").to_string())
+    .collect();
     assert!(
         reasons.iter().any(|r| r == "ambiguous_exporters"),
         "{reasons:?}"
@@ -577,28 +581,35 @@ fn a_pr_scratch_copy_does_not_make_imports_ambiguous() {
     let linked = reopened.graph_link(&f.workspace, &f.key).unwrap();
     assert_eq!(linked["pr_scratch_skipped"], json!([copy]), "{linked}");
     assert!(linked["edges"].as_u64().unwrap() >= 2, "{linked}");
-    let targets: Vec<String> = db
-        .prepare("SELECT DISTINCT target_repository_id FROM gf_cross_edges WHERE source_repository_id=? AND valid_to_episode IS NULL")
-        .unwrap()
-        .query_map([&f.b], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let targets: Vec<String> = crate::grows(
+        &db,
+        "MATCH (a:Symbol)-[r:CROSS_CALL]->(b:Symbol) \
+         WHERE r.source_repository_id = $r AND r.valid_to_episode IS NULL \
+         RETURN DISTINCT r.target_repository_id AS target",
+        &[("r", json!(f.b))],
+    )
+    .iter()
+    .map(|row| s(row, "target").to_string())
+    .collect();
     assert_eq!(targets, vec![f.a.clone()], "{linked}");
-    let live_ambiguous: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_cross_unresolved WHERE source_repository_id=? AND valid_to_episode IS NULL AND reason='ambiguous_exporters'",
-            [&f.b],
-            |r| r.get(0),
-        )
+    let live_ambiguous = crate::grows(
+        &db,
+        "MATCH (u:UnresolvedCross {source_repository_id:$r}) \
+         WHERE u.valid_to_episode IS NULL AND u.reason = 'ambiguous_exporters' \
+         RETURN count(u) AS n",
+        &[("r", json!(f.b))],
+    )[0]["n"]
+        .as_i64()
         .unwrap();
     assert_eq!(live_ambiguous, 0);
-    let copy_live: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_cross_edges WHERE (source_repository_id=?1 OR target_repository_id=?1) AND valid_to_episode IS NULL",
-            [&copy],
-            |r| r.get(0),
-        )
+    let copy_live = crate::grows(
+        &db,
+        "MATCH (a:Symbol)-[r:CROSS_CALL]->(b:Symbol) \
+         WHERE r.source_repository_id = $r OR r.target_repository_id = $r \
+         RETURN count(r) AS n",
+        &[("r", json!(copy))],
+    )[0]["n"]
+        .as_i64()
         .unwrap();
     assert_eq!(copy_live, 0);
     // Nothing was deleted: the copy and its graph stay reachable.

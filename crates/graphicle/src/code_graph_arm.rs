@@ -90,7 +90,7 @@ pub fn reading(
     heads: &BTreeMap<String, String>,
     current: &str,
 ) -> Result<Option<Reading>> {
-    if graph_projection::is_recorded(db, repository, current)? {
+    if graph_projection::is_recorded(&crate::store_graph::shared_for(db)?, repository, current)? {
         return Ok(Some(Reading {
             episode: current.to_string(),
             lag: None,
@@ -105,7 +105,7 @@ pub fn reading(
         return Ok(None);
     };
     let episode = s(&latest, "episode").to_string();
-    let Some(recorded) = graph_projection::stored_episode_heads(db, repository, &episode)? else {
+    let Some(recorded) = graph_projection::stored_episode_heads(&crate::store_graph::shared_for(db)?, repository, &episode)? else {
         return Ok(None);
     };
     let unchanged: BTreeSet<String> = heads
@@ -243,7 +243,7 @@ pub fn skip_reason(
         [repository],
     )?;
     let lag = match &latest {
-        Some(row) => graph_projection::stored_episode_heads(db, repository, s(row, "episode"))?
+        Some(row) => graph_projection::stored_episode_heads(&crate::store_graph::shared_for(db)?, repository, s(row, "episode"))?
             .map(|recorded| {
                 let changed = heads
                     .iter()
@@ -545,7 +545,7 @@ pub fn arm_with(
         }
         Ok::<_, crate::Error>(())
     };
-    let handle = graph_projection::resident(db, repository, &episode)?;
+    let handle = graph_projection::resident(&crate::store_graph::shared_for(db)?, repository, &episode)?;
     let reference = graph_projection::graph_ref(repository, &episode);
     let index = resident_index(&reference, &handle);
     let graph: &Graph = &handle;
@@ -762,7 +762,7 @@ pub fn integration_default(db: &Connection, repository: &str) -> Result<Value> {
     let Some(Reading { episode, .. }) = reading(db, repository, &heads, &current)? else {
         return Ok(json!({"integrated": false, "reason": "no_episode", "episode": null}));
     };
-    let handle = graph_projection::resident(db, repository, &episode)?;
+    let handle = graph_projection::resident(&crate::store_graph::shared_for(db)?, repository, &episode)?;
     let graph: &Graph = &handle;
     let integrated = graph
         .nodes()

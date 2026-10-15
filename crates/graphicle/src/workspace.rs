@@ -810,7 +810,8 @@ impl<'a> Graphs<'a> {
         self.loaded
             .entry((repository.to_string(), episode.to_string()))
             .or_insert_with(|| {
-                let handle = graph_projection::resident(self.db, repository, episode).ok()?;
+                let store = crate::store_graph::shared_for(self.db).ok()?;
+                let handle = graph_projection::resident(&store, repository, episode).ok()?;
                 let starts = code_graph_arm::symbol_starts(&handle);
                 Some(Loaded { handle, starts })
             })
@@ -893,7 +894,7 @@ fn cross_step(
             (0, CrossDirection::Outgoing, "target_repository_id"),
             (1, CrossDirection::Incoming, "source_repository_id"),
         ] {
-            pair[slot] = graph_projection::live_cross_edges(db, p, read.id(), direction)?
+            pair[slot] = graph_projection::live_cross_edges(db, &crate::store_graph::shared_for(db)?, p, read.id(), direction)?
                 .into_iter()
                 .filter(|edge| index.contains_key(s(edge, other)))
                 .collect();
@@ -1036,7 +1037,7 @@ fn cross_step(
                     continue;
                 };
                 if other_episode != current[j]
-                    && graph_projection::stored_episode_heads(db, reads[j].id(), &other_episode)
+                    && graph_projection::stored_episode_heads(&crate::store_graph::shared_for(db)?, reads[j].id(), &other_episode)
                         .ok()
                         .flatten()
                         .is_none_or(|heads| {

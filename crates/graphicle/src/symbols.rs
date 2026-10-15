@@ -281,12 +281,12 @@ pub fn ensure(db: &Connection, repository: &str, episode: &str) -> Result<bool> 
     }
     let heads = crate::store::heads(db, repository)?;
     if graph_projection::episode_of(&heads) != episode
-        || !graph_projection::is_recorded(db, repository, episode)?
+        || !graph_projection::is_recorded(&crate::store_graph::shared_for(db)?, repository, episode)?
     {
         return Ok(false);
     }
     savepoint(db, || {
-        let handle = graph_projection::resident(db, repository, episode)?;
+        let handle = graph_projection::resident(&crate::store_graph::shared_for(db)?, repository, episode)?;
         let graph: &Graph = &handle;
         replace(db, repository, episode, rows_of(graph, &heads, None), None)
     })?;
@@ -563,7 +563,7 @@ fn describe(
         return Ok(None);
     };
     let heads = manifest.get_or_insert_with(|| {
-        graph_projection::stored_episode_heads(db, repository, episode)
+        graph_projection::stored_episode_heads(&crate::store_graph::shared_for(db).ok()?, repository, episode)
             .ok()
             .flatten()
     });

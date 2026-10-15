@@ -101,13 +101,25 @@ impl Fixture {
     fn db(&self) -> rusqlite::Connection {
         self.store.connect().unwrap()
     }
+    /// Row counts of the projection's graph-native state, named after the
+    /// `gf_*` tables of the SQL store so the assertions read as they did:
+    /// episodes are `Episode` nodes, nodes are `SymbolVersion`s, edges the
+    /// versioned relationships (live and `*_HIST`).
     fn count(&self, table: &str) -> i64 {
-        self.db()
-            .query_row(
-                &format!("SELECT count(*) FROM {table} WHERE repository_id=?"),
-                [&self.repo],
-                |r| r.get(0),
-            )
+        let cypher = match table {
+            "gf_episodes" => "MATCH (e:Episode {repository_id:$r}) RETURN count(e) AS n",
+            "gf_nodes" => {
+                "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:SymbolVersion) \
+                 RETURN count(v) AS n"
+            }
+            "gf_edges" => {
+                "MATCH (a:Symbol {repository_id:$r})-[r]->(b:Symbol) \
+                 WHERE r.valid_from_episode IS NOT NULL RETURN count(r) AS n"
+            }
+            other => panic!("no graph-native count for {other}"),
+        };
+        crate::grows(&self.db(), cypher, &[("r", json!(self.repo))])[0]["n"]
+            .as_i64()
             .unwrap()
     }
     fn app(&self) -> Router {
@@ -258,6 +270,7 @@ fn loaded_episode_equals_built_graph() {
         ("docs/notes.md", "# Notes\n\nSee a.py\n"),
     ]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let (episode, built) = graph_projection::build_graph(&db, &f.repo).unwrap();
     assert!(built.node_count() >= 5);
     assert!(built.is_directed());
@@ -265,13 +278,13 @@ fn loaded_episode_equals_built_graph() {
     assert_eq!(projected["episode"], json!(episode));
     assert_eq!(projected["nodes"], json!(built.node_count()));
     assert_eq!(projected["edges"], json!(built.edge_count()));
-    let loaded = graph_projection::load(&db, &f.repo, &episode).unwrap();
+    let loaded = graph_projection::load(&store, &f.repo, &episode).unwrap();
     assert_eq!(sorted_node_link(&loaded), sorted_node_link(&built));
     // The registry is process-wide and holds 8 graphs: tests running beside
     // this one can evict the projection's handle before it is read (seen on a
     // 96-core Linux machine), so an evicted handle is reopened from
     // the tables, as every reader of a resident graph does.
-    let resident = graph_projection::resident(&db, &f.repo, &episode).unwrap();
+    let resident = graph_projection::resident(&store, &f.repo, &episode).unwrap();
     assert_eq!(sorted_node_link(&resident), sorted_node_link(&built));
     assert!(
         loaded
@@ -293,6 +306,7 @@ fn extraction_cache_persists_across_builds_and_leaves_the_graph_unchanged() {
         ("docs/notes.md", "# Notes\n\nSee a.py\n"),
     ]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let cache = graph_projection::cache_root(&db, &f.repo).unwrap();
     assert!(cache.starts_with(std::fs::canonicalize(f._dir.path()).unwrap()));
     let (episode, cold, summary) = graph_projection::build_graph_with_report(&db, &f.repo).unwrap();
@@ -326,7 +340,7 @@ fn extraction_cache_persists_across_builds_and_leaves_the_graph_unchanged() {
     assert!(graph.attributes().get("extraction_run").is_none());
     let projected = f.project();
     assert_eq!(projected["episode"], json!(edited));
-    let listing = graph_projection::episodes(&db, &f.repo).unwrap();
+    let listing = graph_projection::episodes(&store, &f.repo).unwrap();
     let recorded = listing
         .iter()
         .find(|e| e["episode"] == json!(edited))
@@ -335,7 +349,7 @@ fn extraction_cache_persists_across_builds_and_leaves_the_graph_unchanged() {
     assert_eq!(recorded["extraction"]["unchanged"], 3);
     assert_eq!(recorded["extraction"]["changed"], 0);
     // The run report never leaks into the reconstructed graph.
-    let loaded = graph_projection::load(&db, &f.repo, &edited).unwrap();
+    let loaded = graph_projection::load(&store, &f.repo, &edited).unwrap();
     assert_eq!(sorted_node_link(&loaded), sorted_node_link(&graph));
 }
 
@@ -343,6 +357,7 @@ fn extraction_cache_persists_across_builds_and_leaves_the_graph_unchanged() {
 fn projection_keeps_edge_identities_distinct_with_embedded_nul() {
     let f = Fixture::new(&[("a.py", A_V1)]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let graph = |links: Value| {
         graphicle::graph::Graph::from_node_link(
             &json!({
@@ -360,16 +375,16 @@ fn projection_keeps_edge_identities_distinct_with_embedded_nul() {
     let second = graph(json!([first_edge]));
     let third = graph(json!([]));
     for (episode, current) in [("first", &first), ("second", &second), ("third", &third)] {
-        graph_projection::persist(&db, &f.repo, episode, current).unwrap();
+        graph_projection::persist(&db, &store, &f.repo, episode, current).unwrap();
         assert_eq!(
-            sorted_node_link(&graph_projection::load(&db, &f.repo, episode).unwrap()),
+            sorted_node_link(&graph_projection::load(&store, &f.repo, episode).unwrap()),
             sorted_node_link(current),
             "current episode {episode}"
         );
     }
     for (episode, expected) in [("first", &first), ("second", &second)] {
         assert_eq!(
-            sorted_node_link(&graph_projection::load(&db, &f.repo, episode).unwrap()),
+            sorted_node_link(&graph_projection::load(&store, &f.repo, episode).unwrap()),
             sorted_node_link(expected),
             "historical episode {episode}"
         );
@@ -419,6 +434,7 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
     use graphicle::graph::Graph;
     let f = Fixture::new(&[("a.py", A_V1), ("b.py", B)]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let make = |label: &str, target: &str, include_b: bool| {
         let mut nodes = vec![
             json!({"id":"a", "relpath":"a.py", "label":label}),
@@ -439,9 +455,11 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
         .unwrap()
     };
     let stats = |episode: &str| -> Value {
-        let raw: String = db.query_row("SELECT json_extract(attributes,'$.extraction_run.persistence') FROM gf_episodes WHERE repository_id=? AND episode=?",
-            rusqlite::params![f.repo, episode], |r| r.get(0)).unwrap();
-        serde_json::from_str(&raw).unwrap()
+        let row = graph_projection::episode_row(&store, &f.repo, episode)
+            .unwrap()
+            .unwrap();
+        let attributes: Value = serde_json::from_str(s(&row, "attributes")).unwrap();
+        attributes["extraction_run"]["persistence"].clone()
     };
     let first = make("first", "c", true);
     let changed = make("second", "c", true);
@@ -454,10 +472,10 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
         ("endpoint", &endpoint),
         ("remove", &removed),
     ] {
-        graph_projection::persist_with_report(&db, &f.repo, episode, graph, Some(&json!({})))
+        graph_projection::persist_with_report(&db, &store, &f.repo, episode, graph, Some(&json!({})))
             .unwrap();
         assert_eq!(
-            sorted_node_link(&graph_projection::load(&db, &f.repo, episode).unwrap()),
+            sorted_node_link(&graph_projection::load(&store, &f.repo, episode).unwrap()),
             sorted_node_link(graph)
         );
     }
@@ -469,17 +487,41 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
     assert_eq!(stats("endpoint")["dirty_groups"], 1);
     assert_eq!(stats("remove")["dirty_groups"], 1);
     assert_eq!(
-        sorted_node_link(&graph_projection::load(&db, &f.repo, "one").unwrap()),
+        sorted_node_link(&graph_projection::load(&store, &f.repo, "one").unwrap()),
         sorted_node_link(&first)
     );
     // Writes outside the projector invalidate fingerprints. An unchanged
-    // authoritative graph must restore the altered live row.
-    db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
-    graph_projection::persist_with_report(&db, &f.repo, "repair", &removed, Some(&json!({})))
+    // authoritative graph must restore the altered live row. The SQL
+    // triggers that did this are gone with the store: tamper with the live
+    // version in the graph store, then invalidate the group fingerprint
+    // explicitly (the write path's replacement for the trigger).
+    let live = crate::grows(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r, node_id:'a'})-[:HAS_VERSION]->(v:Live) \
+         RETURN v.data AS data",
+        &[("r", json!(f.repo))],
+    );
+    let mut tampered: Value = serde_json::from_str(s(&live[0], "data")).unwrap();
+    tampered["label"] = json!("tampered");
+    crate::gwrite(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r, node_id:'a'})-[:HAS_VERSION]->(v:Live) \
+         SET v.data = $data",
+        &[
+            ("r", json!(f.repo)),
+            ("data", json!(graphicle_memory::text::canonical(&tampered))),
+        ],
+    );
+    db.execute(
+        "UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=? AND owner='a.py'",
+        [&f.repo],
+    )
+    .unwrap();
+    graph_projection::persist_with_report(&db, &store, &f.repo, "repair", &removed, Some(&json!({})))
         .unwrap();
     assert_eq!(stats("repair")["dirty_groups"], 1);
     assert_eq!(
-        sorted_node_link(&graph_projection::load(&db, &f.repo, "repair").unwrap()),
+        sorted_node_link(&graph_projection::load(&store, &f.repo, "repair").unwrap()),
         sorted_node_link(&removed)
     );
     // Reopening an existing store preserves valid cache entries.
@@ -500,6 +542,7 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
     use graphicle::graph::Graph;
     let f = Fixture::new(&[("a.py", A_V1), ("b.py", B)]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let make = |label: &str, target: &str| {
         Graph::from_node_link(
             &json!({"directed":true,"multigraph":false,"nodes":[
@@ -511,40 +554,30 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         .unwrap()
     };
     let original = make("original", "b");
-    graph_projection::persist_with_report(&db, &f.repo, "one", &original, Some(&json!({})))
+    graph_projection::persist_with_report(&db, &store, &f.repo, "one", &original, Some(&json!({})))
         .unwrap();
-    assert!(db.is_autocommit());
-    db.execute_batch(
-        "CREATE TABLE rollback_marker(value INTEGER);
-         CREATE TRIGGER reject_projection BEFORE INSERT ON gf_edges
-         WHEN NEW.valid_from_episode='failed' BEGIN
-             SELECT RAISE(ABORT,'forced projection failure');
-         END;",
+    // A graph that cannot be recorded: a numeric `kind` violates the graph
+    // type's `Symbol.kind IS STRING` declaration, so the episode's graph
+    // transaction aborts mid-write and rolls the whole episode back
+    // (the savepoint-trigger dance of the SQL store is gone; the engine
+    // transaction is the boundary).
+    let conflict = Graph::from_node_link(
+        &json!({"directed":true,"multigraph":false,"nodes":[
+            {"id":"a","relpath":"a.py","kind":42},
+            {"id":"c","relpath":"c.py"}
+        ],"links":[]}),
+        "links",
     )
     .unwrap();
-    let outer = db.unchecked_transaction().unwrap();
-    outer
-        .execute("INSERT INTO rollback_marker VALUES(1)", [])
-        .unwrap();
-    let error = graph_projection::persist_with_report(
-        &outer,
-        &f.repo,
-        "failed",
-        &make("changed", "a"),
-        Some(&json!({})),
-    )
-    .unwrap_err();
+    let error =
+        graph_projection::persist_with_report(&db, &store, &f.repo, "failed", &conflict, Some(&json!({})))
+            .unwrap_err();
     assert!(
-        error.to_string().contains("forced projection failure"),
+        error.to_string().contains("property type"),
         "{error}"
     );
-    outer.commit().unwrap();
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM rollback_marker", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
+    assert!(!graph_projection::is_recorded(&store, &f.repo, "failed").unwrap());
+    // The episode's SQLite mirror took no row either.
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM gf_episodes WHERE episode='failed'",
@@ -554,25 +587,45 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         .unwrap(),
         0
     );
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM gf_nodes WHERE repository_id=? AND valid_to_episode IS NULL",
-            [&f.repo],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        2
+    let live = crate::grows(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) RETURN count(v) AS n",
+        &[("r", json!(f.repo))],
     );
+    assert_eq!(live[0]["n"], json!(2));
     assert_eq!(
-        sorted_node_link(&graph_projection::load(&db, &f.repo, "one").unwrap()),
+        sorted_node_link(&graph_projection::load(&store, &f.repo, "one").unwrap()),
         sorted_node_link(&original),
     );
-    // The failed projection must restore invalidation before an outer commit.
-    db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
-    graph_projection::persist_with_report(&db, &f.repo, "repair", &original, Some(&json!({})))
+    // The failed projection touched no fingerprints (they publish only after
+    // a successful record), so a tampered live row is still detected once its
+    // group is invalidated explicitly, and repaired by re-recording.
+    let live = crate::grows(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r, node_id:'a'})-[:HAS_VERSION]->(v:Live) \
+         RETURN v.data AS data",
+        &[("r", json!(f.repo))],
+    );
+    let mut tampered: Value = serde_json::from_str(s(&live[0], "data")).unwrap();
+    tampered["label"] = json!("tampered");
+    crate::gwrite(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r, node_id:'a'})-[:HAS_VERSION]->(v:Live) \
+         SET v.data = $data",
+        &[
+            ("r", json!(f.repo)),
+            ("data", json!(graphicle_memory::text::canonical(&tampered))),
+        ],
+    );
+    db.execute(
+        "UPDATE gf_projection_groups SET digest=NULL WHERE repository_id=? AND owner='a.py'",
+        [&f.repo],
+    )
+    .unwrap();
+    graph_projection::persist_with_report(&db, &store, &f.repo, "repair", &original, Some(&json!({})))
         .unwrap();
     assert_eq!(
-        sorted_node_link(&graph_projection::load(&db, &f.repo, "repair").unwrap()),
+        sorted_node_link(&graph_projection::load(&store, &f.repo, "repair").unwrap()),
         sorted_node_link(&original),
     );
 }
@@ -581,24 +634,25 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
 fn earlier_episode_is_reconstructed_as_of_after_later_projection() {
     let f = Fixture::new(&[("a.py", A_V1), ("b.py", B)]);
     let db = f.db();
+    let store = crate::gstore(&db);
     let episode1 = s(&f.project(), "episode").to_string();
-    let before = sorted_node_link(&graph_projection::load(&db, &f.repo, &episode1).unwrap());
+    let before = sorted_node_link(&graph_projection::load(&store, &f.repo, &episode1).unwrap());
     let nodes_before = f.count("gf_nodes");
     f.sync(&[("a.py", A_V2), ("b.py", B)]);
     let episode2 = s(&f.project(), "episode").to_string();
-    // Rows are closed, never deleted.
+    // Versions are closed, never deleted.
     assert!(f.count("gf_nodes") >= nodes_before);
-    let closed: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_nodes WHERE repository_id=? AND node_id='a_beta' AND valid_to_episode=? AND expired_at IS NOT NULL",
-            rusqlite::params![f.repo, episode2],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(closed, 1);
-    let after = sorted_node_link(&graph_projection::load(&db, &f.repo, &episode1).unwrap());
+    // Closing a version is a label flip: `REMOVE v:Live`, validity window set.
+    let closed = crate::grows(
+        &db,
+        "MATCH (s:Symbol {repository_id:$r, node_id:'a_beta'})-[:HAS_VERSION]->(v:SymbolVersion) \
+         WHERE v.valid_to_episode = $e AND v.expired_at IS NOT NULL RETURN count(v) AS n",
+        &[("r", json!(f.repo)), ("e", json!(episode2))],
+    );
+    assert_eq!(closed[0]["n"], json!(1));
+    let after = sorted_node_link(&graph_projection::load(&store, &f.repo, &episode1).unwrap());
     assert_eq!(after, before);
-    let head = graph_projection::load(&db, &f.repo, &episode2).unwrap();
+    let head = graph_projection::load(&store, &f.repo, &episode2).unwrap();
     assert!(head.node_index(&json!("a_beta")).is_none());
     assert_eq!(
         head.node_count() + 1,
@@ -615,7 +669,7 @@ fn earlier_episode_is_reconstructed_as_of_after_later_projection() {
     assert_eq!(listed["current_episode"], json!(episode2));
     assert_eq!(listed["episodes"][0]["sequence"], 1);
     assert_eq!(listed["episodes"][1]["sequence"], 2);
-    assert!(graph_projection::load(&db, &f.repo, "missing").is_err());
+    assert!(graph_projection::load(&store, &f.repo, "missing").is_err());
 }
 
 #[tokio::test]

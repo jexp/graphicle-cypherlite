@@ -15,6 +15,81 @@
 /// call `crate::edition_setup()` and `crate::fork_guard`.
 pub fn edition_setup() {}
 
+/// The graph store beside a test's SQLite connection (the projection's
+/// bi-temporal state lives there, not in SQLite).
+#[allow(dead_code)]
+pub fn gstore(db: &rusqlite::Connection) -> graphicle_runtime::store_graph::GraphStore {
+    graphicle_runtime::store_graph::shared_for(db).unwrap()
+}
+
+/// A read-only Cypher probe against a test's graph store.
+#[allow(dead_code)]
+pub fn grows(
+    db: &rusqlite::Connection,
+    cypher: &str,
+    params: &[(&str, serde_json::Value)],
+) -> Vec<serde_json::Value> {
+    graphicle_runtime::graph_projection::graph_rows(&gstore(db), cypher, params).unwrap()
+}
+
+/// One write statement against a test's graph store (tampering, fixture
+/// setup).
+#[allow(dead_code)]
+pub fn gwrite(db: &rusqlite::Connection, cypher: &str, params: &[(&str, serde_json::Value)]) {
+    graphicle_runtime::graph_projection::graph_write(&gstore(db), cypher, params).unwrap()
+}
+
+/// The graph store beside a test's SQLite connection, opened read-only
+/// (WAL follower) and never taking the writer lease: for polling the work of
+/// a subprocess that owns the store (an mcp server, a `sync --background`
+/// builder). Waits briefly for the subprocess to create the store.
+#[allow(dead_code)]
+pub fn gstore_reader(db: &rusqlite::Connection) -> graphicle_runtime::store_graph::GraphStore {
+    let path = std::path::Path::new(db.path().unwrap())
+        .parent()
+        .unwrap()
+        .join("reviews.graph");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
+    loop {
+        match graphicle_runtime::store_graph::GraphStore::open_follower(&path) {
+            Ok(store) => return store,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("follower open failed: {error}"),
+        }
+    }
+}
+
+/// Rewrite every recorded episode's `attributes` blob in the graph store
+/// (degradation tests that tamper with the stored manifest).
+#[allow(dead_code)]
+pub fn rewrite_episode_attributes(
+    db: &rusqlite::Connection,
+    repo: &str,
+    mut edit: impl FnMut(&mut serde_json::Value),
+) {
+    let rows = grows(
+        db,
+        "MATCH (e:Episode {repository_id:$r}) RETURN e.episode AS episode, e.attributes AS attributes",
+        &[("r", serde_json::json!(repo))],
+    );
+    for row in rows {
+        let mut attributes: serde_json::Value =
+            serde_json::from_str(graphicle_runtime::store::s(&row, "attributes")).unwrap();
+        edit(&mut attributes);
+        gwrite(
+            db,
+            "MATCH (e:Episode {repository_id:$r, episode:$e}) SET e.attributes = $a",
+            &[
+                ("r", serde_json::json!(repo)),
+                ("e", row["episode"].clone()),
+                ("a", serde_json::json!(attributes.to_string())),
+            ],
+        );
+    }
+}
+
 /// Child processes versus tests that rely on flock exclusivity.
 mod fork_guard;
 
