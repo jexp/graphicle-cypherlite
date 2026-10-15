@@ -129,7 +129,7 @@ async fn imported_duplicate_text_keeps_each_source_vector_and_accounts_only_subm
     store
         .authorized(ws, key, "read", |db, principal| {
             let repository = store::repo(db, principal, project_id)?;
-            let snapshot = query::snapshot(db, &repository, principal)?;
+            let snapshot = query::snapshot(&store, db, &repository, principal)?;
             let (candidates, _) = query::candidates(&snapshot)?;
             let vectors = store::rows(
                 db,

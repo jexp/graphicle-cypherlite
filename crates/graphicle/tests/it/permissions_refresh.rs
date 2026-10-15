@@ -47,8 +47,19 @@ fn provider_store() -> (tempfile::TempDir, Store, String, String, String, String
         )
         .unwrap();
     let cfg = json!({"repository":"org/project","permission_mode":"provider","permission_max_age_seconds":300,"sync_every_seconds":900,"acl":{"workspace_readers":true,"credentials":[]}});
-    // Never synced, so a scheduler would queue its first sync.
-    store.connect().unwrap().execute("UPDATE am_connectors SET kind='github',config=?,credential_env=?,last_sync=NULL WHERE id=?",rusqlite::params![cfg.to_string(),s(&credential,"credential_ref"),s(&connector,"id")]).unwrap();
+    // Never synced, so a scheduler would queue its first sync. Connectors
+    // live in the graph store; flip the fixture there.
+    store.graph.transaction(|db| {
+        graphicle_runtime::store_graph::write(
+            db,
+            "MATCH (c:Connector {id: $id}) SET c.kind='github', c.config=$config, c.credential_env=$credential, c.last_sync=NULL",
+            graphicle_runtime::store_graph::Params::from([
+                ("id".into(), graphicle_runtime::store_graph::json_to_value(&connector["id"])),
+                ("config".into(), graphicle_runtime::store_graph::json_to_value(&json!(cfg.to_string()))),
+                ("credential".into(), graphicle_runtime::store_graph::json_to_value(&credential["credential_ref"])),
+            ]),
+        )
+    }).unwrap();
     let connector = s(&connector, "id").to_string();
     (dir, store, w, key, r, connector)
 }
@@ -165,29 +176,44 @@ fn portable_backup_excludes_encrypted_credentials_and_pauses_their_connections()
     let file = dir.path().join("backup.sqlite3");
     store.backup(&file).unwrap();
     let restored = rusqlite::Connection::open(file).unwrap();
-    assert_eq!(
-        restored
-            .query_row("SELECT count(*) FROM am_secrets", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        restored
-            .query_row("SELECT state FROM am_connectors", [], |r| r
-                .get::<_, String>(0))
-            .unwrap(),
-        "paused"
-    );
-    assert_eq!(
-        store
-            .connect()
-            .unwrap()
-            .query_row("SELECT count(*) FROM am_secrets", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
+    // Credentials and connectors live in the graph store, which a SQLite
+    // backup never carries; the legacy SQL tables stay empty everywhere.
+    for table in ["am_secrets", "am_connectors"] {
+        assert_eq!(
+            restored
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    // The live store keeps them, in the graph.
+    let secrets = store
+        .graph
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (s:Secret) RETURN count(s) AS n",
+                Default::default(),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["n"].as_i64())
+        .unwrap();
+    assert_eq!(secrets, 1);
+    let state = store
+        .graph
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (c:Connector) RETURN c.state AS state",
+                Default::default(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(state["state"], "active");
 }
 
 #[test]

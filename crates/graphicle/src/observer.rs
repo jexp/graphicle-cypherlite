@@ -260,7 +260,7 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
         .collect();
     let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
     let documents = jobs::guarded_read(&worker.store, &job, |db, p, repo| {
-        memory::documents(db, repo, p)
+        memory::documents(&worker.store, db, repo, p)
     })?;
     let selected = units(&documents, &prefixes);
     let (mut processed, mut reused, mut too_long) = (0usize, 0usize, 0usize);

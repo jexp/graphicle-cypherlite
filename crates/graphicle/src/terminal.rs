@@ -3269,8 +3269,8 @@ pub fn origin_note(
         return None;
     }
     let folder = store
-        .authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-            crate::folders::current_folder(db, &resolved.id)
+        .authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+            crate::folders::current_folder(&store.graph, &resolved.id)
         })
         .ok()
         .flatten();
@@ -3605,8 +3605,8 @@ pub fn overview(
     let folder = match &resolved.folder {
         Some(folder) => Some(folder.clone()),
         None => {
-            store.authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-                crate::folders::current_folder(db, &resolved.id)
+            store.authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+                crate::folders::current_folder(&store.graph, &resolved.id)
             })?
         }
     };
@@ -4179,8 +4179,8 @@ fn apply_fixes(options: &Doctor<'_>) -> Vec<Value> {
     if let Some(resolved) = &resolved {
         let folder = resolved.folder.clone().or_else(|| {
             store
-                .authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-                    crate::folders::current_folder(db, &resolved.id)
+                .authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+                    crate::folders::current_folder(&store.graph, &resolved.id)
                 })
                 .ok()
                 .flatten()
@@ -4207,8 +4207,8 @@ fn apply_fixes(options: &Doctor<'_>) -> Vec<Value> {
         .and_then(|r| {
             r.folder.clone().or_else(|| {
                 store
-                    .authorized_read(&session.workspace, &session.capability, "read", |db, _| {
-                        crate::folders::current_folder(db, &r.id)
+                    .authorized_read(&session.workspace, &session.capability, "read", |_db, _| {
+                        crate::folders::current_folder(&store.graph, &r.id)
                     })
                     .ok()
                     .flatten()
@@ -4569,7 +4569,7 @@ fn checks(options: &Doctor<'_>) -> Vec<Check> {
                                 &session.workspace,
                                 &session.capability,
                                 "read",
-                                |db, _| crate::folders::current_folder(db, &resolved.id),
+                                |_db, _| crate::folders::current_folder(&store.graph, &resolved.id),
                             )
                             .ok()
                             .flatten()

@@ -811,12 +811,13 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
         f.store
             .authorized(&f.workspace, &f.key, "propose", |db, p| {
                 let repo = graphicle_runtime::store::repo(db, p, &f.project)?;
-                let docs = memory::documents(db, &repo, p)?;
+                let docs = memory::documents(&f.store, db, &repo, p)?;
                 let sources = docs
                     .iter()
                     .map(|d| json!({"id":d["id"],"text":d["content"],"sha256":d["sha256"]}))
                     .collect::<Vec<_>>();
                 claims::propose(
+                    &f.store,
                     db,
                     &repo,
                     p,
@@ -833,7 +834,7 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
     let targets = f
         .store
         .authorized(&f.workspace, &f.key, "read", |db, p| {
-            claims::current(db, &graphicle_runtime::store::repo(db, p, &f.project)?, p)
+            claims::current(&f.store, db, &graphicle_runtime::store::repo(db, p, &f.project)?, p)
         })
         .unwrap();
     let mut corrected = claim(
@@ -1265,7 +1266,12 @@ fn expired_connector_snapshot_is_withheld_and_only_one_scan_can_own_a_cursor() {
     let f = Fixture::new();
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Source","config":{"acl":{"workspace_readers":true,"credentials":[]},"max_age_seconds":60}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"old","title":"Remote","content":"Remote source text."}]}))).unwrap();
-    f.store.transaction(|db| {db.execute("UPDATE am_connectors SET kind='github',last_sync='2020-01-01T00:00:00Z' WHERE id=?",[s(&connector,"id")])?;Ok(())}).unwrap();
+    // Connectors live in the graph store; age the fixture's snapshot there.
+    crate::gql_write(
+        &f.store,
+        "MATCH (c:Connector {id: $id}) SET c.kind='github', c.last_sync='2020-01-01T00:00:00Z'",
+        graphicle_runtime::store_graph::Params::from([crate::gp("id", connector["id"].clone())]),
+    );
     assert_eq!(
         f.store
             .project_read(&f.workspace, &f.key, "files", &f.args(json!({})))

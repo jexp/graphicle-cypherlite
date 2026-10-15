@@ -2,13 +2,12 @@
 use crate::{Error, Result};
 use crate::{
     id, now,
-    store::{Store, decode, one, repo, s},
+    store::{Store, repo, s},
     string,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calamine::{Reader, open_workbook_auto_from_rs};
 use quick_xml::{Reader as XmlReader, events::Event};
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::{
     io::{Cursor, Read},
@@ -677,38 +676,57 @@ impl Store {
         let parsed = extract(name, &bytes)?;
         self.authorized(workspace,token,"collect",|db,p|{
             let repository=repo(db,p,string(args,"repository_id",100)?)?;
-            let mut connector=one(db,"SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND kind='jsonl' AND state='active'",params![s(&repository,"id"),string(args,"connector_id",100)?])?.ok_or_else(||Error::bad("Choose a file-import connector"))?;
-            decode(&mut connector,"config")?;
+            let connector=crate::connectors::get_connector_pub(&self.graph,string(args,"connector_id",100)?)?
+                .filter(|c| c["repository_id"]==repository["id"] && c["kind"]=="jsonl" && c["state"]=="active")
+                .ok_or_else(||Error::bad("Choose a file-import connector"))?;
             if !crate::memory::acl_allows(&connector["config"]["acl"],p){return Err(Error::denied());}
             let source_id=args["source_id"].as_str().unwrap_or(name);
             if source_id.is_empty()||source_id.len()>500{return Err(Error::bad("Invalid document source ID"));}
             let full_id=format!("connector:{}:{source_id}",s(&connector,"id"));
-            let used:i64=db.query_row("SELECT coalesce(sum(length(bytes)),0) FROM am_original_documents WHERE repository_id=?",[s(&repository,"id")],|r|r.get(0))?;
-            let exists=one(db,"SELECT sha256 FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",params![s(&repository,"id"),full_id,s(&parsed,"original_sha256")])?.is_some();
-            let cap=self.limits()?.retained_original_bytes;if usize::try_from(used+if exists{0}else{bytes.len() as i64}).unwrap_or(usize::MAX)>cap{return Err(Error::bad(format!("Original document storage exceeds {}; prune retained versions, or raise the limit with {}",crate::limits::size(cap),crate::limits::raise("retained_original_bytes"))));}
             let scan=id();
-            crate::connectors::stage(db,&connector,&scan,&json!({"id":source_id,"title":name,"content":parsed["text"],"source_timestamp":args["source_timestamp"],"metadata":{"original_sha256":parsed["original_sha256"],"parser":parsed["parser"],"original_bytes":bytes.len(),"coordinates":parsed["coordinates"]}}))?;
-            crate::connectors::activate(db,&connector,&scan,false)?;
-            crate::doc_links::after_sync(db,s(&repository,"id"),s(&connector,"id"),p)?;
-            db.execute("INSERT OR IGNORE INTO am_original_documents VALUES(?,?,?,?,?,?,?,?,?)",params![s(&repository,"id"),s(&connector,"id"),full_id,s(&parsed,"original_sha256"),name,s(&parsed,"parser"),s(&parsed,"text_sha256"),bytes,now()])?;
+            self.graph.transaction(|gdb|{
+                let used=crate::store_graph::one(gdb,"MATCH (o:OriginalDocument {repository_id: $repository}) RETURN coalesce(sum(o.bytes_len),0) AS used",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&repository["id"]))]))?.and_then(|row|row["used"].as_i64()).unwrap_or(0);
+                let exists=crate::store_graph::one(gdb,"MATCH (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) RETURN o.sha256 AS sha256",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&repository["id"])),("source".into(),crate::store_graph::json_to_value(&json!(full_id))),("sha".into(),crate::store_graph::json_to_value(&parsed["original_sha256"]))]))?.is_some();
+                let cap=self.limits()?.retained_original_bytes;if usize::try_from(used+if exists{0}else{bytes.len() as i64}).unwrap_or(usize::MAX)>cap{return Err(Error::bad(format!("Original document storage exceeds {}; prune retained versions, or raise the limit with {}",crate::limits::size(cap),crate::limits::raise("retained_original_bytes"))));}
+                crate::connectors::stage(gdb,&connector,&scan,&json!({"id":source_id,"title":name,"content":parsed["text"],"source_timestamp":args["source_timestamp"],"metadata":{"original_sha256":parsed["original_sha256"],"parser":parsed["parser"],"original_bytes":bytes.len(),"coordinates":parsed["coordinates"]}}))?;
+                crate::connectors::activate(gdb,db,&connector,&scan,false)?;
+                crate::store_graph::write(gdb,"MERGE (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) SET o.connector_id=$connector, o.name=$name, o.parser=$parser, o.text_sha256=$text_sha, o.bytes=$bytes, o.bytes_len=$bytes_len, o.created_at=$now",crate::store_graph::Params::from([
+                    ("repository".into(),crate::store_graph::json_to_value(&repository["id"])),
+                    ("source".into(),crate::store_graph::json_to_value(&json!(full_id))),
+                    ("sha".into(),crate::store_graph::json_to_value(&parsed["original_sha256"])),
+                    ("connector".into(),crate::store_graph::json_to_value(&connector["id"])),
+                    ("name".into(),crate::store_graph::json_to_value(&json!(name))),
+                    ("parser".into(),crate::store_graph::json_to_value(&parsed["parser"])),
+                    ("text_sha".into(),crate::store_graph::json_to_value(&parsed["text_sha256"])),
+                    ("bytes".into(),crate::store_graph::json_to_value(&json!(crate::store_graph::b64e(&bytes)))),
+                    ("bytes_len".into(),cypherlite::Value::Int(bytes.len() as i64)),
+                    ("now".into(),crate::store_graph::json_to_value(&json!(now()))),
+                ]))?;
+                Ok(())
+            })?;
+            crate::doc_links::after_sync(self,db,s(&repository,"id"),s(&connector,"id"),p)?;
             Ok(json!({"source_id":full_id,"original_sha256":parsed["original_sha256"],"text_sha256":parsed["text_sha256"],"parser":parsed["parser"],"original_retained":true}))
         })
     }
     pub fn original_document(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace,token,"read",|db,p|{
             let repository=repo(db,p,string(args,"repository_id",100)?)?;
-            let docs=crate::memory::documents(db,&repository,p)?;
+            let docs=crate::memory::documents(self,db,&repository,p)?;
             let source_id=string(args,"source_id",1500)?;
             let doc=docs.iter().find(|d|s(d,"id")==source_id).ok_or_else(Error::denied)?;
             if args["sha256"].as_str().is_some_and(|expected|expected!=s(doc,"sha256")) || args["original_sha256"].as_str().is_some_and(|expected|expected!=s(&doc["metadata"],"original_sha256")) {
                 return Err(Error::conflict("The original document changed; reopen the current source"));
             }
-            let mut stmt=db.prepare("SELECT sha256,name,parser,text_sha256,bytes FROM am_original_documents WHERE repository_id=? AND source_id=? AND text_sha256=? AND sha256=? LIMIT 1")?;
-            let mut rows=stmt.query(params![s(&repository,"id"),source_id,s(doc,"sha256"),s(&doc["metadata"],"original_sha256")])?;
-            let row=rows.next()?.ok_or_else(||Error::bad("Original binary object unavailable"))?;
-            let bytes:Vec<u8>=row.get(4)?;let hash:String=row.get(0)?;
+            let row=self.graph.read(|gdb|crate::store_graph::one(gdb,"MATCH (o:OriginalDocument {repository_id: $repository, source_id: $source, text_sha256: $text_sha, sha256: $sha}) RETURN o.sha256 AS sha256, o.name AS name, o.parser AS parser, o.bytes AS bytes LIMIT 1",crate::store_graph::Params::from([
+                ("repository".into(),crate::store_graph::json_to_value(&repository["id"])),
+                ("source".into(),crate::store_graph::json_to_value(&json!(source_id))),
+                ("text_sha".into(),crate::store_graph::json_to_value(&json!(s(doc,"sha256")))),
+                ("sha".into(),crate::store_graph::json_to_value(&doc["metadata"]["original_sha256"])),
+            ])))?.ok_or_else(||Error::bad("Original binary object unavailable"))?;
+            let bytes=crate::store_graph::b64d(crate::store::s(&row,"bytes"))?;
+            let hash=crate::store::s(&row,"sha256").to_string();
             if graphicle_memory::text::sha256(&bytes)!=hash{return Err(Error::bad("Original document integrity check failed"));}
-            Ok(json!({"name":row.get::<_,String>(1)?,"parser":row.get::<_,String>(2)?,"sha256":hash,"base64":STANDARD.encode(bytes)}))
+            Ok(json!({"name":row["name"],"parser":row["parser"],"sha256":hash,"base64":STANDARD.encode(&bytes)}))
         })
     }
 }

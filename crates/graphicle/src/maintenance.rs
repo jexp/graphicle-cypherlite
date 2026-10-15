@@ -2,7 +2,7 @@
 //! Forgetting (connector.delete, source.forget) is implemented and verified in
 //! [`crate::deletion`].
 use crate::deletion::{self, Scope};
-use crate::store::{self, Store, decode, one, repo, rows, s};
+use crate::store::{self, Store, decode, repo, rows, s};
 use crate::{Error, Result, integer, now, string};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -32,19 +32,50 @@ fn still_present(
 /// rows (they cascade) and sign its receipt, with `removed` added to the
 /// receipt's `removed`.
 fn delete_project(
+    store: &Store,
     db: &Connection,
     p: &store::Principal,
     identifier: &str,
     mut removed: Value,
 ) -> Result<Value> {
-    let connectors: Vec<String> = rows(
-        db,
-        "SELECT id FROM am_connectors WHERE repository_id=? ORDER BY id",
-        [identifier],
-    )?
+    // The project's connector-domain data lives in the graph store; it goes
+    // with the project here.
+    let connectors: Vec<String> = store
+        .graph
+        .read(|db| {
+            crate::store_graph::rows(
+                db,
+                "MATCH (c:Connector {repository_id: $repository}) RETURN c.id AS id ORDER BY c.id",
+                crate::store_graph::Params::from([(
+                    "repository".into(),
+                    crate::store_graph::json_to_value(&json!(identifier)),
+                )]),
+            )
+        })?
     .iter()
     .map(|c| s(c, "id").to_string())
     .collect();
+    store.graph.transaction(|db| {
+        let params = || {
+            crate::store_graph::Params::from([
+                ("repository".into(), crate::store_graph::json_to_value(&json!(identifier))),
+                ("connectors".into(), crate::store_graph::json_to_value(&json!(connectors))),
+            ])
+        };
+        for cypher in [
+            "MATCH (d:ConnectorDoc) WHERE d.connector_id IN $connectors DETACH DELETE d",
+            "MATCH (s:ConnectorStage) WHERE s.connector_id IN $connectors DELETE s",
+            "MATCH (v:ConnectorVersion) WHERE v.connector_id IN $connectors DELETE v",
+            "MATCH (sp:SourcePermission) WHERE sp.connector_id IN $connectors DELETE sp",
+            "MATCH (c:Connector {repository_id: $repository}) DETACH DELETE c",
+            "MATCH (o:OriginalDocument {repository_id: $repository}) DELETE o",
+            "MATCH (w:WorkState {repository_id: $repository}) DELETE w",
+            "MATCH (f:Folder {repository_id: $repository}) DELETE f",
+        ] {
+            crate::store_graph::write(db, cypher, params())?;
+        }
+        Ok(())
+    })?;
     crate::projection::enqueue(db, identifier, "project_deleted")?;
     removed["references"] =
         deletion::forget_project_references(db, &p.workspace, identifier, &connectors)?;
@@ -62,6 +93,7 @@ fn delete_project(
 /// echo the `plan_hash` of `retention.preview`, so exactly the previewed
 /// documents are forgotten.
 fn apply_source_retention(
+    store: &Store,
     db: &Connection,
     p: &store::Principal,
     repository: &Value,
@@ -69,7 +101,7 @@ fn apply_source_retention(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let policy = crate::retention::SourcePolicy::from_args(args)?;
-    let plan = crate::retention::source_plan(db, p, repository, &policy, chrono::Utc::now())?;
+    let plan = crate::retention::source_plan(store, db, p, repository, &policy, chrono::Utc::now())?;
     if args["plan_hash"].as_str() != Some(plan.plan_hash.as_str()) {
         return Err(Error::conflict(
             "The retention plan changed or was not previewed; run retention.preview and pass its plan_hash",
@@ -84,7 +116,7 @@ fn apply_source_retention(
             let scope =
                 Scope::document_set(connector, batch.iter().map(|d| (*d).clone()).collect());
             let started = now();
-            let forget_plan = deletion::plan(db, &p.workspace, identifier, &scope)?;
+            let forget_plan = deletion::plan(store, db, &p.workspace, identifier, &scope)?;
             if forget_plan.sources() == 0 {
                 continue;
             }
@@ -92,7 +124,7 @@ fn apply_source_retention(
             let since = forget_plan.since().map(str::to_string);
             let forgotten =
                 deletion::forget(db, &p.workspace, identifier, &scope, since.as_deref())?;
-            let erased = deletion::erase(db, identifier, &scope)?;
+            let erased = deletion::erase(store, db, identifier, &scope)?;
             graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
             store::event(
                 db,
@@ -102,6 +134,7 @@ fn apply_source_retention(
             )?;
             forgotten_documents += batch.len();
             receipts.push(deletion::policy_receipt(
+                store,
                 db,
                 p,
                 repository,
@@ -138,28 +171,30 @@ impl Store {
             match operation {
                 "connector.state" | "connector.delete" | "source.forget"=>{
                     let connector=string(args,"connector_id",100)?;
-                    one(db,"SELECT id FROM am_connectors WHERE repository_id=? AND id=?",params![identifier,connector])?.ok_or_else(||Error::bad("Connector unavailable"))?;
+                    self.graph.read(|db|crate::store_graph::one(db,"MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.id AS id",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(identifier))),("id".into(),crate::store_graph::json_to_value(&json!(connector)))])))?.ok_or_else(||Error::bad("Connector unavailable"))?;
                     if operation!="connector.state" {
                         let scope=if operation=="connector.delete" {Scope::connector(connector)} else {Scope::documents(connector,&args["document_ids"])?};
                         // Capture coverage first; forget, erase, verify and sign in one transaction.
                         let started=now();
-                        let plan=deletion::plan(db,&p.workspace,identifier,&scope)?;
+                        let plan=deletion::plan(self,db,&p.workspace,identifier,&scope)?;
                         if operation=="source.forget" && plan.sources()==0 {return Err(Error::bad("None of these documents exist in this connector"));}
                         crate::projection::enqueue(db,identifier,if operation=="connector.delete" {"connector_deleted"} else {"source_forgotten"})?;
                         let since=plan.since().map(str::to_string);
                         let forgotten=deletion::forget(db,&p.workspace,identifier,&scope,since.as_deref())?;
-                        let erased=deletion::erase(db,identifier,&scope)?;
+                        let erased=deletion::erase(self,db,identifier,&scope)?;
                         // In-process features and layouts of forgotten text go now, not at expiry.
                         graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
                         let derived=forgotten["memories"].clone();
                         store::event(db,identifier,"source_forgotten",json!({"derived_records_removed":derived}))?;
-                        let receipt=deletion::receipt(db,p,&repository,operation,plan,&started,forgotten,erased)?;
+                        let receipt=deletion::receipt(self,db,p,&repository,operation,plan,&started,forgotten,erased)?;
                         return Ok(json!({"deleted":true,"derived_records_removed":derived,"local_backups_are_separate":true,"receipt":receipt}));
                     }
                     let state=string(args,"state",20)?;
                     if !["active","paused"].contains(&state){return Err(Error::bad("Activate or pause this connector"));}
-                    db.execute("UPDATE am_connectors SET state=?,generation=generation+1,cursor=NULL,last_sync=NULL WHERE id=?",params![state,connector])?;
-                    db.execute("DELETE FROM am_connector_stage WHERE connector_id=?",[connector])?;
+                    self.graph.transaction(|db|{
+                        crate::store_graph::write(db,"MATCH (c:Connector {id: $id}) SET c.state=$state, c.generation=c.generation+1, c.cursor=NULL, c.last_sync=NULL",crate::store_graph::Params::from([("id".into(),crate::store_graph::json_to_value(&json!(connector))),("state".into(),crate::store_graph::json_to_value(&json!(state)))]))?;
+                        crate::store_graph::write(db,"MATCH (s:ConnectorStage {connector_id: $id}) DELETE s",crate::store_graph::Params::from([("id".into(),crate::store_graph::json_to_value(&json!(connector)))]))
+                    })?;
                     db.execute("DELETE FROM am_model_cache WHERE repository_id=?",[identifier])?;
                     store::invalidate(db,identifier)?;
                     Ok(json!({"state":state,"remote_sources_withheld_until_sync":state=="active"}))
@@ -173,10 +208,10 @@ impl Store {
                     let copies=crate::folders::scratch_projects(db,identifier)?;
                     let mut scratch=Vec::with_capacity(copies.len());
                     for copy in &copies {
-                        scratch.push(delete_project(db,p,copy,json!({}))?);
+                        scratch.push(delete_project(self,db,p,copy,json!({}))?);
                     }
                     let removed=if copies.is_empty() {json!({})} else {json!({"pr_scratch_projects":copies})};
-                    let receipt=delete_project(db,p,identifier,removed)?;
+                    let receipt=delete_project(self,db,p,identifier,removed)?;
                     let mut result=json!({"deleted":true,"local_backups_are_separate":true,"receipt":receipt});
                     if !scratch.is_empty() {result["pr_scratch_projects"]=json!(scratch);}
                     Ok(result)
@@ -211,11 +246,17 @@ impl Store {
                     }
                     let syncs_removed=db.execute("DELETE FROM repo_syncs WHERE repository_id=? AND state NOT IN ('pending','preparing')",[identifier])?;
                     let mut originals_freed=0;
-                    for original in rows(db,"SELECT source_id,sha256,text_sha256,length(bytes) AS bytes FROM am_original_documents WHERE repository_id=?",[identifier])? {
+                    let originals=self.graph.read(|db|crate::store_graph::rows(db,"MATCH (o:OriginalDocument {repository_id: $repository}) RETURN o.source_id AS source_id, o.sha256 AS sha256, o.text_sha256 AS text_sha256, o.bytes_len AS bytes",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(identifier)))])))?;
+                    // The current sources referencing an original, by sha256:
+                    // a present connector document whose provider metadata
+                    // names it. (metadata is a JSON text property; filter here.)
+                    let referenced: std::collections::BTreeSet<String>=self.graph.read(|db|crate::store_graph::rows(db,"MATCH (d:ConnectorDoc {present: true})<-[:FROM]-(c:Connector {repository_id: $repository}) RETURN d.metadata AS metadata",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(identifier)))])))?.iter().filter_map(|row|serde_json::from_str::<Value>(s(row,"metadata")).ok()).filter_map(|m|m["provider_metadata"]["original_sha256"].as_str().map(str::to_string)).collect();
+                    for original in &originals {
                         // Keep originals referenced by any retained source object, including snapshots.
-                        let current=one(db,"SELECT 1 AS yes FROM am_connector_docs WHERE connector_id IN (SELECT id FROM am_connectors WHERE repository_id=?) AND 'connector:'||connector_id||':'||id=? AND present=1 AND json_extract(metadata,'$.provider_metadata.original_sha256')=?",params![identifier,s(&original,"source_id"),s(&original,"sha256")])?.is_some();
+                        let current=referenced.contains(s(&original,"sha256"));
                         if !current && !objects.contains(s(&original,"text_sha256")){
-                            originals_freed+=original["bytes"].as_u64().unwrap_or(0);db.execute("DELETE FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",params![identifier,s(&original,"source_id"),s(&original,"sha256")])?;
+                            originals_freed+=original["bytes"].as_u64().unwrap_or(0);
+                            self.graph.transaction(|db|{crate::store_graph::write(db,"MATCH (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) DELETE o",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(identifier))),("source".into(),crate::store_graph::json_to_value(&original["source_id"])),("sha".into(),crate::store_graph::json_to_value(&original["sha256"]))]))})?;
                             originals_removed.push((s(&original,"source_id").to_string(),s(&original,"sha256").to_string()));
                         }
                     }
@@ -225,7 +266,10 @@ impl Store {
                         let remaining=json!({
                             "repo_snapshots":still_present(db,"SELECT count(*) FROM repo_snapshots WHERE repository_id=? AND sha256=?",identifier,snapshots_removed.iter().map(|k|vec![k.clone()]))?,
                             "repo_objects":still_present(db,"SELECT count(*) FROM repo_objects WHERE repository_id=? AND sha256=?",identifier,objects_removed.iter().map(|k|vec![k.clone()]))?,
-                            "am_original_documents":still_present(db,"SELECT count(*) FROM am_original_documents WHERE repository_id=? AND source_id=? AND sha256=?",identifier,originals_removed.iter().map(|(a,b)|vec![a.clone(),b.clone()]))?,
+                            "am_original_documents":originals_removed.iter().map(|(source,sha)|{
+                                self.graph.read(|db|crate::store_graph::one(db,"MATCH (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) RETURN count(o) AS n",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(identifier))),("source".into(),crate::store_graph::json_to_value(&json!(source))),("sha".into(),crate::store_graph::json_to_value(&json!(sha)))])))
+                                .map(|row|row.and_then(|r|r["n"].as_i64()).unwrap_or(0))
+                            }).collect::<Result<Vec<i64>>>()?.iter().sum::<i64>(),
                         });
                         pruned.extend(snapshots_removed.iter().map(|k|format!("snapshot:{k}")));
                         pruned.extend(objects_removed.iter().map(|k|format!("object:{k}")));
@@ -237,7 +281,7 @@ impl Store {
                 },
                 "retention.apply"=>{
                     if args.get("sources").is_some_and(|v|!v.is_null()) {
-                        return apply_source_retention(db,p,&repository,args);
+                        return apply_source_retention(self,db,p,&repository,args);
                     }
                     let retention=crate::retention::Retention::from_args(args)?;
                     let mut result=crate::retention::apply(db,identifier,&retention)?;

@@ -30,9 +30,9 @@ use crate::{
     Error, Result,
     local::{self, Session},
     model,
-    store::{Store, one, s},
+    store::{Store, s},
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -180,7 +180,7 @@ impl Mark {
 /// Store `mark` as the record of `folder`'s completed sync into `snapshot`,
 /// in the sync's last transaction, after the folder's alias is recorded.
 pub(crate) fn record(
-    db: &Connection,
+    store: &crate::store_graph::GraphStore,
     workspace: &str,
     folder: &Path,
     mark: &Mark,
@@ -196,7 +196,7 @@ pub(crate) fn record(
         // kept from a sync whose record named it ([`converted_here`]).
         converter: Some(local::converter()),
     };
-    write_record(db, workspace, folder, &record)
+    write_record(store, workspace, folder, &record)
 }
 
 /// Whether the last completed sync of `folder` (canonical) left `snapshot`
@@ -204,19 +204,17 @@ pub(crate) fn record(
 /// document whose original is unchanged would convert to the text that
 /// snapshot holds for it.
 pub(crate) fn converted_here(
-    db: &Connection,
+    store: &crate::store_graph::GraphStore,
     workspace: &str,
     folder: &Path,
     snapshot: &str,
 ) -> Result<bool> {
-    let record: Option<String> = db
-        .query_row(
-            "SELECT freshness FROM repo_folders WHERE workspace_id=? AND folder_key=?",
-            params![workspace, crate::folders::folder_key(folder)],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
+    let record: Option<String> = crate::folders::folder_of(
+        store,
+        workspace,
+        &crate::folders::folder_key(folder),
+    )?
+    .and_then(|row| row["freshness"].as_str().map(str::to_string));
     Ok(record
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
         .is_some_and(|record| {
@@ -227,16 +225,13 @@ pub(crate) fn converted_here(
         }))
 }
 
-fn write_record(db: &Connection, workspace: &str, folder: &Path, record: &Record) -> Result<()> {
-    db.execute(
-        "UPDATE repo_folders SET freshness=? WHERE workspace_id=? AND folder_key=?",
-        params![
-            serde_json::to_string(record)?,
-            workspace,
-            crate::folders::folder_key(folder)
-        ],
-    )?;
-    Ok(())
+fn write_record(store: &crate::store_graph::GraphStore, workspace: &str, folder: &Path, record: &Record) -> Result<()> {
+    crate::folders::set_freshness(
+        store,
+        workspace,
+        &crate::folders::folder_key(folder),
+        Some(&serde_json::to_string(record)?),
+    )
 }
 
 /// Where a project stands against its folder.
@@ -364,16 +359,13 @@ fn check_at(
             return Ok(None);
         }
         let row = match folder {
-            Some(folder) => one(
-                db,
-                "SELECT path,updated_at,freshness FROM repo_folders WHERE workspace_id=? AND folder_key=? AND repository_id=? AND path IS NOT NULL",
-                params![p.workspace, crate::folders::folder_key(folder), project],
-            )?,
-            None => one(
-                db,
-                "SELECT path,updated_at,freshness FROM repo_folders WHERE repository_id=? AND path IS NOT NULL ORDER BY updated_at DESC,path LIMIT 1",
-                [project],
-            )?,
+            Some(folder) => crate::folders::folder_of(
+                &store.graph,
+                &p.workspace,
+                &crate::folders::folder_key(folder),
+            )?
+            .filter(|row| row["repository_id"] == project && row["path"].is_string()),
+            None => crate::folders::folders_of(&store.graph, project)?.into_iter().next(),
         };
         Ok(row.map(|row| Baseline {
             folder: PathBuf::from(s(&row, "path")),
@@ -1276,17 +1268,17 @@ fn folder_project(
 ) -> Result<Option<String>> {
     let cwd = std::env::current_dir().ok();
     store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
-        let Some(row) = one(
-            db,
-            "SELECT repository_id FROM repo_folders WHERE workspace_id=? AND folder_key=?",
-            params![p.workspace, crate::folders::folder_key(folder)],
+        let Some(row) = crate::folders::folder_of(
+            &store.graph,
+            &p.workspace,
+            &crate::folders::folder_key(folder),
         )?
         else {
             return Ok(None);
         };
         let own = s(&row, "repository_id").to_string();
         if let Some(value) = requested
-            && crate::folders::requested(db, p, value, cwd.as_deref(), true)? != own
+            && crate::folders::requested(&store.graph, db, p, value, cwd.as_deref(), true)? != own
         {
             return Ok(None);
         }
@@ -1376,7 +1368,7 @@ fn rebaseline(store: &Store, session: &Session, folder: &Path, check: &Check) ->
                 )
                 .ok();
             if current.as_deref() == Some(record.snapshot.as_str()) {
-                write_record(db, &p.workspace, folder, &updated)?;
+                write_record(&store.graph, &p.workspace, folder, &updated)?;
             }
             Ok(())
         },

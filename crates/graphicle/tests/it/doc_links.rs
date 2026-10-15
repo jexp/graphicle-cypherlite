@@ -1203,16 +1203,15 @@ async fn connector_code_marks_link_without_changing_text_or_staling_memories() {
     );
     // The issue's text has no backticks: it is the frozen conversion's.
     let stored = |id: &str| {
-        f.store
-            .read(|db| {
-                Ok(store::one(
-                    db,
-                    "SELECT content,sha256,metadata FROM am_connector_docs WHERE connector_id=? AND id=?",
-                    rusqlite::params![connectors[0], id],
-                )?
-                .unwrap())
-            })
-            .unwrap()
+        crate::gql_one(
+            &f.store,
+            "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id}) RETURN d.content AS content, d.sha256 AS sha256, d.metadata AS metadata",
+            graphicle_runtime::store_graph::Params::from([
+                crate::gp("connector", json!(connectors[0])),
+                crate::gp("id", json!(id)),
+            ]),
+        )
+        .unwrap()
     };
     let issue = stored("GW-1");
     assert!(s(&issue, "content").ends_with(&frozen_adf_text(&code_marked_adf(true))));

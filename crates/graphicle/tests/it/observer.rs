@@ -364,7 +364,7 @@ async fn metadata_changes_invalidate_and_reobserve_dated_notes() {
         .store
         .authorized_read(&f.workspace, &f.key, "read", |db, p| {
             let repo = graphicle_runtime::store::repo(db, p, &f.repo)?;
-            let docs = graphicle_runtime::memory::documents(db, &repo, p)?;
+            let docs = graphicle_runtime::memory::documents(&f.store, db, &repo, p)?;
             observer::notes_for(db, &f.repo, &docs)
         })
         .unwrap();

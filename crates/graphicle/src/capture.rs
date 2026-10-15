@@ -29,9 +29,8 @@
 //! hooks stay installed — `session.forget` is the lasting way to forget.
 use crate::{
     Error, Result, id, now,
-    store::{Store, one, repo, rows, s},
+    store::{Store, repo, s},
 };
-use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -753,12 +752,18 @@ pub(crate) fn document_session_marker(document: &str) -> Option<String> {
 }
 
 /// The repository's agent-sessions connector (`id`, `state`), if any.
-fn find_connector(db: &Connection, repository: &str) -> Result<Option<Value>> {
-    one(
-        db,
-        "SELECT id,state FROM am_connectors WHERE repository_id=? AND kind='jsonl' AND name=? ORDER BY created_at,id LIMIT 1",
-        params![repository, CONNECTOR_NAME],
-    )
+/// Connectors live in the graph store.
+fn find_connector(store: &Store, repository: &str) -> Result<Option<Value>> {
+    store.graph.read(|db| {
+        crate::store_graph::one(
+            db,
+            "MATCH (c:Connector {repository_id: $repository, kind: 'jsonl', name: $name}) RETURN c.id AS id, c.state AS state ORDER BY c.created_at, c.id LIMIT 1",
+            crate::store_graph::Params::from([
+                ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+                ("name".into(), crate::store_graph::json_to_value(&json!(CONNECTOR_NAME))),
+            ]),
+        )
+    })
 }
 
 impl Store {
@@ -774,23 +779,29 @@ impl Store {
         self.authorized(workspace, token, "collect", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
-            if let Some(row) = find_connector(db, identifier)? {
+            if let Some(row) = find_connector(self, identifier)? {
                 return Ok((s(&row, "id").to_string(), s(&row, "state").to_string()));
             }
             if !p.permits("admin") {
                 return Err(Error::denied());
             }
             let created = id();
-            db.execute(
-                "INSERT INTO am_connectors(id,repository_id,name,kind,config,credential_env,state,created_at) VALUES(?,?,?,'jsonl',?,NULL,'active',?)",
-                params![
-                    created,
-                    identifier,
-                    CONNECTOR_NAME,
-                    json!({"acl":{"workspace_readers":false,"credentials":[]}}).to_string(),
-                    now()
-                ],
-            )?;
+            self.graph.transaction(|db| {
+                crate::store_graph::write(
+                    db,
+                    "MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: 'jsonl', config: $config, credential_env: NULL, state: 'active', generation: 0, created_at: $now})-[:OF]->(p)",
+                    crate::store_graph::Params::from([
+                        ("id".into(), crate::store_graph::json_to_value(&json!(created))),
+                        ("repository".into(), crate::store_graph::json_to_value(&repository["id"])),
+                        ("workspace".into(), crate::store_graph::json_to_value(&repository["workspace_id"])),
+                        ("project_key".into(), crate::store_graph::json_to_value(&repository["project_key"])),
+                        ("project_name".into(), crate::store_graph::json_to_value(&repository["name"])),
+                        ("name".into(), crate::store_graph::json_to_value(&json!(CONNECTOR_NAME))),
+                        ("config".into(), cypherlite::Value::String(json!({"acl":{"workspace_readers":false,"credentials":[]}}).to_string().into())),
+                        ("now".into(), crate::store_graph::json_to_value(&json!(now()))),
+                    ]),
+                )
+            })?;
             Ok((created, "active".to_string()))
         })
     }
@@ -827,16 +838,21 @@ impl Store {
         }
         let (connector, state) = self.agent_connector(workspace, token, repository)?;
         let prefix = format!("{}:{}:", client.as_str(), session.session_id);
-        let (stored, blocked): (BTreeMap<String, String>, bool) = self.authorized_read(workspace, token, "collect", |db, _| {
-            let stored = rows(
-                db,
-                "SELECT id,sha256 FROM am_connector_docs WHERE connector_id=? AND substr(id,1,length(?2))=?2",
-                params![connector, prefix],
-            )?
+        let (stored, blocked): (BTreeMap<String, String>, bool) = self.authorized_read(workspace, token, "collect", |_db, _| {
+            let stored = self.graph.read(|db| {
+                crate::store_graph::rows(
+                    db,
+                    "MATCH (d:ConnectorDoc {connector_id: $connector}) WHERE d.id STARTS WITH $prefix RETURN d.id AS id, d.sha256 AS sha256",
+                    crate::store_graph::Params::from([
+                        ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                        ("prefix".into(), crate::store_graph::json_to_value(&json!(prefix))),
+                    ]),
+                )
+            })?
             .into_iter()
             .map(|r| (s(&r, "id").to_string(), s(&r, "sha256").to_string()))
             .collect();
-            let blocked = crate::deletion::forgotten(db, &connector, &session_marker(client, &session.session_id))?;
+            let blocked = self.graph.read(|gdb| crate::deletion::forgotten(gdb, &connector, &session_marker(client, &session.session_id)))?;
             Ok((stored, blocked))
         })?;
         let documents = documents(client, session);
@@ -920,13 +936,18 @@ impl Store {
             let ids: Vec<String> = self.authorized(workspace, token, "admin", |db, p| {
                 repo(db, p, &repository)?;
                 if round == 0 {
-                    crate::deletion::block(db, &connector, &session_marker(client, session))?;
+                    self.graph.transaction(|gdb| crate::deletion::block(gdb, &connector, &session_marker(client, session)))?;
                 }
-                Ok(rows(
-                    db,
-                    "SELECT id FROM am_connector_docs WHERE connector_id=? AND substr(id,1,length(?2))=?2 ORDER BY id",
-                    params![connector, prefix],
-                )?
+                Ok(self.graph.read(|db| {
+                    crate::store_graph::rows(
+                        db,
+                        "MATCH (d:ConnectorDoc {connector_id: $connector}) WHERE d.id STARTS WITH $prefix RETURN d.id AS id ORDER BY d.id",
+                        crate::store_graph::Params::from([
+                            ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                            ("prefix".into(), crate::store_graph::json_to_value(&json!(prefix))),
+                        ]),
+                    )
+                })?
                 .iter()
                 .map(|r| s(r, "id").to_string())
                 .collect())
@@ -959,12 +980,12 @@ impl Store {
         let after = crate::integer(args, "after", 3, 20)?;
         self.authorized_read(workspace, token, "read", |db, p| {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
-            let Some(connector) = find_connector(db, s(&repository, "id"))? else {
+            let Some(connector) = find_connector(self, s(&repository, "id"))? else {
                 return Ok(json!({"sessions":[],"turns":[],"captured":false}));
             };
             let prefix = format!("connector:{}:", s(&connector, "id"));
             let mut turns: Vec<(String, String, usize, String, Value)> = Vec::new();
-            for doc in crate::memory::documents(db, &repository, p)? {
+            for doc in crate::memory::documents(self, db, &repository, p)? {
                 let Some(document) = s(&doc, "id").strip_prefix(&prefix) else {
                     continue;
                 };
@@ -1043,13 +1064,13 @@ impl Store {
             self.authorized_read(workspace, token, "read", |db, p| {
                 let repository = repo(db, p, repository)?;
                 let open_work = crate::work_state::start_section(
-                    db,
+                    &self.graph,
                     s(&repository, "id"),
                     chrono::Utc::now().timestamp_millis(),
                 )?;
                 let mut reviewed = Vec::new();
                 let mut stale = 0usize;
-                for memory in crate::memory::list(db, &repository, p, false)? {
+                for memory in crate::memory::list(self, db, &repository, p, false)? {
                     if memory["state"] != "reviewed" {
                         continue;
                     }
@@ -1062,11 +1083,11 @@ impl Store {
                         s(&memory, "id").to_string(),
                     ));
                 }
-                let connector = find_connector(db, s(&repository, "id"))?;
+                let connector = find_connector(self, s(&repository, "id"))?;
                 let mut turns: Vec<(String, String, String)> = Vec::new();
                 if let Some(connector) = connector {
                     let prefix = format!("connector:{}:", s(&connector, "id"));
-                    for doc in crate::memory::documents(db, &repository, p)? {
+                    for doc in crate::memory::documents(self, db, &repository, p)? {
                         if s(&doc, "id").starts_with(&prefix) {
                             turns.push((
                                 s(&doc, "recorded_at").to_string(),

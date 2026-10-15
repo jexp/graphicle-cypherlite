@@ -528,43 +528,40 @@ fn revocation_matches_credential_ids_exactly_not_as_substrings() {
     }
     // A provider-side grant on the shared fixture document names `cred-ab`'s
     // verified identity, not `cred-a`'s.
-    let generation: i64 = db
-        .query_row(
-            "SELECT generation FROM am_connector_docs WHERE connector_id=? AND id='plan'",
-            [&f.connector],
-            |r| r.get(0),
-        )
-        .unwrap();
-    db.execute(
-        "INSERT INTO am_source_permissions VALUES(?,?,?,?,1,?)",
-        rusqlite::params![
-            f.connector,
-            "plan",
-            json!([{"type":"user","id":"U-AB"}]).to_string(),
-            graphicle_runtime::now(),
-            generation
-        ],
+    // Provider permissions and identities live in the graph store.
+    let generation: i64 = crate::gql_one(
+        &f.store,
+        "MATCH (d:ConnectorDoc {connector_id: $connector, id: 'plan'}) RETURN d.generation AS generation",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(f.connector))]),
     )
+    .and_then(|row| row["generation"].as_i64())
     .unwrap();
-    db.execute(
-        "INSERT INTO am_provider_identities VALUES(?,?,?,?,?)",
-        rusqlite::params![
-            f.workspace,
-            "jsonl",
-            "U-AB",
-            "cred-ab",
-            graphicle_runtime::now()
-        ],
-    )
-    .unwrap();
+    crate::gql_write(
+        &f.store,
+        "CREATE (sp:SourcePermission {connector_id: $connector, source_id: 'plan', principals: $principals, complete: true, checked_at: $now, generation: $generation})",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("connector", json!(f.connector)),
+            crate::gp("principals", json!(json!([{"type":"user","id":"U-AB"}]).to_string())),
+            crate::gp("now", json!(graphicle_runtime::now())),
+            crate::gp("generation", json!(generation)),
+        ]),
+    );
+    crate::gql_write(
+        &f.store,
+        "CREATE (i:ProviderIdentity {workspace_id: $workspace, provider: 'jsonl', external_id: 'U-AB', credential_id: 'cred-ab', verified_at: $now})",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("workspace", json!(f.workspace)),
+            crate::gp("now", json!(graphicle_runtime::now())),
+        ]),
+    );
 
     let expected = |connector: &str, doc: &str| format!("connector:{connector}:{doc}");
     assert_eq!(
-        graphicle_runtime::store::credential_sources(&db, &f.workspace, "cred-a").unwrap(),
+        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-a").unwrap(),
         vec![expected(&connectors[0], "doc")]
     );
     assert_eq!(
-        graphicle_runtime::store::credential_sources(&db, &f.workspace, "cred-ab").unwrap(),
+        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-ab").unwrap(),
         {
             let mut both = vec![
                 expected(&connectors[1], "doc"),

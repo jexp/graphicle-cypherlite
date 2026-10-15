@@ -154,7 +154,7 @@ impl Store {
         };
         self.authorized_read(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let documents = memory::documents(db, &repository, p)?;
+            let documents = memory::documents(self, db, &repository, p)?;
             let visible = memory::list_of(db, &repository, &documents, true)?;
             let mut memories = Vec::new();
             let mut descriptors = Vec::new();

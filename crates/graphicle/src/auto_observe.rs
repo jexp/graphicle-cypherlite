@@ -101,23 +101,44 @@ impl Store {
         config: &model::Config,
         connector: Option<&str>,
     ) -> Result<Vec<Value>> {
-        let connectors = {
-            let db = self.connect()?;
-            rows(
-                &db,
-                "SELECT c.id,c.repository_id,c.config,c.generation,p.workspace_id,w.capability_hash FROM am_connectors c JOIN repo_projects p ON p.id=c.repository_id JOIN workspaces w ON w.id=p.workspace_id WHERE c.state='active' AND json_type(c.config,'$.observe')='object' AND (?1 IS NULL OR c.id=?1) ORDER BY c.id",
-                [connector],
-            )?
-        };
+        // Connector rows live in the graph store; the workspace side of the
+        // join stays in SQL until the ownership spine migrates.
+        let mut connectors = self.graph.read(|db| {
+            crate::store_graph::rows(
+                db,
+                "MATCH (c:Connector {state: 'active'}) RETURN c.id AS id, c.repository_id AS repository_id, c.config AS config, c.generation AS generation ORDER BY c.id",
+                crate::store_graph::Params::new(),
+            )
+        })?;
+        connectors.retain(|c| {
+            (connector.is_none() || Some(s(c, "id")) == connector)
+                && serde_json::from_str::<Value>(s(c, "config"))
+                    .map(|config| config["observe"].is_object())
+                    .unwrap_or(false)
+        });
         let mut decisions = Vec::new();
         for mut connector in connectors {
             decode(&mut connector, "config")?;
+            let ids = self
+                .connect()?
+                .query_row(
+                    "SELECT p.workspace_id, w.capability_hash FROM repo_projects p JOIN workspaces w ON w.id=p.workspace_id WHERE p.id=?",
+                    [s(&connector, "repository_id")],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                );
+            match ids {
+                Ok((workspace, hash)) => {
+                    connector["workspace_id"] = Value::String(workspace);
+                    connector["capability_hash"] = Value::String(hash);
+                }
+                Err(_) => continue,
+            }
             let decision = crate::settings::configuration(
                 self,
                 s(&connector, "workspace_id"),
                 config,
             )
-            .and_then(|config| self.transaction(|db| decide(db, &connector, &config)))
+            .and_then(|config| self.transaction(|db| decide(self, db, &connector, &config)))
             .unwrap_or_else(
                 |e| json!({"connector_id":connector["id"],"queued":false,"reason":e.message}),
             );
@@ -137,7 +158,7 @@ fn unfinished(rounds: &[&Value]) -> bool {
         .is_some_and(|r| r["state"] == "complete" && r["result"]["complete"] == false)
 }
 
-fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
+fn decide(store: &Store, db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
     let id = s(connector, "id");
     let repository_id = s(connector, "repository_id");
     let generation = connector["generation"].as_i64().unwrap_or(0);
@@ -186,7 +207,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
     }
     let max_rounds = integer(policy, "max_rounds", ROUNDS, 64)?;
     let repository = repo(db, &p, repository_id)?;
-    let documents = memory::documents(db, &repository, &p)?;
+    let documents = memory::documents(store, db, &repository, &p)?;
     let prefix = format!("connector:{id}:");
     let args = observe_args(policy, repository_id, &prefix);
     let (_, profile) = config.profile(args["model"].as_str())?;
@@ -222,7 +243,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
     };
     if unobserved > 0 && (unobserved >= threshold || unfinished(&observing)) {
         if observing.len() < max_rounds {
-            return enqueue(db, &p, args, config, decision, generation);
+            return enqueue(store, db, &p, args, config, decision, generation);
         }
         idle = "observation rounds exhausted for this generation";
     }
@@ -231,6 +252,7 @@ fn decide(db: &Connection, connector: &Value, config: &model::Config) -> Result<
 }
 
 fn enqueue(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     mut args: Value,
@@ -240,7 +262,7 @@ fn enqueue(
 ) -> Result<Value> {
     jobs::check(&args, config)?;
     args["auto"] = json!({"connector_id":decision["connector_id"],"generation":generation});
-    let job = jobs::queue(db, p, &args, config)?;
+    let job = jobs::queue(store, db, p, &args, config)?;
     decision["kind"] = args["kind"].clone();
     decision["job_id"] = job["id"].clone();
     if job["replayed"] == true {

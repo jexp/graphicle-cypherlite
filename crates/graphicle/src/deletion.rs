@@ -241,13 +241,25 @@ pub fn document_hash(connector: &str, document: &str) -> String {
 pub const MAX_SCOPE_DOCUMENTS: usize = MAX_DOCUMENTS;
 
 /// Whether an incoming connector document was forgotten earlier.
-pub(crate) fn forgotten(db: &Connection, connector: &str, document: &str) -> Result<bool> {
+/// Tombstones live in the graph store (the connector they name is there).
+pub(crate) fn forgotten(
+    db: &mut cypherlite::Connection,
+    connector: &str,
+    document: &str,
+) -> Result<bool> {
     let session = crate::capture::document_session_marker(document)
         .map(|marker| tombstone(connector, &marker));
-    Ok(one(
+    let mut hashes = vec![tombstone(connector, document)];
+    if let Some(session) = session {
+        hashes.push(session);
+    }
+    Ok(crate::store_graph::one(
         db,
-        "SELECT 1 AS yes FROM am_forgotten_sources WHERE connector_id=? AND id_hash IN (?,?) LIMIT 1",
-        params![connector, tombstone(connector, document), session],
+        "MATCH (f:ForgottenSource {connector_id: $connector}) WHERE f.id_hash IN $hashes RETURN f.id_hash AS id_hash LIMIT 1",
+        crate::store_graph::Params::from([
+            ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+            ("hashes".into(), crate::store_graph::json_to_value(&json!(hashes))),
+        ]),
     )?
     .is_some())
 }
@@ -255,10 +267,19 @@ pub(crate) fn forgotten(db: &Connection, connector: &str, document: &str) -> Res
 /// Block a connector document id before it exists (the later turns of a
 /// forgotten agent session) with the same one-way tombstone a forgotten
 /// document leaves, so no identifier is kept.
-pub(crate) fn block(db: &Connection, connector: &str, document: &str) -> Result<()> {
-    db.execute(
-        "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-        params![connector, tombstone(connector, document), now()],
+pub(crate) fn block(
+    db: &mut cypherlite::Connection,
+    connector: &str,
+    document: &str,
+) -> Result<()> {
+    crate::store_graph::write(
+        db,
+        "MERGE (f:ForgottenSource {connector_id: $connector, id_hash: $hash}) SET f.forgotten_at=$now",
+        crate::store_graph::Params::from([
+            ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+            ("hash".into(), crate::store_graph::json_to_value(&json!(tombstone(connector, document)))),
+            ("now".into(), crate::store_graph::json_to_value(&json!(now()))),
+        ]),
     )?;
     Ok(())
 }
@@ -295,6 +316,43 @@ fn select_rowids(
         }
     }
     Ok(out)
+}
+
+/// A graph write in the connector's scope, returning the engine's stats.
+fn graph_write(
+    db: &mut cypherlite::Connection,
+    cypher: &str,
+    connector: &str,
+) -> Result<cypherlite::QueryStats> {
+    crate::store_graph::write(
+        db,
+        cypher,
+        crate::store_graph::Params::from([(
+            "connector".into(),
+            crate::store_graph::json_to_value(&json!(connector)),
+        )]),
+    )
+}
+
+/// `UNWIND $ids` scoped delete; returns the nodes deleted.
+fn graph_write_list(
+    db: &mut cypherlite::Connection,
+    cypher: &str,
+    connector: &str,
+    ids: &[String],
+) -> Result<usize> {
+    Ok(crate::store_graph::write(
+        db,
+        cypher,
+        crate::store_graph::Params::from([
+            (
+                "connector".into(),
+                crate::store_graph::json_to_value(&json!(connector)),
+            ),
+            ("ids".into(), crate::store_graph::json_to_value(&json!(ids))),
+        ]),
+    )?
+    .nodes_deleted as usize)
 }
 
 fn delete_rowids(db: &Connection, table: &str, rowids: &[i64]) -> Result<usize> {
@@ -656,6 +714,7 @@ fn index_markers(
 
 /// Rows derived from or naming the forgotten documents, by kind.
 fn source_rows(
+    store: &Store,
     db: &Connection,
     workspace: &str,
     repository: &str,
@@ -663,36 +722,59 @@ fn source_rows(
 ) -> Result<BTreeMap<&'static str, usize>> {
     let connector = scope.connector.as_str();
     let mut out = BTreeMap::new();
-    if scope.whole() {
-        out.insert(
-            "connector",
-            count(
-                db,
-                "SELECT count(*) FROM am_connectors WHERE id=?",
-                [connector],
-            )?,
-        );
-    }
-    for (name, table, column) in [
-        ("documents", "am_connector_docs", "id"),
-        ("versions", "am_connector_versions", "id"),
-        ("staged", "am_connector_stage", "id"),
-        ("permissions", "am_source_permissions", "source_id"),
-    ] {
-        let found = select_rowids(
+    // The connector domain lives in the graph store; count its nodes there.
+    store.graph.read(|db| {
+        if scope.whole() {
+            out.insert(
+                "connector",
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {id: $connector}) RETURN count(c) AS n",
+                    crate::store_graph::Params::from([(
+                        "connector".into(),
+                        crate::store_graph::json_to_value(&json!(connector)),
+                    )]),
+                )?
+                .and_then(|row| row["n"].as_u64())
+                .unwrap_or(0) as usize,
+            );
+        }
+        for (name, cypher) in [
+            ("documents", "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS key"),
+            ("versions", "MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS key"),
+            ("staged", "MATCH (s:ConnectorStage {connector_id: $connector}) RETURN s.id AS key"),
+            ("permissions", "MATCH (sp:SourcePermission {connector_id: $connector}) RETURN sp.source_id AS key"),
+        ] {
+            out.insert(
+                name,
+                crate::store_graph::rows(
+                    db,
+                    cypher,
+                    crate::store_graph::Params::from([(
+                        "connector".into(),
+                        crate::store_graph::json_to_value(&json!(connector)),
+                    )]),
+                )?
+                .into_iter()
+                .filter(|row| scope.document(crate::store_graph::s(row, "key")))
+                .count(),
+            );
+        }
+        let originals = crate::store_graph::rows(
             db,
-            &format!("SELECT rowid,{column} FROM {table} WHERE connector_id=?"),
-            [connector],
-            |v| scope.document(v),
-        )?;
-        out.insert(name, found.len());
-    }
-    let per_repository: [(&'static str, &str, Matches); 12] = [
-        (
-            "originals",
-            "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
+            "MATCH (o:OriginalDocument {repository_id: $repository}) RETURN o.source_id AS source_id",
+            crate::store_graph::Params::from([(
+                "repository".into(),
+                crate::store_graph::json_to_value(&json!(repository)),
+            )]),
+        )?
+        .into_iter()
+        .filter(|row| scope.source(crate::store_graph::s(row, "source_id")))
+        .count();
+        out.insert("originals", originals);
+        Ok(())
+    })?;
+    let per_repository: [(&'static str, &str, Matches); 11] = [
         (
             "memories",
             "SELECT rowid,data FROM repo_memories WHERE repository_id=?",
@@ -822,52 +904,60 @@ impl Plan {
     }
 }
 
-pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
+pub fn plan(
+    store: &Store,
+    db: &Connection,
+    workspace: &str,
+    repository: &str,
+    scope: &Scope,
+) -> Result<Plan> {
     let prefix = scope.prefix();
     let mut sources = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
-    for table in [
-        "am_connector_docs",
-        "am_connector_versions",
-        "am_connector_stage",
-    ] {
-        for row in rows(
+    // The connector domain lives in the graph store.
+    let graph = store.graph.read(|db| {
+        let doc_rows = crate::store_graph::rows(
             db,
-            &format!("SELECT id,sha256,content FROM {table} WHERE connector_id=?"),
-            [&scope.connector],
-        )? {
-            if !scope.document(s(&row, "id")) {
-                continue;
-            }
-            sources.insert((
-                format!("{prefix}{}", s(&row, "id")),
-                s(&row, "sha256").to_string(),
-            ));
-            texts
-                .entry(s(&row, "sha256").to_string())
-                .or_insert_with(|| s(&row, "content").to_string());
+            "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id, d.sha256 AS sha256, d.content AS content              UNION ALL              MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS id, v.sha256 AS sha256, v.content AS content              UNION ALL              MATCH (s:ConnectorStage {connector_id: $connector}) RETURN s.id AS id, s.sha256 AS sha256, s.content AS content",
+            crate::store_graph::Params::from([("connector".into(), crate::store_graph::json_to_value(&json!(scope.connector)))]),
+        )?;
+        let originals = crate::store_graph::rows(
+            db,
+            "MATCH (o:OriginalDocument {repository_id: $repository}) RETURN o.source_id AS source_id, o.sha256 AS sha256",
+            crate::store_graph::Params::from([("repository".into(), crate::store_graph::json_to_value(&json!(repository)))]),
+        )?;
+        let versions = crate::store_graph::rows(
+            db,
+            "MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS id, v.created_at AS created_at",
+            crate::store_graph::Params::from([("connector".into(), crate::store_graph::json_to_value(&json!(scope.connector)))]),
+        )?;
+        Ok((doc_rows, originals, versions))
+    })?;
+    let (doc_rows, originals, versions) = graph;
+    for row in &doc_rows {
+        if !scope.document(s(row, "id")) {
+            continue;
         }
+        sources.insert((
+            format!("{prefix}{}", s(row, "id")),
+            s(row, "sha256").to_string(),
+        ));
+        texts
+            .entry(s(row, "sha256").to_string())
+            .or_insert_with(|| s(row, "content").to_string());
     }
-    for row in rows(
-        db,
-        "SELECT source_id,sha256 FROM am_original_documents WHERE repository_id=?",
-        [repository],
-    )? {
-        if scope.source(s(&row, "source_id")) {
+    for row in &originals {
+        if scope.source(s(row, "source_id")) {
             sources.insert((
-                s(&row, "source_id").to_string(),
-                s(&row, "sha256").to_string(),
+                s(row, "source_id").to_string(),
+                s(row, "sha256").to_string(),
             ));
         }
     }
     let mut since: Option<String> = None;
-    for row in rows(
-        db,
-        "SELECT id,created_at FROM am_connector_versions WHERE connector_id=?",
-        [&scope.connector],
-    )? {
-        let stamp = s(&row, "created_at");
-        if scope.document(s(&row, "id")) && since.as_deref().is_none_or(|first| stamp < first) {
+    for row in &versions {
+        let stamp = s(row, "created_at");
+        if scope.document(s(row, "id")) && since.as_deref().is_none_or(|first| stamp < first) {
             since = Some(stamp.to_string());
         }
     }
@@ -883,7 +973,7 @@ pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -
         sources_digest: digest(&json!(sources)),
         texts: texts.len(),
         fingerprints,
-        rows: source_rows(db, workspace, repository, scope)?,
+        rows: source_rows(store, db, workspace, repository, scope)?,
         visible_since: since_visible(db, repository, since.as_deref(), None)?,
         since,
     })
@@ -1338,44 +1428,117 @@ pub fn forget(
 
 /// Remove the originals in scope. Forgotten documents keep a one-way
 /// tombstone so a later sync or import skips them.
-pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> {
+pub fn erase(store: &Store, _db: &Connection, repository: &str, scope: &Scope) -> Result<Value> {
     let connector = scope.connector.as_str();
     if scope.whole() {
-        let n = db.execute("DELETE FROM am_connectors WHERE id=?", [connector])?;
+        // Everything the connector owns goes with it (the SQL schema's
+        // ON DELETE CASCADE): documents, versions, staged rows, provider
+        // permissions and retained originals, then the connector itself.
+        let n = store.graph.transaction(|db| {
+            for cypher in [
+                "MATCH (d:ConnectorDoc {connector_id: $connector}) DETACH DELETE d",
+                "MATCH (s:ConnectorStage {connector_id: $connector}) DELETE s",
+                "MATCH (v:ConnectorVersion {connector_id: $connector}) DELETE v",
+                "MATCH (sp:SourcePermission {connector_id: $connector}) DELETE sp",
+                "MATCH (o:OriginalDocument {connector_id: $connector}) DELETE o",
+                "MATCH (f:ForgottenSource {connector_id: $connector}) DELETE f",
+            ] {
+                graph_write(db, cypher, connector)?;
+            }
+            Ok(graph_write(
+                db,
+                "MATCH (c:Connector {id: $connector}) DETACH DELETE c",
+                connector,
+            )?
+            .nodes_deleted)
+        })?;
         return Ok(json!({"connector":n}));
     }
-    let mut out = BTreeMap::new();
-    for (name, table, column) in [
-        ("documents", "am_connector_docs", "id"),
-        ("versions", "am_connector_versions", "id"),
-        ("staged", "am_connector_stage", "id"),
-        ("permissions", "am_source_permissions", "source_id"),
-    ] {
-        let found = select_rowids(
+    // The connector domain lives in the graph store: collect the in-scope
+    // document ids there and delete the matching nodes.
+    let out: BTreeMap<&'static str, usize> = store.graph.transaction(|db| {
+        let mut out = BTreeMap::new();
+        let ids_of = |db: &mut cypherlite::Connection, cypher: &str| -> Result<Vec<String>> {
+            Ok(crate::store_graph::rows(
+                db,
+                cypher,
+                crate::store_graph::Params::from([(
+                    "connector".into(),
+                    crate::store_graph::json_to_value(&json!(connector)),
+                )]),
+            )?
+            .into_iter()
+            .map(|row| crate::store_graph::s(&row, "id").to_string())
+            .filter(|id| scope.document(id))
+            .collect())
+        };
+        for (name, label, key, cypher) in [
+            ("documents", "ConnectorDoc", "id", "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id"),
+            ("versions", "ConnectorVersion", "id", "MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS id"),
+            ("staged", "ConnectorStage", "id", "MATCH (s:ConnectorStage {connector_id: $connector}) RETURN s.id AS id"),
+            ("permissions", "SourcePermission", "source_id", "MATCH (sp:SourcePermission {connector_id: $connector}) RETURN sp.source_id AS id"),
+        ] {
+            let found = ids_of(db, cypher)?;
+            out.insert(
+                name,
+                graph_write_list(
+                    db,
+                    &format!(
+                        "UNWIND $ids AS id MATCH (n:{label} {{connector_id: $connector}}) WHERE n.{key} = id DETACH DELETE n"
+                    ),
+                    connector,
+                    &found,
+                )?,
+            );
+        }
+        let originals = crate::store_graph::rows(
             db,
-            &format!("SELECT rowid,{column} FROM {table} WHERE connector_id=?"),
-            [connector],
-            |v| scope.document(v),
-        )?;
-        out.insert(name, delete_rowids(db, table, &found)?);
-    }
-    let originals = select_rowids(
-        db,
-        "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
-        [repository],
-        |v| scope.source(v),
-    )?;
-    out.insert(
-        "originals",
-        delete_rowids(db, "am_original_documents", &originals)?,
-    );
+            "MATCH (o:OriginalDocument {repository_id: $repository}) RETURN o.source_id AS source_id, o.sha256 AS sha256",
+            crate::store_graph::Params::from([(
+                "repository".into(),
+                crate::store_graph::json_to_value(&json!(repository)),
+            )]),
+        )?
+        .into_iter()
+        .filter(|row| scope.source(crate::store_graph::s(row, "source_id")))
+        .map(|row| {
+            (
+                crate::store_graph::s(&row, "source_id").to_string(),
+                crate::store_graph::s(&row, "sha256").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+        let mut removed = 0usize;
+        for (source_id, sha256) in &originals {
+            removed += crate::store_graph::write(
+                db,
+                "MATCH (o:OriginalDocument {repository_id: $repository, source_id: $source_id, sha256: $sha256}) DELETE o",
+                crate::store_graph::Params::from([
+                    ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+                    ("source_id".into(), crate::store_graph::json_to_value(&json!(source_id))),
+                    ("sha256".into(), crate::store_graph::json_to_value(&json!(sha256))),
+                ]),
+            )?
+            .nodes_deleted as usize;
+        }
+        out.insert("originals", removed);
+        Ok(out)
+    })?;
     let stamp = now();
-    for hash in scope.hashes() {
-        db.execute(
-            "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-            params![connector, hash, stamp],
-        )?;
-    }
+    store.graph.transaction(|db| {
+        for hash in scope.hashes() {
+            crate::store_graph::write(
+                db,
+                "MERGE (f:ForgottenSource {connector_id: $connector, id_hash: $hash}) SET f.forgotten_at=$now",
+                crate::store_graph::Params::from([
+                    ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                    ("hash".into(), crate::store_graph::json_to_value(&json!(hash))),
+                    ("now".into(), crate::store_graph::json_to_value(&json!(stamp))),
+                ]),
+            )?;
+        }
+        Ok(())
+    })?;
     Ok(json!(out))
 }
 
@@ -1383,6 +1546,7 @@ pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> 
 /// `started` is when the request began; artifacts dated after it are new work.
 #[allow(clippy::too_many_arguments)]
 pub fn receipt(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     repository: &Value,
@@ -1393,7 +1557,7 @@ pub fn receipt(
     erased: Value,
 ) -> Result<Value> {
     policy_receipt(
-        db, p, repository, operation, plan, started, forgotten, erased, None,
+        store, db, p, repository, operation, plan, started, forgotten, erased, None,
     )
 }
 
@@ -1401,6 +1565,7 @@ pub fn receipt(
 /// carries the policy and its digest.
 #[allow(clippy::too_many_arguments)]
 pub fn policy_receipt(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     repository: &Value,
@@ -1413,7 +1578,7 @@ pub fn policy_receipt(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let scope = &plan.scope;
-    let remaining = source_rows(db, &p.workspace, identifier, scope)?;
+    let remaining = source_rows(store, db, &p.workspace, identifier, scope)?;
     let tainted = since_visible(db, identifier, plan.since(), Some(started))?;
     let catalog = tables(db)?;
     let ids = if scope.whole() {
@@ -1426,18 +1591,25 @@ pub fn policy_receipt(
             false,
         )?
     } else {
-        let existing: BTreeSet<String> = rows(
-            db,
-            "SELECT id FROM am_connector_docs WHERE connector_id=?",
-            [&scope.connector],
-        )?
+        let existing: BTreeSet<String> = store
+            .graph
+            .read(|db| {
+                crate::store_graph::rows(
+                    db,
+                    "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id",
+                    crate::store_graph::Params::from([(
+                        "connector".into(),
+                        crate::store_graph::json_to_value(&json!(scope.connector)),
+                    )]),
+                )
+            })?
         .iter()
         .map(|r| format!("{}{}", scope.prefix(), s(r, "id")))
         .collect();
         document_references(db, &catalog, scope, &existing, (identifier, &p.workspace))?
     };
     let text = verbatim(db, &catalog, &plan.fingerprints, identifier)?;
-    let visible = crate::memory::documents(db, repository, p)?
+    let visible = crate::memory::documents(store, db, repository, p)?
         .iter()
         .filter(|d| scope.source(s(d, "id")))
         .count();
@@ -1920,6 +2092,8 @@ fn chain(db: &Connection, workspace: &str) -> Result<Value> {
 /// Flush deleted pages out of the write-ahead log after the deletion commits;
 /// `secure_delete` has already zeroed them in the database pages.
 pub fn checkpoint(store: &Store) -> Result<Value> {
+    // The graph store checkpoints too, so deleted connector data is flushed.
+    store.graph.checkpoint()?;
     let (busy, log, done) =
         store
             .connect()?
@@ -1958,13 +2132,13 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
         let current = match s(&receipt, "operation") {
             "connector.delete" => {
                 let scope = Scope::connector(s(&receipt, "target"));
-                let remaining = source_rows(db, workspace, &repository, &scope)?;
+                let remaining = source_rows(store, db, workspace, &repository, &scope)?;
                 let ids = references(db, &catalog, &[scope.prefix()], (&repository, workspace), &[], false)?;
                 // Caches refill with unrelated work, so only the deleted
                 // sources' own rows and references are re-checked.
                 let visible = match &project {
                     Some(project) => Some(
-                        crate::memory::documents(db, project, p)?
+                        crate::memory::documents(store, db, project, p)?
                             .iter()
                             .filter(|d| scope.source(s(d, "id")))
                             .count(),
@@ -1986,30 +2160,62 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
                     .filter_map(Value::as_str)
                     .collect();
                 let mut reappeared = BTreeMap::new();
-                for (name, table, column) in [
-                    ("documents", "am_connector_docs", "id"),
-                    ("versions", "am_connector_versions", "id"),
-                    ("staged", "am_connector_stage", "id"),
-                    ("permissions", "am_source_permissions", "source_id"),
-                ] {
-                    let count = rows(db, &format!("SELECT {column} AS id FROM {table} WHERE connector_id=?"), [connector])?
-                        .iter().filter(|d| hashes.contains(tombstone(connector, s(d,"id")).as_str())).count();
-                    reappeared.insert(name, count);
-                }
+                // The connector domain lives in the graph store.
                 let prefix = format!("connector:{connector}:");
-                let originals = rows(db, "SELECT source_id FROM am_original_documents WHERE repository_id=?", [&repository])?
-                    .iter().filter(|d| s(d,"source_id").strip_prefix(&prefix)
-                        .is_some_and(|id| hashes.contains(tombstone(connector,id).as_str()))).count();
-                reappeared.insert("originals", originals);
-                let tombstones = rows(
-                    db,
-                    "SELECT id_hash FROM am_forgotten_sources WHERE connector_id=?",
-                    [connector],
-                )?
+                store.graph.read(|db| {
+                    for (name, cypher) in [
+                        ("documents", "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id"),
+                        ("versions", "MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS id"),
+                        ("staged", "MATCH (s:ConnectorStage {connector_id: $connector}) RETURN s.id AS id"),
+                        ("permissions", "MATCH (sp:SourcePermission {connector_id: $connector}) RETURN sp.source_id AS id"),
+                    ] {
+                        let count = crate::store_graph::rows(
+                            db,
+                            cypher,
+                            crate::store_graph::Params::from([(
+                                "connector".into(),
+                                crate::store_graph::json_to_value(&json!(connector)),
+                            )]),
+                        )?
+                        .iter()
+                        .filter(|d| hashes.contains(tombstone(connector, crate::store_graph::s(d, "id")).as_str()))
+                        .count();
+                        reappeared.insert(name, count);
+                    }
+                    let originals = crate::store_graph::rows(
+                        db,
+                        "MATCH (o:OriginalDocument {repository_id: $repository}) RETURN o.source_id AS source_id",
+                        crate::store_graph::Params::from([(
+                            "repository".into(),
+                            crate::store_graph::json_to_value(&json!(repository)),
+                        )]),
+                    )?
+                    .iter()
+                    .filter(|d| {
+                        crate::store_graph::s(d, "source_id")
+                            .strip_prefix(&prefix)
+                            .is_some_and(|id| hashes.contains(tombstone(connector, id).as_str()))
+                    })
+                    .count();
+                    reappeared.insert("originals", originals);
+                    Ok::<_, Error>(())
+                })?;
+                let tombstones = store
+                    .graph
+                    .read(|db| {
+                        crate::store_graph::rows(
+                            db,
+                            "MATCH (f:ForgottenSource {connector_id: $connector}) RETURN f.id_hash AS id_hash",
+                            crate::store_graph::Params::from([(
+                                "connector".into(),
+                                crate::store_graph::json_to_value(&json!(connector)),
+                            )]),
+                        )
+                    })?
                 .iter()
                 .filter(|r| hashes.contains(s(r, "id_hash")))
                 .count();
-                let connector_present = one(db,"SELECT id FROM am_connectors WHERE id=?",[connector])?.is_some();
+                let connector_present = store.graph.read(|db| crate::store_graph::one(db,"MATCH (c:Connector {id: $id}) RETURN c.id AS id",crate::store_graph::Params::from([("id".into(),crate::store_graph::json_to_value(&json!(connector)))])))?.is_some();
                 let clean = receipt["verified_local"] == true && reappeared.values().all(|n| *n == 0)
                     && (!connector_present || tombstones == hashes.len());
                 json!({"verified_local":clean,"reappeared_documents":reappeared["documents"],"reappeared_rows":reappeared,

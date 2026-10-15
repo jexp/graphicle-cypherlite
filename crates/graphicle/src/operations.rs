@@ -97,17 +97,17 @@ impl Store {
             match operation {
                 "files"=>{
                     let prefix=args["prefix"].as_str().unwrap_or("");let offset=integer(args,"offset",0,100000)?;let limit=integer(args,"limit",100,500)?.max(1);
-                    let docs=memory::documents(db,&repository,p)?;let matching:Vec<_>=docs.iter().filter(|d|s(d,"path").starts_with(prefix)).collect();
+                    let docs=memory::documents(self,db,&repository,p)?;let matching:Vec<_>=docs.iter().filter(|d|s(d,"path").starts_with(prefix)).collect();
                     let files:Vec<_>=matching.iter().skip(offset).take(limit).map(|d|json!({"id":d["id"],"path":d["path"],"title":d["title"],"sha256":d["sha256"],"source_kind":d["source_kind"],"bytes":s(d,"content").len()})).collect();
                     Ok(json!({"files":files,"total":matching.len(),"next_offset":if offset+limit<matching.len(){Some(offset+limit)}else{None},"snapshot":repository["snapshot"]}))
                 },
-                "memories"=>Ok(json!(memory::list(db,&repository,p,args["include_retired"]==true)?)),
+                "memories"=>Ok(json!(memory::list(self,db,&repository,p,args["include_retired"]==true)?)),
                 "memory.history"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
+                    let memories=memory::list(self,db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     let known=args["known_at"].as_str().map(graphicle_memory::temporal::instant).transpose().map_err(Error::bad)?;
                     let mut versions=Vec::new();
-                    let docs=memory::documents(db,&repository,p)?;
+                    let docs=memory::documents(self,db,&repository,p)?;
                     for mut row in rows(db,"SELECT data,created_at FROM repo_memory_revisions WHERE memory_id=? ORDER BY revision",[memory_id])? {
                         if known.is_some_and(|at|graphicle_memory::temporal::instant(s(&row,"created_at")).is_ok_and(|t|t>at)){continue;}
                         decode(&mut row,"data")?;let mut memory=row["data"].clone();decode(&mut memory,"data")?;
@@ -115,7 +115,7 @@ impl Store {
                     }
                     if known.is_some(){Ok(json!({"memory":versions.last(),"historical":true}))}else{Ok(json!({"versions":versions}))}
                 },
-                "memory.export"=>Ok(json!({"format":"graphicle.memories.v1","repository_id":identifier,"memories":memory::list(db,&repository,p,true)?})),
+                "memory.export"=>Ok(json!({"format":"graphicle.memories.v1","repository_id":identifier,"memories":memory::list(self,db,&repository,p,true)?})),
                 "history"=>Ok(json!({"snapshots":rows(db,"SELECT sha256,metadata,created_at FROM repo_snapshots WHERE repository_id=? ORDER BY created_at DESC LIMIT 100",[identifier])?})),
                 _=>Err(Error::bad("Unsupported project read"))
             }
@@ -137,15 +137,15 @@ impl Store {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;let identifier=s(&repository,"id");
             match operation {
                 "sync.abort"=>{db.execute("UPDATE repo_syncs SET state='aborted' WHERE repository_id=? AND id=? AND state IN ('pending','preparing')",params![identifier,string(args,"sync_id",100)?])?;Ok(json!({"aborted":true}))},
-                "learning.refresh.propose"=>memory::propose_refresh(db,&repository,p,args),
+                "learning.refresh.propose"=>memory::propose_refresh(self,db,&repository,p,args),
                 "memory.state"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let old=memories.iter().find(|m|m["id"]==args["memory_id"]).ok_or_else(||Error::bad("Memory unavailable"))?;
+                    let memories=memory::list(self,db,&repository,p,true)?;let old=memories.iter().find(|m|m["id"]==args["memory_id"]).ok_or_else(||Error::bad("Memory unavailable"))?;
                     if args["state"]!="retired"{return Err(Error::bad("Use draft review to approve a memory"));}
                     let data=old["data"].clone();let result=memory::save(db,identifier,Some(s(old,"id")),args["expected_revision"].as_i64(),s(old,"kind"),s(old,"title"),s(old,"body"),"retired",&data)?;
                     db.execute("UPDATE am_claims SET state='retired',updated_at=? WHERE repository_id=? AND memory_id=?",params![now(),identifier,s(old,"id")])?;Ok(result)
                 },
                 "memory.delete"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
+                    let memories=memory::list(self,db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     // The memory, its dependents and everything naming them go in one transaction, with a hash-chained receipt.
                     let (deleted,counts)=crate::deletion::delete_memories(db,&p.workspace,identifier,&memories,memory_id)?;
@@ -187,7 +187,7 @@ impl Store {
                         return Ok(json!({"memory_id":old["id"],"state":old["state"],"replayed":true}));
                     }
                     // Every quote must appear in a source the caller can read now.
-                    let docs=memory::documents(db,&repository,p)?;
+                    let docs=memory::documents(self,db,&repository,p)?;
                     let mut data=memory::dependencies(db,identifier,&citations,&docs)?;
                     crate::symbols::name(db,identifier,&named,&docs,&mut data)?;
                     // The named files become dependencies,
@@ -211,7 +211,7 @@ impl Store {
                     let values=args["memories"].as_array().filter(|v|v.len()<=500).ok_or_else(||Error::bad("Import at most 500 memories"))?;let mut imported=Vec::new();
                     // Symbol links are
                     // re-grounded here through their logical identity.
-                    let docs=memory::documents(db,&repository,p)?;let mut regrounded=0;let mut unresolved=0;
+                    let docs=memory::documents(self,db,&repository,p)?;let mut regrounded=0;let mut unresolved=0;
                     for value in values {let mut data=value.get("data").cloned().unwrap_or(json!({}));if !data.is_object(){return Err(Error::bad("Invalid memory data"));}
                         if let Some(value)=data.get("recall") { data["recall"]=serde_json::to_value(crate::structured_memory::metadata(value)?)?; }
                         data["authority"]=json!("unreviewed_import");data["notes"]=json!({});data.as_object_mut().unwrap().remove("refresh_target");data.as_object_mut().unwrap().remove("target_revision");

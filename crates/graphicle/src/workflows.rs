@@ -191,7 +191,7 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
         graphicle_memory::semantic::INSTRUCTIONS
     );
     let (snapshot, targets) = jobs::guarded_read(&worker.store, job, |db, p, repo| {
-        Ok((query::snapshot(db, repo, p)?, claims::current(db, repo, p)?))
+        Ok((query::snapshot(&worker.store, db, repo, p)?, claims::current(&worker.store, db, repo, p)?))
     })?;
     let configuration =
         crate::settings::configuration(&worker.store, &job.workspace, &worker.config)?;
@@ -349,7 +349,7 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
             .cloned()
             .collect();
         let result = jobs::guarded(&worker.store, job, |db, p, repo| {
-            let fresh = claims::current(db, repo, p)?;
+            let fresh = claims::current(&worker.store, db, repo, p)?;
             for target in &target_context {
                 if !fresh.iter().any(|t| {
                     t["id"] == target["id"] && t["memory_revision"] == target["memory_revision"]
@@ -360,6 +360,7 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
                 }
             }
             let result = claims::propose(
+                &worker.store,
                 db,
                 repo,
                 p,
@@ -466,7 +467,7 @@ fn refresh_correction(document: &Value, operations: &Value, skipped: &[Value]) -
 
 pub async fn refresh(worker: &Worker, job: &Job) -> Result<Value> {
     let prepared = jobs::guarded_read(&worker.store, job, |db, p, repo| {
-        memory::prepare_refresh(db, repo, p, string(&job.payload, "memory_id", 100)?)
+        memory::prepare_refresh(&worker.store, db, repo, p, string(&job.payload, "memory_id", 100)?)
     })?;
     let contract = native("document.contract", json!({}))?;
     let schema = object(json!({"operations":contract,"evidence":evidence_schema()}));
@@ -508,6 +509,7 @@ pub async fn refresh(worker: &Worker, job: &Job) -> Result<Value> {
     };
     jobs::guarded(&worker.store, job, |db, p, repo| {
         memory::propose_refresh(
+            &worker.store,
             db,
             repo,
             p,
@@ -734,13 +736,13 @@ async fn semantic_rankings_role(
 }
 pub async fn recall(worker: &Worker, job: &Job) -> Result<Value> {
     let mut snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(&worker.store, db, repo, p)
     })?;
     if job.payload["memory_retrieval"] == false {
         snap.memories.clear();
     }
     let graph = jobs::guarded(&worker.store, job, |db, p, repo| {
-        crate::graph::for_query(db, repo, p, &snap, &job.payload)
+        crate::graph::for_query(&worker.store, db, repo, p, &snap, &job.payload)
     })?;
     let question = string(&job.payload, "question", 8000)?;
     let variants = graphicle_memory::retrieval::query_variants(
@@ -778,7 +780,7 @@ fn reviewed_excerpts(snap: &query::Snapshot, packet: &Value) -> Vec<Value> {
 
 pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
     let mut snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(&worker.store, db, repo, p)
     })?;
     if job.payload["memory_retrieval"] == false {
         snap.memories.clear();
@@ -789,7 +791,7 @@ pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
     let question = string(&job.payload, "question", 8000)?;
     let budget = crate::answer_review::selected_budget(&job.payload, profile.input_limit)?;
     let graph = jobs::guarded(&worker.store, job, |db, p, repo| {
-        crate::graph::for_query(db, repo, p, &snap, &job.payload)
+        crate::graph::for_query(&worker.store, db, repo, p, &snap, &job.payload)
     })?;
     let initial_rankings = crate::graph::add_rankings(
         &snap,
@@ -913,7 +915,7 @@ pub async fn reflect(worker: &Worker, job: &Job) -> Result<Value> {
                         && answer["abstain"] != true
                         && answer["review"]["status"] != "failed"
                     {
-                        let docs = memory::documents(db, repo, p)?;
+                        let docs = memory::documents(&worker.store, db, repo, p)?;
                         let citations = answer["evidence"].as_array().unwrap();
                         let mut data = memory::dependencies(db, &job.repository, citations, &docs)?;
                         crate::symbols::carry_windows(
@@ -1063,7 +1065,7 @@ const REFLECT: &str = "Answer the user's entire question from supplied sources. 
 
 pub async fn embed(worker: &Worker, job: &Job) -> Result<Value> {
     let snap = jobs::guarded(&worker.store, job, |db, p, repo| {
-        query::snapshot(db, repo, p)
+        query::snapshot(&worker.store, db, repo, p)
     })?;
     let (candidates, _) = query::candidates(&snap)?;
     let configuration =
@@ -1170,7 +1172,7 @@ fn store_vectors(
     vectors: &[Vec<f64>],
 ) -> Result<()> {
     jobs::guarded(&worker.store, job, |db, p, repo| {
-        let current = query::snapshot(db, repo, p)?;
+        let current = query::snapshot(&worker.store, db, repo, p)?;
         if current.state != state {
             return Err(Error::conflict("Memory changed during embedding"));
         }

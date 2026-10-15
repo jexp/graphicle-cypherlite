@@ -98,6 +98,10 @@ pub fn lock_report() -> Value {
 pub struct Store {
     pub directory: Arc<PathBuf>,
     pub database: Arc<PathBuf>,
+    /// The CypherLite graph store (`reviews.graph` beside the SQLite file):
+    /// the domains migrated off SQL (connectors, account, folders, usage,
+    /// work state) live here; see `docs/store-api.md`.
+    pub graph: crate::store_graph::GraphStore,
     /// Signalled when a job is queued, so an idle worker in this process
     /// starts it at once instead of at its next poll.
     pub wake: Arc<tokio::sync::Notify>,
@@ -326,6 +330,7 @@ impl Store {
         let store = Self {
             directory: Arc::new(directory.to_path_buf()),
             database: Arc::new(database),
+            graph: crate::store_graph::GraphStore::open(directory.join("reviews.graph"))?,
             wake: Arc::new(tokio::sync::Notify::new()),
             limits: None,
         };
@@ -340,7 +345,6 @@ impl Store {
         crate::temporal_graph::migrate(&db)?;
         crate::graph_delta::migrate(&db)?;
         db.execute_batch(include_str!("product_schema.sql"))?;
-        crate::work_state::migrate(&db)?;
         // Each folder's freshness record.
         crate::fresh::migrate(&db)?;
         // Documents' mention links to code symbols.
@@ -514,7 +518,7 @@ impl Store {
             db.execute("UPDATE am_jobs SET state='cancelled',updated_at=? WHERE principal_hash IN (SELECT capability_hash FROM credentials WHERE id=?) AND state IN ('queued','retry','running')",params![now(),credential])?;
             // Cached answers produced under the revoked credential are no longer current.
             let hash:String=db.query_row("SELECT capability_hash FROM credentials WHERE id=?",[credential],|r|r.get(0))?;
-            let revoked_sources=credential_sources(db,workspace,credential)?;
+            let revoked_sources=credential_sources(self,db,workspace,credential)?;
             crate::invalidation::permissions_changed(db,workspace,Some(&hash),&revoked_sources,"credential_revoked")?;
             Ok(json!({"revoked":true,"sources":revoked_sources}))
         })
@@ -630,7 +634,7 @@ impl Store {
                 // Identical tree, possibly a new commit identity: the existing
                 // episode still gains the sha from this sync's metadata.
                 let metadata:Value=serde_json::from_str(&metadata)?;
-                let projection=crate::jobs::enqueue_projection(db,identifier,p,&snapshot,&metadata)?;
+                let projection=crate::jobs::enqueue_projection(self,db,identifier,p,&snapshot,&metadata)?;
                 return Ok(json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}));
             }
             let mut missing=Vec::new();
@@ -882,7 +886,7 @@ impl Store {
             event(db,identifier,"synced",json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed}))?;
             // Every commit yields a graph episode labelled with its commit identity.
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
-            let projection=crate::jobs::enqueue_projection(db,identifier,p,s(&sync,"snapshot"),&metadata)?;
+            let projection=crate::jobs::enqueue_projection(self,db,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
             crate::graph_projection::clear_stale_when_current(db,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
@@ -896,50 +900,138 @@ impl Store {
 
 /// Connector documents whose sharing policy names `credential` exactly: an
 /// entry of the document's ACL credential list, or a provider-side principal
-/// (`am_source_permissions`) that maps to one of the credential's verified
-/// provider identities. Both are joins on the identifier, never text search
-/// over the JSON, so `cred-a` does not match `cred-ab`.
+/// that maps to one of the credential's verified provider identities. The
+/// connector domain lives in the graph store: the ACL credential list is a
+/// list property read by membership, and provider grants are matched on
+/// identifiers in Rust, never by text search, so `cred-a` does not match
+/// `cred-ab`.
 pub fn credential_sources(
+    store: &Store,
     db: &Connection,
     workspace: &str,
     credential: &str,
 ) -> Result<Vec<String>> {
     let mut sources = BTreeSet::new();
-    for row in rows(
-        db,
-        "SELECT d.connector_id,d.id FROM am_connector_docs d \
-         JOIN am_connectors c ON c.id=d.connector_id \
-         JOIN repo_projects r ON r.id=c.repository_id \
-         JOIN json_each(d.acl,'$.credentials') reader \
-         WHERE r.workspace_id=? AND d.present=1 AND reader.value=?",
-        params![workspace, credential],
-    )? {
-        sources.insert(crate::invalidation::connector_document_id(
-            s(&row, "connector_id"),
-            s(&row, "id"),
-        ));
-    }
-    for row in rows(
-        db,
-        "SELECT DISTINCT d.connector_id,d.id FROM am_connector_docs d \
-         JOIN am_connectors c ON c.id=d.connector_id \
-         JOIN repo_projects r ON r.id=c.repository_id \
-         JOIN am_source_permissions p ON p.connector_id=d.connector_id AND p.source_id=d.id \
-         JOIN json_each(p.principals) grant_ \
-         JOIN am_provider_identities i ON i.workspace_id=r.workspace_id AND i.provider=c.kind AND i.credential_id=? \
-         LEFT JOIN am_provider_emails e ON e.workspace_id=i.workspace_id AND e.provider=i.provider AND e.external_id=i.external_id \
-         LEFT JOIN am_oauth_accounts o ON o.workspace_id=i.workspace_id AND o.provider=i.provider AND o.external_id=i.external_id AND o.state='active' \
-         WHERE r.workspace_id=? AND d.present=1 AND ( \
-            (json_extract(grant_.value,'$.type')='user' AND json_extract(grant_.value,'$.id')=i.external_id) OR \
-            (json_extract(grant_.value,'$.type')='email' AND coalesce(json_extract(grant_.value,'$.email'),'')!='' \
-             AND lower(json_extract(grant_.value,'$.email')) IN (lower(coalesce(e.email,'')),lower(coalesce(o.email,'')))))",
-        params![credential, workspace],
-    )? {
-        sources.insert(crate::invalidation::connector_document_id(
-            s(&row, "connector_id"),
-            s(&row, "id"),
-        ));
-    }
+    let projects: Vec<String> =
+        rows(db, "SELECT id FROM repo_projects WHERE workspace_id=?", [workspace])?
+            .iter()
+            .map(|r| s(r, "id").to_string())
+            .collect();
+    let connectors: Vec<Value> = store.graph.read(|db| {
+        crate::store_graph::rows(
+            db,
+            "MATCH (c:Connector) WHERE c.repository_id IN $projects RETURN c.id AS id, c.kind AS kind",
+            crate::store_graph::Params::from([(
+                "projects".into(),
+                crate::store_graph::json_to_value(&json!(projects)),
+            )]),
+        )
+    })?;
+    let ids: Vec<String> = connectors.iter().map(|c| s(c, "id").to_string()).collect();
+    store.graph.read(|db| {
+        for row in crate::store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {present: true}) WHERE d.connector_id IN $connectors AND $credential IN d.acl_credentials RETURN d.connector_id AS connector_id, d.id AS id",
+            crate::store_graph::Params::from([
+                ("connectors".into(), crate::store_graph::json_to_value(&json!(ids))),
+                ("credential".into(), crate::store_graph::json_to_value(&json!(credential))),
+            ]),
+        )? {
+            sources.insert(crate::invalidation::connector_document_id(
+                s(&row, "connector_id"),
+                s(&row, "id"),
+            ));
+        }
+        // Provider-side grants: the credential's verified identities of each
+        // connector's provider, then user/email grants naming them.
+        let identities = crate::store_graph::rows(
+            db,
+            "MATCH (i:ProviderIdentity {workspace_id: $workspace, credential_id: $credential}) RETURN i.provider AS provider, i.external_id AS external_id",
+            crate::store_graph::Params::from([
+                ("workspace".into(), crate::store_graph::json_to_value(&json!(workspace))),
+                ("credential".into(), crate::store_graph::json_to_value(&json!(credential))),
+            ]),
+        )?;
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let mut emails: std::collections::BTreeMap<(String, String), String> = Default::default();
+        for row in crate::store_graph::rows(
+            db,
+            "MATCH (e:ProviderEmail {workspace_id: $workspace}) RETURN e.provider AS provider, e.external_id AS external_id, e.email AS email              UNION ALL              MATCH (o:OAuthAccount {workspace_id: $workspace, state: 'active'}) RETURN o.provider AS provider, o.external_id AS external_id, o.email AS email",
+            crate::store_graph::Params::from([("workspace".into(), crate::store_graph::json_to_value(&json!(workspace)))]),
+        )? {
+            let email = s(&row, "email").to_lowercase();
+            if !email.is_empty() {
+                emails.insert(
+                    (s(&row, "provider").to_string(), s(&row, "external_id").to_string()),
+                    email,
+                );
+            }
+        }
+        let permissions = crate::store_graph::rows(
+            db,
+            "MATCH (sp:SourcePermission) WHERE sp.connector_id IN $connectors RETURN sp.connector_id AS connector_id, sp.source_id AS source_id, sp.principals AS principals",
+            crate::store_graph::Params::from([(
+                "connectors".into(),
+                crate::store_graph::json_to_value(&json!(
+                    connectors.iter().map(|c| s(c, "id").to_string()).collect::<Vec<_>>()
+                )),
+            )]),
+        )?;
+        let kind_of: BTreeMap<&str, &str> = connectors
+            .iter()
+            .map(|c| (s(c, "id"), s(c, "kind")))
+            .collect();
+        let present: BTreeSet<(String, String)> = crate::store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {present: true}) WHERE d.connector_id IN $connectors RETURN d.connector_id AS connector_id, d.id AS id",
+            crate::store_graph::Params::from([(
+                "connectors".into(),
+                crate::store_graph::json_to_value(&json!(
+                    connectors.iter().map(|c| s(c, "id").to_string()).collect::<Vec<_>>()
+                )),
+            )]),
+        )?
+        .iter()
+        .map(|row| (s(row, "connector_id").to_string(), s(row, "id").to_string()))
+        .collect();
+        for permission in permissions {
+            let key = (
+                s(&permission, "connector_id").to_string(),
+                s(&permission, "source_id").to_string(),
+            );
+            if !present.contains(&key) {
+                continue;
+            }
+            let provider = kind_of.get(s(&permission, "connector_id")).copied().unwrap_or("");
+            let grants: Value =
+                serde_json::from_str(s(&permission, "principals")).unwrap_or(Value::Null);
+            for identity in &identities {
+                if s(identity, "provider") != provider {
+                    continue;
+                }
+                let external = s(identity, "external_id");
+                let email = emails
+                    .get(&(provider.to_string(), external.to_string()))
+                    .cloned()
+                    .unwrap_or_default();
+                let granted = grants.as_array().into_iter().flatten().any(|grant| {
+                    (grant["type"] == "user" && grant["id"] == external)
+                        || (grant["type"] == "email"
+                            && !email.is_empty()
+                            && s(grant, "email").eq_ignore_ascii_case(&email))
+                });
+                if granted {
+                    sources.insert(crate::invalidation::connector_document_id(
+                        &key.0, &key.1,
+                    ));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })?;
     Ok(sources.into_iter().collect())
 }
 

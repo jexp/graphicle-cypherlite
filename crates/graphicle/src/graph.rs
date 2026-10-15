@@ -18,9 +18,9 @@ pub const MAX_EDGES: usize = 200_000;
 /// `context` takes it out before fusion, as it does the observer's note keys.
 pub const LOCAL_STATUS: &str = "graph_local_status";
 
-pub fn snapshot(db: &Connection, repository: &Value, principal: &Principal) -> Result<Value> {
-    let snap = query::snapshot(db, repository, principal)?;
-    from_snapshot(db, repository, principal, &snap)
+pub fn snapshot(store: &Store, db: &Connection, repository: &Value, principal: &Principal) -> Result<Value> {
+    let snap = query::snapshot(store, db, repository, principal)?;
+    from_snapshot(store, db, repository, principal, &snap)
 }
 
 /// The property graph, or what exceeded its budget.
@@ -30,12 +30,13 @@ enum Built {
 }
 
 pub fn from_snapshot(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     principal: &Principal,
     snap: &query::Snapshot,
 ) -> Result<Value> {
-    match build(db, repository, principal, snap, true)? {
+    match build(store, db, repository, principal, snap, true)? {
         Built::Graph(graph) => Ok(graph),
         Built::OverBudget(_) => Err(Error::bad(
             "Property graph exceeds its configured node/edge budget",
@@ -47,6 +48,7 @@ pub fn from_snapshot(
 /// the static edges from documents to code are left
 /// out, and the graph says so (`document_edges: "excluded"`).
 fn build(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     principal: &Principal,
@@ -93,7 +95,7 @@ fn build(
             edge(&mut edges, from, to, "code", e.clone());
         }
     }
-    let facts = claims::current(db, repository, principal)?;
+    let facts = claims::current(store, db, repository, principal)?;
     let links = rows(
         db,
         "SELECT * FROM am_entity_links WHERE repository_id=?",
@@ -228,6 +230,7 @@ const DOCUMENT_EDGES: &str = "document_edges";
 /// With `doc_links: false` neither the graph nor
 /// its seed search has an edge from a document to code.
 pub fn for_query(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     principal: &Principal,
@@ -245,7 +248,7 @@ pub fn for_query(
     }
     let documents = crate::doc_links::Options::parse(args)?.documents();
     Ok(Some(
-        match build(db, repository, principal, snap, documents)? {
+        match build(store, db, repository, principal, snap, documents)? {
             Built::Graph(graph) => graph,
             Built::OverBudget(report) => json!({"degraded": report}),
         },
@@ -293,8 +296,8 @@ pub fn add_rankings_on(
 pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
     store.authorized(workspace,token,"read",|db,p|{
         let repository=repo(db,p,string(args,"repository_id",100)?)?;
-        let snap=query::snapshot(db,&repository,p)?;
-        let graph=match build(db,&repository,p,&snap,true)? {
+        let snap=query::snapshot(store,db,&repository,p)?;
+        let graph=match build(store,db,&repository,p,&snap,true)? {
             Built::Graph(graph)=>graph,
             // Past the property graph's budget a read answers with no nodes
             // and says why (`degraded`), as `graph_local` does, instead of
@@ -579,7 +582,7 @@ pub async fn neo4j(
         }
         Ok((
             backend["config"].clone(),
-            snapshot(db, &repository, p)?,
+            snapshot(store, db, &repository, p)?,
             crate::projection::marker(db, s(&repository, "id"), "neo4j", &backend["config"])?,
         ))
     })?;
@@ -608,7 +611,7 @@ pub async fn neo4j(
         cypher(store, client, workspace, &config, statements).await?;
         let still_current = store.authorized(workspace, token, "admin", |db, p| {
             let repository = repo(db, p, scope)?;
-            Ok(snapshot(db, &repository, p)?["source_state"] == graph["source_state"] && crate::projection::marker(db, scope, "neo4j", &config)? == revision)
+            Ok(snapshot(store, db, &repository, p)?["source_state"] == graph["source_state"] && crate::projection::marker(db, scope, "neo4j", &config)? == revision)
         })?;
         if !still_current {
             cypher(store,client,workspace,&config,json!([{"statement":"MATCH (n:Graphicle {scope:$scope,generation:$generation}) DETACH DELETE n","parameters":{"scope":scope,"generation":generation}}])).await?;
@@ -637,7 +640,7 @@ pub async fn neo4j(
         let results=cypher(store,client,workspace,&config,json!([{"statement":"MATCH (n:Graphicle {scope:$scope}) WHERE toLower(n.name) CONTAINS toLower($query) RETURN n.id AS id LIMIT $limit","parameters":{"scope":scope,"query":args["query"].as_str().unwrap_or(""),"limit":integer(args,"limit",20,200)?}}])).await?;
         // Read a new canonical view after the network request, so revocation wins.
         store.authorized(workspace,token,"admin",|db,p|{
-            let repository=repo(db,p,scope)?;let current=snapshot(db,&repository,p)?;
+            let repository=repo(db,p,scope)?;let current=snapshot(store,db,&repository,p)?;
             let ids=results[0]["data"].as_array().into_iter().flatten().filter_map(|v|v["row"][0].as_str()).collect::<BTreeSet<_>>();
             Ok(json!({"nodes":current["nodes"].as_array().unwrap().iter().filter(|n|ids.contains(s(n,"id"))).collect::<Vec<_>>(),"canonical_revalidation":true,"source_state":current["source_state"]}))
         })

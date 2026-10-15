@@ -8,8 +8,8 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub fn current(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
-    let memories = memory::list(db, repository, p, true)?;
+pub fn current(store: &Store, db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
+    let memories = memory::list(store, db, repository, p, true)?;
     let allowed: BTreeMap<&str, &Value> = memories
         .iter()
         .filter(|m| m["state"] == "reviewed" && m["stale"] != true)
@@ -30,6 +30,7 @@ pub fn current(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec
     Ok(output)
 }
 pub fn propose(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     p: &Principal,
@@ -43,7 +44,7 @@ pub fn propose(
         "interpretation.validate",
         json!({"scope":identifier,"claims":claims,"sources":sources,"target_ids":targets.iter().map(|t|t["id"].clone()).collect::<Vec<_>>()}),
     )?;
-    let docs = memory::documents(db, repository, p)?;
+    let docs = memory::documents(store, db, repository, p)?;
     // Stamp the view of the sources the claims were read from, not of every
     // document: a claim then carries no trace of unrelated sources, which
     // forgetting one of them requires.
@@ -292,8 +293,8 @@ pub fn apply_memory_review(
     }
     Ok(())
 }
-pub fn prepare(db: &Connection, repository: &Value, p: &Principal, args: &Value) -> Result<Value> {
-    let docs = memory::documents(db, repository, p)?;
+pub fn prepare(store: &Store, db: &Connection, repository: &Value, p: &Principal, args: &Value) -> Result<Value> {
+    let docs = memory::documents(store, db, repository, p)?;
     let limit = crate::integer(args, "limit", 4, 12)?.max(1);
     // Any byte of a document: an indexed file or a converted or connector
     // document (earlier builds: 512 KiB).
@@ -317,7 +318,7 @@ pub fn prepare(db: &Connection, repository: &Value, p: &Principal, args: &Value)
     if sources.is_empty() {
         return Err(Error::bad("No authorized sources to interpret"));
     }
-    let targets = current(db, repository, p)?
+    let targets = current(store, db, repository, p)?
         .into_iter()
         .filter(|t| {
             t["data"]["evidence"]
@@ -347,7 +348,7 @@ impl Store {
             if propose_draft { "propose" } else { "read" },
             |db, p| {
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                let prepared = prepare(db, &repository, p, args)?;
+                let prepared = prepare(self, db, &repository, p, args)?;
                 if !propose_draft {
                     return Ok(prepared);
                 }
@@ -357,6 +358,7 @@ impl Store {
                     ));
                 }
                 propose(
+                    self,
                     db,
                     &repository,
                     p,
@@ -372,7 +374,7 @@ impl Store {
     pub fn claim_history(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let memories = memory::list(db, &repository, p, true)?;
+            let memories = memory::list(self, db, &repository, p, true)?;
             let mut claims = Vec::new();
             let as_of = args["as_of"]
                 .as_str()

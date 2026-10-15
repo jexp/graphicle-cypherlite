@@ -274,17 +274,24 @@ async fn archived_options_are_refused_where_callers_sent_them_and_inert_values_p
         if entry.surfaces.contains(&Surface::ObservePolicy) {
             // A policy stored before the archive stops automatic observation
             // and says why.
-            f.store
-                .connect()
-                .unwrap()
-                .execute(
-                    "UPDATE am_connectors SET config=json_set(config,'$.observe',json(?)) WHERE id=?",
-                    rusqlite::params![
-                        json!({ entry.option: turned_on(entry) }).to_string(),
-                        f.connector
-                    ],
-                )
-                .unwrap();
+            // Connectors live in the graph store; rewrite the policy there.
+            let current = crate::gql_one(
+                &f.store,
+                "MATCH (c:Connector {id: $id}) RETURN c.config AS config",
+                graphicle_runtime::store_graph::Params::from([crate::gp("id", json!(f.connector))]),
+            )
+            .unwrap();
+            let mut config: Value =
+                serde_json::from_str(current["config"].as_str().unwrap()).unwrap();
+            config["observe"] = json!({ entry.option: turned_on(entry) });
+            crate::gql_write(
+                &f.store,
+                "MATCH (c:Connector {id: $id}) SET c.config=$config",
+                graphicle_runtime::store_graph::Params::from([
+                    crate::gp("id", json!(f.connector)),
+                    crate::gp("config", json!(config.to_string())),
+                ]),
+            );
             let decisions = f.store.auto_observe(&f.config, Some(&f.connector)).unwrap();
             assert!(
                 decisions

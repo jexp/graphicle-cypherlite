@@ -17,8 +17,8 @@
 //! published only when enabled (`graphicle mcp --work-state`).
 use crate::capture::Applied;
 use crate::store::{Store, repo, s};
+use crate::store_graph::{self as graph, GraphStore, Params, json_to_value};
 use crate::{Error, Result};
-use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
@@ -30,18 +30,6 @@ pub const MAX_LIST_CHARS: usize = 200;
 pub const MAX_KEY_CHARS: usize = 100;
 /// Entries one repository may hold (at most about 100 MB of fields).
 pub const MAX_ENTRIES: i64 = 50_000;
-
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS am_work_state (
- id INTEGER PRIMARY KEY,
- repository_id TEXT NOT NULL REFERENCES repo_projects(id) ON DELETE CASCADE,
- list_name TEXT NOT NULL, fields TEXT NOT NULL,
- created_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS am_work_state_list ON am_work_state(repository_id, list_name, id);";
-
-pub fn migrate(db: &Connection) -> Result<()> {
-    db.execute_batch(SCHEMA)?;
-    Ok(())
-}
 
 /// One stored write.
 #[derive(Clone, Debug, PartialEq)]
@@ -319,43 +307,46 @@ fn write_fields(args: &Value) -> Result<(Map<String, Value>, Applied)> {
 }
 
 /// The repository's entries (one list's, when named), oldest first.
-fn entries(db: &Connection, repository: &str, list: Option<&str>) -> Result<Vec<Entry>> {
-    let mut statement = db.prepare(
-        "SELECT id,list_name,fields,created_at FROM am_work_state
-         WHERE repository_id=?1 AND (?2 IS NULL OR list_name=?2) ORDER BY id",
-    )?;
-    let rows = statement.query_map(params![repository, list], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, list, fields, at) = row?;
-        let at_ms = chrono::DateTime::parse_from_rfc3339(&at)
-            .map_err(|_| Error::bad("A work-state entry has an unreadable time"))?
-            .timestamp_millis();
-        out.push(Entry {
-            id,
-            list,
-            fields: serde_json::from_str(&fields)?,
-            at_ms,
-        });
-    }
-    Ok(out)
+fn entries(store: &GraphStore, repository: &str, list: Option<&str>) -> Result<Vec<Entry>> {
+    store.read(|db| {
+        let rows = graph::rows(
+            db,
+            "MATCH (w:WorkState {repository_id: $repository})
+             WHERE $list IS NULL OR w.list_name = $list
+             RETURN w.seq AS id, w.list_name AS list_name, w.fields AS fields, w.created_at AS created_at
+             ORDER BY w.seq",
+            Params::from([
+                ("repository".into(), graph::json_to_value(&json!(repository))),
+                (
+                    "list".into(),
+                    list.map(|l| json_to_value(&json!(l))).unwrap_or(cypherlite::Value::Null),
+                ),
+            ]),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let at_ms = chrono::DateTime::parse_from_rfc3339(graph::s(&row, "created_at"))
+                .map_err(|_| Error::bad("A work-state entry has an unreadable time"))?
+                .timestamp_millis();
+            out.push(Entry {
+                id: row["id"].as_i64().unwrap_or_default(),
+                list: graph::s(&row, "list_name").to_string(),
+                fields: serde_json::from_str(graph::s(&row, "fields"))?,
+                at_ms,
+            });
+        }
+        Ok(out)
+    })
 }
 
 /// The session-start section: what is still open in every list, within
 /// [`SECTION_CHARS`]; `None` when nothing is open.
 pub(crate) fn start_section(
-    db: &Connection,
+    store: &GraphStore,
     repository: &str,
     now_ms: i64,
 ) -> Result<Option<String>> {
-    let lines = render(&entries(db, repository, None)?, now_ms, false);
+    let lines = render(&entries(store, repository, None)?, now_ms, false);
     Ok((!lines.is_empty()).then(|| {
         fit(
             "Open work an agent recorded (work_state_write; not reviewed). Status \"done\" or \"dropped\" closes an item or list:",
@@ -374,33 +365,51 @@ impl Store {
     pub fn work_state_write(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         let list = list_name(args)?.ok_or_else(|| Error::bad("list must name a list"))?;
         let (fields, applied) = write_fields(args)?;
-        let encoded = serde_json::to_string(&fields)?;
         self.authorized(workspace, token, "propose", |db, p| {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
-            let repository = s(&repository, "id");
-            let held: i64 = db.query_row(
-                "SELECT count(*) FROM am_work_state WHERE repository_id=?",
-                [repository],
-                |row| row.get(0),
-            )?;
-            if held >= MAX_ENTRIES {
-                return Err(Error::bad(format!(
-                    "This project's work state is full ({MAX_ENTRIES} entries)"
-                )));
-            }
+            let repository = s(&repository, "id").to_string();
             let at = chrono::Utc::now();
             let now_ms = at.timestamp_millis();
-            db.execute(
-                "INSERT INTO am_work_state(repository_id,list_name,fields,created_at) VALUES(?,?,?,?)",
-                params![
-                    repository,
-                    list,
-                    encoded,
-                    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                ],
-            )?;
-            let entry = db.last_insert_rowid();
-            let lines = render(&entries(db, repository, Some(&list))?, now_ms, false);
+            let entry = self.graph.transaction(|db| {
+                let held = graph::one(
+                    db,
+                    "MATCH (w:WorkState {repository_id: $repository}) RETURN count(w) AS held",
+                    Params::from([("repository".into(), json_to_value(&json!(repository)))]),
+                )?
+                .and_then(|row| row["held"].as_i64())
+                .unwrap_or(0);
+                if held >= MAX_ENTRIES {
+                    return Err(Error::bad(format!(
+                        "This project's work state is full ({MAX_ENTRIES} entries)"
+                    )));
+                }
+                let seq = graph::one(
+                    db,
+                    "MERGE (c:Counter {name: 'work_state'}) ON CREATE SET c.value = 0
+                     WITH c SET c.value = c.value + 1 RETURN c.value AS seq",
+                    Params::new(),
+                )?
+                .and_then(|row| row["seq"].as_i64())
+                .ok_or_else(|| Error::bad("The work-state sequence did not advance"))?;
+                graph::write(
+                    db,
+                    "CREATE (w:WorkState {repository_id: $repository, seq: $seq, list_name: $list, fields: $fields, created_at: $created_at})",
+                    Params::from([
+                        ("repository".into(), json_to_value(&json!(repository))),
+                        ("seq".into(), cypherlite::Value::Int(seq)),
+                        ("list".into(), json_to_value(&json!(list))),
+                        ("fields".into(), cypherlite::Value::String(serde_json::to_string(&fields)?.into())),
+                        (
+                            "created_at".into(),
+                            json_to_value(&json!(
+                                at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                            )),
+                        ),
+                    ]),
+                )?;
+                Ok(seq)
+            })?;
+            let lines = render(&entries(&self.graph, &repository, Some(&list))?, now_ms, false);
             let saved = format!("Saved to \"{}\".", one_line(&list));
             let text = if lines.is_empty() {
                 format!("{saved} Nothing in it is open now.")
@@ -427,7 +436,7 @@ impl Store {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
             let now_ms = chrono::Utc::now().timestamp_millis();
             let lines = render(
-                &entries(db, s(&repository, "id"), list.as_deref())?,
+                &entries(&self.graph, s(&repository, "id"), list.as_deref())?,
                 now_ms,
                 include_closed,
             );

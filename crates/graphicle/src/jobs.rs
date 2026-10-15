@@ -42,15 +42,15 @@ static READY_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-// ?5 is false when this program cannot sync provider permissions: then the
-// sync of a connector in provider permission mode is left queued (as are
-// `permissions` jobs, through the excluded kinds) for a program that can.
-// ?6 lists the job kinds this program knows: a job of any other kind (queued
+// The provider-mode connector check runs in Rust over the candidates
+// (connectors live in the graph store): when this program cannot sync
+// provider permissions such a sync stays queued for a program that can.
+// ?5 lists the job kinds this program knows: a job of any other kind (queued
 // by an extension this program lacks) is left queued for a program that runs
 // it, and never hides known work behind the candidate cap.
 static LEASE_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT j.*,p.workspace_id FROM am_jobs j JOIN repo_projects p ON p.id=j.repository_id WHERE j.state IN ('queued','retry') AND j.not_before<=?1 AND j.kind NOT IN (SELECT value FROM json_each(?2)) AND j.kind IN (SELECT value FROM json_each(?6)) AND (?3 IS NULL OR (j.repository_id=?3 AND j.kind=?4)) AND (?5 OR j.kind!='connector' OR NOT EXISTS (SELECT 1 FROM am_connectors c WHERE c.repository_id=j.repository_id AND c.id=json_extract(j.payload,'$.connector_id') AND json_extract(c.config,'$.permission_mode')='provider')) AND NOT {RUNNING_CONFLICT} ORDER BY j.priority DESC,j.created_at LIMIT 100"
+        "SELECT j.*,p.workspace_id FROM am_jobs j JOIN repo_projects p ON p.id=j.repository_id WHERE j.state IN ('queued','retry') AND j.not_before<=?1 AND j.kind NOT IN (SELECT value FROM json_each(?2)) AND j.kind IN (SELECT value FROM json_each(?5)) AND (?3 IS NULL OR (j.repository_id=?3 AND j.kind=?4)) AND NOT {RUNNING_CONFLICT} ORDER BY j.priority DESC,j.created_at LIMIT 100"
     )
 });
 
@@ -94,7 +94,8 @@ pub const UNKNOWN_KIND: &str = "Waiting for a Graphicle edition that runs this k
 /// which needs an extension that syncs provider permissions. Such a job is
 /// never leased here, so a program that can run it still finds it queued.
 pub fn unavailable(
-    db: &Connection,
+    store: &Store,
+    _db: &Connection,
     repository: &str,
     kind: &str,
     payload: &Value,
@@ -110,12 +111,23 @@ pub fn unavailable(
     }
     let provider = match kind {
         PERMISSIONS => true,
-        "connector" => one(
-            db,
-            "SELECT 1 AS provider FROM am_connectors WHERE repository_id=? AND id=? AND json_extract(config,'$.permission_mode')='provider'",
-            params![repository, s(payload, "connector_id")],
-        )?
-        .is_some(),
+        "connector" => store
+            .graph
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.config AS config",
+                    crate::store_graph::Params::from([
+                        ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+                        ("id".into(), crate::store_graph::json_to_value(&payload["connector_id"])),
+                    ]),
+                )
+            })?
+            .is_some_and(|c| {
+                serde_json::from_str::<Value>(s(&c, "config"))
+                    .map(|c| c["permission_mode"] == "provider")
+                    .unwrap_or(false)
+            }),
         _ => false,
     };
     Ok(provider.then(|| crate::connectors::PROVIDER_SYNC_UNAVAILABLE.to_string()))
@@ -215,6 +227,7 @@ pub fn projection_state(db: &Connection, repository: &str, episode: &str) -> Res
 /// waiting one whose principal can no longer read the project (a revoked or
 /// expired key would have it cancelled when leased).
 pub fn enqueue_projection(
+    store: &Store,
     db: &Connection,
     repository: &str,
     p: &Principal,
@@ -342,7 +355,7 @@ pub fn enqueue_projection(
     let job_id = id();
     let stamp = now();
     let repository_row = repo(db, p, repository)?;
-    let source_state = memory::state(&memory::documents(db, &repository_row, p)?);
+    let source_state = memory::state(&memory::documents(store, db, &repository_row, p)?);
     let payload = json!({"kind":"project","episode":episode,"labels":labels,"snapshot":snapshot,"runtime_revision":runtime_revision(),"source_state":source_state});
     let encoded = payload.to_string();
     crate::ingestion::check_queue_bytes(
@@ -642,7 +655,7 @@ fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
     store.transaction(|db| {
         leased(db, job)?;
         let p = authorize_hash(db, &job.workspace, &job.principal_hash, "read")?;
-        let summary = crate::graph_projection::link_workspace(db, &p)?;
+        let summary = crate::graph_projection::link_workspace(&store.graph, db, &p)?;
         let mut result = json!({
             "edges": summary["edges"],
             "unresolved": summary["unresolved"],
@@ -802,7 +815,7 @@ pub fn guarded<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.transaction(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(store, db, job)?;
         f(db, &p, &repository)
     })
 }
@@ -814,13 +827,13 @@ pub fn guarded_read<T>(
     f: impl FnOnce(&Connection, &Principal, &Value) -> Result<T>,
 ) -> Result<T> {
     store.read(|db| {
-        let (p, repository) = still_valid(db, job)?;
+        let (p, repository) = still_valid(store, db, job)?;
         f(db, &p, &repository)
     })
 }
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
-fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
+fn still_valid(store: &Store, db: &Connection, job: &Job) -> Result<(Principal, Value)> {
     let row = one(
         db,
         "SELECT state,lease_token,lease_until FROM am_jobs WHERE id=?",
@@ -842,7 +855,7 @@ fn still_valid(db: &Connection, job: &Job) -> Result<(Principal, Value)> {
     let repository = repo(db, &p, &job.repository)?;
     if !source_task(&job.kind) {
         // One read of the sources serves both checks.
-        let documents = memory::documents(db, &repository, &p)?;
+        let documents = memory::documents(store, db, &repository, &p)?;
         if memory::state(&documents) != s(&job.payload, "source_state") {
             return Err(Error::conflict(
                 "Sources or source access changed during the job",
@@ -985,6 +998,7 @@ pub fn check(args: &Value, config: &model::Config) -> Result<&'static str> {
 
 /// Queue a checked workflow for `p` inside the caller's transaction.
 pub fn queue(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     args: &Value,
@@ -1007,7 +1021,7 @@ pub fn queue(
         });
     let repository = repo(db, p, string(args, "repository_id", 100)?)?;
     let identifier = s(&repository, "id");
-    if let Some(reason) = unavailable(db, identifier, kind, args)? {
+    if let Some(reason) = unavailable(store, db, identifier, kind, args)? {
         return Err(Error::bad(reason));
     }
     if args.to_string().len() > 65536 {
@@ -1023,7 +1037,7 @@ pub fn queue(
     payload["max_output_tokens"] = json!(max_output);
     payload["runtime_revision"] = json!(runtime_revision());
     crate::workflow_retrieval::pin(&mut payload, config)?;
-    let documents = memory::documents(db, &repository, p)?;
+    let documents = memory::documents(store, db, &repository, p)?;
     payload["source_state"] = json!(memory::state(&documents));
     payload["memory_state"] = json!(memory::reviewed_state_of(db, &repository, &documents)?);
     if !source_task(kind) {
@@ -1089,11 +1103,18 @@ pub fn queue(
             "SELECT count(*) AS count,max(created_at) AS latest FROM am_observer_notes WHERE repository_id=?",
             [identifier],
         )?,
-        "connector" | "permissions" | "connector_probe" => one(
-            db,
-            "SELECT generation,cursor FROM am_connectors WHERE repository_id=? AND id=?",
-            params![identifier, string(args, "connector_id", 100)?],
-        )?,
+        "connector" | "permissions" | "connector_probe" => store
+            .graph
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.generation AS generation, c.cursor AS cursor",
+                    crate::store_graph::Params::from([
+                        ("repository".into(), crate::store_graph::json_to_value(&json!(identifier))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(string(args, "connector_id", 100)?))),
+                    ]),
+                )
+            })?,
         _ => None,
     };
     payload["progress"] = json!(progress);
@@ -1150,7 +1171,7 @@ impl Store {
         }
         let permission = check(args, &config)?;
         self.authorized(workspace, token, permission, |db, p| {
-            queue(db, p, args, &config)
+            queue(self, db, p, args, &config)
         })
         .inspect(|job| {
             if job["replayed"] == false {
@@ -1171,13 +1192,13 @@ impl Store {
                 if args["job_id"].as_str().is_some_and(|j|s(&row,"id")!=j) {continue;}
                 decode(&mut row,"result")?;decode(&mut row,"payload")?;
                 // Work this program cannot run waits for one that can.
-                if ["queued","retry"].contains(&s(&row,"state")) && let Some(reason)=unavailable(db,s(&repository,"id"),s(&row,"kind"),&row["payload"])? {row["waiting_for"]=json!(reason);}
+                if ["queued","retry"].contains(&s(&row,"state")) && let Some(reason)=unavailable(self,db,s(&repository,"id"),s(&row,"kind"),&row["payload"])? {row["waiting_for"]=json!(reason);}
                 // An unsupported kind names its unit, whatever its state.
                 if let Some(archived)=crate::archived::kind(s(&row,"kind")) {row["archived"]=json!(archived.listing());}
                 // Job answers can include private evidence. Recheck the caller's
                 // entire source view even after the job has finished.
                 if !source_task(s(&row,"kind")) {
-                    if documents.is_none() {documents=Some(memory::documents(db,&repository,p)?);}
+                    if documents.is_none() {documents=Some(memory::documents(self,db,&repository,p)?);}
                     let view=documents.as_deref().unwrap_or_default();
                     if sources.is_none() {sources=Some(memory::state(view));}
                     if Some(s(&row["payload"],"source_state"))!=sources.as_deref() {
@@ -1319,7 +1340,15 @@ impl Store {
             expire_leases(db, &stamp)?;
             // Apply admission/repository filters before the candidate cap so
             // unrelated ready jobs cannot hide all eligible work.
-            for mut row in rows(db,&LEASE_JOB_QUERY,params![stamp,json!(excluded).to_string(),only.map(|v|v.0),only.map(|v|v.1),provider_sync,json!(known_kinds()).to_string()])? {
+            for mut row in rows(db,&LEASE_JOB_QUERY,params![stamp,json!(excluded).to_string(),only.map(|v|v.0),only.map(|v|v.1),json!(known_kinds()).to_string()])? {
+                // A provider-mode connector job stays queued for a program
+                // that syncs provider permissions (the connector lives in
+                // the graph store).
+                if !provider_sync && s(&row,"kind")=="connector" {
+                    let payload:Value=serde_json::from_str(s(&row,"payload")).unwrap_or(Value::Null);
+                    let provider=self.graph.read(|db|crate::store_graph::one(db,"MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.config AS config",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(s(&row,"repository_id")))),("id".into(),crate::store_graph::json_to_value(&payload["connector_id"]))])))?.is_some_and(|c|serde_json::from_str::<Value>(s(&c,"config")).map(|c|c["permission_mode"]=="provider").unwrap_or(false));
+                    if provider {continue;}
+                }
                 // Known kinds only (?6); a kind unknown here stays queued.
                 let Ok(permission)=permission(s(&row,"kind")) else {continue};
                 if authorize_hash(db,s(&row,"workspace_id"),s(&row,"principal_hash"),permission).is_err() {

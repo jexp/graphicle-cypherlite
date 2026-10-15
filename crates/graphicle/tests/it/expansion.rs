@@ -120,13 +120,13 @@ fn binary_original_follows_permissions_and_cascade_deletion() {
             &json!({"repository_id":project,"connector_id":connector["id"]}),
         )
         .unwrap();
-    let remaining: i64 = store
-        .connect()
-        .unwrap()
-        .query_row("SELECT count(*) FROM am_original_documents", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
+    let remaining: i64 = crate::gql_one(
+        &store,
+        "MATCH (o:OriginalDocument) RETURN count(o) AS n",
+        Default::default(),
+    )
+    .and_then(|row| row["n"].as_i64())
+    .unwrap();
     assert_eq!(remaining, 0);
 }
 #[test]
@@ -139,15 +139,19 @@ fn secrets_are_encrypted_and_workspace_bound() {
             &json!({"name":"test-source","value":"TEST-ONLY-credential-12345"}),
         )
         .unwrap();
-    let ciphertext: Vec<u8> = store
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT ciphertext FROM am_secrets WHERE id=?",
-            [s(&secret, "id")],
-            |r| r.get(0),
-        )
-        .unwrap();
+    // Secrets live in the graph store, ciphertext base64-encoded.
+    let ciphertext: Vec<u8> = crate::gql_one(
+        &store,
+        "MATCH (s:Secret {id: $id}) RETURN s.ciphertext AS ciphertext",
+        graphicle_runtime::store_graph::Params::from([crate::gp("id", json!(s(&secret, "id")))]),
+    )
+    .map(|row| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(row["ciphertext"].as_str().unwrap())
+            .unwrap()
+    })
+    .unwrap();
     let needle = b"TEST-ONLY-credential-12345";
     assert!(!ciphertext.windows(needle.len()).any(|w| w == needle));
     let other = store.create_workspace("Another workspace").unwrap();
@@ -183,24 +187,19 @@ fn provider_membership_expiry_and_revocation_change_recall() {
         .grant(&ws, &token, &json!({"role":"reader","label":"Teammate"}))
         .unwrap();
     // A verified mapping, as the commercial edition's provider.identity.map records it.
-    store
-        .connect()
-        .unwrap()
-        .execute(
-            "INSERT INTO am_provider_identities VALUES(?,?,?,?,?)",
-            rusqlite::params![
-                ws,
-                "slack",
-                "U123",
-                s(&reader, "id"),
-                graphicle_runtime::now()
-            ],
-        )
-        .unwrap();
-    store.authorized(&ws,s(&reader,"capability"),"read",|db,p|{
-        let current=json!({"complete":true,"checked_at":graphicle_runtime::now(),"principals":[{"type":"user","id":"U123"}]});assert!(permissions::allows(db,&ws,"slack",&current,p,300)?);
-        assert!(!permissions::allows(db,&ws,"slack",&json!({"complete":true,"checked_at":graphicle_runtime::now(),"principals":[]}),p,300)?);
-        assert!(!permissions::allows(db,&ws,"slack",&json!({"complete":true,"checked_at":"2000-01-01T00:00:00Z","principals":[{"type":"user","id":"U123"}]}),p,300)?);
+    crate::gql_write(
+        &store,
+        "CREATE (i:ProviderIdentity {workspace_id: $workspace, provider: 'slack', external_id: 'U123', credential_id: $credential, verified_at: $now})",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("workspace", json!(ws.clone())),
+            crate::gp("credential", json!(s(&reader, "id"))),
+            crate::gp("now", json!(graphicle_runtime::now())),
+        ]),
+    );
+    store.authorized(&ws,s(&reader,"capability"),"read",|_,p|{
+        let current=json!({"complete":true,"checked_at":graphicle_runtime::now(),"principals":[{"type":"user","id":"U123"}]});assert!(permissions::allows(&store.graph,&ws,"slack",&current,p,300)?);
+        assert!(!permissions::allows(&store.graph,&ws,"slack",&json!({"complete":true,"checked_at":graphicle_runtime::now(),"principals":[]}),p,300)?);
+        assert!(!permissions::allows(&store.graph,&ws,"slack",&json!({"complete":true,"checked_at":"2000-01-01T00:00:00Z","principals":[{"type":"user","id":"U123"}]}),p,300)?);
         Ok(())
     }).unwrap();
     let _ = project;

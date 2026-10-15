@@ -1072,7 +1072,7 @@ pub fn command(
         "workflow.retry" => store.retry_job(workspace, capability, args, &app.worker.config),
         "observer.status" => store.authorized_read(workspace, capability, "read", |db, p| {
             let repo = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
-            let documents = crate::memory::documents(db, &repo, p)?;
+            let documents = crate::memory::documents(store, db, &repo, p)?;
             crate::observer::status(db, crate::store::s(&repo, "id"), &documents, args)
         }),
         "observer.context" => {
@@ -1090,7 +1090,7 @@ pub fn command(
             };
             store.authorized_read(workspace, capability, "read", |db, p| {
                 let repo = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
-                let documents = crate::memory::documents(db, &repo, p)?;
+                let documents = crate::memory::documents(store, db, &repo, p)?;
                 crate::observer::context_with(db, crate::store::s(&repo, "id"), &documents, args, embedding.as_ref())
             })
         }
@@ -1820,7 +1820,7 @@ fn mcp_in(
                             workspace,
                             capability,
                             "read",
-                            |db, p| crate::folders::named(db, p, named, app.mcp.cwd.as_deref()),
+                            |db, p| crate::folders::named(&app.worker.store.graph, db, p, named, app.mcp.cwd.as_deref()),
                         )?;
                         args["repository_id"] = json!(named);
                     }

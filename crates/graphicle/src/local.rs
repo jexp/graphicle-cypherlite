@@ -321,7 +321,7 @@ fn converted(
     store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
         let project = crate::store::repo(db, p, repository)?;
         let mut found = std::collections::HashMap::new();
-        if !crate::fresh::converted_here(db, &p.workspace, root, s(&project, "snapshot"))? {
+        if !crate::fresh::converted_here(&store.graph, &p.workspace, root, s(&project, "snapshot"))? {
             return Ok(found);
         }
         let mut rows = db.prepare(
@@ -663,8 +663,8 @@ pub fn sync_folder(
                 )?;
             }
             // The folder is this project's from now on.
-            crate::folders::record(db, &p.workspace, &repository, &root)?;
-            crate::fresh::record(db, &p.workspace, &root, &mark, s(&current, "snapshot"))?;
+            crate::folders::record(&store.graph, &p.workspace, &repository, &root)?;
+            crate::fresh::record(&store.graph, &p.workspace, &root, &mark, s(&current, "snapshot"))?;
             Ok(())
         },
     )?;
@@ -736,10 +736,23 @@ fn store_originals(
 ) -> Result<()> {
     store.authorized(&session.workspace,&session.capability,"collect",|db,p|{
         crate::store::repo(db,p,repository)?;
-        for (path,original,parsed) in originals {
-            db.execute("INSERT OR IGNORE INTO am_original_documents VALUES(?,NULL,?,?,?,?,?,?,?)",rusqlite::params![repository,format!("file:{path}"),s(parsed,"original_sha256"),path,s(parsed,"parser"),s(parsed,"text_sha256"),original,now()])?;
-        }
-        let size:i64=db.query_row("SELECT coalesce(sum(length(bytes)),0) FROM am_original_documents WHERE repository_id=?",[repository],|r|r.get(0))?;
+        store.graph.transaction(|db|{
+            for (path,original,parsed) in originals {
+                crate::store_graph::write(db,"MERGE (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) SET o.connector_id=NULL, o.name=$name, o.parser=$parser, o.text_sha256=$text_sha, o.bytes=$bytes, o.bytes_len=$bytes_len, o.created_at=$now",crate::store_graph::Params::from([
+                    ("repository".into(),crate::store_graph::json_to_value(&json!(repository))),
+                    ("source".into(),crate::store_graph::json_to_value(&json!(format!("file:{path}")))),
+                    ("sha".into(),crate::store_graph::json_to_value(&parsed["original_sha256"])),
+                    ("name".into(),crate::store_graph::json_to_value(&json!(path))),
+                    ("parser".into(),crate::store_graph::json_to_value(&parsed["parser"])),
+                    ("text_sha".into(),crate::store_graph::json_to_value(&parsed["text_sha256"])),
+                    ("bytes".into(),crate::store_graph::json_to_value(&json!(crate::store_graph::b64e(original)))),
+                    ("bytes_len".into(),cypherlite::Value::Int(original.len() as i64)),
+                    ("now".into(),crate::store_graph::json_to_value(&json!(now()))),
+                ]))?;
+            }
+            Ok(())
+        })?;
+        let size:i64=store.graph.read(|db|crate::store_graph::one(db,"MATCH (o:OriginalDocument {repository_id: $repository}) RETURN coalesce(sum(o.bytes_len),0) AS used",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(repository)))])))?.and_then(|row|row["used"].as_i64()).unwrap_or(0);
         let cap=store.limits()?.retained_original_bytes;
         if usize::try_from(size).unwrap_or(usize::MAX)>cap{return Err(Error::bad(format!("Retained document originals exceed {}; prune earlier versions with storage.prune, or raise the limit with {}",crate::limits::size(cap),crate::limits::raise("retained_original_bytes"))));}Ok(())
     })

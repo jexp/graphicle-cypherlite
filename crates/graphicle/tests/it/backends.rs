@@ -380,7 +380,7 @@ async fn real_qdrant_filters_fingerprints_and_authorized_candidate_ids() {
         .store
         .authorized(&f.ws, &f.key, "read", |db, p| {
             let r = repo(db, p, &f.project)?;
-            query::candidates(&query::snapshot(db, &r, p)?).map(|v| v.0)
+            query::candidates(&query::snapshot(&f.store, db, &r, p)?).map(|v| v.0)
         })
         .unwrap();
     for row in &candidates {

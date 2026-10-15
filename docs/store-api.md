@@ -25,11 +25,18 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
 - `GraphStore::open_in_memory()` is the `:memory:` mode that replaces
   rusqlite's `open_in_memory` in tests and transient processing (staging,
   expansion scratch).
-- `GraphStore` is cheap to clone; clones share one engine. The engine takes
-  a single-process writer lease on a durable store.
+- `GraphStore` is cheap to clone; clones share one location. The engine
+  takes a single-process writer lease on a durable store, so a durable
+  store is **not held open**: the engine opens on first use, is shared
+  through a process-wide registry, and is reaped after a 250 ms idle grace
+  (engine open replays state, so bursts of work share one open), releasing
+  the writer lease; a busy `storage locked` answer from another process
+  mid-write is retried for up to 30 s. A hook or CLI child process can
+  therefore work beside a running server; keep transactions short, since a
+  live connection holds the lease.
 - `store.checkpoint()` flushes the WAL into a snapshot (maintenance/backup
-  paths); `store.database()` exposes the raw `cypherlite::Database` for
-  snapshot/clone work.
+  paths); `store.database()` returns the transiently opened
+  `Arc<cypherlite::Database>` for snapshot/clone work.
 
 ## Connections: one per worker thread, never one per request
 

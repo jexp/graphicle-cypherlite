@@ -1743,7 +1743,7 @@ fn export_index(
 /// side moved to a new episode the stale rows are closed with
 /// `valid_to_episode` (the new episode of the side that changed) and the pair
 /// is re-linked.
-pub fn link_workspace(db: &Connection, p: &Principal) -> Result<Value> {
+pub fn link_workspace(store: &crate::store_graph::GraphStore, db: &Connection, p: &Principal) -> Result<Value> {
     let workspace = p.workspace.as_str();
     let mut hidden = 0usize;
     let mut unprojected = Vec::new();
@@ -1802,7 +1802,7 @@ pub fn link_workspace(db: &Connection, p: &Principal) -> Result<Value> {
     // another linkable project's folder owns the packages and modules under
     // it, so the outer project stops exporting them and the two never export
     // the same import root (which made every import of it ambiguous).
-    let nested = nested_prefixes(db, &repos)?;
+    let nested = nested_prefixes(store, db, &repos)?;
     for repo in &mut repos {
         if let Some(prefixes) = nested.get(&repo.id) {
             let mut index = repo.index.clone();
@@ -2090,10 +2090,10 @@ fn below(path: &str, prefix: &str) -> bool {
 /// another folder replaced) do not describe its files and take no part,
 /// nor do projects without recorded folders (synced by an earlier build,
 /// or over HTTP).
-fn nested_prefixes(db: &Connection, repos: &[Linkable]) -> Result<HashMap<String, Vec<String>>> {
+fn nested_prefixes(store: &crate::store_graph::GraphStore, _db: &Connection, repos: &[Linkable]) -> Result<HashMap<String, Vec<String>>> {
     let mut folders: Vec<(&str, PathBuf)> = Vec::with_capacity(repos.len());
     for repo in repos {
-        if let Some(folder) = crate::folders::current_folder(db, &repo.id)? {
+        if let Some(folder) = crate::folders::current_folder(store, &repo.id)? {
             folders.push((repo.id.as_str(), folder));
         }
     }
@@ -2294,7 +2294,7 @@ impl Store {
     /// result's `documents`.
     pub fn graph_link(&self, workspace: &str, token: &str) -> Result<Value> {
         let (mut result, principal) = self.authorized(workspace, token, "read", |db, p| {
-            Ok((link_workspace(db, p)?, p.hash.clone()))
+            Ok((link_workspace(&self.graph, db, p)?, p.hash.clone()))
         })?;
         result["documents"] =
             match crate::doc_links::relink(self, workspace, &principal, |_| Ok(())) {

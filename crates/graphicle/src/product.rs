@@ -4,6 +4,7 @@ use crate::{
     Error, Result,
     api::{self, App},
     store::{Store, one, repo, rows, s},
+    store_graph::{self as graph, Params, json_to_value},
 };
 use axum::{
     Json, Router,
@@ -177,14 +178,19 @@ fn day() -> String {
 }
 
 fn limits(
+    store: &Store,
     db: &rusqlite::Connection,
     workspace: &str,
 ) -> Result<(Option<u64>, Option<u64>, Option<u64>)> {
-    let budget = one(
-        db,
-        "SELECT monthly_request_budget AS value FROM am_product_policy WHERE workspace_id=?",
-        [workspace],
-    )?
+    let budget = store
+        .graph
+        .read(|db| {
+            graph::one(
+                db,
+                "MATCH (p:ProductPolicy {workspace_id: $workspace}) RETURN p.monthly_request_budget AS value",
+                Params::from([("workspace".into(), json_to_value(&json!(workspace)))]),
+            )
+        })?
     .and_then(|r| r["value"].as_u64());
     // An installed extension may set an allowance (a plan, for example);
     // the lowest of them and the owner's own budget applies.
@@ -263,8 +269,13 @@ impl Store {
             if p.role == "owner" {
                 value["jobs"] = json!(rows(db,
                     "SELECT state,count(*) AS count FROM am_jobs WHERE repository_id=? GROUP BY state", [identifier])?);
-                value["connectors"] = json!(rows(db,
-                    "SELECT id,name,kind,state,last_sync FROM am_connectors WHERE repository_id=? ORDER BY name LIMIT 100", [identifier])?);
+                value["connectors"] = json!(self.graph.read(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (c:Connector {repository_id: $repository}) RETURN c.id AS id, c.name AS name, c.kind AS kind, c.state AS state, c.last_sync AS last_sync ORDER BY c.name LIMIT 100",
+                        Params::from([("repository".into(), json_to_value(&json!(identifier)))]),
+                    )
+                })?);
             }
             Ok(value)
         })
@@ -295,10 +306,19 @@ impl Store {
         };
         self.authorized(workspace, cap, "admin", |db, p| {
             // This is a customer-selected cap, not a billing entitlement.
-            db.execute("INSERT INTO am_product_policy(workspace_id,monthly_request_budget,updated_at) VALUES(?,?,?)
-                ON CONFLICT(workspace_id) DO UPDATE SET monthly_request_budget=excluded.monthly_request_budget,updated_at=excluded.updated_at",
-                params![p.workspace,limit,crate::now()])?;
-            Ok(json!({"monthly_requests":limit,"effective_limit":limits(db,&p.workspace)?.2}))
+            let workspace = p.workspace.clone();
+            self.graph.transaction(|db| {
+                graph::write(
+                    db,
+                    "MERGE (p:ProductPolicy {workspace_id: $workspace}) SET p.monthly_request_budget=$budget, p.updated_at=$now",
+                    Params::from([
+                        ("workspace".into(), json_to_value(&json!(workspace))),
+                        ("budget".into(), limit.map(|n| cypherlite::Value::Int(n as i64)).unwrap_or(cypherlite::Value::Null)),
+                        ("now".into(), json_to_value(&json!(crate::now()))),
+                    ]),
+                )
+            })?;
+            Ok(json!({"monthly_requests":limit,"effective_limit":limits(self,db,&p.workspace)?.2}))
         })
     }
 
@@ -306,11 +326,19 @@ impl Store {
         self.authorized_read(workspace, cap, "admin", |db, p| {
             let period = month();
             let start = format!("{period}-01");
-            let daily = rows(db, "SELECT day,requests,errors,elapsed_ms FROM am_usage WHERE workspace_id=? AND day>=? ORDER BY day",
-                params![p.workspace,start])?;
+            let daily = self.graph.read(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (u:Usage {workspace_id: $workspace}) WHERE u.day >= $start RETURN u.day AS day, u.requests AS requests, u.errors AS errors, u.elapsed_ms AS elapsed_ms ORDER BY u.day",
+                    Params::from([
+                        ("workspace".into(), json_to_value(&json!(p.workspace))),
+                        ("start".into(), json_to_value(&json!(start))),
+                    ]),
+                )
+            })?;
             let requests:u64 = daily.iter().filter_map(|d| d["requests"].as_u64()).sum();
             let errors:u64 = daily.iter().filter_map(|d| d["errors"].as_u64()).sum();
-            let (budget, allowance, effective) = limits(db, &p.workspace)?;
+            let (budget, allowance, effective) = limits(self, db, &p.workspace)?;
             let models = one(db,
                 "SELECT count(*) AS calls,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens
                  FROM am_model_calls c JOIN repo_projects r ON r.id=c.repository_id
@@ -336,19 +364,54 @@ impl Store {
         self.authorized(workspace, cap, "read", |db, p| {
             let date = day();
             let start = format!("{}-01", &date[..7]);
-            let used:i64 = db.query_row("SELECT coalesce(sum(requests),0) FROM am_usage WHERE workspace_id=? AND day>=?",
-                params![p.workspace,start], |r| r.get(0))?;
-            let limit = limits(db, &p.workspace)?.2;
-            if limit.is_some_and(|n| used as u64 >= n) {
-                return Err(Error { status:StatusCode::TOO_MANY_REQUESTS,
-                    message:"Workspace request budget reached. The owner can review Usage; export, deletion and cancellation remain available.".into(),
-                    provider_failure:None });
-            }
-            db.execute("INSERT INTO am_usage(workspace_id,day,requests) VALUES(?,?,1)
-                ON CONFLICT(workspace_id,day) DO UPDATE SET requests=requests+1",params![p.workspace,date])?;
-            // Daily counters retain 25 months; they never grow with individual requests.
-            let cutoff = (Utc::now() - chrono::Duration::days(760)).format("%Y-%m-%d").to_string();
-            db.execute("DELETE FROM am_usage WHERE workspace_id=? AND day<?", params![p.workspace,cutoff])?;
+            let limit = limits(self, db, &p.workspace)?.2;
+            // The budget check and the day's increment are one graph
+            // transaction; the engine's optimistic commit retries it whole
+            // under contention, so concurrent requests cannot overspend.
+            let workspace_id = p.workspace.clone();
+            let mut attempts = 0;
+            let used = loop {
+                attempts += 1;
+                match self.graph.transaction(|db| {
+                    let used = graph::one(
+                        db,
+                        "MATCH (u:Usage {workspace_id: $workspace}) WHERE u.day >= $start RETURN coalesce(sum(u.requests),0) AS used",
+                        Params::from([
+                            ("workspace".into(), json_to_value(&json!(workspace_id))),
+                            ("start".into(), json_to_value(&json!(start))),
+                        ]),
+                    )?
+                    .and_then(|row| row["used"].as_i64())
+                    .unwrap_or(0);
+                    if limit.is_some_and(|n| used as u64 >= n) {
+                        return Err(Error { status:StatusCode::TOO_MANY_REQUESTS,
+                            message:"Workspace request budget reached. The owner can review Usage; export, deletion and cancellation remain available.".into(),
+                            provider_failure:None });
+                    }
+                    graph::write(
+                        db,
+                        "MERGE (u:Usage {workspace_id: $workspace, day: $day}) ON CREATE SET u.requests=0, u.errors=0, u.elapsed_ms=0 SET u.requests=u.requests+1",
+                        Params::from([
+                            ("workspace".into(), json_to_value(&json!(workspace_id))),
+                            ("day".into(), json_to_value(&json!(date))),
+                        ]),
+                    )?;
+                    // Daily counters retain 25 months; they never grow with individual requests.
+                    let cutoff = (Utc::now() - chrono::Duration::days(760)).format("%Y-%m-%d").to_string();
+                    graph::write(
+                        db,
+                        "MATCH (u:Usage {workspace_id: $workspace}) WHERE u.day < $cutoff DELETE u",
+                        Params::from([
+                            ("workspace".into(), json_to_value(&json!(workspace_id))),
+                            ("cutoff".into(), json_to_value(&json!(cutoff))),
+                        ]),
+                    )?;
+                    Ok(used)
+                }) {
+                    Err(error) if error.status == StatusCode::CONFLICT && attempts < 50 => continue,
+                    outcome => break outcome?,
+                }
+            };
             Ok((date,limit.map(|n| n.saturating_sub(used as u64 + 1))))
         })
     }
@@ -359,9 +422,17 @@ impl Store {
         failed: bool,
         elapsed: u64,
     ) -> Result<()> {
-        self.transaction(|db| {
-            db.execute("UPDATE am_usage SET errors=errors+?,elapsed_ms=elapsed_ms+? WHERE workspace_id=? AND day=?",
-                params![i64::from(failed),elapsed.min(i64::MAX as u64),workspace,date])?;
+        self.graph.transaction(|db| {
+            graph::write(
+                db,
+                "MATCH (u:Usage {workspace_id: $workspace, day: $day}) SET u.errors=u.errors+$failed, u.elapsed_ms=u.elapsed_ms+$elapsed",
+                Params::from([
+                    ("workspace".into(), json_to_value(&json!(workspace))),
+                    ("day".into(), json_to_value(&json!(date))),
+                    ("failed".into(), cypherlite::Value::Int(i64::from(failed))),
+                    ("elapsed".into(), cypherlite::Value::Int(elapsed.min(i64::MAX as u64) as i64)),
+                ]),
+            )?;
             Ok(())
         })
     }

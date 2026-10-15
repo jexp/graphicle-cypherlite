@@ -211,8 +211,8 @@ pub fn source_graph(db: &Connection, repository: &Value, p: &Principal) -> Resul
         }
     }
 }
-pub fn snapshot(db: &Connection, repository: &Value, p: &Principal) -> Result<Snapshot> {
-    let documents = memory::documents(db, repository, p)?;
+pub fn snapshot(store: &Store, db: &Connection, repository: &Value, p: &Principal) -> Result<Snapshot> {
+    let documents = memory::documents(store, db, repository, p)?;
     // One read of the sources serves the memory listing too.
     let memories = memory::list_of(db, repository, &documents, true)?;
     let graph = source_graph(db, repository, p)?;
@@ -1376,12 +1376,12 @@ impl Store {
                     return Err(Error::bad("max_projects applies only with scope workspace"));
                 }
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                Ok(project_packet(db, p, &repository, args, embedding, reranker)?.1)
+                Ok(project_packet(self, db, p, &repository, args, embedding, reranker)?.1)
             }
             // Every project of the workspace the principal may read, each
             // read as this project is above.
             crate::workspace::Scope::Workspace => {
-                crate::workspace::context(db, p, args, embedding, reranker)
+                crate::workspace::context(self, db, p, args, embedding, reranker)
             }
         })
     }
@@ -1393,6 +1393,7 @@ impl Store {
 /// scope through this function, so a workspace read is authorized and
 /// ranked exactly as a single-project read.
 pub fn project_packet(
+    store: &Store,
     db: &Connection,
     p: &Principal,
     repository: &Value,
@@ -1400,13 +1401,13 @@ pub fn project_packet(
     embedding: Option<&crate::model::Profile>,
     reranker: Option<&crate::model::Profile>,
 ) -> Result<(Snapshot, Value)> {
-    let mut snap = crate::phase::phase("context_snapshot", || snapshot(db, repository, p))?;
+    let mut snap = crate::phase::phase("context_snapshot", || snapshot(store, db, repository, p))?;
     if args["memory_retrieval"] == false {
         snap.memories.clear();
     }
     let filter = Filter::parse(args)?.map(|f| restrict(&mut snap, &f));
     let graph = crate::phase::phase("context_graph", || {
-        crate::graph::for_query(db, repository, p, &snap, args)
+        crate::graph::for_query(store, db, repository, p, &snap, args)
     })?;
     let question = string(args, "question", 16000)?;
     // One chunking of the snapshot serves `graph_local`'s seed and
@@ -1525,7 +1526,7 @@ pub fn project_packet(
             arm
         })
     };
-    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"));
+    let lookup = crate::doc_links::Lookup::new(store, db, s(repository, "id"));
     if crate::observer::KeyMode::parse(args.get("note_keys"))?.is_some() {
         rankings[crate::observer::NOTE_KEYS] = json!(crate::observer::notes_for(
             db,
@@ -1560,8 +1561,8 @@ pub fn project_packet(
 impl Store {
     pub fn project_status(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace,token,"read",|db,p| {
-            let repository=repo(db,p,string(args,"repository_id",100)?)?;let snap=snapshot(db,&repository,p)?;
-            let observed:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM am_connectors WHERE repository_id=? AND state='active' AND json_type(config,'$.observe')='object')",[s(&repository,"id")],|r|r.get(0))?;
+            let repository=repo(db,p,string(args,"repository_id",100)?)?;let snap=snapshot(self,db,&repository,p)?;
+            let observed:bool=self.graph.read(|db|crate::store_graph::rows(db,"MATCH (c:Connector {repository_id: $repository, state: 'active'}) RETURN c.config AS config",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&repository["id"]))])))?.iter().any(|c|serde_json::from_str::<Value>(crate::store_graph::s(c,"config")).map(|c|c["observe"].is_object()).unwrap_or(false));
             Ok(json!({"repository":repository,"files":snap.documents.iter().filter(|d|d["source_kind"]=="repository_file").count(),
                 "evidence_sources":snap.documents.len(),"memories":snap.memories.len(),"stale_memories":snap.memories.iter().filter(|m|m["stale"]==true).count(),
                 "draft_memories":snap.memories.iter().filter(|m|m["state"]=="draft").count(),"source_state":snap.state,"native_runtime":{"enabled":true,"language":"rust","service_version":env!("CARGO_PKG_VERSION"),"core_version":graphicle_memory::VERSION},
@@ -1573,7 +1574,7 @@ impl Store {
     pub fn read_project_source(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let docs = memory::documents(db, &repository, p)?;
+            let docs = memory::documents(self, db, &repository, p)?;
             let identifier = args["source_id"]
                 .as_str()
                 .map(str::to_string)
@@ -1772,7 +1773,9 @@ mod tests {
             })
             .collect();
         let snapshot = synthetic(documents, vec![]);
-        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let db = store.connect().unwrap();
         let principal = crate::store::Principal {
             workspace: "w".into(),
             credential: "c".into(),
@@ -1781,7 +1784,7 @@ mod tests {
         };
         let args = json!({"question":"note 50000","graph_retrieval":true});
         let graph =
-            crate::graph::for_query(&db, &snapshot.repository, &principal, &snapshot, &args)
+            crate::graph::for_query(&store, &db, &snapshot.repository, &principal, &snapshot, &args)
                 .unwrap()
                 .unwrap();
         assert_eq!(graph["degraded"]["nodes"], bound + 1, "{graph}");
@@ -1944,7 +1947,7 @@ mod tests {
         };
         let args = json!({"question":"refresh token","graph_retrieval":true});
         let graph =
-            crate::graph::for_query(&db, &snapshot.repository, &principal, &snapshot, &args)
+            crate::graph::for_query(&store, &db, &snapshot.repository, &principal, &snapshot, &args)
                 .unwrap()
                 .unwrap();
         assert_eq!(graph["degraded"]["nodes"], 2, "{graph}");

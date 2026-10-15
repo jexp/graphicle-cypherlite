@@ -296,6 +296,7 @@ fn document_date(metadata: &Value, by: Dated) -> Option<chrono::DateTime<chrono:
 
 /// Select the documents `policy` would forget at `now`.
 pub fn source_plan(
+    store: &Store,
     db: &Connection,
     principal: &crate::store::Principal,
     repository: &Value,
@@ -306,7 +307,7 @@ pub fn source_plan(
     let cutoff = now - chrono::Duration::days(i64::from(policy.max_age_days));
     let mut cited = std::collections::BTreeSet::new();
     if policy.skip_cited_by_reviewed {
-        for memory in crate::memory::list(db, repository, principal, true)? {
+        for memory in crate::memory::list(store, db, repository, principal, true)? {
             if memory["state"] != "reviewed" {
                 continue;
             }
@@ -323,17 +324,26 @@ pub fn source_plan(
     };
     let mut hashes: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for connector in &policy.connector_ids {
-        one(
-            db,
-            "SELECT id FROM am_connectors WHERE repository_id=? AND id=?",
-            params![identifier, connector],
-        )?
+        store
+            .graph
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.id AS id",
+                    crate::store_graph::Params::from([
+                        ("repository".into(), crate::store_graph::json_to_value(&json!(identifier))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(connector))),
+                    ]),
+                )
+            })?
         .ok_or_else(|| Error::bad(format!("Connector unavailable: {connector}")))?;
-        for doc in rows(
-            db,
-            "SELECT id,metadata FROM am_connector_docs WHERE connector_id=? ORDER BY id",
-            [connector],
-        )? {
+        for doc in store.graph.read(|db| {
+            crate::store_graph::rows(
+                db,
+                "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id, d.metadata AS metadata ORDER BY d.id",
+                crate::store_graph::Params::from([("connector".into(), crate::store_graph::json_to_value(&json!(connector)))]),
+            )
+        })? {
             let metadata: Value = serde_json::from_str(s(&doc, "metadata")).unwrap_or(Value::Null);
             let Some(date) = document_date(&metadata, policy.by) else {
                 plan.skipped_undated += 1;
@@ -380,7 +390,7 @@ impl Store {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, crate::string(args, "repository_id", 100)?)?;
             let identifier = s(&repository, "id");
-            let plan = source_plan(db, p, &repository, &policy, chrono::Utc::now())?;
+            let plan = source_plan(self, db, p, &repository, &policy, chrono::Utc::now())?;
             let mut connectors = serde_json::Map::new();
             for (connector, documents) in &plan.documents {
                 let mut removes: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -391,7 +401,7 @@ impl Store {
                         connector,
                         batch.iter().map(|d| (*d).clone()).collect(),
                     );
-                    let forget = crate::deletion::plan(db, &p.workspace, identifier, &scope)?;
+                    let forget = crate::deletion::plan(self, db, &p.workspace, identifier, &scope)?;
                     for (table, n) in forget.rows() {
                         *removes.entry(table).or_default() += n;
                     }

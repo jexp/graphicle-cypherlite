@@ -1350,7 +1350,7 @@ fn agent_sessions(kind: &str, name: &str) -> bool {
 /// reStructuredText files (Sphinx `.txt` pages when a `conf.py` declares
 /// them) and the present documents of its active connectors, except
 /// captured agent sessions and the SDK's conversation sessions.
-fn documents_of(db: &Connection, project: &Project) -> Result<Vec<Document>> {
+fn documents_of(store: &Store, db: &Connection, project: &Project) -> Result<Vec<Document>> {
     let mut found = Vec::new();
     let mut conf = HashMap::new();
     for (path, sha) in &project.heads {
@@ -1375,21 +1375,23 @@ fn documents_of(db: &Connection, project: &Project) -> Result<Vec<Document>> {
             input: String::new(),
         });
     }
-    for row in rows(
-        db,
-        "SELECT d.connector_id,d.id,d.sha256,json_extract(d.metadata,'$.code_spans') AS spans,c.kind,c.name \
-         FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id \
-         WHERE c.repository_id=? AND c.state='active' AND d.present=1 \
-         AND coalesce(json_extract(d.metadata,'$.provider_metadata.schema'),'')<>? ORDER BY d.connector_id,d.id",
-        params![project.id, SDK_SESSION_SCHEMA],
-    )? {
+    for row in store.graph.read(|db| {
+        crate::store_graph::rows(
+            db,
+            "MATCH (c:Connector {repository_id: $repository, state: 'active'})<-[:FROM]-(d:ConnectorDoc {present: true}) \
+             RETURN d.connector_id AS connector_id, d.id AS id, d.sha256 AS sha256, d.metadata AS metadata, c.kind AS kind, c.name AS name \
+             ORDER BY d.connector_id, d.id",
+            crate::store_graph::Params::from([("repository".into(), crate::store_graph::json_to_value(&json!(project.id)))]),
+        )
+    })? {
+        let metadata: Value = serde_json::from_str(s(&row, "metadata"))?;
+        if metadata["provider_metadata"]["schema"] == SDK_SESSION_SCHEMA {
+            continue;
+        }
         if agent_sessions(s(&row, "kind"), s(&row, "name")) {
             continue;
         }
-        let spans = row["spans"]
-            .as_str()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or(Value::Null);
+        let spans = metadata.get("code_spans").cloned().unwrap_or(Value::Null);
         found.push(Document {
             project: project.id.clone(),
             id: format!("connector:{}:{}", s(&row, "connector_id"), s(&row, "id")),
@@ -1487,7 +1489,7 @@ impl Checker<'_> {
     }
 }
 
-fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
+fn plan(store: &Store, db: &Connection, workspace: &str) -> Result<Plan> {
     let fingerprint = fingerprint(db, workspace)?;
     let scratch = graph_projection::pr_scratch_projects(db, workspace)?;
     let mut projects = Vec::new();
@@ -1546,7 +1548,7 @@ fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
     let mut documents = Vec::new();
     let mut gone = Vec::new();
     for (index, project) in projects.iter().enumerate() {
-        let found = documents_of(db, project)?;
+        let found = documents_of(store, db, project)?;
         let stored: HashMap<String, (String, String)> = rows(
             db,
             "SELECT document_id,input,dependencies FROM gf_doc_link_sources WHERE repository_id=?",
@@ -1647,7 +1649,7 @@ struct Resolved {
 /// document's own project is opened when it has mentions; another project
 /// only when a mention found no candidate in its own and the other project
 /// defines that name at all (its labels, read without opening its graph).
-fn compute(db: &Connection, plan: &Plan) -> Resolved {
+fn compute(store: &Store, db: &Connection, plan: &Plan) -> Resolved {
     let mut views: HashMap<String, View> = HashMap::new();
     let mut windows: HashMap<(String, String), Option<Window>> = HashMap::new();
     let mut files: Lines = HashMap::new();
@@ -1655,6 +1657,7 @@ fn compute(db: &Connection, plan: &Plan) -> Resolved {
     for document in &plan.documents {
         let project = &plan.projects[plan.by_id[&document.project]];
         match compute_one(
+            store,
             db,
             plan,
             project,
@@ -1678,6 +1681,7 @@ fn compute(db: &Connection, plan: &Plan) -> Resolved {
 }
 
 fn compute_one(
+    store: &Store,
     db: &Connection,
     plan: &Plan,
     project: &Project,
@@ -1688,12 +1692,19 @@ fn compute_one(
 ) -> Result<Option<Computed>> {
     let content = match (&document.path, &document.connector) {
         (Some(_), _) => object(db, &project.id, &document.sha)?,
-        (None, Some((connector, id))) => one(
-            db,
-            "SELECT content FROM am_connector_docs WHERE connector_id=? AND id=?",
-            params![connector, id],
-        )?
-        .map(|row| s(&row, "content").to_string()),
+        (None, Some((connector, id))) => store
+            .graph
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id}) RETURN d.content AS content",
+                    crate::store_graph::Params::from([
+                        ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(id))),
+                    ]),
+                )
+            })?
+            .map(|row| s(&row, "content").to_string()),
         _ => None,
     };
     let Some(content) = content else {
@@ -1867,19 +1878,25 @@ fn target_window(
 }
 
 /// The document's current sha256: its head, or its present connector copy.
-fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
+fn current_sha(store: &Store, db: &Connection, document: &Document) -> Result<Option<String>> {
     let row = match (&document.path, &document.connector) {
         (Some(path), _) => one(
             db,
             "SELECT sha256 FROM repo_heads WHERE repository_id=? AND path=?",
             params![document.project, path],
         )?,
-        (None, Some((connector, id))) => one(
-            db,
-            "SELECT d.sha256 FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id \
-             WHERE d.connector_id=? AND d.id=? AND d.present=1 AND c.state='active'",
-            params![connector, id],
-        )?,
+        (None, Some((connector, id))) => store
+            .graph
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {id: $connector, state: 'active'})<-[:FROM]-(d:ConnectorDoc {connector_id: $connector, id: $id, present: true}) RETURN d.sha256 AS sha256",
+                    crate::store_graph::Params::from([
+                        ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(id))),
+                    ]),
+                )
+            })?,
         _ => None,
     };
     Ok(row.map(|row| s(&row, "sha256").to_string()))
@@ -1971,27 +1988,42 @@ fn write(db: &Connection, computed: &Computed) -> Result<usize> {
 /// SDK's conversation sessions) queues nothing, unless links of its
 /// documents remain to be removed.
 pub fn after_sync(
+    store: &Store,
     db: &Connection,
     repository: &str,
     connector: &str,
     p: &Principal,
 ) -> Result<Value> {
-    let Some(row) = one(
-        db,
-        "SELECT kind,name FROM am_connectors WHERE id=? AND repository_id=?",
-        params![connector, repository],
-    )?
+    let Some(read) = store.graph.read(|db| {
+        let row = crate::store_graph::one(
+            db,
+            "MATCH (c:Connector {id: $connector, repository_id: $repository}) RETURN c.kind AS kind, c.name AS name",
+            crate::store_graph::Params::from([
+                ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+                ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+            ]),
+        )?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // SDK session transcripts are not linked.
+        let read = !agent_sessions(s(&row, "kind"), s(&row, "name"))
+            && crate::store_graph::rows(
+                db,
+                "MATCH (d:ConnectorDoc {connector_id: $connector, present: true}) RETURN d.metadata AS metadata",
+                crate::store_graph::Params::from([("connector".into(), crate::store_graph::json_to_value(&json!(connector)))]),
+            )?
+            .iter()
+            .any(|row| {
+                serde_json::from_str::<Value>(s(row, "metadata"))
+                    .map(|m| m["provider_metadata"]["schema"] != SDK_SESSION_SCHEMA)
+                    .unwrap_or(false)
+            });
+        Ok(Some(read))
+    })?
     else {
         return Ok(Value::Null);
     };
-    let read = !agent_sessions(s(&row, "kind"), s(&row, "name"))
-        && one(
-            db,
-            "SELECT 1 AS yes FROM am_connector_docs WHERE connector_id=? AND present=1 \
-             AND coalesce(json_extract(metadata,'$.provider_metadata.schema'),'')<>? LIMIT 1",
-            params![connector, SDK_SESSION_SCHEMA],
-        )?
-        .is_some();
     let prefix = format!("connector:{connector}:");
     let linked = one(
         db,
@@ -2053,8 +2085,8 @@ pub fn relink(
     leased: impl Fn(&Connection) -> Result<()>,
 ) -> Result<Value> {
     let (plan, resolved) = store.read(|db| {
-        let plan = plan(db, workspace)?;
-        let resolved = compute(db, &plan);
+        let plan = plan(store, db, workspace)?;
+        let resolved = compute(store, db, &plan);
         Ok((plan, resolved))
     })?;
     write_all(store, workspace, principal, &leased, &plan, &resolved)
@@ -2159,7 +2191,7 @@ fn write_all(
             };
             for item in *batch {
                 let kind = item.document.kind;
-                if current_sha(db, &item.document)?.as_deref() != Some(item.document.sha.as_str()) {
+                if current_sha(store, db, &item.document)?.as_deref() != Some(item.document.sha.as_str()) {
                     tally.changed += usize::from(visible(db, &item.document.project, kind)?);
                     continue;
                 }
@@ -2334,7 +2366,7 @@ pub fn sdk_session(document: &Value) -> bool {
 /// or reStructuredText file, or a document of a connector other than the
 /// captured agent sessions that is not an SDK conversation `session`. (A
 /// Sphinx `.txt` page counts once it has rows.)
-fn linkable(db: &Connection, id: &str, session: bool) -> Result<bool> {
+fn linkable(store: &Store, id: &str, session: bool) -> Result<bool> {
     if let Some(path) = id.strip_prefix("file:") {
         return Ok(format_of(path).is_some());
     }
@@ -2347,12 +2379,16 @@ fn linkable(db: &Connection, id: &str, session: bool) -> Result<bool> {
     if session {
         return Ok(false);
     }
-    Ok(one(
-        db,
-        "SELECT kind,name FROM am_connectors WHERE id=?",
-        [connector],
-    )?
-    .is_some_and(|row| !agent_sessions(s(&row, "kind"), s(&row, "name"))))
+    Ok(store
+        .graph
+        .read(|db| {
+            crate::store_graph::one(
+                db,
+                "MATCH (c:Connector {id: $id}) RETURN c.kind AS kind, c.name AS name",
+                crate::store_graph::Params::from([("id".into(), crate::store_graph::json_to_value(&json!(connector)))]),
+            )
+        })?
+        .is_some_and(|row| !agent_sessions(s(&row, "kind"), s(&row, "name"))))
 }
 
 /// The producers whose rows this program reads: its own, and those of the
@@ -2366,6 +2402,7 @@ pub fn producers() -> Vec<&'static str> {
 
 /// The link rows of one project, read during a query.
 pub struct Lookup<'a> {
+    store: &'a Store,
     db: &'a Connection,
     repository: String,
     producers: String,
@@ -2394,8 +2431,9 @@ struct Link {
 }
 
 impl<'a> Lookup<'a> {
-    pub fn new(db: &'a Connection, repository: &str) -> Self {
+    pub fn new(store: &'a Store, db: &'a Connection, repository: &str) -> Self {
         Self {
+            store,
             db,
             repository: repository.to_string(),
             producers: json!(producers()).to_string(),
@@ -2601,7 +2639,7 @@ pub fn lift(
         // computed for these bytes yet: the `link` job has not run since it
         // changed.
         if options.follows(s(document, "source_kind"))
-            && linkable(lookup.db, id, sdk_session(document))?
+            && linkable(lookup.store, id, sdk_session(document))?
             && !lookup.computed_for(id, sha)?
         {
             unlinked.insert(id.to_string());
@@ -2774,6 +2812,7 @@ struct Listed {
 /// What a reader may read, per project (the snapshot's filter: access,
 /// connector sharing and freshness).
 struct Readable<'a> {
+    store: &'a Store,
     db: &'a Connection,
     p: &'a Principal,
     documents: HashMap<String, Option<HashMap<String, Listed>>>,
@@ -2782,8 +2821,9 @@ struct Readable<'a> {
 }
 
 impl<'a> Readable<'a> {
-    fn new(db: &'a Connection, p: &'a Principal) -> Self {
+    fn new(store: &'a Store, db: &'a Connection, p: &'a Principal) -> Self {
         Self {
+            store,
             db,
             p,
             documents: HashMap::new(),
@@ -2838,7 +2878,7 @@ impl<'a> Readable<'a> {
             let listed = if self.project(project)? {
                 let repository = crate::store::repo(self.db, self.p, project)?;
                 Some(
-                    crate::memory::documents(self.db, &repository, self.p)?
+                    crate::memory::documents(self.store, self.db, &repository, self.p)?
                         .iter()
                         .map(|d| {
                             (
@@ -2901,7 +2941,7 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
     store.authorized_read(workspace, token, "read", |db, p| {
         let repository = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
         let project = s(&repository, "id").to_string();
-        let mut readable = Readable::new(db, p);
+        let mut readable = Readable::new(store, db, p);
         let producers = json!(producers()).to_string();
         let limit = crate::integer(args, "limit", 200, 2000)?.max(1);
         if let Some(stable) = args.get("stable_id").filter(|v| !v.is_null()) {
@@ -2977,7 +3017,7 @@ pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
                 params![project, document, listed.sha],
             )?
             .is_some();
-            let pending = pending || (!computed && linkable(db, document, listed.session)?);
+            let pending = pending || (!computed && linkable(store, document, listed.session)?);
             return Ok(json!({"repository_id":project,"document_id":document,"mentions":out,
                 "pending":pending,"rules":RULES}));
         }
@@ -3029,11 +3069,19 @@ fn coverage(
     }
     // Documents the job reads that it has not read yet ([`linkable`], with
     // the project's agent-session connectors read once).
-    let sessions: HashSet<String> = rows(
-        db,
-        "SELECT id FROM am_connectors WHERE repository_id=? AND kind='jsonl' AND name=?",
-        params![project, crate::capture::CONNECTOR_NAME],
-    )?
+    let sessions: HashSet<String> = readable
+        .store
+        .graph
+        .read(|db| {
+            crate::store_graph::rows(
+                db,
+                "MATCH (c:Connector {repository_id: $repository, kind: 'jsonl', name: $name}) RETURN c.id AS id",
+                crate::store_graph::Params::from([
+                    ("repository".into(), crate::store_graph::json_to_value(&json!(project))),
+                    ("name".into(), crate::store_graph::json_to_value(&json!(crate::capture::CONNECTOR_NAME))),
+                ]),
+            )
+        })?
     .iter()
     .map(|row| s(row, "id").to_string())
     .collect();
@@ -3459,8 +3507,8 @@ mod tests {
         let (planned, resolved) = unit
             .store
             .read(|db| {
-                let planned = plan(db, &unit.workspace)?;
-                let resolved = compute(db, &planned);
+                let planned = plan(&unit.store, db, &unit.workspace)?;
+                let resolved = compute(&unit.store, db, &planned);
                 Ok((planned, resolved))
             })
             .unwrap();

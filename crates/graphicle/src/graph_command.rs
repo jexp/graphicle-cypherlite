@@ -138,7 +138,8 @@ fn project_name(db: &rusqlite::Connection, id: &str) -> Option<String> {
 /// creating, migrating or writing anything.
 pub fn project_of_folder(directory: &Path, folder: &Path) -> Option<(String, String)> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
+    let graph = crate::store_graph::GraphStore::open(directory.join("reviews.graph")).ok()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
     let name = project_name(&db, &found.id)?;
     Some((found.id, name))
 }
@@ -173,7 +174,8 @@ pub fn project_with_graph(
     file: Option<&Path>,
 ) -> Option<GraphFolder> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
+    let graph = crate::store_graph::GraphStore::open(directory.join("reviews.graph")).ok()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
     let built = db
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM gf_symbol_state WHERE repository_id=?)",

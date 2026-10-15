@@ -4,7 +4,12 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
+pub fn documents(
+    store: &Store,
+    db: &Connection,
+    repository: &Value,
+    p: &Principal,
+) -> Result<Vec<Value>> {
     let identifier = s(repository, "id");
     let mut output = Vec::new();
     for row in rows(
@@ -21,44 +26,62 @@ pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<V
     // The Python host's workspace-source links
     // (`repo_evidence_links` over `sources`) are no longer read; nothing in
     // this program writes them. Their tables stay.
-    for mut row in rows(
-        db,
-        "SELECT d.*,c.name AS connector_name,c.kind,c.config,c.last_sync,c.credential_env,p.principals AS synced_principals,p.checked_at AS permission_checked_at,p.complete AS permission_complete,p.generation AS permission_generation FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id LEFT JOIN am_source_permissions p ON p.connector_id=d.connector_id AND p.source_id=d.id WHERE c.repository_id=? AND c.state='active' AND d.present=1 ORDER BY d.connector_id,d.id",
-        [identifier],
-    )? {
-        decode(&mut row, "acl")?;
+    for mut row in store.graph.read(|db| {
+        crate::store_graph::rows(
+            db,
+            "MATCH (c:Connector {repository_id: $repository, state: 'active'})<-[:FROM]-(d:ConnectorDoc {present: true}) \
+             OPTIONAL MATCH (sp:SourcePermission {connector_id: d.connector_id}) WHERE sp.source_id = d.id \
+             RETURN d.connector_id AS connector_id, d.id AS id, d.content AS content, d.sha256 AS sha256, d.metadata AS metadata, \
+                    d.acl_readers AS acl_readers, d.acl_credentials AS acl_credentials, d.generation AS generation, \
+                    c.name AS connector_name, c.kind AS kind, c.config AS config, c.last_sync AS last_sync, c.credential_env AS credential_env, \
+                    sp.principals AS synced_principals, sp.checked_at AS permission_checked_at, sp.complete AS permission_complete, sp.generation AS permission_generation \
+             ORDER BY d.connector_id, d.id",
+            crate::store_graph::Params::from([("repository".into(), crate::store_graph::json_to_value(&json!(identifier)))]),
+        )
+    })? {
         decode(&mut row, "metadata")?;
         decode(&mut row, "config")?;
+        row["acl"] = json!({"workspace_readers":row["acl_readers"],"credentials":row["acl_credentials"]});
         if !acl_allows(&row["acl"], p) {
             continue;
         }
         if let Some(secret) = s(&row, "credential_env").strip_prefix("secret:")
-            && one(
-                db,
-                "SELECT id FROM am_secrets WHERE workspace_id=? AND id=?",
-                params![p.workspace, secret],
-            )?
+            && store.graph.read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (sc:Secret {workspace_id: $workspace, id: $id}) RETURN sc.id AS id",
+                    crate::store_graph::Params::from([
+                        ("workspace".into(), crate::store_graph::json_to_value(&json!(p.workspace))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(secret))),
+                    ]),
+                )
+            })?
             .is_none()
         {
             continue;
         }
         if let Some(account) = s(&row, "credential_env").strip_prefix("oauth:")
-            && one(
-                db,
-                "SELECT id FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND state='active'",
-                params![p.workspace, account],
-            )?
+            && store.graph.read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, state: 'active'}) RETURN a.id AS id",
+                    crate::store_graph::Params::from([
+                        ("workspace".into(), crate::store_graph::json_to_value(&json!(p.workspace))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(account))),
+                    ]),
+                )
+            })?
             .is_none()
         {
             continue;
         }
         if row["permission_generation"] == row["generation"] && row["synced_principals"].is_string()
         {
-            row["metadata"]["provider_permissions"] = json!({"principals":serde_json::from_str::<Value>(s(&row,"synced_principals"))?,"complete":row["permission_complete"]==1,"checked_at":row["permission_checked_at"]});
+            row["metadata"]["provider_permissions"] = json!({"principals":serde_json::from_str::<Value>(s(&row,"synced_principals"))?,"complete":row["permission_complete"],"checked_at":row["permission_checked_at"]});
         }
         if row["config"]["permission_mode"] == "provider"
             && !crate::permissions::allows(
-                db,
+                &store.graph,
                 &p.workspace,
                 s(&row, "kind"),
                 &row["metadata"]["provider_permissions"],
@@ -111,8 +134,13 @@ pub fn state(documents: &[Value]) -> String {
             .collect::<Vec<_>>()
     ))
 }
-pub fn reviewed_state(db: &Connection, repository: &Value, p: &Principal) -> Result<String> {
-    reviewed_state_for(db, repository, &list(db, repository, p, true)?)
+pub fn reviewed_state(
+    store: &Store,
+    db: &Connection,
+    repository: &Value,
+    p: &Principal,
+) -> Result<String> {
+    reviewed_state_for(db, repository, &list(store, db, repository, p, true)?)
 }
 /// `reviewed_state` over sources the caller already read for this principal.
 pub fn reviewed_state_of(
@@ -328,6 +356,7 @@ pub fn reasons(
     )?)
 }
 pub fn list(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     p: &Principal,
@@ -336,7 +365,7 @@ pub fn list(
     list_of(
         db,
         repository,
-        &documents(db, repository, p)?,
+        &documents(store, db, repository, p)?,
         include_retired,
     )
 }
@@ -536,7 +565,7 @@ impl Store {
     pub fn note(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "approve", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let docs = documents(db, &repository, p)?;
+            let docs = documents(self, db, &repository, p)?;
             let paths = args["dependencies"].as_array().cloned().unwrap_or_default();
             let mut files = BTreeMap::new();
             for value in &paths {
@@ -596,13 +625,13 @@ impl Store {
     pub fn refresh_context(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            prepare_refresh(db, &repository, p, string(args, "memory_id", 100)?)
+            prepare_refresh(self, db, &repository, p, string(args, "memory_id", 100)?)
         })
     }
     pub fn review_memory(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "approve", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            apply_review(db, &repository, p, args, None)
+            apply_review(self, db, &repository, p, args, None)
         })
     }
 }
@@ -611,6 +640,7 @@ impl Store {
 /// freshness, optimistic revision and claim-transition checks. The provenance
 /// of a model review is supplied internally, never accepted from API arguments.
 pub(crate) fn apply_review(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     p: &Principal,
@@ -621,7 +651,7 @@ pub(crate) fn apply_review(
         return Err(Error::denied());
     }
     let identifier = s(repository, "id");
-    let memories = list(db, repository, p, true)?;
+    let memories = list(store, db, repository, p, true)?;
     let old = memories
         .iter()
         .find(|m| s(m, "id") == s(args, "memory_id"))
@@ -712,17 +742,18 @@ pub(crate) fn apply_review(
 }
 
 pub fn prepare_refresh(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     p: &Principal,
     memory_id: &str,
 ) -> Result<Value> {
-    let memories = list(db, repository, p, true)?;
+    let memories = list(store, db, repository, p, true)?;
     let old = memories
         .iter()
         .find(|m| s(m, "id") == memory_id && m["state"] != "retired")
         .ok_or_else(|| Error::bad("Memory unavailable"))?;
-    let docs = documents(db, repository, p)?;
+    let docs = documents(store, db, repository, p)?;
     let all_state = state(&docs);
     let mut paths: BTreeSet<String> = old["data"]["dependencies"]
         .as_object()
@@ -763,12 +794,13 @@ pub fn prepare_refresh(
     )
 }
 pub fn propose_refresh(
+    store: &Store,
     db: &Connection,
     repository: &Value,
     p: &Principal,
     args: &Value,
 ) -> Result<Value> {
-    let prepared = prepare_refresh(db, repository, p, string(args, "memory_id", 100)?)?;
+    let prepared = prepare_refresh(store, db, repository, p, string(args, "memory_id", 100)?)?;
     let context = &prepared["context"];
     if context["sha256"] != args["context_sha256"] {
         return Err(Error::conflict("Refresh context changed"));
@@ -798,7 +830,7 @@ pub fn propose_refresh(
     if preview["changed"] != true {
         return Ok(json!({"drafts":[],"changed":false}));
     }
-    let docs = documents(db, repository, p)?;
+    let docs = documents(store, db, repository, p)?;
     let citations = args["evidence"]
         .as_array()
         .filter(|v| !v.is_empty() && v.len() <= 12)
@@ -823,7 +855,7 @@ pub fn propose_refresh(
     data["candidate"] = json!({"evidence":citations,"title":context["title"]});
     data["warnings"] =
         json!(["Review the changes against current sources. Earlier revisions remain available."]);
-    let old = list(db, repository, p, false)?
+    let old = list(store, db, repository, p, false)?
         .into_iter()
         .find(|m| m["id"] == context["memory_id"])
         .ok_or_else(|| Error::conflict("Memory disappeared"))?;

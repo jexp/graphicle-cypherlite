@@ -113,7 +113,7 @@ pub async fn publish(
     let (config, snapshot, vectors, revision) =
         store.authorized(workspace, token, "admin", |db, p| {
             let r = repo(db, p, string(args, "repository_id", 100)?)?;
-            let snapshot = query::snapshot(db, &r, p)?;
+            let snapshot = query::snapshot(store, db, &r, p)?;
             let (candidates, _) = query::candidates(&snapshot)?;
             let valid = candidates
                 .iter()
@@ -177,7 +177,7 @@ pub async fn publish(
     for batch in vectors.chunks(64) {
         store.authorized(workspace, token, "admin", |db, p| {
             let r = repo(db, p, scope)?;
-            if query::snapshot(db, &r, p)?.state != snapshot.state || crate::projection::marker(db, scope, "qdrant", &config)? != revision {
+            if query::snapshot(store, db, &r, p)?.state != snapshot.state || crate::projection::marker(db, scope, "qdrant", &config)? != revision {
                 return Err(Error::conflict("Sources changed during vector publication"));
             }
             Ok(())
@@ -197,7 +197,7 @@ pub async fn publish(
     }
     let current = store.authorized(workspace, token, "admin", |db, p| {
         let r = repo(db, p, scope)?;
-        Ok(query::snapshot(db, &r, p)?.state == snapshot.state && crate::projection::marker(db, scope, "qdrant", &config)? == revision)
+        Ok(query::snapshot(store, db, &r, p)?.state == snapshot.state && crate::projection::marker(db, scope, "qdrant", &config)? == revision)
     })?;
     if !current {
         return Err(Error::conflict(
