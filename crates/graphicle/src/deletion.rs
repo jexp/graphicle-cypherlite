@@ -1,5 +1,5 @@
 //! Verified deletion ("certified forgetting") of connector documents, whole
-//! connectors and projects.
+//! connectors and projects — on the CypherLite graph store.
 //!
 //! Forgetting removes the originals and every artifact that could carry their
 //! information, verifies the result in the same transaction, and stores a
@@ -18,12 +18,13 @@
 //! [`state`] digests a store so the claim can be checked: fork a store before
 //! the documents arrive, forget them in one copy, rerun the same work in both,
 //! and compare (tests/it/forgetting.rs, tools/certify_forgetting.py). The state
-//! contract is `graphicle.state.v2`: tables with no rows in the project's
-//! scope are left out, so a store that has an edition's tables and one that
+//! contract is `graphicle.state.v2`: labels with no nodes in the project's
+//! scope are left out, so a store that has an edition's labels and one that
 //! never had them digest equally when their content is equal; history is the
-//! core's history tables plus those the installed extensions declare and, on
-//! a store that has them, the commercial edition's team history tables ([`crate::store_compat`]),
-//! so one store digests the same whichever edition reads it.
+//! core's history labels plus those the installed extensions declare and, on
+//! a store that has them, the commercial edition's team history labels
+//! ([`crate::store_compat`]), so one store digests the same whichever edition
+//! reads it.
 //!
 //! Residue is reported, never hidden: records people wrote are not silently
 //! destroyed, and the receipt is then not `verified_local`. Receipts outlive
@@ -31,17 +32,46 @@
 //! named only by one-way hashes, which also stop a later sync re-importing
 //! them. Backups taken earlier, provider-side retention of past model requests
 //! and copies exported earlier are outside any receipt.
-use crate::store::{Principal, Store, decode, one, repo, rows, s};
+//!
+//! Storage model (migration plan §2.5, `docs/store-api.md`): every removal is
+//! a label-scoped walk — `MATCH (n:Label) WHERE <scope> DETACH DELETE n` —
+//! over the label catalog ([`LABELS`], the walk list); a label the catalog
+//! does not declare is still discovered and scanned, because residue is
+//! reported, never hidden. Receipts are the
+//! `(:DeletionReceipt)-[:NEXT]->(:DeletionReceipt)` chain of §2.5: plain
+//! properties, no project reference (they outlive their project), sequence
+//! numbers taken from the workspace's receipt chain itself, each receipt
+//! hash-chained to its predecessor's digest. JSON-object payloads follow the
+//! engine's rules (v0.12.2): maps cannot be property values, so objects with
+//! known keys are flattened to dotted properties (`n.`data.foo``) and
+//! genuinely dynamic-keyed objects stay stringified JSON in a String
+//! property, parsed at the boundary.
+use crate::store::{Principal, Store, decode, repo, s};
+use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result, digest, id, now, string};
-use rusqlite::types::ValueRef;
-use rusqlite::{Connection, params, params_from_iter};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The graph connection every operation in this module runs on (the
+/// migration seam: callers hold the transaction, this module runs its
+/// statements inside it).
+type Graph<'a> = &'a mut cypherlite::Connection;
+
+/// The SQLite implementation, kept while sibling modules still write SQL:
+/// their callers run it, and the `Store`-facing entry points fall back to it
+/// when the receipt or content lives there. Deleted once the store holds no
+/// deletion-relevant data in SQLite.
+#[doc(hidden)] // transition-only; not part of the public API contract
+#[allow(dead_code)] // some entries serve only callers that migrate later
+pub mod legacy;
+
 pub const CONTRACT: &str = "graphicle.deletion.v1";
 pub const STATE_CONTRACT: &str = "graphicle.state.v2";
-const RECEIPTS: &str = "am_deletion_receipts";
-const TOMBSTONES: &str = "am_forgotten_sources";
+/// The receipt chain's label; receipts are never residue of anything.
+const RECEIPTS: &str = "DeletionReceipt";
+/// One-way tombstones of forgotten documents: block re-import without keeping
+/// identifiers.
+const TOMBSTONES: &str = "ForgottenSource";
 /// Whether a row's key or text belongs to the scope being forgotten.
 type Matches = fn(&str, &Scope) -> bool;
 const FINGERPRINTS: usize = 16;
@@ -49,17 +79,11 @@ const FINGERPRINT_BYTES: usize = 48;
 const MIN_FINGERPRINT_BYTES: usize = 16;
 const MAX_DOCUMENTS: usize = 1000;
 /// Other sources' originals: identical text there is an independent copy.
-const INDEPENDENT: &[&str] = &[
-    "repo_objects",
-    "repo_chunks",
-    "repo_parses",
-    "repo_snapshots",
-    "repo_heads",
-];
+const INDEPENDENT: &[&str] = &["Object", "Chunk", "Parse", "Snapshot", "File"];
 /// Kept by design when a project is deleted: audit trails, and the durable
 /// external-cleanup queue that must name the scope until cleanup completes.
 /// Installed extensions add theirs ([`retained`]).
-const RETAINED: &[&str] = &["am_identity_audit", "am_projection_cleanup"];
+const RETAINED: &[&str] = &["IdentityAudit", "ProjectionCleanup"];
 const NOT_COVERED: &[&str] = &[
     "backups taken before the deletion",
     "model-provider retention of requests already sent",
@@ -69,77 +93,247 @@ const NOT_COVERED: &[&str] = &[
 /// state equality; residue scans still read them. Installed extensions add
 /// theirs ([`history`]).
 const HISTORY: &[&str] = &[
-    "am_jobs",
-    "am_model_calls",
-    "am_call_reservations",
-    "repo_events",
-    "repo_syncs",
-    "repo_runs",
-    "repo_tool_events",
-    "am_identity_audit",
-    "am_projection_cleanup",
+    "Job",
+    "ModelCall",
+    "Reservation",
+    "Event",
+    "Sync",
+    "Run",
+    "ToolEvent",
+    "IdentityAudit",
+    "ProjectionCleanup",
     TOMBSTONES,
-    "am_oauth_pending",
+    "OAuthPending",
 ];
-/// Columns holding digests of capabilities minted per store (the owner's and
-/// granted credentials'). Like minted identifiers, they never take part in
-/// state equality.
+/// Properties holding digests of capabilities minted per store (the owner's
+/// and granted credentials'). Like minted identifiers, they never take part
+/// in state equality.
 const MINTED_DIGESTS: &[&str] = &["capability_hash"];
 
-/// The tables kept by design: the installed extensions' (for example a team
-/// audit trail) and the commercial edition's team audit trail when this store has it and no
-/// extension named it ([`crate::store_compat`]), then the core's. One store
-/// therefore lists the same tables in every edition.
-fn retained(db: &Connection) -> Result<Vec<&'static str>> {
-    let mut tables = crate::extension::installed().retained_tables();
-    crate::store_compat::add_present(db, &mut tables, crate::store_compat::RETAINED_TABLES)?;
-    tables.extend_from_slice(RETAINED);
-    Ok(tables)
+/// How a label's nodes are scoped to one project (or to the workspace) — the
+/// graph counterpart of the SQL scoping columns. Writers denormalize
+/// `repository_id` onto every project-scoped node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scoped {
+    /// `n.repository_id = $repo`.
+    Repository,
+    /// Some other property holds the project id (e.g. `ProjectionCleanup.scope`).
+    RepositoryIn(&'static str),
+    /// `n.workspace_id = $ws`.
+    WorkspaceId,
+    /// `n.workspace = $ws`.
+    WorkspaceProp,
+    /// `n.id = $repo` / `n.id = $ws` — the scope's own node.
+    Own,
+    /// Scoped through its connector (`n.connector_id IN $connectors`).
+    Connector,
+    /// Scoped through the memory it revises (`-[:REVISION_OF]->(:Memory)`).
+    OfMemory,
+    /// Cross-repository: either side names the project.
+    Cross,
+    /// Not scoped to a project or workspace: never part of a state digest;
+    /// residue scans still read every node (residue is never hidden).
+    Global,
 }
-/// The history tables: the installed extensions' (for example sign-in
-/// attempts and browser sessions) and the commercial edition's team history tables that this
-/// store has and no extension named ([`crate::store_compat`]), then the
-/// core's.
-fn history(db: &Connection) -> Result<Vec<&'static str>> {
-    let mut tables = crate::extension::installed().history_tables();
-    crate::store_compat::add_present(db, &mut tables, crate::store_compat::HISTORY_TABLES)?;
-    tables.extend_from_slice(HISTORY);
-    Ok(tables)
+
+/// The store's label catalog: the graph model's labels (migration plan §2 —
+/// table names become labels), with each label's project scoping and the
+/// legacy table name receipts keep using, so a `graphicle.deletion.v1`
+/// receipt reads the same whichever backend wrote it. This catalog — not any
+/// enumeration of the store — is the walk list for verified deletion;
+/// [`discovered`] adds labels the catalog does not declare (another
+/// edition's), because residue is reported, never hidden.
+const LABELS: &[(&str, &str, Scoped)] = &[
+    ("Alias", "gf_aliases", Scoped::Repository),
+    ("AliasProposal", "am_alias_proposals", Scoped::Repository),
+    ("AnchorEdge", "gf_anchor_edges", Scoped::Repository),
+    ("Artifact", "gf_dependencies", Scoped::WorkspaceProp),
+    ("Assertion", "gf_timeline", Scoped::Repository),
+    ("Backend", "am_backends", Scoped::Global),
+    ("BinaryHead", "am_binary_heads", Scoped::Repository),
+    ("Claim", "am_claims", Scoped::Repository),
+    ("Chunk", "repo_chunks", Scoped::Repository),
+    ("ClaimEvent", "am_claim_events", Scoped::Repository),
+    ("Commit", "gf_commits", Scoped::Repository),
+    ("Community", "am_communities", Scoped::Repository),
+    ("Connector", "am_connectors", Scoped::Repository),
+    ("ConnectorDoc", "am_connector_docs", Scoped::Connector),
+    ("ConnectorStage", "am_connector_stage", Scoped::Connector),
+    ("ConnectorVersion", "am_connector_versions", Scoped::Connector),
+    ("Contradiction", "gf_contradictions", Scoped::Repository),
+    ("CoverageInventory", "gf_coverage_inventory", Scoped::Repository),
+    ("CoverageUpload", "gf_coverage_uploads", Scoped::Repository),
+    ("Credential", "credentials", Scoped::WorkspaceProp),
+    ("CrossPackage", "gf_cross_packages", Scoped::Cross),
+    ("Decision", "decisions", Scoped::WorkspaceId),
+    ("DocumentRead", "am_document_reads", Scoped::Repository),
+    ("EmbeddingCache", "am_embedding_cache", Scoped::Global),
+    ("Entity", "am_entities", Scoped::Repository),
+    ("Episode", "gf_episodes", Scoped::Repository),
+    ("EpisodeLabel", "gf_episode_labels", Scoped::WorkspaceProp),
+    ("Event", "repo_events", Scoped::Repository),
+    ("EvidenceLink", "repo_evidence_links", Scoped::Repository),
+    ("File", "repo_heads", Scoped::Repository),
+    ("ForgottenSource", "am_forgotten_sources", Scoped::Connector),
+    ("Folder", "repo_folders", Scoped::Repository),
+    ("Group", "am_groups", Scoped::WorkspaceId),
+    ("GroupMember", "am_group_members", Scoped::WorkspaceId),
+    ("HeldOut", "gf_heldout", Scoped::Repository),
+    ("Hint", "gf_hints", Scoped::Repository),
+    ("Hyperedge", "gf_hyperedges", Scoped::Repository),
+    ("IdentityAudit", "am_identity_audit", Scoped::WorkspaceId),
+    ("Job", "am_jobs", Scoped::Repository),
+    ("LanguageServer", "am_language_servers", Scoped::Global),
+    ("Member", "am_members", Scoped::WorkspaceId),
+    ("Memory", "repo_memories", Scoped::Repository),
+    ("MemoryRevision", "repo_memory_revisions", Scoped::OfMemory),
+    ("MentalModel", "am_observer_reflections", Scoped::Repository),
+    ("ModelCache", "am_model_cache", Scoped::Repository),
+    ("ModelCall", "am_model_calls", Scoped::Repository),
+    ("ModelProfile", "am_model_profiles", Scoped::Global),
+    ("Observation", "am_observer_notes", Scoped::Repository),
+    ("OAuthAccount", "am_oauth_accounts", Scoped::WorkspaceId),
+    ("OAuthPending", "am_oauth_pending", Scoped::WorkspaceId),
+    ("Object", "repo_objects", Scoped::Repository),
+    ("ObservationCheckpoint", "gf_doc_link_checkpoints", Scoped::Repository),
+    ("Outcome", "gf_outcomes", Scoped::Repository),
+    ("OverlayAliasProposal", "gf_alias_proposals", Scoped::Repository),
+    ("OverlayCommunity", "gf_communities", Scoped::Repository),
+    ("Parse", "repo_parses", Scoped::Repository),
+    ("PreparationStep", "am_preparation_steps", Scoped::Repository),
+    ("ProductPolicy", "am_product_policy", Scoped::WorkspaceId),
+    ("ProjectionCleanup", "am_projection_cleanup", Scoped::RepositoryIn("scope")),
+    ("ProjectionGroup", "gf_projection_groups", Scoped::Repository),
+    ("ProviderEmail", "am_provider_emails", Scoped::WorkspaceId),
+    ("ProviderIdentity", "am_provider_identities", Scoped::WorkspaceId),
+    ("QueryCache", "am_query_cache", Scoped::Repository),
+    ("ReleaseSeen", "am_release_seen", Scoped::Global),
+    ("Report", "am_reports", Scoped::Repository),
+    ("ReportTiming", "gf_report_timings", Scoped::Repository),
+    ("RepoAccess", "gf_repo_access", Scoped::WorkspaceProp),
+    ("Reservation", "am_call_reservations", Scoped::Repository),
+    ("Review", "reviews", Scoped::WorkspaceId),
+    ("Run", "repo_runs", Scoped::Repository),
+    ("Secret", "am_secrets", Scoped::WorkspaceId),
+    ("Served", "gf_served", Scoped::Repository),
+    ("Snapshot", "repo_snapshots", Scoped::Repository),
+    ("Source", "sources", Scoped::WorkspaceId),
+    ("SourcePermission", "am_source_permissions", Scoped::Connector),
+    ("Stale", "gf_stale", Scoped::WorkspaceProp),
+    ("Symbol", "gf_nodes", Scoped::Repository),
+    ("SymbolMove", "gf_symbol_moves", Scoped::Repository),
+    ("SymbolVersion", "gf_nodes versions", Scoped::Repository),
+    ("Sync", "repo_syncs", Scoped::Repository),
+    ("TeamAudit", "am_team_audit", Scoped::WorkspaceId),
+    ("Test", "gf_test_coverage", Scoped::Repository),
+    ("ToolEvent", "repo_tool_events", Scoped::Repository),
+    ("Usage", "am_usage", Scoped::WorkspaceId),
+    ("WorkState", "am_work_state", Scoped::Repository),
+    ("Workspace", "workspaces", Scoped::Own),
+];
+
+/// The legacy table name receipts report a label as.
+fn table_of(label: &str) -> &str {
+    LABELS
+        .iter()
+        .find(|(l, _, _)| *l == label)
+        .map_or(label, |(_, t, _)| t)
 }
-/// Caches whose rows depend on when invalidation happened, not only on the
+
+/// How `label` is scoped (catalog-declared), `Global` when undeclared.
+fn scoping(label: &str) -> Scoped {
+    LABELS
+        .iter()
+        .find(|(l, _, _)| *l == label)
+        .map_or(Scoped::Global, |(_, _, s)| *s)
+}
+
+/// The labels kept by design: the installed extensions' (for example a team
+/// audit trail) and the commercial edition's team audit trail when this store
+/// has it and no extension named it ([`crate::store_compat`]), then the
+/// core's. One store therefore lists the same labels in every edition.
+fn retained(db: Graph) -> Result<Vec<&'static str>> {
+    let mut labels = crate::extension::installed().retained_tables();
+    for label in crate::store_compat::RETAINED_TABLES {
+        let label = known_label(label);
+        if !labels.contains(&label) && present(db, label)? {
+            labels.push(label);
+        }
+    }
+    labels.extend_from_slice(RETAINED);
+    Ok(labels)
+}
+
+/// The history labels: the installed extensions' (for example sign-in
+/// attempts and browser sessions) and the commercial edition's team history
+/// labels that this store has and no extension named
+/// ([`crate::store_compat`]), then the core's.
+fn history(db: Graph) -> Result<Vec<&'static str>> {
+    let mut labels = crate::extension::installed().history_tables();
+    for label in crate::store_compat::HISTORY_TABLES {
+        let label = known_label(label);
+        if !labels.contains(&label) && present(db, label)? {
+            labels.push(label);
+        }
+    }
+    labels.extend_from_slice(HISTORY);
+    Ok(labels)
+}
+
+/// A legacy table name as its label, when the catalog renames it.
+fn known_label(name: &'static str) -> &'static str {
+    LABELS
+        .iter()
+        .find(|(_, t, _)| *t == name)
+        .map_or(name, |(l, _, _)| l)
+}
+
+/// Whether the store holds any node of `label` (presence probe; an empty
+/// label says nothing either way, state contract v2).
+fn present(db: Graph, label: &str) -> Result<bool> {
+    Ok(one(
+        db,
+        "MATCH (n:$($label)) RETURN 1 AS x LIMIT 1",
+        gparams([("label", json!(label))]),
+    )?
+    .is_some())
+}
+
+/// Caches whose entries depend on when invalidation happened, not only on the
 /// sources. Excluded from state equality; forgetting removes every entry
 /// computed while the documents were visible.
-const CACHES: &[&str] = &["am_model_cache", "am_query_cache"];
+const CACHES: &[&str] = &["ModelCache", "QueryCache"];
 /// Where a project's folders are on this machine: the folder
 /// aliases a local sync records, with canonical paths. Location, not
 /// content: excluded from state equality, so two stores that hold the same
 /// content digest equally wherever their folders are. Residue scans still
 /// read them, and they go with their project.
-const LOCATIONS: &[&str] = &["repo_folders"];
-/// Sync counters: they count imports, not content.
+const LOCATIONS: &[&str] = &["Folder"];
+/// Sync counters: they count imports, not content (label, property).
 const COUNTERS: &[(&str, &str)] = &[
-    ("am_connectors", "generation"),
-    ("am_connectors", "cursor"),
-    ("am_connector_docs", "generation"),
-    ("am_source_permissions", "generation"),
+    ("Connector", "generation"),
+    ("Connector", "cursor"),
+    ("ConnectorDoc", "generation"),
+    ("SourcePermission", "generation"),
 ];
 /// Artifacts whose input may include any document visible when they were
-/// computed, with the column that dates them. Rows dated at or after the
-/// first moment the forgotten documents were visible are removed.
+/// computed, with the property that dates them (receipt name, label,
+/// dating property). Nodes dated at or after the first moment the forgotten
+/// documents were visible are removed.
 const SINCE_VISIBLE: &[(&str, &str, &str)] = &[
-    ("model_cache", "am_model_cache", "created_at"),
-    ("preparation_steps", "am_preparation_steps", "created_at"),
-    ("reports", "am_reports", "created_at"),
-    ("communities", "am_communities", "created_at"),
-    ("jobs", "am_jobs", "created_at"),
-    ("events", "repo_events", "created_at"),
-    ("alias_proposals", "am_alias_proposals", "created_at"),
-    ("served", "gf_served", "created_at"),
-    ("outcomes", "gf_outcomes", "created_at"),
-    ("hints", "gf_hints", "updated_at"),
-    ("anchors", "gf_anchor_edges", "created_at"),
-    ("overlay_communities", "gf_communities", "created_at"),
-    ("overlay_aliases", "gf_alias_proposals", "created_at"),
+    ("model_cache", "ModelCache", "created_at"),
+    ("preparation_steps", "PreparationStep", "created_at"),
+    ("reports", "Report", "created_at"),
+    ("communities", "Community", "created_at"),
+    ("jobs", "Job", "created_at"),
+    ("events", "Event", "created_at"),
+    ("alias_proposals", "AliasProposal", "created_at"),
+    ("served", "Served", "created_at"),
+    ("outcomes", "Outcome", "created_at"),
+    ("hints", "Hint", "updated_at"),
+    ("anchors", "AnchorEdge", "created_at"),
+    ("overlay_communities", "OverlayCommunity", "created_at"),
+    ("overlay_aliases", "OverlayAliasProposal", "created_at"),
 ];
 
 /// What one forget request covers: every document of a connector, or named
@@ -240,199 +434,222 @@ pub fn document_hash(connector: &str, document: &str) -> String {
 /// Most documents one forget request (and one receipt) names.
 pub const MAX_SCOPE_DOCUMENTS: usize = MAX_DOCUMENTS;
 
-/// Whether an incoming connector document was forgotten earlier.
-pub(crate) fn forgotten(db: &Connection, connector: &str, document: &str) -> Result<bool> {
+/// Whether an incoming connector document was forgotten earlier. Legacy
+/// ingestion path: the connectors module still writes and consults the SQL
+/// tombstones table; it migrates to `ForgottenSource` nodes with the
+/// connectors module.
+pub(crate) fn forgotten(
+    db: &rusqlite::Connection,
+    connector: &str,
+    document: &str,
+) -> Result<bool> {
     let session = crate::capture::document_session_marker(document)
         .map(|marker| tombstone(connector, &marker));
-    Ok(one(
+    Ok(crate::store::one(
         db,
         "SELECT 1 AS yes FROM am_forgotten_sources WHERE connector_id=? AND id_hash IN (?,?) LIMIT 1",
-        params![connector, tombstone(connector, document), session],
+        rusqlite::params![connector, tombstone(connector, document), session],
     )?
     .is_some())
 }
 
 /// Block a connector document id before it exists (the later turns of a
 /// forgotten agent session) with the same one-way tombstone a forgotten
-/// document leaves, so no identifier is kept.
-pub(crate) fn block(db: &Connection, connector: &str, document: &str) -> Result<()> {
+/// document leaves, so no identifier is kept. Legacy SQL path; migrates with
+/// the connectors module.
+pub(crate) fn block(db: &rusqlite::Connection, connector: &str, document: &str) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-        params![connector, tombstone(connector, document), now()],
+        rusqlite::params![connector, tombstone(connector, document), now()],
     )?;
     Ok(())
 }
 
-struct Table {
-    name: String,
-    text: Vec<String>,
-    columns: BTreeSet<String>,
+/// The graph store of this data directory (`<dir>/reviews.graph`), opened
+/// beside the SQLite store while the migration runs (docs/store-api.md:
+/// "beside, not instead of"). Opening applies the schema idempotently.
+pub(crate) fn graph_store(store: &Store) -> Result<GraphStore> {
+    GraphStore::open(store.directory.join("reviews.graph"))
 }
 
-fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// Query parameters for one statement, from JSON pairs.
+fn gparams(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> store_graph::Params {
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), store_graph::json_to_value(&v)))
+        .collect()
 }
 
-fn count(db: &Connection, sql: &str, arguments: impl rusqlite::Params) -> Result<usize> {
-    Ok(db.query_row(sql, arguments, |r| r.get::<_, i64>(0))? as usize)
+use store_graph::{one, rows};
+
+/// The count a query returns (`RETURN count(…) AS n`).
+fn counted(db: Graph, cypher: &str, params: store_graph::Params) -> Result<usize> {
+    Ok(one(db, cypher, params)?
+        .and_then(|r| r["n"].as_i64())
+        .unwrap_or(0) as usize)
 }
 
-/// Rowids of the rows a query returns (`SELECT rowid, value …`) whose value
-/// satisfies `keep`.
-fn select_rowids(
-    db: &Connection,
-    sql: &str,
-    arguments: impl rusqlite::Params,
-    keep: impl Fn(&str) -> bool,
-) -> Result<Vec<i64>> {
-    let mut statement = db.prepare(sql)?;
-    let mut found = statement.query(arguments)?;
-    let mut out = Vec::new();
-    while let Some(row) = found.next()? {
-        let value: Option<String> = row.get(1)?;
-        if value.as_deref().is_some_and(&keep) {
-            out.push(row.get(0)?);
-        }
-    }
-    Ok(out)
-}
-
-fn delete_rowids(db: &Connection, table: &str, rowids: &[i64]) -> Result<usize> {
-    for rowid in rowids {
-        db.execute(&format!("DELETE FROM {table} WHERE rowid=?"), [rowid])?;
-    }
-    Ok(rowids.len())
-}
-
-/// Every ordinary table with its text columns. FTS indexes (derived from
-/// repository files only) and the receipts themselves are excluded.
-fn tables(db: &Connection) -> Result<Vec<Table>> {
-    let all = rows(
+/// The graph's labels, including any the catalog does not declare (another
+/// edition's): residue is reported, never hidden. Catalog labels come first,
+/// in catalog order, then undeclared ones by name; the receipts label itself
+/// is never part of a scan.
+fn catalog(db: Graph) -> Result<Vec<String>> {
+    let mut labels: Vec<String> = LABELS.iter().map(|(l, _, _)| l.to_string()).collect();
+    for found in rows(
         db,
-        "SELECT name,coalesce(sql,'') AS sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        [],
-    )?;
-    let virtual_tables: Vec<&str> = all
+        "MATCH (n) UNWIND labels(n) AS label RETURN DISTINCT label",
+        store_graph::Params::new(),
+    )? {
+        let label = s(&found, "label");
+        if label != RECEIPTS && !labels.iter().any(|l| l == label) {
+            labels.push(label.to_string());
+        }
+    }
+    Ok(labels)
+}
+
+/// Ids of the project's connectors (the scoping path of
+/// [`Scoped::Connector`] labels).
+fn connectors_of(db: Graph, repository: &str) -> Result<Vec<String>> {
+    Ok(rows(
+        db,
+        "MATCH (c:Connector {repository_id: $repo}) RETURN c.id AS id",
+        gparams([("repo", json!(repository))]),
+    )?
+    .iter()
+    .map(|r| s(r, "id").to_string())
+    .collect())
+}
+
+/// The nodes of `label` in scope (project `repository`, workspace
+/// `workspace`), as JSON property maps (`_id`/`_labels` included). `Global`
+/// labels are scanned whole: residue is reported, never hidden.
+fn nodes(db: Graph, label: &str, repository: &str, workspace: &str) -> Result<Vec<Value>> {
+    let run = |db: Graph, pattern: &str, predicate: Option<String>, params: store_graph::Params| {
+        let cypher = format!(
+            "{pattern}{} RETURN n",
+            predicate.map_or_else(String::new, |p| format!(" WHERE {p}"))
+        );
+        Ok(rows(db, &cypher, params)?
+            .into_iter()
+            .map(|r| r["n"].clone())
+            .collect::<Vec<_>>())
+    };
+    let label_p = || ("label", json!(label));
+    let repo_p = || ("repo", json!(repository));
+    let ws_p = || ("ws", json!(workspace));
+    match scoping(label) {
+        Scoped::Repository => run(
+            db,
+            "MATCH (n:$($label))",
+            Some("n.repository_id = $repo".into()),
+            gparams([label_p(), repo_p()]),
+        ),
+        Scoped::RepositoryIn(property) => run(
+            db,
+            "MATCH (n:$($label))",
+            Some(format!("n.`{property}` = $repo")),
+            gparams([label_p(), repo_p()]),
+        ),
+        Scoped::WorkspaceId => run(
+            db,
+            "MATCH (n:$($label))",
+            Some("n.workspace_id = $ws".into()),
+            gparams([label_p(), ws_p()]),
+        ),
+        Scoped::WorkspaceProp => run(
+            db,
+            "MATCH (n:$($label))",
+            Some("n.workspace = $ws".into()),
+            gparams([label_p(), ws_p()]),
+        ),
+        Scoped::Own => run(
+            db,
+            "MATCH (n:$($label))",
+            Some("n.id = $scope".into()),
+            gparams([
+                label_p(),
+                (
+                    "scope",
+                    json!(if label == "Workspace" { workspace } else { repository }),
+                ),
+            ]),
+        ),
+        Scoped::Connector => {
+            let connectors = connectors_of(db, repository)?;
+            run(
+                db,
+                "MATCH (n:$($label))",
+                Some("n.connector_id IN $connectors".into()),
+                gparams([label_p(), ("connectors", json!(connectors))]),
+            )
+        }
+        Scoped::OfMemory => run(
+            db,
+            "MATCH (n:$($label))-[:REVISION_OF]->(:Memory {repository_id: $repo})",
+            None,
+            gparams([label_p(), repo_p()]),
+        ),
+        Scoped::Cross => run(
+            db,
+            "MATCH (n:$($label))",
+            Some("(n.source_repository_id = $repo OR n.target_repository_id = $repo)".into()),
+            gparams([label_p(), repo_p()]),
+        ),
+        Scoped::Global => run(db, "MATCH (n:$($label))", None, gparams([label_p()])),
+    }
+}
+
+/// A node's text: its string properties, concatenated (engine `_`-prefixed
+/// metadata excluded).
+fn text_of(node: &Value) -> String {
+    node.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .filter_map(|(_, v)| v.as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Nodes whose text contains any pattern.
+fn matching(nodes: &[Value], patterns: &[String]) -> usize {
+    if patterns.is_empty() {
+        return 0;
+    }
+    nodes
         .iter()
-        .filter(|t| {
-            s(t, "sql")
-                .trim_start()
-                .to_ascii_uppercase()
-                .starts_with("CREATE VIRTUAL TABLE")
+        .filter(|n| {
+            let text = text_of(n);
+            patterns.iter().any(|p| text.contains(p.as_str()))
         })
-        .map(|t| s(t, "name"))
-        .collect();
-    let mut out = Vec::new();
-    for table in &all {
-        let name = s(table, "name");
-        if name == RECEIPTS
-            || virtual_tables
-                .iter()
-                .any(|v| name == *v || name.starts_with(&format!("{v}_")))
-        {
-            continue;
-        }
-        let mut entry = Table {
-            name: name.to_string(),
-            text: vec![],
-            columns: BTreeSet::new(),
-        };
-        for column in rows(db, "SELECT name,type FROM pragma_table_info(?)", [name])? {
-            let kind = s(&column, "type").to_ascii_uppercase();
-            if kind.is_empty()
-                || ["TEXT", "CHAR", "CLOB", "JSON"]
-                    .iter()
-                    .any(|k| kind.contains(k))
-            {
-                entry.text.push(s(&column, "name").to_string());
-            }
-            entry.columns.insert(s(&column, "name").to_string());
-        }
-        out.push(entry);
-    }
-    Ok(out)
+        .count()
 }
 
-/// The rows of `table` a scan may read: one repository, else one workspace.
-fn filter<'a>(
-    table: &Table,
-    repository: &'a str,
-    workspace: &'a str,
-) -> Option<(&'static str, &'a str)> {
-    if table.columns.contains("repository_id") {
-        Some(("repository_id", repository))
-    } else if table.columns.contains("workspace_id") {
-        Some(("workspace_id", workspace))
-    } else if table.columns.contains("workspace") {
-        Some(("workspace", workspace))
-    } else {
-        None
-    }
-}
-
-/// `SELECT … WHERE (instr(col, pattern) > 0 OR …) [AND scope]` for a table's
-/// text columns.
-fn instr_query(
-    table: &Table,
-    select: &str,
-    patterns: &[String],
-    filter: Option<(&str, &str)>,
-) -> (String, Vec<String>) {
-    let terms: Vec<String> = table
-        .text
-        .iter()
-        .flat_map(|c| (1..=patterns.len()).map(move |i| format!("instr({},?{i})>0", quote(c))))
-        .collect();
-    let mut sql = format!(
-        "SELECT {select} FROM {} WHERE ({})",
-        quote(&table.name),
-        terms.join(" OR ")
-    );
-    let mut values: Vec<String> = patterns.to_vec();
-    if let Some((column, value)) = filter {
-        sql.push_str(&format!(" AND {}=?{}", quote(column), patterns.len() + 1));
-        values.push(value.to_string());
-    }
-    (sql, values)
-}
-
-/// Rows whose text columns contain any pattern.
-fn matching(
-    db: &Connection,
-    table: &Table,
-    patterns: &[String],
-    filter: Option<(&str, &str)>,
-) -> Result<usize> {
-    if table.text.is_empty() || patterns.is_empty() {
-        return Ok(0);
-    }
-    let (sql, values) = instr_query(table, "count(*)", patterns, filter);
-    count(db, &sql, params_from_iter(values))
-}
-
-/// Exact references to deleted ids in every table in scope. Tables holding
+/// Exact references to deleted ids on every label in scope. Labels holding
 /// connectors' originals are checked structurally instead.
 fn references(
-    db: &Connection,
-    tables: &[Table],
+    db: Graph,
+    labels: &[String],
     patterns: &[String],
     (repository, workspace): (&str, &str),
     skip: &[&str],
-    skip_repository_tables: bool,
+    skip_repository_labels: bool,
 ) -> Result<Value> {
     let mut scanned = 0;
     let mut matches = Vec::new();
-    for table in tables {
-        if skip.contains(&table.name.as_str())
-            || table.columns.contains("connector_id")
-            || (skip_repository_tables && table.columns.contains("repository_id"))
+    for label in labels {
+        if skip.contains(&label.as_str())
+            || skip.contains(&table_of(label))
+            || scoping(label) == Scoped::Connector
+            || (skip_repository_labels && scoping(label) == Scoped::Repository)
         {
             continue;
         }
         scanned += 1;
-        let rows = matching(db, table, patterns, filter(table, repository, workspace))?;
-        if rows > 0 {
-            matches.push(json!({"table":table.name,"rows":rows}));
+        let found = matching(&nodes(db, label, repository, workspace)?, patterns);
+        if found > 0 {
+            matches.push(json!({"table":table_of(label),"rows":found}));
         }
     }
     Ok(json!({"tables_scanned":scanned,"matches":matches}))
@@ -441,8 +658,8 @@ fn references(
 /// References to forgotten document ids. A substring hit counts unless it is
 /// the start of a longer id of a document that still exists (`a` inside `a:b`).
 fn document_references(
-    db: &Connection,
-    tables: &[Table],
+    db: Graph,
+    labels: &[String],
     scope: &Scope,
     existing: &BTreeSet<String>,
     (repository, workspace): (&str, &str),
@@ -450,29 +667,17 @@ fn document_references(
     let ids = scope.sources();
     let mut scanned = 0;
     let mut matches = Vec::new();
-    for table in tables {
-        if table.columns.contains("connector_id") || table.text.is_empty() {
+    for label in labels {
+        if scoping(label) == Scoped::Connector {
             continue;
         }
         scanned += 1;
-        let joined = table
-            .text
+        let found = nodes(db, label, repository, workspace)?
             .iter()
-            .map(|c| format!("coalesce(CAST({} AS TEXT),'')", quote(c)))
-            .collect::<Vec<_>>()
-            .join("||char(10)||");
-        let (sql, values) = instr_query(table, &joined, &ids, filter(table, repository, workspace));
-        let mut statement = db.prepare(&sql)?;
-        let mut found = statement.query(params_from_iter(values))?;
-        let mut rows = 0;
-        while let Some(row) = found.next()? {
-            let text: String = row.get(0)?;
-            if names_any(&text, &ids, existing) {
-                rows += 1;
-            }
-        }
-        if rows > 0 {
-            matches.push(json!({"table":table.name,"rows":rows}));
+            .filter(|n| names_any(&text_of(n), &ids, existing))
+            .count();
+        if found > 0 {
+            matches.push(json!({"table":table_of(label),"rows":found}));
         }
     }
     Ok(json!({"tables_scanned":scanned,"matches":matches}))
@@ -489,33 +694,30 @@ fn names_any(text: &str, ids: &[String], existing: &BTreeSet<String>) -> bool {
     })
 }
 
-/// Verbatim excerpts of deleted text in this project's derived tables.
+/// Verbatim excerpts of deleted text in this project's derived labels.
 fn verbatim(
-    db: &Connection,
-    tables: &[Table],
+    db: Graph,
+    labels: &[String],
     fingerprints: &[String],
     repository: &str,
 ) -> Result<Value> {
     let mut scanned = 0;
     let mut matches = Vec::new();
-    for table in tables {
-        if !table.columns.contains("repository_id")
-            || table.columns.contains("connector_id")
-            || INDEPENDENT.contains(&table.name.as_str())
-        {
+    for label in labels {
+        if scoping(label) != Scoped::Repository || INDEPENDENT.contains(&label.as_str()) {
             continue;
         }
         scanned += 1;
-        let rows = matching(db, table, fingerprints, Some(("repository_id", repository)))?;
-        if rows > 0 {
-            matches.push(json!({"table":table.name,"rows":rows}));
+        let found = matching(&nodes(db, label, repository, "")?, fingerprints);
+        if found > 0 {
+            matches.push(json!({"table":table_of(label),"rows":found}));
         }
     }
     Ok(json!({"fingerprints":fingerprints.len(),"tables_scanned":scanned,"matches":matches}))
 }
 
 /// A middle window of the longest run of characters that no JSON encoder
-/// escapes, so a copy is found inside serialized columns too.
+/// escapes, so a copy is found inside serialized properties too.
 fn excerpt(content: &str) -> Option<String> {
     let safe = |c: char| c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\';
     let mut best = (0, 0);
@@ -540,41 +742,91 @@ fn excerpt(content: &str) -> Option<String> {
         .then(|| window.to_string())
 }
 
-fn secure_delete(db: &Connection) -> Result<bool> {
-    Ok(db.query_row("PRAGMA secure_delete", [], |r| r.get::<_, i64>(0))? == 1)
-}
-
-fn external(db: &Connection, repository: &str) -> Result<Vec<Value>> {
-    rows(
+/// Nodes of `label` matching `predicate` whose `key` property passes `keep` —
+/// counted, and with `delete` also detach-deleted (the label-scoped removal
+/// walk). `key` is a module constant, so interpolating it (dotted properties
+/// backtick-quoted) is safe.
+fn walk(
+    db: Graph,
+    label: &str,
+    predicate: &str,
+    key: &str,
+    params: store_graph::Params,
+    keep: impl Fn(&str) -> bool,
+    delete: bool,
+) -> Result<usize> {
+    let mut params = params;
+    params.insert("label".into(), store_graph::json_to_value(&json!(label)));
+    let found: Vec<String> = rows(
         db,
-        "SELECT id,kind,revision,state FROM am_projection_cleanup WHERE scope=? ORDER BY kind,id",
-        [repository],
-    )
-}
-
-/// A captured external cleanup is done once its row completed at (or after)
-/// the captured revision; revisions only grow.
-fn external_now(db: &Connection, captured: &Value) -> Result<(Vec<Value>, bool)> {
-    let mut pending = false;
-    let mut out = Vec::new();
-    for cleanup in captured.as_array().into_iter().flatten() {
-        let row = one(
-            db,
-            "SELECT revision,state,error FROM am_projection_cleanup WHERE id=?",
-            [s(cleanup, "id")],
+        &format!("MATCH (n:$($label)) WHERE {predicate} RETURN n.`{key}` AS key"),
+        params.clone(),
+    )?
+    .into_iter()
+    .filter_map(|r| r["key"].as_str().map(str::to_string))
+    .filter(|v| keep(v))
+    .collect();
+    if delete && !found.is_empty() {
+        params.insert("keys".into(), store_graph::json_to_value(&json!(found)));
+        db.query_with_params(
+            &format!("MATCH (n:$($label)) WHERE {predicate} AND n.`{key}` IN $keys DETACH DELETE n"),
+            params,
         )?;
-        let done = row.as_ref().is_some_and(|r| {
-            r["state"] == "complete" && r["revision"].as_i64() >= cleanup["revision"].as_i64()
-        });
-        pending |= !done;
-        out.push(json!({"id":cleanup["id"],"kind":cleanup["kind"],"captured_revision":cleanup["revision"],
-            "state":row.as_ref().map_or(json!("unknown"),|r|r["state"].clone()),"error":row.map_or(Value::Null,|r|r["error"].clone()),"complete":done}));
     }
-    Ok((out, pending))
+    Ok(found.len())
 }
 
-fn empty(scan: &Value) -> bool {
-    scan["matches"].as_array().is_some_and(Vec::is_empty)
+/// Delete nodes of `label` matching `predicate`, returning the count.
+fn detach(db: Graph, label: &str, predicate: &str, params: store_graph::Params) -> Result<usize> {
+    let mut params = params;
+    params.insert("label".into(), store_graph::json_to_value(&json!(label)));
+    let found = counted(
+        db,
+        &format!("MATCH (n:$($label)) WHERE {predicate} RETURN count(n) AS n"),
+        params.clone(),
+    )?;
+    if found > 0 {
+        db.query_with_params(
+            &format!("MATCH (n:$($label)) WHERE {predicate} DETACH DELETE n"),
+            params,
+        )?;
+    }
+    Ok(found)
+}
+
+/// Delete nodes by internal id (collected by an earlier scan this
+/// transaction).
+fn detach_ids(db: Graph, label: &str, ids: &[i64]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    db.query_with_params(
+        "MATCH (n:$($label)) WHERE id(n) IN $ids DETACH DELETE n",
+        gparams([("label", json!(label)), ("ids", json!(ids))]),
+    )?;
+    Ok(ids.len())
+}
+
+/// The dependency index's `(:Artifact {kind, id, workspace})
+/// -[:DEPENDS_ON]->(:Source)` entries of one dependent — the graph
+/// counterpart of `invalidation::forget_dependent` (which migrates with the
+/// invalidation module).
+fn forget_dependent(db: Graph, workspace: &str, kind: &str, id: &str) -> Result<()> {
+    db.query_with_params(
+        "MATCH (a:Artifact {workspace: $ws, kind: $kind, id: $id})-[r:DEPENDS_ON]->() DELETE r",
+        gparams([("ws", json!(workspace)), ("kind", json!(kind)), ("id", json!(id))]),
+    )?;
+    Ok(())
+}
+
+/// Drop the staleness markers of one artifact (the graph counterpart of
+/// `invalidation::clear_stale`).
+fn clear_stale(db: Graph, workspace: &str, kind: &str, id: &str) -> Result<()> {
+    db.query_with_params(
+        "MATCH (s:Stale {workspace: $ws, kind: $kind, id: $id}) DETACH DELETE s",
+        gparams([("ws", json!(workspace)), ("kind", json!(kind)), ("id", json!(id))]),
+    )?;
+    Ok(())
 }
 
 fn cites(data: &str, scope: &Scope) -> bool {
@@ -608,20 +860,18 @@ fn derived(repository: &str, scope: &Scope, kind: &str, id: &str) -> bool {
     }
 }
 
-fn index_edges(
-    db: &Connection,
-    workspace: &str,
-    repository: &str,
-    scope: &Scope,
-) -> Result<Vec<i64>> {
+/// Dependency-index relationship ids (`(:Artifact)-[:DEPENDS_ON]->(:Source)`)
+/// naming or derived from the forgotten documents.
+fn index_edges(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Result<Vec<i64>> {
     let mut out = Vec::new();
     for row in rows(
         db,
-        "SELECT rowid,dependent_kind,dependent_id,source_kind,source_id FROM gf_dependencies WHERE workspace=?",
-        [workspace],
+        "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Source) \
+         RETURN id(r) AS rid, a.kind AS dependent_kind, a.id AS dependent_id, \
+         src.kind AS source_kind, src.id AS source_id",
+        gparams([("ws", json!(workspace))]),
     )? {
-        if (row["source_kind"] == crate::invalidation::DOCUMENT
-            && scope.source(s(&row, "source_id")))
+        if (row["source_kind"] == crate::invalidation::DOCUMENT && scope.source(s(&row, "source_id")))
             || derived(
                 repository,
                 scope,
@@ -629,34 +879,32 @@ fn index_edges(
                 s(&row, "dependent_id"),
             )
         {
-            out.push(row["rowid"].as_i64().unwrap_or_default());
+            out.push(row["rid"].as_i64().unwrap_or_default());
         }
     }
     Ok(out)
 }
 
-fn index_markers(
-    db: &Connection,
-    workspace: &str,
-    repository: &str,
-    scope: &Scope,
-) -> Result<Vec<i64>> {
+/// Staleness markers (`:Stale` nodes) of artifacts derived from the
+/// forgotten documents.
+fn index_markers(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Result<Vec<i64>> {
     let mut out = Vec::new();
     for row in rows(
         db,
-        "SELECT rowid,kind,id FROM gf_stale WHERE workspace=?",
-        [workspace],
+        "MATCH (s:Stale {workspace: $ws}) RETURN id(s) AS nid, s.kind AS kind, s.id AS id",
+        gparams([("ws", json!(workspace))]),
     )? {
         if derived(repository, scope, s(&row, "kind"), s(&row, "id")) {
-            out.push(row["rowid"].as_i64().unwrap_or_default());
+            out.push(row["nid"].as_i64().unwrap_or_default());
         }
     }
     Ok(out)
 }
 
-/// Rows derived from or naming the forgotten documents, by kind.
+/// Nodes derived from or naming the forgotten documents, by kind. Receipts
+/// keep the legacy table names as keys (`graphicle.deletion.v1`).
 fn source_rows(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -666,94 +914,79 @@ fn source_rows(
     if scope.whole() {
         out.insert(
             "connector",
-            count(
+            counted(
                 db,
-                "SELECT count(*) FROM am_connectors WHERE id=?",
-                [connector],
+                "MATCH (c:Connector {id: $connector}) RETURN count(c) AS n",
+                gparams([("connector", json!(connector))]),
             )?,
         );
     }
-    for (name, table, column) in [
-        ("documents", "am_connector_docs", "id"),
-        ("versions", "am_connector_versions", "id"),
-        ("staged", "am_connector_stage", "id"),
-        ("permissions", "am_source_permissions", "source_id"),
+    for (name, label, key) in [
+        ("documents", "ConnectorDoc", "id"),
+        ("versions", "ConnectorVersion", "id"),
+        ("staged", "ConnectorStage", "id"),
+        ("permissions", "SourcePermission", "source_id"),
     ] {
-        let found = select_rowids(
+        let found = walk(
             db,
-            &format!("SELECT rowid,{column} FROM {table} WHERE connector_id=?"),
-            [connector],
+            label,
+            "n.connector_id = $connector",
+            key,
+            gparams([("connector", json!(connector))]),
             |v| scope.document(v),
+            false,
         )?;
-        out.insert(name, found.len());
+        out.insert(name, found);
     }
-    let per_repository: [(&'static str, &str, Matches); 12] = [
-        (
-            "originals",
-            "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "memories",
-            "SELECT rowid,data FROM repo_memories WHERE repository_id=?",
-            cites,
-        ),
-        (
-            "observer_notes",
-            "SELECT rowid,source_id FROM am_observer_notes WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "observer_reflections",
-            "SELECT rowid,sources FROM am_observer_reflections WHERE repository_id=?",
-            lists,
-        ),
-        (
-            "vectors",
-            "SELECT rowid,identity FROM am_vectors WHERE repository_id=?",
-            |v, sc| sc.passage(v),
-        ),
-        (
-            "document_reads",
-            "SELECT rowid,source_id FROM am_document_reads WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "anchors",
-            "SELECT rowid,json_extract(attributes,'$.document_id') FROM gf_anchor_edges WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "hints",
-            "SELECT rowid,target FROM gf_hints WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        // A forgotten document's mention links and what they
-        // were computed from.
-        (
-            "doc_links",
-            "SELECT rowid,document_id FROM gf_doc_links WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "doc_link_sources",
-            "SELECT rowid,document_id FROM gf_doc_link_sources WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "served",
-            "SELECT rowid,served FROM gf_served WHERE repository_id=?",
-            lists,
-        ),
-        (
-            "outcomes",
-            "SELECT rowid,targets FROM gf_outcomes WHERE repository_id=?",
-            lists,
-        ),
+    let repo = gparams([("repo", json!(repository))]);
+    let per_repository: [(&'static str, &'static str, &'static str, Matches); 9] = [
+        ("originals", "OriginalDocument", "source_id", |v, sc| sc.source(v)),
+        ("memories", "Memory", "data", cites),
+        ("observer_notes", "Observation", "source_id", |v, sc| sc.source(v)),
+        ("observer_reflections", "MentalModel", "sources", lists),
+        ("vectors", "Chunk", "identity", |v, sc| sc.passage(v)),
+        ("document_reads", "DocumentRead", "source_id", |v, sc| sc.source(v)),
+        ("anchors", "AnchorEdge", "attributes.document_id", |v, sc| sc.source(v)),
+        ("hints", "Hint", "target", |v, sc| sc.source(v)),
+        ("doc_links", "DocLink", "document_id", |v, sc| sc.source(v)),
     ];
-    for (name, sql, keep) in per_repository {
-        let found = select_rowids(db, sql, [repository], |v| keep(v, scope))?;
-        out.insert(name, found.len());
+    for (name, label, key, keep) in per_repository {
+        let found = walk(
+            db,
+            label,
+            "n.repository_id = $repo",
+            key,
+            repo.clone(),
+            |v| keep(v, scope),
+            false,
+        )?;
+        out.insert(name, found);
+    }
+    out.insert(
+        "doc_link_sources",
+        walk(
+            db,
+            "DocLinkSource",
+            "n.repository_id = $repo",
+            "document_id",
+            repo.clone(),
+            |v| scope.source(v),
+            false,
+        )?,
+    );
+    // Served-evidence and outcome records whose lists name the documents
+    // (the lists are list-of-scalar properties; older writers stringified
+    // them — both read).
+    for (name, label, property) in [("served", "Served", "served"), ("outcomes", "Outcome", "targets")] {
+        let found = nodes(db, label, repository, workspace)?
+            .iter()
+            .filter(|n| match &n[property] {
+                Value::Array(items) => items.iter().any(|i| i.as_str().is_some_and(|i| scope.source(i))),
+                Value::String(text) => lists(text, scope),
+                _ => false,
+            })
+            .count();
+        out.insert(name, found);
     }
     out.insert(
         "dependency_edges",
@@ -766,24 +999,31 @@ fn source_rows(
     Ok(out)
 }
 
-/// Rows of the artifacts listed in [`SINCE_VISIBLE`] dated from `since` (and
-/// before `until`, when given).
+/// Nodes of the artifacts listed in [`SINCE_VISIBLE`] dated from `since`
+/// (and before `until`, when given).
 fn since_visible(
-    db: &Connection,
+    db: Graph,
     repository: &str,
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<BTreeMap<&'static str, usize>> {
     let mut out = BTreeMap::new();
-    for (name, table, column) in SINCE_VISIBLE {
+    for (name, label, column) in SINCE_VISIBLE {
         let n = match since {
             None => 0,
-            Some(since) => count(
+            Some(since) => counted(
                 db,
                 &format!(
-                    "SELECT count(*) FROM {table} WHERE repository_id=?1 AND {column}>=?2 AND (?3 IS NULL OR {column}<?3)"
+                    "MATCH (n:$($label)) WHERE n.repository_id = $repo \
+                     AND n.`{column}` >= $since AND ($until IS NULL OR n.`{column}` < $until) \
+                     RETURN count(n) AS n"
                 ),
-                params![repository, since, until],
+                gparams([
+                    ("label", json!(label)),
+                    ("repo", json!(repository)),
+                    ("since", json!(since)),
+                    ("until", until.map_or(Value::Null, |u| json!(u))),
+                ]),
             )?,
         };
         out.insert(*name, n);
@@ -812,7 +1052,8 @@ impl Plan {
     pub fn sources(&self) -> usize {
         self.sources
     }
-    /// Rows forgetting would remove, per table (originals and single-source artifacts).
+    /// Rows forgetting would remove, per label (originals and single-source
+    /// artifacts).
     pub fn rows(&self) -> &BTreeMap<&'static str, usize> {
         &self.rows
     }
@@ -822,19 +1063,16 @@ impl Plan {
     }
 }
 
-pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
+pub fn plan(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
     let prefix = scope.prefix();
     let mut sources = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
-    for table in [
-        "am_connector_docs",
-        "am_connector_versions",
-        "am_connector_stage",
-    ] {
+    for label in ["ConnectorDoc", "ConnectorVersion", "ConnectorStage"] {
         for row in rows(
             db,
-            &format!("SELECT id,sha256,content FROM {table} WHERE connector_id=?"),
-            [&scope.connector],
+            "MATCH (d:$($label) {connector_id: $connector}) \
+             RETURN d.id AS id, d.sha256 AS sha256, d.content AS content",
+            gparams([("label", json!(label)), ("connector", json!(scope.connector))]),
         )? {
             if !scope.document(s(&row, "id")) {
                 continue;
@@ -850,8 +1088,8 @@ pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -
     }
     for row in rows(
         db,
-        "SELECT source_id,sha256 FROM am_original_documents WHERE repository_id=?",
-        [repository],
+        "MATCH (o:OriginalDocument {repository_id: $repo}) RETURN o.source_id AS source_id, o.sha256 AS sha256",
+        gparams([("repo", json!(repository))]),
     )? {
         if scope.source(s(&row, "source_id")) {
             sources.insert((
@@ -863,8 +1101,8 @@ pub fn plan(db: &Connection, workspace: &str, repository: &str, scope: &Scope) -
     let mut since: Option<String> = None;
     for row in rows(
         db,
-        "SELECT id,created_at FROM am_connector_versions WHERE connector_id=?",
-        [&scope.connector],
+        "MATCH (v:ConnectorVersion {connector_id: $connector}) RETURN v.id AS id, v.created_at AS created_at",
+        gparams([("connector", json!(scope.connector))]),
     )? {
         let stamp = s(&row, "created_at");
         if scope.document(s(&row, "id")) && since.as_deref().is_none_or(|first| stamp < first) {
@@ -902,37 +1140,62 @@ fn drafted_while_visible(record: &Value, since: &str) -> bool {
             .contains(&s(&record["data"], "authority"))
 }
 
+/// A memory record as the memory pipeline stores it: `data` holds the
+/// memory's JSON (a stringified property — its keys are document-specific,
+/// so it is not flattened; engine v0.12.2 stores no map-valued properties).
+fn memory_record(row: &Value) -> Result<Value> {
+    let mut record = json!({
+        "id": row["id"], "state": row["state"], "created_at": row["created_at"],
+        "data": row["data"],
+    });
+    decode(&mut record, "data")?;
+    Ok(record)
+}
+
+/// The dependency-index and embedding cleanup that follows a removed memory
+/// (the passage identity `memory:<id>` and its index key).
+fn forget_memory_artifacts(db: Graph, workspace: &str, repository: &str, identifier: &str) -> Result<()> {
+    forget_dependent(db, workspace, crate::invalidation::MEMORY, identifier)?;
+    clear_stale(db, workspace, crate::invalidation::MEMORY, identifier)?;
+    let key = format!("{repository}:memory:{identifier}");
+    forget_dependent(db, workspace, crate::invalidation::EMBEDDING, &key)?;
+    clear_stale(db, workspace, crate::invalidation::EMBEDDING, &key)?;
+    Ok(())
+}
+
 /// Memories citing the documents in any revision, model drafts written while
 /// they were visible, and memories that depend on either.
 fn forget_memories(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     scope: &Scope,
     since: Option<&str>,
 ) -> Result<BTreeSet<String>> {
-    use crate::invalidation::{self, EMBEDDING, MEMORY};
-    let mut records = rows(
+    let mut records = Vec::new();
+    for row in rows(
         db,
-        "SELECT * FROM repo_memories WHERE repository_id=?",
-        [repository],
-    )?;
+        "MATCH (m:Memory {repository_id: $repo}) \
+         RETURN m.id AS id, m.state AS state, m.created_at AS created_at, m.data AS data",
+        gparams([("repo", json!(repository))]),
+    )? {
+        records.push(memory_record(&row)?);
+    }
     let mut removed = BTreeSet::new();
     let direct = |data: &Value| {
         data["native_sources"]
             .as_object()
             .is_some_and(|d| d.keys().any(|k| scope.source(k)))
     };
-    for record in &mut records {
-        decode(record, "data")?;
+    for record in &records {
         let identifier = s(record, "id").to_string();
         if direct(&record["data"]) || since.is_some_and(|t| drafted_while_visible(record, t)) {
             removed.insert(identifier.clone());
         }
         for revision in rows(
             db,
-            "SELECT data FROM repo_memory_revisions WHERE memory_id=?",
-            [&identifier],
+            "MATCH (r:MemoryRevision)-[:REVISION_OF]->(:Memory {id: $id}) RETURN r.data AS data",
+            gparams([("id", json!(identifier))]),
         )? {
             let mut prior: Value = serde_json::from_str(s(&revision, "data"))?;
             decode(&mut prior, "data")?;
@@ -941,6 +1204,7 @@ fn forget_memories(
             }
         }
     }
+    let records = records;
     loop {
         let before = removed.len();
         for record in &records {
@@ -958,48 +1222,42 @@ fn forget_memories(
         }
     }
     for identifier in &removed {
-        db.execute(
-            "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, identifier],
+        // The node takes its revisions, its embedding and every relationship
+        // (claims' ABOUT_MEMORY, symbol PINNED_TO) with it.
+        db.query_with_params(
+            "MATCH (m:Memory {repository_id: $repo, id: $id}) DETACH DELETE m",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
         )?;
-        invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
-        invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
-        let passage = format!("memory:{identifier}");
-        db.execute(
-            "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
-            params![repository, passage],
-        )?;
-        let key = format!("{repository}:{passage}");
-        invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
-        invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
+        forget_memory_artifacts(db, workspace, repository, identifier)?;
     }
     Ok(removed)
 }
 
-/// Derived rows that may name a memory by id: served-evidence records,
-/// outcomes, hints and caches. [`delete_memories`] removes the rows naming a
-/// deleted memory; the rest of each table stays.
-const NAMES_MEMORIES: &[&str] = &[
-    "gf_served",
-    "gf_outcomes",
-    "gf_hints",
-    "am_model_cache",
-    "am_query_cache",
+/// Derived nodes that may name a memory by id: served-evidence records,
+/// outcomes, hints and caches. [`delete_memories`] removes the nodes naming a
+/// deleted memory; the rest of each label stays. (Receipt keys keep the
+/// legacy table names.)
+const NAMES_MEMORIES: &[(&str, &str)] = &[
+    ("gf_served", "Served"),
+    ("gf_outcomes", "Outcome"),
+    ("gf_hints", "Hint"),
+    ("am_model_cache", "ModelCache"),
+    ("am_query_cache", "QueryCache"),
 ];
 
 /// Delete `memory_id` and every visible memory that depends on it — notes
 /// naming it, historical versions targeting it, transitively — with their
-/// revisions and claims (cascaded), vectors, dependency-index entries and
-/// the derived rows ([`NAMES_MEMORIES`]) that name them. Returns the removed
-/// ids and per-table counts; the caller signs [`rows_receipt`].
+/// revisions and claims (cascaded), embeddings, dependency-index entries and
+/// the derived nodes ([`NAMES_MEMORIES`]) that name them. Returns the removed
+/// ids and per-label counts (keyed by the legacy names); the caller signs
+/// [`rows_receipt`].
 pub fn delete_memories(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     memories: &[Value],
     memory_id: &str,
 ) -> Result<(BTreeSet<String>, Value)> {
-    use crate::invalidation::{self, EMBEDDING, MEMORY};
     let mut removed = BTreeSet::from([memory_id.to_string()]);
     loop {
         let before = removed.len();
@@ -1024,36 +1282,34 @@ pub fn delete_memories(
     let mut vectors = 0usize;
     let mut pins = 0usize;
     for identifier in &removed {
-        revisions += count(
+        revisions += counted(
             db,
-            "SELECT count(*) FROM repo_memory_revisions WHERE memory_id=?",
-            [identifier],
+            "MATCH (r:MemoryRevision)-[:REVISION_OF]->(:Memory {id: $id}) RETURN count(r) AS n",
+            gparams([("id", json!(identifier))]),
         )?;
         // The memory's pinned or pending quotes go with it.
-        pins += count(
+        pins += counted(
             db,
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=? AND memory_id=?",
-            params![repository, identifier],
+            "MATCH (:Memory {repository_id: $repo, id: $id})-[r:PINNED_TO]->() RETURN count(r) AS n",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
         )?;
-        claims += count(
+        claims += detach(
             db,
-            "SELECT count(*) FROM am_claims WHERE repository_id=? AND memory_id=?",
-            params![repository, identifier],
+            "Claim",
+            "n.repository_id = $repo AND n.memory_id = $id",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
         )?;
-        db.execute(
-            "DELETE FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, identifier],
+        vectors += counted(
+            db,
+            "MATCH (m:Memory {repository_id: $repo, id: $id}) \
+             WHERE m.embedding IS NOT NULL RETURN count(m) AS n",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
         )?;
-        invalidation::forget_dependent(db, workspace, (MEMORY, identifier))?;
-        invalidation::clear_stale(db, workspace, MEMORY, identifier)?;
-        let passage = format!("memory:{identifier}");
-        vectors += db.execute(
-            "DELETE FROM am_vectors WHERE repository_id=? AND identity=?",
-            params![repository, passage],
+        db.query_with_params(
+            "MATCH (m:Memory {repository_id: $repo, id: $id}) DETACH DELETE m",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
         )?;
-        let key = format!("{repository}:{passage}");
-        invalidation::forget_dependent(db, workspace, (EMBEDDING, &key))?;
-        invalidation::clear_stale(db, workspace, EMBEDDING, &key)?;
+        forget_memory_artifacts(db, workspace, repository, identifier)?;
     }
     counts.insert("repo_memories".to_string(), removed.len());
     counts.insert("repo_memory_revisions".to_string(), revisions);
@@ -1062,271 +1318,341 @@ pub fn delete_memories(
     if pins > 0 {
         counts.insert("gf_symbol_pins".to_string(), pins);
     }
-    let catalog = tables(db)?;
-    for name in NAMES_MEMORIES {
-        let Some(table) = catalog.iter().find(|t| t.name == *name) else {
-            continue;
-        };
-        if table.text.is_empty() {
+    let labels = catalog(db)?;
+    for (legacy, label) in NAMES_MEMORIES {
+        if !labels.iter().any(|l| l == label) {
             continue;
         }
-        let (sql, values) =
-            instr_query(table, "rowid", &keys, filter(table, repository, workspace));
-        let rowids: Vec<i64> = {
-            let mut statement = db.prepare(&sql)?;
-            let found = statement.query_map(params_from_iter(values), |r| r.get::<_, i64>(0))?;
-            found.collect::<std::result::Result<_, _>>()?
-        };
-        let deleted = delete_rowids(db, &quote(name), &rowids)?;
+        let mut ids = Vec::new();
+        for node in nodes(db, label, repository, workspace)? {
+            let text = text_of(&node);
+            if keys.iter().any(|k| text.contains(k.as_str())) {
+                ids.push(node["_id"].as_i64().unwrap_or_default());
+            }
+        }
+        let deleted = detach_ids(db, label, &ids)?;
         if deleted > 0 {
-            counts.insert(name.to_string(), deleted);
+            counts.insert(legacy.to_string(), deleted);
         }
     }
     Ok((removed, json!(counts)))
 }
 
-/// Rows still holding any of the deleted memories, per table (all zero after
-/// [`delete_memories`]).
-pub fn memory_rows(db: &Connection, repository: &str, ids: &[String]) -> Result<Value> {
+/// Rows still holding any of the deleted memories, per label (all zero after
+/// [`delete_memories`]). Keys keep the legacy names.
+pub fn memory_rows(db: Graph, repository: &str, ids: &[String]) -> Result<Value> {
     let mut out = BTreeMap::new();
-    for (table, sql) in [
+    let repo = || gparams([("repo", json!(repository)), ("ids", json!(ids))]);
+    for (legacy, cypher) in [
         (
             "repo_memories",
-            "SELECT count(*) FROM repo_memories WHERE repository_id=?1 AND id=?2",
+            "MATCH (m:Memory {repository_id: $repo}) WHERE m.id IN $ids RETURN count(m) AS n",
         ),
         (
             "repo_memory_revisions",
-            "SELECT count(*) FROM repo_memory_revisions WHERE memory_id=?2",
+            "MATCH (r:MemoryRevision) WHERE r.memory_id IN $ids RETURN count(r) AS n",
         ),
         (
             "am_claims",
-            "SELECT count(*) FROM am_claims WHERE repository_id=?1 AND memory_id=?2",
-        ),
-        (
-            "am_vectors",
-            "SELECT count(*) FROM am_vectors WHERE repository_id=?1 AND identity='memory:'||?2",
+            "MATCH (c:Claim {repository_id: $repo}) WHERE c.memory_id IN $ids RETURN count(c) AS n",
         ),
         (
             "gf_symbol_pins",
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=?1 AND memory_id=?2",
+            "MATCH (m:Memory {repository_id: $repo})-[r:PINNED_TO]->() WHERE m.id IN $ids RETURN count(r) AS n",
         ),
     ] {
-        let mut total = 0;
-        for id in ids {
-            total += count(db, sql, params![repository, id])?;
-        }
+        let total = counted(db, cypher, repo())?;
         // Listed only when a deleted memory's pin remains.
-        if table == "gf_symbol_pins" && total == 0 {
+        if legacy == "gf_symbol_pins" && total == 0 {
             continue;
         }
-        out.insert(table.to_string(), total);
+        out.insert(legacy.to_string(), total);
     }
+    // Passage embeddings of the deleted memories (`memory:<id>` identities).
+    let passages: Vec<String> = ids.iter().map(|i| format!("memory:{i}")).collect();
+    let mut vectors = 0;
+    for label in ["Chunk", "Memory", "Entity"] {
+        vectors += counted(
+            db,
+            "MATCH (n:$($label) {repository_id: $repo}) \
+             WHERE n.identity IN $ids AND n.embedding IS NOT NULL RETURN count(n) AS n",
+            gparams([("label", json!(label)), ("repo", json!(repository)), ("ids", json!(passages))]),
+        )?;
+    }
+    out.insert("am_vectors".to_string(), vectors);
     Ok(json!(out))
 }
 
 /// Remove every derived artifact that could carry the documents' information
-/// (see the module documentation). Originals are removed by [`erase`].
+/// (see the module documentation): label-scoped `DETACH DELETE` walks over
+/// the catalog, inside the caller's graph transaction. Originals are removed
+/// by [`erase`].
 pub fn forget(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     scope: &Scope,
     since: Option<&str>,
 ) -> Result<Value> {
-    use crate::invalidation;
-    let claims = || -> Result<BTreeSet<String>> {
+    let repo = || gparams([("repo", json!(repository))]);
+    let claims = |db: Graph| -> Result<BTreeSet<String>> {
         Ok(rows(
             db,
-            "SELECT id FROM am_claims WHERE repository_id=?",
-            [repository],
+            "MATCH (c:Claim {repository_id: $repo}) RETURN c.id AS id",
+            repo(),
         )?
         .iter()
         .map(|r| s(r, "id").to_string())
         .collect())
     };
-    let claims_before = claims()?;
-    let pins = || {
-        count(
+    let pins = |db: Graph| {
+        counted(
             db,
-            "SELECT count(*) FROM gf_symbol_pins WHERE repository_id=?",
-            [repository],
+            "MATCH (:Memory {repository_id: $repo})-[r:PINNED_TO]->() RETURN count(r) AS n",
+            repo(),
         )
     };
-    let pins_before = pins()?;
+    let claims_before = claims(db)?;
+    let pins_before = pins(db)?;
     let memories = forget_memories(db, workspace, repository, scope, since)?;
     // The forgotten memories' symbol pins went with them.
-    let symbol_pins = pins_before.saturating_sub(pins()?);
+    let symbol_pins = pins_before.saturating_sub(pins(db)?);
     let lost: Vec<String> = claims_before
-        .difference(&claims()?)
+        .difference(&claims(db)?)
         .cloned()
         .chain(memories.iter().cloned())
         .collect();
     // A reflection consumed many sources; any forgotten one removes it.
-    let reflections = select_rowids(
+    let reflections = walk(
         db,
-        "SELECT rowid,sources FROM am_observer_reflections WHERE repository_id=?",
-        [repository],
+        "MentalModel",
+        "n.repository_id = $repo",
+        "sources",
+        repo(),
         |v| lists(v, scope),
+        true,
     )?;
-    let reflections = delete_rowids(db, "am_observer_reflections", &reflections)?;
     // Single-source artifacts of the forgotten documents.
     let mut notes = 0;
     for row in rows(
         db,
-        "SELECT source_id FROM am_observer_notes WHERE repository_id=?",
-        [repository],
+        "MATCH (o:Observation {repository_id: $repo}) RETURN o.source_id AS source_id",
+        repo(),
     )? {
-        if scope.source(s(&row, "source_id")) {
-            notes +=
-                crate::observer::forget_source(db, workspace, repository, s(&row, "source_id"))?;
+        let source = s(&row, "source_id");
+        if scope.source(source) {
+            notes += detach(
+                db,
+                "Observation",
+                "n.repository_id = $repo AND n.source_id = $source",
+                gparams([("repo", json!(repository)), ("source", json!(source))]),
+            )?;
+            let artifact = crate::observer::artifact_id(repository, source);
+            forget_dependent(db, workspace, crate::observer::NOTE, &artifact)?;
+            clear_stale(db, workspace, crate::observer::NOTE, &artifact)?;
         }
     }
-    let vectors = select_rowids(
-        db,
-        "SELECT rowid,identity FROM am_vectors WHERE repository_id=?",
-        [repository],
-        |v| scope.passage(v),
-    )?;
-    let vectors = delete_rowids(db, "am_vectors", &vectors)?;
+    // Passage embeddings of the forgotten documents (the passages live on the
+    // nodes they describe; forgetting strips the embedding, the chunk of an
+    // independent source stays).
+    let mut passages = Vec::new();
+    for label in ["Chunk", "Entity"] {
+        for row in rows(
+            db,
+            "MATCH (n:$($label) {repository_id: $repo}) RETURN n.identity AS identity",
+            gparams([("label", json!(label)), ("repo", json!(repository))]),
+        )? {
+            if scope.passage(s(&row, "identity")) {
+                passages.push((label, s(&row, "identity").to_string()));
+            }
+        }
+    }
+    let vectors = passages.len();
+    for (label, identity) in passages {
+        db.query_with_params(
+            "MATCH (n:$($label) {repository_id: $repo, identity: $identity}) \
+             REMOVE n.embedding, n.model_key",
+            gparams([
+                ("label", json!(label)),
+                ("repo", json!(repository)),
+                ("identity", json!(identity)),
+            ]),
+        )?;
+    }
     // An extraction read whose drafts were just removed must run again.
-    let reads = select_rowids(
+    let mut read_ids = Vec::new();
+    for row in rows(
         db,
-        "SELECT rowid,source_id||char(10)||claim_ids FROM am_document_reads WHERE repository_id=?",
-        [repository],
-        |v| {
-            let (source, claims) = v.split_once('\n').unwrap_or((v, ""));
-            scope.source(source) || lost.iter().any(|id| claims.contains(id.as_str()))
-        },
-    )?;
-    let reads = delete_rowids(db, "am_document_reads", &reads)?;
+        "MATCH (r:DocumentRead {repository_id: $repo}) \
+         RETURN id(r) AS nid, r.source_id AS source_id, r.claim_ids AS claim_ids",
+        repo(),
+    )? {
+        let lost_claim = |claims: &str| {
+            serde_json::from_str::<Vec<Value>>(claims).is_ok_and(|v| {
+                v.iter()
+                    .any(|c| c.as_str().is_some_and(|c| lost.iter().any(|id| id == c)))
+            })
+        };
+        if scope.source(s(&row, "source_id")) || lost_claim(s(&row, "claim_ids")) {
+            read_ids.push(row["nid"].as_i64().unwrap_or_default());
+        }
+    }
+    let reads = detach_ids(db, "DocumentRead", &read_ids)?;
     // Artifacts computed while the documents were visible.
     let mut visible_since = BTreeMap::new();
     if let Some(since) = since {
         // Cached answers: their index entries go with them.
         for row in rows(
             db,
-            "SELECT dependent_id FROM gf_dependencies WHERE workspace=?1 AND dependent_kind=?2 AND substr(dependent_id,1,length(?3))=?3 AND recorded_at>=?4",
-            params![
-                workspace,
-                invalidation::ANSWER,
-                format!("{repository}:"),
-                since
-            ],
+            "MATCH (a:Artifact {workspace: $ws, kind: $kind}) \
+             WHERE a.id STARTS WITH $prefix AND a.recorded_at >= $since RETURN a.id AS id",
+            gparams([
+                ("ws", json!(workspace)),
+                ("kind", json!(crate::invalidation::ANSWER)),
+                ("prefix", json!(format!("{repository}:"))),
+                ("since", json!(since)),
+            ]),
         )? {
-            let key = s(&row, "dependent_id");
-            invalidation::forget_dependent(db, workspace, (invalidation::ANSWER, key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANSWER, key)?;
+            let key = s(&row, "id");
+            forget_dependent(db, workspace, crate::invalidation::ANSWER, key)?;
+            clear_stale(db, workspace, crate::invalidation::ANSWER, key)?;
         }
-        for (kind, table) in [
-            (invalidation::REPORT, "am_reports"),
-            (invalidation::COMMUNITY, "am_communities"),
+        for (kind, label) in [
+            (crate::invalidation::REPORT, "Report"),
+            (crate::invalidation::COMMUNITY, "Community"),
         ] {
             for row in rows(
                 db,
-                &format!("SELECT id FROM {table} WHERE repository_id=? AND created_at>=?"),
-                params![repository, since],
+                "MATCH (n:$($label) {repository_id: $repo}) WHERE n.created_at >= $since RETURN n.id AS id",
+                gparams([
+                    ("label", json!(label)),
+                    ("repo", json!(repository)),
+                    ("since", json!(since)),
+                ]),
             )? {
                 let key = format!("{repository}:{}", s(&row, "id"));
-                invalidation::forget_dependent(db, workspace, (kind, &key))?;
-                invalidation::clear_stale(db, workspace, kind, &key)?;
+                forget_dependent(db, workspace, kind, &key)?;
+                clear_stale(db, workspace, kind, &key)?;
             }
         }
         for row in rows(
             db,
-            "SELECT chunk_id FROM gf_anchor_edges WHERE repository_id=? AND created_at>=?",
-            params![repository, since],
+            "MATCH (a:AnchorEdge {repository_id: $repo}) WHERE a.created_at >= $since RETURN a.chunk_id AS chunk_id",
+            gparams([("repo", json!(repository)), ("since", json!(since))]),
         )? {
-            let key = invalidation::anchor_id(repository, s(&row, "chunk_id"));
-            invalidation::forget_dependent(db, workspace, (invalidation::ANCHOR, &key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANCHOR, &key)?;
+            let key = crate::invalidation::anchor_id(repository, s(&row, "chunk_id"));
+            forget_dependent(db, workspace, crate::invalidation::ANCHOR, &key)?;
+            clear_stale(db, workspace, crate::invalidation::ANCHOR, &key)?;
         }
-        for (name, table, column) in SINCE_VISIBLE {
-            let n = db.execute(
-                &format!("DELETE FROM {table} WHERE repository_id=? AND {column}>=?"),
-                params![repository, since],
+        for (name, label, column) in SINCE_VISIBLE {
+            let n = detach(
+                db,
+                label,
+                &format!("n.repository_id = $repo AND n.`{column}` >= $since"),
+                gparams([("repo", json!(repository)), ("since", json!(since))]),
             )?;
             visible_since.insert(*name, n);
         }
     }
-    // References in older rows (none unless written outside the normal flow).
+    // References in older nodes (none unless written outside the normal flow).
     let mut anchors = 0;
     for row in rows(
         db,
-        "SELECT rowid,chunk_id,json_extract(attributes,'$.document_id') AS document FROM gf_anchor_edges WHERE repository_id=?",
-        [repository],
+        "MATCH (a:AnchorEdge {repository_id: $repo}) \
+         RETURN id(a) AS nid, a.chunk_id AS chunk_id, a.`attributes.document_id` AS document",
+        repo(),
     )? {
         if scope.source(s(&row, "document")) {
-            let key = invalidation::anchor_id(repository, s(&row, "chunk_id"));
-            invalidation::forget_dependent(db, workspace, (invalidation::ANCHOR, &key))?;
-            invalidation::clear_stale(db, workspace, invalidation::ANCHOR, &key)?;
-            anchors += db.execute(
-                "DELETE FROM gf_anchor_edges WHERE rowid=?",
-                [row["rowid"].as_i64()],
-            )?;
+            let key = crate::invalidation::anchor_id(repository, s(&row, "chunk_id"));
+            forget_dependent(db, workspace, crate::invalidation::ANCHOR, &key)?;
+            clear_stale(db, workspace, crate::invalidation::ANCHOR, &key)?;
+            anchors += detach_ids(db, "AnchorEdge", &[row["nid"].as_i64().unwrap_or_default()])?;
         }
     }
-    let hints = select_rowids(
+    let hints = walk(
         db,
-        "SELECT rowid,target FROM gf_hints WHERE repository_id=?",
-        [repository],
+        "Hint",
+        "n.repository_id = $repo",
+        "target",
+        repo(),
         |v| scope.source(v),
+        true,
     )?;
-    let hints = delete_rowids(db, "gf_hints", &hints)?;
-    // The documents' mention links and their inputs.
+    // The documents' mention links and what they were computed from
+    // (`(:ConnectorDoc)-[:LINKS_TO]->(:Symbol)`, §2.5).
     let mut doc_links = 0;
-    for table in ["gf_doc_links", "gf_doc_link_sources"] {
-        let found = select_rowids(
-            db,
-            &format!("SELECT rowid,document_id FROM {table} WHERE repository_id=?"),
-            [repository],
-            |v| scope.source(v),
-        )?;
-        doc_links += delete_rowids(db, table, &found)?;
-    }
-    let mut stripped = BTreeMap::new();
-    for (table, column) in [("gf_served", "served"), ("gf_outcomes", "targets")] {
-        let mut changed = 0;
+    for rel_type in ["LINKS_TO", "LINK_SOURCE"] {
+        let mut ids = Vec::new();
         for row in rows(
             db,
-            &format!("SELECT rowid,{column} AS list FROM {table} WHERE repository_id=?"),
-            [repository],
+            &format!(
+                "MATCH ()-[r:{rel_type}]->() WHERE r.repository_id = $repo \
+                 RETURN id(r) AS rid, r.document_id AS document"
+            ),
+            repo(),
         )? {
-            let list: Vec<Value> = serde_json::from_str(s(&row, "list")).unwrap_or_default();
-            let kept: Vec<&Value> = list
-                .iter()
-                .filter(|v| !v.as_str().is_some_and(|i| scope.source(i)))
-                .collect();
+            if scope.source(s(&row, "document")) {
+                ids.push(row["rid"].as_i64().unwrap_or_default());
+            }
+        }
+        if !ids.is_empty() {
+            db.query_with_params(
+                &format!("MATCH ()-[r:{rel_type}]->() WHERE id(r) IN $ids DELETE r"),
+                gparams([("ids", json!(ids))]),
+            )?;
+            doc_links += ids.len();
+        }
+    }
+    // Served-evidence and outcome lists naming the documents: strip the
+    // forgotten entries; a record left empty goes entirely. (Lists of scalars
+    // are valid property values; the lists are source-id strings.)
+    let mut stripped = BTreeMap::new();
+    for (legacy, label, property) in [("gf_served", "Served", "served"), ("gf_outcomes", "Outcome", "targets")] {
+        let mut changed = 0;
+        for node in nodes(db, label, repository, workspace)? {
+            let list: Vec<String> = match &node[property] {
+                Value::Array(items) => items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect(),
+                Value::String(text) => serde_json::from_str(text).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let kept: Vec<&String> = list.iter().filter(|i| !scope.source(i)).collect();
             if kept.len() == list.len() {
                 continue;
             }
             changed += 1;
+            let nid = node["_id"].as_i64().unwrap_or_default();
             if kept.is_empty() {
-                db.execute(
-                    &format!("DELETE FROM {table} WHERE rowid=?"),
-                    [row["rowid"].as_i64()],
-                )?;
+                detach_ids(db, label, &[nid])?;
             } else {
-                db.execute(
-                    &format!("UPDATE {table} SET {column}=? WHERE rowid=?"),
-                    params![json!(kept).to_string(), row["rowid"].as_i64()],
+                db.query_with_params(
+                    &format!("MATCH (n:$($label)) WHERE id(n) = $nid SET n.`{property}` = $kept"),
+                    gparams([
+                        ("label", json!(label)),
+                        ("nid", json!(nid)),
+                        ("kept", json!(kept)),
+                    ]),
                 )?;
             }
         }
-        stripped.insert(table, changed);
+        stripped.insert(legacy, changed);
     }
     // The dependency index follows the artifacts.
-    let edges = delete_rowids(
-        db,
-        "gf_dependencies",
-        &index_edges(db, workspace, repository, scope)?,
+    let edge_ids = index_edges(db, workspace, repository, scope)?;
+    if !edge_ids.is_empty() {
+        db.query_with_params(
+            "MATCH ()-[r:DEPENDS_ON]->() WHERE id(r) IN $ids DELETE r",
+            gparams([("ids", json!(edge_ids))]),
+        )?;
+    }
+    let edges = edge_ids.len();
+    let marker_ids = index_markers(db, workspace, repository, scope)?;
+    let markers = detach_ids(db, "Stale", &marker_ids)?;
+    // Entities nothing links to any more.
+    db.query_with_params(
+        "MATCH (e:Entity {repository_id: $repo}) \
+         WHERE NOT (e)<-[:HAS_SUBJECT|HAS_OBJECT]-() DETACH DELETE e",
+        repo(),
     )?;
-    let markers = delete_rowids(
-        db,
-        "gf_stale",
-        &index_markers(db, workspace, repository, scope)?,
-    )?;
-    db.execute("DELETE FROM am_entities WHERE repository_id=? AND id NOT IN (SELECT subject_id FROM am_entity_links UNION SELECT object_id FROM am_entity_links)",[repository])?;
-    crate::store::invalidate(db, repository)?;
     let mut removed = json!({"memories":memories.len(),"observer_notes":notes,"observer_reflections":reflections,"vectors":vectors,"document_reads":reads,
         "since_visible":visible_since,"anchors":anchors,"hints":hints,"doc_links":doc_links,"served_records":stripped["gf_served"],
         "outcome_records":stripped["gf_outcomes"],"dependency_edges":edges,"stale_markers":markers});
@@ -1336,54 +1662,146 @@ pub fn forget(
     Ok(removed)
 }
 
-/// Remove the originals in scope. Forgotten documents keep a one-way
-/// tombstone so a later sync or import skips them.
-pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> {
+/// Remove the originals in scope: label-scoped walks over the connector's
+/// labels and the project's originals. Forgotten documents keep a one-way
+/// `ForgottenSource` tombstone so a later sync or import skips them.
+pub fn erase(db: Graph, repository: &str, scope: &Scope) -> Result<Value> {
     let connector = scope.connector.as_str();
-    if scope.whole() {
-        let n = db.execute("DELETE FROM am_connectors WHERE id=?", [connector])?;
-        return Ok(json!({"connector":n}));
-    }
     let mut out = BTreeMap::new();
-    for (name, table, column) in [
-        ("documents", "am_connector_docs", "id"),
-        ("versions", "am_connector_versions", "id"),
-        ("staged", "am_connector_stage", "id"),
-        ("permissions", "am_source_permissions", "source_id"),
-    ] {
-        let found = select_rowids(
+    if scope.whole() {
+        for (name, label) in [
+            ("documents", "ConnectorDoc"),
+            ("versions", "ConnectorVersion"),
+            ("staged", "ConnectorStage"),
+            ("permissions", "SourcePermission"),
+        ] {
+            let n = detach(
+                db,
+                label,
+                "n.connector_id = $connector",
+                gparams([("connector", json!(connector))]),
+            )?;
+            if n > 0 {
+                out.insert(name, n);
+            }
+        }
+        let originals = detach(
             db,
-            &format!("SELECT rowid,{column} FROM {table} WHERE connector_id=?"),
-            [connector],
-            |v| scope.document(v),
+            "OriginalDocument",
+            "n.repository_id = $repo AND n.source_id STARTS WITH $prefix",
+            gparams([("repo", json!(repository)), ("prefix", json!(scope.prefix()))]),
         )?;
-        out.insert(name, delete_rowids(db, table, &found)?);
+        if originals > 0 {
+            out.insert("originals", originals);
+        }
+        let n = detach(
+            db,
+            "Connector",
+            "n.id = $connector",
+            gparams([("connector", json!(connector))]),
+        )?;
+        out.insert("connector", n);
+        return Ok(json!(out));
     }
-    let originals = select_rowids(
+    for (name, label, key) in [
+        ("documents", "ConnectorDoc", "id"),
+        ("versions", "ConnectorVersion", "id"),
+        ("staged", "ConnectorStage", "id"),
+        ("permissions", "SourcePermission", "source_id"),
+    ] {
+        let found = walk(
+            db,
+            label,
+            "n.connector_id = $connector",
+            key,
+            gparams([("connector", json!(connector))]),
+            |v| scope.document(v),
+            true,
+        )?;
+        out.insert(name, found);
+    }
+    let originals = walk(
         db,
-        "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
-        [repository],
+        "OriginalDocument",
+        "n.repository_id = $repo",
+        "source_id",
+        gparams([("repo", json!(repository))]),
         |v| scope.source(v),
+        true,
     )?;
-    out.insert(
-        "originals",
-        delete_rowids(db, "am_original_documents", &originals)?,
-    );
+    out.insert("originals", originals);
     let stamp = now();
     for hash in scope.hashes() {
-        db.execute(
-            "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-            params![connector, hash, stamp],
+        db.query_with_params(
+            "MERGE (f:ForgottenSource {connector_id: $connector, id_hash: $hash}) \
+             ON CREATE SET f.created_at = $at",
+            gparams([
+                ("connector", json!(connector)),
+                ("hash", json!(hash)),
+                ("at", json!(stamp)),
+            ]),
         )?;
     }
     Ok(json!(out))
+}
+
+/// Documents of the project the scope names, still visible to serving
+/// (connector documents scoped through their connector).
+fn visible_documents(db: Graph, repository: &str, scope: &Scope) -> Result<usize> {
+    let connectors = connectors_of(db, repository)?;
+    Ok(rows(
+        db,
+        "MATCH (d:ConnectorDoc) WHERE d.connector_id IN $connectors RETURN d.id AS id",
+        gparams([("connectors", json!(connectors))]),
+    )?
+    .iter()
+    .filter(|d| scope.source(s(d, "id")))
+    .count())
+}
+
+/// Queued external cleanups of the project (the durable
+/// `ProjectionCleanup` queue, retained by design until cleanup completes).
+fn external(db: Graph, repository: &str) -> Result<Vec<Value>> {
+    rows(
+        db,
+        "MATCH (c:ProjectionCleanup {scope: $repo}) \
+         RETURN c.id AS id, c.kind AS kind, c.revision AS revision, c.state AS state \
+         ORDER BY c.kind, c.id",
+        gparams([("repo", json!(repository))]),
+    )
+}
+
+/// A captured external cleanup is done once its node completed at (or after)
+/// the captured revision; revisions only grow.
+fn external_now(db: Graph, captured: &Value) -> Result<(Vec<Value>, bool)> {
+    let mut pending = false;
+    let mut out = Vec::new();
+    for cleanup in captured.as_array().into_iter().flatten() {
+        let row = one(
+            db,
+            "MATCH (c:ProjectionCleanup {id: $id}) \
+             RETURN c.revision AS revision, c.state AS state, c.error AS error",
+            gparams([("id", json!(s(cleanup, "id")))]),
+        )?;
+        let done = row.as_ref().is_some_and(|r| {
+            r["state"] == "complete" && r["revision"].as_i64() >= cleanup["revision"].as_i64()
+        });
+        pending |= !done;
+        out.push(json!({"id":cleanup["id"],"kind":cleanup["kind"],"captured_revision":cleanup["revision"],
+            "state":row.as_ref().map_or(json!("unknown"),|r|r["state"].clone()),"error":row.map_or(Value::Null,|r|r["error"].clone()),"complete":done}));
+    }
+    Ok((out, pending))
+}
+
+fn empty(scan: &Value) -> bool {
+    scan["matches"].as_array().is_some_and(Vec::is_empty)
 }
 
 /// Verify a forget request inside its transaction and store the receipt.
 /// `started` is when the request began; artifacts dated after it are new work.
 #[allow(clippy::too_many_arguments)]
 pub fn receipt(
-    db: &Connection,
+    db: Graph,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1392,16 +1810,14 @@ pub fn receipt(
     forgotten: Value,
     erased: Value,
 ) -> Result<Value> {
-    policy_receipt(
-        db, p, repository, operation, plan, started, forgotten, erased, None,
-    )
+    policy_receipt(db, p, repository, operation, plan, started, forgotten, erased, None)
 }
 
 /// [`receipt`] for a deletion a retention policy chose: the receipt also
 /// carries the policy and its digest.
 #[allow(clippy::too_many_arguments)]
 pub fn policy_receipt(
-    db: &Connection,
+    db: Graph,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1415,32 +1831,22 @@ pub fn policy_receipt(
     let scope = &plan.scope;
     let remaining = source_rows(db, &p.workspace, identifier, scope)?;
     let tainted = since_visible(db, identifier, plan.since(), Some(started))?;
-    let catalog = tables(db)?;
+    let labels = catalog(db)?;
     let ids = if scope.whole() {
-        references(
-            db,
-            &catalog,
-            &[scope.prefix()],
-            (identifier, &p.workspace),
-            &[],
-            false,
-        )?
+        references(db, &labels, &[scope.prefix()], (identifier, &p.workspace), &[], false)?
     } else {
         let existing: BTreeSet<String> = rows(
             db,
-            "SELECT id FROM am_connector_docs WHERE connector_id=?",
-            [&scope.connector],
+            "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id",
+            gparams([("connector", json!(scope.connector))]),
         )?
         .iter()
         .map(|r| format!("{}{}", scope.prefix(), s(r, "id")))
         .collect();
-        document_references(db, &catalog, scope, &existing, (identifier, &p.workspace))?
+        document_references(db, &labels, scope, &existing, (identifier, &p.workspace))?
     };
-    let text = verbatim(db, &catalog, &plan.fingerprints, identifier)?;
-    let visible = crate::memory::documents(db, repository, p)?
-        .iter()
-        .filter(|d| scope.source(s(d, "id")))
-        .count();
+    let text = verbatim(db, &labels, &plan.fingerprints, identifier)?;
+    let visible = visible_documents(db, identifier, scope)?;
     let snapshot = state(db, &p.workspace, identifier)?;
     let cleanups = external(db, identifier)?;
     let clean = remaining.values().chain(tainted.values()).all(|n| *n == 0)
@@ -1471,38 +1877,31 @@ pub fn policy_receipt(
         "reimport_blocked":!scope.whole(),
         "external_cleanup":cleanups,
         "verified_local":clean,"external_pending":pending,"complete":clean && !pending,
-        "not_covered":NOT_COVERED,"storage":{"secure_delete":secure_delete(db)?}
+        "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
     });
     if let Some(policy) = policy {
         receipt["policy"] = policy.clone();
         receipt["policy_digest"] = json!(digest(policy));
     }
-    append(
-        db,
-        &p.workspace,
-        identifier,
-        operation,
-        &scope.connector,
-        receipt,
-    )
+    append(db, &p.workspace, identifier, operation, &scope.connector, receipt)
 }
 
-/// One-way name of a removed row key (a memory id, a pruned object).
+/// One-way name of a removed node key (a memory id, a pruned object).
 pub fn key_hash(operation: &str, key: &str) -> String {
     digest(&json!({"operation":operation,"key":key}))
 }
 
-/// Receipt for a deletion of named rows rather than a source scope — a
+/// Receipt for a deletion of named nodes rather than a source scope — a
 /// memory (`memory.delete`), graph by-products past their retention
 /// (`retention.graph`) or unreferenced storage (`storage.prune`). Removed
-/// rows are counted per table; their keys are kept only as one-way hashes
+/// nodes are counted per label; their keys are kept only as one-way hashes
 /// (`removed.keys`). `remaining` is the caller's re-count of removed keys
-/// still present, per table. With `scan`, every table is searched for the
+/// still present, per label. With `scan`, every label is searched for the
 /// keys themselves: matches in work history are reported as such, any other
 /// match is residue and the receipt is not `verified_local`.
 #[allow(clippy::too_many_arguments)]
 pub fn rows_receipt(
-    db: &Connection,
+    db: Graph,
     p: &Principal,
     repository: &str,
     operation: &str,
@@ -1525,23 +1924,26 @@ pub fn rows_receipt(
         json!([])
     };
     let (residue, history) = if scan && !keys.is_empty() {
-        let catalog = tables(db)?;
+        let labels = catalog(db)?;
         let patterns: Vec<String> = keys.to_vec();
+        let retained = retained(db)?;
         let found = references(
             db,
-            &catalog,
+            &labels,
             &patterns,
             (repository, &p.workspace),
-            &retained(db)?,
+            &retained,
             false,
         )?;
-        let history_tables = history(db)?;
+        let history_labels = history(db)?;
         let (history, other): (Vec<Value>, Vec<Value>) = found["matches"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .partition(|m| history_tables.contains(&s(m, "table")));
+            .partition(|m| {
+                history_labels.contains(&s(m, "table")) || history_labels.contains(&known_label_lossy(s(m, "table")).as_str())
+            });
         (
             json!({"tables_scanned":found["tables_scanned"],"matches":other}),
             json!(history),
@@ -1562,9 +1964,18 @@ pub fn rows_receipt(
         "remaining":remaining,
         "residue":{"references":residue,"history_references":history},
         "verified_local":clean,"external_pending":false,"complete":clean,
-        "not_covered":NOT_COVERED,"storage":{"secure_delete":secure_delete(db)?}
+        "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
     });
     append(db, &p.workspace, repository, operation, target, receipt)
+}
+
+/// The label a legacy table name maps to (lossy helper for receipt fields,
+/// which report legacy names).
+fn known_label_lossy(table: &str) -> String {
+    LABELS
+        .iter()
+        .find(|(_, t, _)| *t == table)
+        .map_or_else(|| table.to_string(), |(l, _, _)| l.to_string())
 }
 
 /// Replace identifiers minted per store and clock readings, so two stores
@@ -1586,129 +1997,83 @@ fn mask(value: &str) -> String {
 /// Canonical digest of everything a store holds for one project: originals,
 /// derived memory and indexes (`graphicle.state.v2`). History,
 /// invalidation-timed caches and folder locations are excluded, and so are
-/// tables with no rows in the project's scope; identifiers and capability
-/// digests minted per store, clock readings and sync counters are masked. Two stores digest equally
-/// when they hold the same content, whichever edition created them.
-pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value> {
+/// labels with no nodes in the project's scope; identifiers and capability
+/// digests minted per store, clock readings and sync counters are masked. Two
+/// stores digest equally when they hold the same content, whichever edition
+/// created them.
+pub fn state(db: Graph, workspace: &str, repository: &str) -> Result<Value> {
     let mut tables_out = BTreeMap::new();
     let history = history(db)?;
-    let all = rows(
-        db,
-        "SELECT name,coalesce(sql,'') AS sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        [],
-    )?;
-    let virtual_tables: Vec<String> = all
-        .iter()
-        .filter(|t| {
-            s(t, "sql")
-                .trim_start()
-                .to_ascii_uppercase()
-                .starts_with("CREATE VIRTUAL TABLE")
-        })
-        .map(|t| s(t, "name").to_string())
-        .collect();
-    for table in &all {
-        let name = s(table, "name");
-        if name == RECEIPTS
-            || history.contains(&name)
-            || CACHES.contains(&name)
-            || LOCATIONS.contains(&name)
-            || virtual_tables
-                .iter()
-                .any(|v| name == v || name.starts_with(&format!("{v}_")))
+    // The label catalog is the walk list: history, caches, locations and the
+    // receipts label are excluded, as are labels this store does not carry.
+    for label in catalog(db)? {
+        if label == RECEIPTS
+            || history.contains(&label.as_str())
+            || CACHES.contains(&label.as_str())
+            || LOCATIONS.contains(&label.as_str())
+            || scoping(&label) == Scoped::Global
         {
             continue;
         }
-        let columns = rows(db, "SELECT name,type,pk FROM pragma_table_info(?)", [name])?;
-        let has = |c: &str| columns.iter().any(|col| s(col, "name") == c);
-        let cross: Vec<&str> = ["source_repository_id", "target_repository_id"]
-            .into_iter()
-            .filter(|c| has(c))
-            .collect();
-        let cross_scope = format!("?1 IN ({})", cross.join(","));
-        let (scope, value) = if name == "repo_projects" {
-            ("id=?", repository)
-        } else if name == "workspaces" {
-            ("id=?", workspace)
-        } else if has("repository_id") {
-            ("repository_id=?", repository)
-        } else if !cross.is_empty() {
-            (cross_scope.as_str(), repository)
-        } else if has("connector_id") {
-            (
-                "connector_id IN (SELECT id FROM am_connectors WHERE repository_id=?)",
-                repository,
-            )
-        } else if has("memory_id") {
-            (
-                "memory_id IN (SELECT id FROM repo_memories WHERE repository_id=?)",
-                repository,
-            )
-        } else if has("workspace_id") {
-            ("workspace_id=?", workspace)
-        } else if has("workspace") {
-            ("workspace=?", workspace)
-        } else {
-            continue;
-        };
-        let selected: Vec<String> = columns
-            .iter()
-            .filter(|c| {
-                let rowid_alias = c["pk"] == 1 && s(c, "type").eq_ignore_ascii_case("INTEGER");
-                // Request keys digest the whole snapshot, including per-store
-                // memory ids; the rows' content is compared instead.
-                !rowid_alias
-                    && s(c, "name") != "request_hash"
-                    && !MINTED_DIGESTS.contains(&s(c, "name"))
-                    && !COUNTERS.contains(&(name, s(c, "name")))
-            })
-            .map(|c| s(c, "name").to_string())
-            .collect();
-        if selected.is_empty() {
-            continue;
-        }
-        // The model cache's dependency-index entries belong to the cache.
-        let cache_index = match name {
-            "gf_dependencies" => selected.iter().position(|c| c == "dependent_kind"),
-            "gf_stale" => selected.iter().position(|c| c == "kind"),
-            _ => None,
-        };
-        let quoted: Vec<String> = selected.iter().map(|c| quote(c)).collect();
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {scope}",
-            quoted.join(","),
-            quote(name)
-        );
-        let mut statement = db.prepare(&sql)?;
-        let mut found = statement.query([value])?;
         let mut canonical = Vec::new();
-        while let Some(row) = found.next()? {
-            let mut values = Vec::with_capacity(selected.len());
-            for i in 0..selected.len() {
-                values.push(match row.get_ref(i)? {
-                    ValueRef::Null => Value::Null,
-                    ValueRef::Integer(n) => json!(n),
-                    ValueRef::Real(n) => json!(n),
-                    ValueRef::Text(t) => json!(mask(&String::from_utf8_lossy(t))),
-                    ValueRef::Blob(b) => {
-                        json!(format!("blob:{}", graphicle_memory::text::sha256(b)))
-                    }
-                });
-            }
-            if cache_index.is_some_and(|i| values[i] == crate::invalidation::ANSWER) {
+        for node in nodes(db, &label, repository, workspace)? {
+            // The model cache's dependency-index entries belong to the cache.
+            if ["Artifact", "Stale"].contains(&label.as_str())
+                && node["kind"] == crate::invalidation::ANSWER
+            {
                 continue;
             }
-            canonical.push(Value::Array(values).to_string());
+            let mut props = serde_json::Map::new();
+            for (key, value) in node.as_object().into_iter().flatten() {
+                // Engine metadata, request keys (they digest the whole
+                // snapshot, including per-store memory ids; the nodes'
+                // content is compared instead), per-store capability
+                // digests and sync counters never take part.
+                if key.starts_with('_')
+                    || key == "request_hash"
+                    || MINTED_DIGESTS.contains(&key.as_str())
+                    || COUNTERS.contains(&(label.as_str(), key.as_str()))
+                {
+                    continue;
+                }
+                props.insert(key.clone(), value.clone());
+            }
+            canonical.push(mask(&Value::Object(props).to_string()));
         }
-        // An empty table says nothing about content (v2): whether a store has
-        // an edition's tables at all must not change its digest.
+        // An empty label says nothing about content (v2): whether a store has
+        // an edition's labels at all must not change its digest.
         if canonical.is_empty() {
             continue;
         }
         canonical.sort();
         tables_out.insert(
-            name.to_string(),
+            table_of(&label).to_string(),
             json!({"rows":canonical.len(),"digest":graphicle_memory::text::sha256(canonical.join("\n").as_bytes())}),
+        );
+    }
+    // Relationships carrying content (edge properties), scoped by their
+    // start node's project: the projection's provenance digests with the
+    // symbols it connects.
+    let mut rels: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows(
+        db,
+        "MATCH (a)-[r]->(b) WHERE a.repository_id = $repo \
+         RETURN type(r) AS t, properties(r) AS p, a.id AS from_id, b.id AS to_id",
+        gparams([("repo", json!(repository))]),
+    )? {
+        let entry = mask(
+            &json!({"from":row["from_id"],"to":row["to_id"],"properties":row["p"]}).to_string(),
+        );
+        rels.entry(s(&row, "t").to_string()).or_default().push(entry);
+    }
+    for (rel_type, mut entries) in rels {
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort();
+        tables_out.insert(
+            rel_type,
+            json!({"rows":entries.len(),"digest":graphicle_memory::text::sha256(entries.join("\n").as_bytes())}),
         );
     }
     Ok(
@@ -1721,17 +2086,30 @@ pub fn state(db: &Connection, workspace: &str, repository: &str) -> Result<Value
 /// `deletion.state`: the canonical digest of one project, for comparing a
 /// store after forgetting with one rebuilt without the documents.
 pub fn state_api(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
+    // A store mid-migration can hold the project's content only in SQLite
+    // (nothing has been written to the graph store yet): digest there.
+    if graph_store(store)?.read(|g| {
+        one(
+            g,
+            "MATCH (n) RETURN 1 AS x LIMIT 1",
+            store_graph::Params::new(),
+        )
+        .map(|r| r.is_none())
+    })? {
+        return legacy::state_api(store, workspace, token, args);
+    }
     store.authorized_read(workspace, token, "admin", |db, p| {
         let project = repo(db, p, string(args, "repository_id", 100)?)?;
-        state(db, &p.workspace, s(&project, "id"))
+        let identifier = s(&project, "id").to_string();
+        let workspace_id = p.workspace.clone();
+        graph_store(store)?.read(|g| state(g, &workspace_id, &identifier))
     })
 }
 
 /// Dependency-index entries and episode labels of a deleted project. They
-/// are keyed by workspace, so the project's foreign-key cascade does not
-/// reach them.
+/// are scoped by workspace, so the project's own removal does not reach them.
 pub fn forget_project_references(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     connectors: &[String],
@@ -1739,17 +2117,37 @@ pub fn forget_project_references(
     let mut edges = 0;
     let mut stale = 0;
     for prefix in project_patterns(repository, connectors) {
-        edges += db.execute("DELETE FROM gf_dependencies WHERE workspace=?1 AND (substr(source_id,1,length(?2))=?2 OR substr(dependent_id,1,length(?2))=?2)", params![workspace, prefix])?;
-        stale += db.execute(
-            "DELETE FROM gf_stale WHERE workspace=?1 AND substr(id,1,length(?2))=?2",
-            params![workspace, prefix],
+        let found = rows(
+            db,
+            "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Source) \
+             WHERE a.id STARTS WITH $prefix OR src.id STARTS WITH $prefix RETURN id(r) AS rid",
+            gparams([("ws", json!(workspace)), ("prefix", json!(prefix))]),
         )?;
+        let ids: Vec<i64> = found.iter().filter_map(|r| r["rid"].as_i64()).collect();
+        if !ids.is_empty() {
+            db.query_with_params(
+                "MATCH ()-[r:DEPENDS_ON]->() WHERE id(r) IN $ids DELETE r",
+                gparams([("ids", json!(ids))]),
+            )?;
+            edges += ids.len();
+        }
+        let mut ids = Vec::new();
+        for row in rows(
+            db,
+            "MATCH (s:Stale {workspace: $ws}) WHERE s.id STARTS WITH $prefix RETURN id(s) AS nid",
+            gparams([("ws", json!(workspace)), ("prefix", json!(prefix))]),
+        )? {
+            ids.push(row["nid"].as_i64().unwrap_or_default());
+        }
+        stale += detach_ids(db, "Stale", &ids)?;
     }
-    // The names (commit, snapshot) of its recorded episodes (every
-    // projected project has them, and they named its id).
-    let labels = db.execute(
-        "DELETE FROM gf_episode_labels WHERE workspace=?1 AND repo=?2",
-        params![workspace, repository],
+    // The names (commit, snapshot) of its recorded episodes (every projected
+    // project has them, and they named its id).
+    let labels = detach(
+        db,
+        "EpisodeLabel",
+        "n.workspace = $ws AND n.repo = $repo",
+        gparams([("ws", json!(workspace)), ("repo", json!(repository))]),
     )?;
     Ok(json!({"dependency_edges":edges,"stale_markers":stale,"episode_labels":labels}))
 }
@@ -1760,87 +2158,90 @@ fn project_patterns(repository: &str, connectors: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Rows still keyed to a deleted project or to one of its connectors.
+/// Nodes still keyed to a deleted project or to one of its connectors.
 fn project_rows(
-    db: &Connection,
-    catalog: &[Table],
+    db: Graph,
+    labels: &[String],
     repository: &str,
     connectors: &[String],
 ) -> Result<Value> {
     let mut checked = 0;
     let mut matches = Vec::new();
     let retained = retained(db)?;
-    for table in catalog
+    for label in labels
         .iter()
-        .filter(|t| !retained.contains(&t.name.as_str()))
+        .filter(|l| !retained.contains(&l.as_str()) && !retained.contains(&table_of(l)))
     {
-        for column in [
-            "repository_id",
-            "source_repository_id",
-            "target_repository_id",
-        ] {
-            if table.columns.contains(column) {
+        match scoping(label) {
+            Scoped::Repository => {
                 checked += 1;
-                let n = count(
+                let n = counted(
                     db,
-                    &format!(
-                        "SELECT count(*) FROM {} WHERE {}=?",
-                        quote(&table.name),
-                        quote(column)
-                    ),
-                    [repository],
+                    "MATCH (n:$($label) {repository_id: $repo}) RETURN count(n) AS n",
+                    gparams([("label", json!(label)), ("repo", json!(repository))]),
                 )?;
                 if n > 0 {
-                    matches.push(json!({"table":table.name,"column":column,"rows":n}));
+                    matches.push(json!({"table":table_of(label),"column":"repository_id","rows":n}));
                 }
             }
-        }
-        if table.columns.contains("connector_id") {
-            for connector in connectors {
+            Scoped::RepositoryIn(property) => {
                 checked += 1;
-                let n = count(
+                let n = counted(
                     db,
-                    &format!(
-                        "SELECT count(*) FROM {} WHERE connector_id=?",
-                        quote(&table.name)
-                    ),
-                    [connector],
+                    &format!("MATCH (n:$($label)) WHERE n.`{property}` = $repo RETURN count(n) AS n"),
+                    gparams([("label", json!(label)), ("repo", json!(repository))]),
                 )?;
                 if n > 0 {
-                    matches.push(json!({"table":table.name,"column":"connector_id","rows":n}));
+                    matches.push(json!({"table":table_of(label),"column":property,"rows":n}));
                 }
             }
+            Scoped::Cross => {
+                checked += 1;
+                let n = counted(
+                    db,
+                    "MATCH (n:$($label)) WHERE n.source_repository_id = $repo OR n.target_repository_id = $repo RETURN count(n) AS n",
+                    gparams([("label", json!(label)), ("repo", json!(repository))]),
+                )?;
+                if n > 0 {
+                    matches.push(json!({"table":table_of(label),"column":"source_repository_id","rows":n}));
+                }
+            }
+            Scoped::Connector => {
+                checked += 1;
+                let n = counted(
+                    db,
+                    "MATCH (n:$($label)) WHERE n.connector_id IN $connectors RETURN count(n) AS n",
+                    gparams([("label", json!(label)), ("connectors", json!(connectors))]),
+                )?;
+                if n > 0 {
+                    matches.push(json!({"table":table_of(label),"column":"connector_id","rows":n}));
+                }
+            }
+            _ => {}
         }
     }
     Ok(json!({"columns_checked":checked,"matches":matches}))
 }
 
 /// The receipt of `project.delete` for `repository`. `removed` holds what
-/// the deletion removed besides the project's own rows: `references`
+/// the deletion removed besides the project's own nodes: `references`
 /// (dependency-index entries) and, when the project had any,
 /// `pr_scratch_projects` (the PR scratch projects deleted with it, each with
 /// its own receipt).
 pub fn project_receipt(
-    db: &Connection,
+    db: Graph,
     p: &Principal,
     repository: &str,
     connectors: &[String],
     removed: Value,
 ) -> Result<Value> {
-    let catalog = tables(db)?;
-    let remaining = project_rows(db, &catalog, repository, connectors)?;
+    let labels = catalog(db)?;
+    let remaining = project_rows(db, &labels, repository, connectors)?;
     let patterns = std::iter::once(repository.to_string())
         .chain(connectors.iter().map(|c| format!("connector:{c}:")))
         .collect::<Vec<_>>();
     let retained = retained(db)?;
-    let ids = references(
-        db,
-        &catalog,
-        &patterns,
-        (repository, &p.workspace),
-        &retained,
-        true,
-    )?;
+    let ids = references(db, &labels, &patterns, (repository, &p.workspace), &retained, true)?;
     let cleanups = external(db, repository)?;
     let clean = empty(&remaining) && empty(&ids);
     let pending = cleanups.iter().any(|c| c["state"] != "complete");
@@ -1852,21 +2253,21 @@ pub fn project_receipt(
         "residue":{"source_ids":ids,"retained_by_design":retained},
         "external_cleanup":cleanups,
         "verified_local":clean,"external_pending":pending,"complete":clean && !pending,
-        "not_covered":NOT_COVERED,"storage":{"secure_delete":secure_delete(db)?}
+        "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
     });
-    append(
-        db,
-        &p.workspace,
-        repository,
-        "project.delete",
-        repository,
-        receipt,
-    )
+    append(db, &p.workspace, repository, "project.delete", repository, receipt)
 }
 
-/// Link a receipt into the workspace chain and store it.
+/// Link a receipt into the workspace chain and store it: the §2.5
+/// `(:DeletionReceipt)-[:NEXT]->(:DeletionReceipt)` hash chain, one chain per
+/// workspace. The sequence number comes from the chain itself (the current
+/// head's sequence + 1), `previous` carries the head's digest, and the
+/// receipt's own digest covers both — rewriting any stored receipt breaks the
+/// chain verifiably ([`chain`]). Receipts are plain properties with no
+/// project reference, so they outlive a deleted project. The body is the
+/// canonical JSON, stringified (the engine stores no map-valued properties).
 fn append(
-    db: &Connection,
+    db: Graph,
     workspace: &str,
     repository: &str,
     operation: &str,
@@ -1875,8 +2276,9 @@ fn append(
 ) -> Result<Value> {
     let last = one(
         db,
-        "SELECT sequence,digest FROM am_deletion_receipts WHERE workspace_id=? ORDER BY sequence DESC LIMIT 1",
-        [workspace],
+        "MATCH (r:DeletionReceipt {workspace_id: $ws}) \
+         RETURN r.sequence AS sequence, r.digest AS digest ORDER BY r.sequence DESC LIMIT 1",
+        gparams([("ws", json!(workspace))]),
     )?;
     let sequence = last
         .as_ref()
@@ -1887,24 +2289,50 @@ fn append(
     receipt["sequence"] = json!(sequence);
     receipt["previous"] = last.map_or(Value::Null, |r| r["digest"].clone());
     let hash = digest(&receipt);
-    db.execute(
-        "INSERT INTO am_deletion_receipts(id,workspace_id,sequence,repository_id,operation,target,body,digest,previous,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        params![s(&receipt, "id"), workspace, sequence, repository, operation, target,
-            graphicle_memory::text::canonical(&receipt), hash, receipt["previous"].as_str(), now()],
+    let body = graphicle_memory::text::canonical(&receipt);
+    db.query_with_params(
+        "CREATE (r:DeletionReceipt {id: $id, workspace_id: $ws, sequence: $seq, \
+         repository_id: $repo, operation: $op, target: $target, body: $body, digest: $digest, \
+         previous: $previous, created_at: $at})",
+        gparams([
+            ("id", s(&receipt, "id").into()),
+            ("ws", json!(workspace)),
+            ("seq", json!(sequence)),
+            ("repo", json!(repository)),
+            ("op", json!(operation)),
+            ("target", json!(target)),
+            ("body", json!(body)),
+            ("digest", json!(hash)),
+            ("previous", receipt["previous"].clone()),
+            ("at", json!(now())),
+        ]),
     )?;
+    if sequence > 1 {
+        db.query_with_params(
+            "MATCH (p:DeletionReceipt {workspace_id: $ws, sequence: $prev}) \
+             MATCH (n:DeletionReceipt {workspace_id: $ws, sequence: $seq}) \
+             CREATE (p)-[:NEXT]->(n)",
+            gparams([
+                ("ws", json!(workspace)),
+                ("prev", json!(sequence - 1)),
+                ("seq", json!(sequence)),
+            ]),
+        )?;
+    }
     receipt["digest"] = json!(hash);
     Ok(receipt)
 }
 
 /// Recompute every digest and link of the workspace's receipt chain.
-fn chain(db: &Connection, workspace: &str) -> Result<Value> {
+fn chain(db: Graph, workspace: &str) -> Result<Value> {
     let mut previous = Value::Null;
     let mut intact = true;
     let mut length = 0i64;
     for row in rows(
         db,
-        "SELECT sequence,body,digest FROM am_deletion_receipts WHERE workspace_id=? ORDER BY sequence",
-        [workspace],
+        "MATCH (r:DeletionReceipt {workspace_id: $ws}) \
+         RETURN r.sequence AS sequence, r.body AS body, r.digest AS digest ORDER BY r.sequence",
+        gparams([("ws", json!(workspace))]),
     )? {
         length += 1;
         let body: Value = serde_json::from_str(s(&row, "body"))?;
@@ -1914,28 +2342,31 @@ fn chain(db: &Connection, workspace: &str) -> Result<Value> {
             && digest(&body) == s(&row, "digest");
         previous = row["digest"].clone();
     }
+    // The NEXT linked list must connect every consecutive pair.
+    let links: BTreeSet<(i64, i64)> = rows(
+        db,
+        "MATCH (a:DeletionReceipt {workspace_id: $ws})-[:NEXT]->(b:DeletionReceipt) \
+         RETURN a.sequence AS from, b.sequence AS to",
+        gparams([("ws", json!(workspace))]),
+    )?
+    .iter()
+    .filter_map(|r| Some((r["from"].as_i64()?, r["to"].as_i64()?)))
+    .collect();
+    intact &= (2..=length).all(|seq| links.contains(&(seq - 1, seq)));
     Ok(json!({"length":length,"intact":intact,"head":previous}))
 }
 
-/// Flush deleted pages out of the write-ahead log after the deletion commits;
-/// `secure_delete` has already zeroed them in the database pages.
+/// Flush deleted nodes' old images into a snapshot after the deletion
+/// commits, so the write-ahead log no longer carries them; the legacy SQLite
+/// half's WAL is truncated too, while the store is dual.
 pub fn checkpoint(store: &Store) -> Result<Value> {
-    let (busy, log, done) =
-        store
-            .connect()?
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-    Ok(
-        json!({"wal_checkpoint":if busy == 0 {"truncated"} else {"busy"},"log_frames":log,"checkpointed_frames":done}),
-    )
+    graph_store(store)?.checkpoint()?;
+    let mut out = legacy::checkpoint(store)?;
+    out["snapshot_checkpoint"] = json!("ok");
+    Ok(out)
 }
 
-/// Re-check a stored receipt against the current database and its chain.
+/// Re-check a stored receipt against the current store and its chain.
 /// Source rows, id references, serving and external cleanup are re-checked;
 /// verbatim text is checked only at deletion time, since the receipt keeps no
 /// excerpt of what it deleted. A document receipt keeps only one-way hashes,
@@ -1943,141 +2374,208 @@ pub fn checkpoint(store: &Store) -> Result<Value> {
 /// A failed deletion-time text scan stays failed: its discarded excerpts
 /// cannot establish that later edits removed the known residue.
 pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
+    // A receipt lives where its deletion wrote it: the graph store, or the
+    // legacy SQL store of a store mid-migration.
+    let receipt_id = string(args, "receipt_id", 100)?;
+    let on_graph = graph_store(store)?.read(|g| {
+        one(
+            g,
+            "MATCH (r:DeletionReceipt {workspace_id: $ws, id: $id}) RETURN 1 AS x",
+            gparams([("ws", json!(workspace)), ("id", json!(receipt_id))]),
+        )
+        .map(|r| r.is_some())
+    })?;
+    if !on_graph {
+        return legacy::verify(store, workspace, token, args);
+    }
     store.authorized_read(workspace, token, "admin", |db, p| {
-        let row = one(
-            db,
-            "SELECT body,digest FROM am_deletion_receipts WHERE workspace_id=? AND id=?",
-            params![workspace, string(args, "receipt_id", 100)?],
-        )?
-        .ok_or_else(|| Error::bad("Deletion receipt unavailable"))?;
-        let mut receipt: Value = serde_json::from_str(s(&row, "body"))?;
-        receipt["digest"] = row["digest"].clone();
-        let repository = s(&receipt, "repository_id").to_string();
-        let catalog = tables(db)?;
-        let project = repo(db, p, &repository).ok();
-        let current = match s(&receipt, "operation") {
-            "connector.delete" => {
-                let scope = Scope::connector(s(&receipt, "target"));
-                let remaining = source_rows(db, workspace, &repository, &scope)?;
-                let ids = references(db, &catalog, &[scope.prefix()], (&repository, workspace), &[], false)?;
-                // Caches refill with unrelated work, so only the deleted
-                // sources' own rows and references are re-checked.
-                let visible = match &project {
-                    Some(project) => Some(
-                        crate::memory::documents(db, project, p)?
-                            .iter()
-                            .filter(|d| scope.source(s(d, "id")))
-                            .count(),
-                    ),
-                    None => None,
-                };
-                let text_clean = empty(&receipt["residue"]["verbatim_text"]);
-                let clean = remaining.values().all(|n| *n == 0) && empty(&ids) && visible.unwrap_or(0) == 0 && text_clean;
-                json!({"verified_local":clean,"rows":remaining,"source_ids":ids,
-                    "verbatim_text":{"recheck":"at_deletion_time","clean":text_clean},
-                    "serving_probe":visible.map_or(json!("project_deleted"),|n|json!({"visible_documents":n}))})
-            }
-            "source.forget" | "retention.forget" => {
-                let connector = s(&receipt, "target");
-                let hashes: BTreeSet<&str> = receipt["sources"]["document_hashes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect();
-                let mut reappeared = BTreeMap::new();
-                for (name, table, column) in [
-                    ("documents", "am_connector_docs", "id"),
-                    ("versions", "am_connector_versions", "id"),
-                    ("staged", "am_connector_stage", "id"),
-                    ("permissions", "am_source_permissions", "source_id"),
-                ] {
-                    let count = rows(db, &format!("SELECT {column} AS id FROM {table} WHERE connector_id=?"), [connector])?
-                        .iter().filter(|d| hashes.contains(tombstone(connector, s(d,"id")).as_str())).count();
-                    reappeared.insert(name, count);
+        let receipt_id = string(args, "receipt_id", 100)?;
+        let graph = graph_store(store)?;
+        graph.read(|g| {
+            let row = one(
+                g,
+                "MATCH (r:DeletionReceipt {workspace_id: $ws, id: $id}) \
+                 RETURN r.body AS body, r.digest AS digest",
+                gparams([("ws", json!(workspace)), ("id", json!(receipt_id))]),
+            )?
+            .ok_or_else(|| Error::bad("Deletion receipt unavailable"))?;
+            let mut receipt: Value = serde_json::from_str(s(&row, "body"))?;
+            receipt["digest"] = row["digest"].clone();
+            let repository = s(&receipt, "repository_id").to_string();
+            let labels = catalog(g)?;
+            let project = repo(db, p, &repository).ok();
+            let current = match s(&receipt, "operation") {
+                "connector.delete" => {
+                    let scope = Scope::connector(s(&receipt, "target"));
+                    let remaining = source_rows(g, workspace, &repository, &scope)?;
+                    let ids = references(g, &labels, &[scope.prefix()], (&repository, workspace), &[], false)?;
+                    // Caches refill with unrelated work, so only the deleted
+                    // sources' own rows and references are re-checked.
+                    let visible = if project.is_some() {
+                        Some(visible_documents(g, &repository, &scope)?)
+                    } else {
+                        None
+                    };
+                    let text_clean = empty(&receipt["residue"]["verbatim_text"]);
+                    let clean = remaining.values().all(|n| *n == 0)
+                        && empty(&ids)
+                        && visible.unwrap_or(0) == 0
+                        && text_clean;
+                    json!({"verified_local":clean,"rows":remaining,"source_ids":ids,
+                        "verbatim_text":{"recheck":"at_deletion_time","clean":text_clean},
+                        "serving_probe":visible.map_or(json!("project_deleted"),|n|json!({"visible_documents":n}))})
                 }
-                let prefix = format!("connector:{connector}:");
-                let originals = rows(db, "SELECT source_id FROM am_original_documents WHERE repository_id=?", [&repository])?
-                    .iter().filter(|d| s(d,"source_id").strip_prefix(&prefix)
-                        .is_some_and(|id| hashes.contains(tombstone(connector,id).as_str()))).count();
-                reappeared.insert("originals", originals);
-                let tombstones = rows(
-                    db,
-                    "SELECT id_hash FROM am_forgotten_sources WHERE connector_id=?",
-                    [connector],
-                )?
-                .iter()
-                .filter(|r| hashes.contains(s(r, "id_hash")))
-                .count();
-                let connector_present = one(db,"SELECT id FROM am_connectors WHERE id=?",[connector])?.is_some();
-                let clean = receipt["verified_local"] == true && reappeared.values().all(|n| *n == 0)
-                    && (!connector_present || tombstones == hashes.len());
-                json!({"verified_local":clean,"reappeared_documents":reappeared["documents"],"reappeared_rows":reappeared,
-                    "deletion_time_checks_passed":receipt["verified_local"],
-                    "tombstones":tombstones,"connector_present":connector_present})
-            }
-            "project.delete" => {
-                let connectors: Vec<String> = receipt["connectors"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|c| c.as_str().map(str::to_string))
-                    .collect();
-                let remaining = project_rows(db, &catalog, &repository, &connectors)?;
-                let mut patterns = vec![repository.clone()];
-                patterns.extend(connectors.iter().map(|c| format!("connector:{c}:")));
-                let ids = references(db, &catalog, &patterns, (&repository, workspace), &retained(db)?, true)?;
-                json!({"verified_local":empty(&remaining) && empty(&ids),"project_rows":remaining,"source_ids":ids})
-            }
-            "memory.delete" => {
-                // Only one-way hashes of the ids are kept: confirm no
-                // current memory carries a deleted id.
-                let hashes: BTreeSet<&str> = receipt["removed"]["keys"]["hashes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect();
-                let reappeared = rows(db, "SELECT id FROM repo_memories WHERE repository_id=?", [&repository])?
+                "source.forget" | "retention.forget" => {
+                    let connector = s(&receipt, "target");
+                    let hashes: BTreeSet<&str> = receipt["sources"]["document_hashes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    let mut reappeared = BTreeMap::new();
+                    for (name, label, key) in [
+                        ("documents", "ConnectorDoc", "id"),
+                        ("versions", "ConnectorVersion", "id"),
+                        ("staged", "ConnectorStage", "id"),
+                        ("permissions", "SourcePermission", "source_id"),
+                    ] {
+                        let count = rows(
+                            g,
+                            &format!("MATCH (d:{label} {{connector_id: $connector}}) RETURN d.`{key}` AS id"),
+                            gparams([("connector", json!(connector))]),
+                        )?
+                        .iter()
+                        .filter(|d| hashes.contains(tombstone(connector, s(d, "id")).as_str()))
+                        .count();
+                        reappeared.insert(name, count);
+                    }
+                    let prefix = format!("connector:{connector}:");
+                    let originals = rows(
+                        g,
+                        "MATCH (o:OriginalDocument {repository_id: $repo}) RETURN o.source_id AS source_id",
+                        gparams([("repo", json!(repository))]),
+                    )?
+                    .iter()
+                    .filter(|d| {
+                        s(d, "source_id")
+                            .strip_prefix(&prefix)
+                            .is_some_and(|id| hashes.contains(tombstone(connector, id).as_str()))
+                    })
+                    .count();
+                    reappeared.insert("originals", originals);
+                    let tombstones = rows(
+                        g,
+                        "MATCH (f:ForgottenSource {connector_id: $connector}) RETURN f.id_hash AS id_hash",
+                        gparams([("connector", json!(connector))]),
+                    )?
+                    .iter()
+                    .filter(|r| hashes.contains(s(r, "id_hash")))
+                    .count();
+                    let connector_present = one(
+                        g,
+                        "MATCH (c:Connector {id: $connector}) RETURN c.id AS id",
+                        gparams([("connector", json!(connector))]),
+                    )?
+                    .is_some();
+                    let clean = receipt["verified_local"] == true
+                        && reappeared.values().all(|n| *n == 0)
+                        && (!connector_present || tombstones == hashes.len());
+                    json!({"verified_local":clean,"reappeared_documents":reappeared["documents"],"reappeared_rows":reappeared,
+                        "deletion_time_checks_passed":receipt["verified_local"],
+                        "tombstones":tombstones,"connector_present":connector_present})
+                }
+                "project.delete" => {
+                    let connectors: Vec<String> = receipt["connectors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect();
+                    let remaining = project_rows(g, &labels, &repository, &connectors)?;
+                    let mut patterns = vec![repository.clone()];
+                    patterns.extend(connectors.iter().map(|c| format!("connector:{c}:")));
+                    let retained = retained(g)?;
+                    let ids = references(g, &labels, &patterns, (&repository, workspace), &retained, true)?;
+                    json!({"verified_local":empty(&remaining) && empty(&ids),"project_rows":remaining,"source_ids":ids})
+                }
+                "memory.delete" => {
+                    // Only one-way hashes of the ids are kept: confirm no
+                    // current memory carries a deleted id.
+                    let hashes: BTreeSet<&str> = receipt["removed"]["keys"]["hashes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    let reappeared = rows(
+                        g,
+                        "MATCH (m:Memory {repository_id: $repo}) RETURN m.id AS id",
+                        gparams([("repo", json!(repository))]),
+                    )?
                     .iter()
                     .filter(|m| hashes.contains(key_hash("memory.delete", s(m, "id")).as_str()))
                     .count();
-                json!({"verified_local":reappeared == 0 && receipt["verified_local"] == true,
-                    "reappeared_memories":reappeared})
-            }
-            "storage.prune" | "retention.graph" => {
-                // Pruned keys are kept only as hashes; the removal was
-                // re-counted when the receipt was signed.
-                json!({"verified_local":receipt["verified_local"] == true,"recheck":"at_deletion_time"})
-            }
-            _ => return Err(Error::bad("Unknown deletion receipt")),
-        };
-        let (cleanups, pending) = external_now(db, &receipt["external_cleanup"])?;
-        let chain = chain(db, workspace)?;
-        let verified = current["verified_local"] == true;
-        Ok(json!({"receipt":receipt,"chain":chain,"current":current,"external_cleanup":cleanups,
-            "verified_local":verified,"external_pending":pending,
-            "complete":verified && !pending && chain["intact"] == true,"checked_at":now()}))
+                    json!({"verified_local":reappeared == 0 && receipt["verified_local"] == true,
+                        "reappeared_memories":reappeared})
+                }
+                "storage.prune" | "retention.graph" => {
+                    // Pruned keys are kept only as hashes; the removal was
+                    // re-counted when the receipt was signed.
+                    json!({"verified_local":receipt["verified_local"] == true,"recheck":"at_deletion_time"})
+                }
+                _ => return Err(Error::bad("Unknown deletion receipt")),
+            };
+            let (cleanups, pending) = external_now(g, &receipt["external_cleanup"])?;
+            let chain = chain(g, workspace)?;
+            let verified = current["verified_local"] == true;
+            Ok(json!({"receipt":receipt,"chain":chain,"current":current,"external_cleanup":cleanups,
+                "verified_local":verified,"external_pending":pending,
+                "complete":verified && !pending && chain["intact"] == true,"checked_at":now()}))
+        })
     })
 }
 
 /// Receipts of this workspace, newest first, with the chain status.
 pub fn list(store: &Store, workspace: &str, token: &str) -> Result<Value> {
+    // Receipts live where their deletions wrote them; a store mid-migration
+    // may hold them only in the legacy SQL store.
+    let on_graph = graph_store(store)?.read(|g| {
+        one(
+            g,
+            "MATCH (r:DeletionReceipt {workspace_id: $ws}) RETURN 1 AS x LIMIT 1",
+            gparams([("ws", json!(workspace))]),
+        )
+        .map(|r| r.is_some())
+    })?;
+    if !on_graph {
+        return legacy::list(store, workspace, token);
+    }
     store.authorized_read(workspace, token, "admin", |db, _| {
-        let receipts: Vec<Value> = rows(
-            db,
-            "SELECT id,sequence,repository_id,operation,target,digest,previous,created_at,json_extract(body,'$.verified_local') AS verified_local,json_extract(body,'$.external_pending') AS external_pending FROM am_deletion_receipts WHERE workspace_id=? ORDER BY sequence DESC LIMIT 200",
-            [workspace],
-        )?
-        .into_iter()
-        .map(|mut r| {
-            for key in ["verified_local", "external_pending"] {
-                r[key] = json!(r[key] == 1);
-            }
-            r
+        let _ = db;
+        let graph = graph_store(store)?;
+        graph.read(|g| {
+            let receipts: Vec<Value> = rows(
+                g,
+                "MATCH (r:DeletionReceipt {workspace_id: $ws}) \
+                 RETURN r.id AS id, r.sequence AS sequence, r.repository_id AS repository_id, \
+                 r.operation AS operation, r.target AS target, r.digest AS digest, \
+                 r.previous AS previous, r.created_at AS created_at, r.body AS body \
+                 ORDER BY r.sequence DESC LIMIT 200",
+                gparams([("ws", json!(workspace))]),
+            )?
+            .into_iter()
+            .map(|mut r| {
+                let body: Value =
+                    serde_json::from_str(s(&r, "body")).unwrap_or(Value::Null);
+                r["verified_local"] = json!(body["verified_local"] == true);
+                r["external_pending"] = json!(body["external_pending"] == true);
+                r.as_object_mut().map(|m| m.remove("body"));
+                r
+            })
+            .collect();
+            Ok(json!({"receipts":receipts,"chain":chain(g, workspace)?}))
         })
-        .collect();
-        Ok(json!({"receipts":receipts,"chain":chain(db, workspace)?}))
     })
 }
 
@@ -2139,4 +2637,198 @@ mod tests {
             "job <id> at <time> sha 3f2b9c0e8a7d4c1b9e6f5a4b3c2d1e0f3f2b9c0e8a7d4c1b9e6f5a4b3c2d1e0f"
         );
     }
+
+    #[test]
+    fn the_label_catalog_is_declared_once() {
+        let mut labels: Vec<&str> = LABELS.iter().map(|(l, _, _)| *l).collect();
+        let mut tables: Vec<&str> = LABELS.iter().map(|(_, t, _)| *t).collect();
+        labels.sort_unstable();
+        tables.sort_unstable();
+        labels.dedup();
+        tables.dedup();
+        assert_eq!(labels.len(), LABELS.len(), "labels unique");
+        assert_eq!(tables.len(), LABELS.len(), "legacy names unique");
+        for (_, label, _) in SINCE_VISIBLE {
+            assert!(LABELS.iter().any(|(l, _, _)| l == label), "{label}");
+        }
+        for (_, label) in NAMES_MEMORIES {
+            assert!(LABELS.iter().any(|(l, _, _)| l == label), "{label}");
+        }
+        for label in HISTORY
+            .iter()
+            .chain(RETAINED)
+            .chain(CACHES)
+            .chain(LOCATIONS)
+            .chain(INDEPENDENT)
+        {
+            assert!(LABELS.iter().any(|(l, _, _)| l == label), "{label}");
+        }
+        for (label, _) in COUNTERS {
+            assert!(LABELS.iter().any(|(l, _, _)| l == label), "{label}");
+        }
+    }
+
+    #[test]
+    fn receipts_form_a_hash_chained_next_linked_list_per_workspace() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .transaction(|db| {
+                let first = append(
+                    db,
+                    "w1",
+                    "r1",
+                    "memory.delete",
+                    "memories",
+                    json!({"contract":CONTRACT,"operation":"memory.delete"}),
+                )?;
+                let second = append(
+                    db,
+                    "w1",
+                    "r1",
+                    "memory.delete",
+                    "memories",
+                    json!({"contract":CONTRACT,"operation":"memory.delete"}),
+                )?;
+                assert_eq!(first["sequence"], json!(1));
+                assert_eq!(second["sequence"], json!(2));
+                assert_eq!(second["previous"], first["digest"]);
+                // Another workspace runs its own chain.
+                let other = append(
+                    db,
+                    "w2",
+                    "r9",
+                    "project.delete",
+                    "r9",
+                    json!({"contract":CONTRACT,"operation":"project.delete"}),
+                )?;
+                assert_eq!(other["sequence"], json!(1));
+                assert_eq!(other["previous"], Value::Null);
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                let status = chain(db, "w1")?;
+                assert_eq!(status["length"], json!(2));
+                assert_eq!(status["intact"], json!(true), "{status}");
+                assert_eq!(chain(db, "w2")?["length"], json!(1));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn erase_walks_remove_scoped_labels_and_leave_tombstones() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .transaction(|db| {
+                db.query(
+                    "CREATE (:Connector {id: 'c1', repository_id: 'r1'}), \
+                     (:ConnectorDoc {id: 'd1', connector_id: 'c1', sha256: 'x1', content: 'secret one'}), \
+                     (:ConnectorDoc {id: 'd2', connector_id: 'c1', sha256: 'x2', content: 'secret two'}), \
+                     (:OriginalDocument {repository_id: 'r1', source_id: 'connector:c1:d1', sha256: 'x1'}), \
+                     (:OriginalDocument {repository_id: 'r1', source_id: 'connector:c1:d2', sha256: 'x2'})",
+                )?;
+                let erased = erase(db, "r1", &Scope::documents("c1", &json!(["d1"]))?)?;
+                assert_eq!(erased["documents"], json!(1));
+                assert_eq!(erased["originals"], json!(1));
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                assert_eq!(
+                    counted(
+                        db,
+                        "MATCH (d:ConnectorDoc {connector_id: 'c1'}) RETURN count(d) AS n",
+                        store_graph::Params::new()
+                    )?,
+                    1,
+                    "d2 stays"
+                );
+                assert_eq!(
+                    counted(
+                        db,
+                        "MATCH (f:ForgottenSource {connector_id: 'c1'}) RETURN count(f) AS n",
+                        store_graph::Params::new()
+                    )?,
+                    1,
+                    "one tombstone"
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .transaction(|db| {
+                let erased = erase(db, "r1", &Scope::connector("c1"))?;
+                assert_eq!(erased["connector"], json!(1));
+                assert_eq!(erased["documents"], json!(1));
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                assert_eq!(
+                    counted(
+                        db,
+                        "MATCH (c:Connector) RETURN count(c) AS n",
+                        store_graph::Params::new()
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn forget_removes_what_was_computed_while_the_documents_were_visible() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .transaction(|db| {
+                db.query(
+                    "CREATE (:ModelCache {repository_id: 'r1', created_at: '2026-01-01T00:00:00Z'}), \
+                     (:ModelCache {repository_id: 'r1', created_at: '2025-01-01T00:00:00Z'}), \
+                     (:Hint {repository_id: 'r1', target: 'connector:c1:d1', updated_at: '2025-02-01T00:00:00Z'}), \
+                     (:Hint {repository_id: 'r1', target: 'other', updated_at: '2025-02-01T00:00:00Z'})",
+                )?;
+                let removed = forget(
+                    db,
+                    "w1",
+                    "r1",
+                    &Scope::connector("c1"),
+                    Some("2026-01-01T00:00:00Z"),
+                )?;
+                assert_eq!(removed["since_visible"]["model_cache"], json!(1));
+                assert_eq!(removed["hints"], json!(1));
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                assert_eq!(
+                    counted(
+                        db,
+                        "MATCH (m:ModelCache {repository_id: 'r1'}) RETURN count(m) AS n",
+                        store_graph::Params::new()
+                    )?,
+                    1,
+                    "the older cache entry predates visibility"
+                );
+                assert_eq!(
+                    counted(
+                        db,
+                        "MATCH (h:Hint {repository_id: 'r1'}) RETURN count(h) AS n",
+                        store_graph::Params::new()
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
 }
+
+
+
+
