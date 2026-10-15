@@ -12,7 +12,7 @@ use graphicle::{
     session::{GraphHandle, registry},
 };
 use graphicle_memory::graph::identity::{self, IdentityOptions};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -123,7 +123,39 @@ pub fn build_graph_with_report(
     let _serial = EXTRACTION.lock().unwrap_or_else(PoisonError::into_inner);
     let cache = cache_root(db, repository);
     let dir = crate::phase::phase("graph_materialize", || {
-        crate::graph_materialize::prepare(db, repository, &heads, cache.as_deref())
+        // Source objects are CAS nodes in the graph store. Transitional:
+        // the content store still lands them in `repo_objects`, so mirror
+        // the wanted heads' blobs before materializing.
+        let mut graph_db = crate::store::graph_for(db)?.connection()?;
+        let mut read = db.prepare_cached(
+            "SELECT content,bytes FROM repo_objects WHERE repository_id=? AND sha256=?",
+        )?;
+        let mut objects = Vec::new();
+        for sha in heads.values() {
+            if let Some((content, bytes)) = read
+                .query_row(params![repository, sha], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .optional()?
+            {
+                objects.push(json!({"repository_id": repository, "sha256": sha,
+                    "content": content, "bytes": bytes}));
+            }
+        }
+        drop(read);
+        if !objects.is_empty() {
+            crate::store_graph::rows(
+                &mut graph_db,
+                "UNWIND $rows AS row
+                 MERGE (o:Object {repository_id: row.repository_id, sha256: row.sha256})
+                 SET o += row",
+                crate::store_graph::Params::from([(
+                    "rows".into(),
+                    crate::store_graph::json_to_value(&json!(objects)),
+                )]),
+            )?;
+        }
+        crate::graph_materialize::prepare(&mut graph_db, repository, &heads, cache.as_deref())
     })?;
     // Canonical root: node identities derive from paths relative to it, and a
     // root that crosses a symlink would make cached and fresh records diverge.
@@ -322,10 +354,19 @@ pub fn persist_with_report(
     if episode_row(db, repository, episode)?.is_some() {
         return Ok(false);
     }
-    let write = crate::graph_delta::ProjectionWrite::begin(db)?;
+    // Projection-group digests and timeline assertions live in the graph
+    // store. One graph transaction spans the SQL row writes below; dropping
+    // it uncommitted on an error path is the rollback (there are no triggers
+    // or savepoints graph-side). The SQL rows themselves stay atomic through
+    // the plain savepoint guard below (the retired ProjectionWrite coupled
+    // this to trigger dropping, which no longer exists).
+    let graph_store = crate::store::graph_for(db)?;
+    let mut graph_db = graph_store.connection()?;
+    graph_db.begin()?;
+    let sql_rows = SqlRows::begin(db)?;
     let stamp = now();
     let heads = crate::store::heads(db, repository)?;
-    let delta = crate::graph_delta::Plan::new(db, repository, graph)?;
+    let delta = crate::graph_delta::Plan::new(&mut graph_db, repository, graph)?;
     let mut attributes = episode_attributes(graph, extraction);
     if let Some(report) = attributes
         .get_mut(EXTRACTION_RUN)
@@ -366,8 +407,24 @@ pub fn persist_with_report(
         ],
     )?;
     let recorded = crate::temporal_graph::instant(&stamp)?;
+    // Transitional dual-write: the episode as a graph node (temporal reads
+    // resolve episodes graph-side) plus its timeline assertion.
+    crate::store_graph::rows(
+        &mut graph_db,
+        "MERGE (p:Project {id: $repository})
+         ON CREATE SET p.workspace_id = $repository, p.project_key = $repository
+         MERGE (e:Episode {repository_id: $repository, sequence: $sequence})
+         ON CREATE SET e.episode = $episode, e.created_at = $created_at
+         MERGE (e)-[:OF]->(p)",
+        crate::store_graph::Params::from([
+            ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+            ("sequence".into(), crate::store_graph::json_to_value(&json!(sequence))),
+            ("episode".into(), crate::store_graph::json_to_value(&json!(episode))),
+            ("created_at".into(), crate::store_graph::json_to_value(&json!(stamp))),
+        ]),
+    )?;
     crate::temporal_graph::observe(
-        db,
+        &mut graph_db,
         repository,
         episode,
         "default",
@@ -617,7 +674,7 @@ pub fn persist_with_report(
         closed_nodes.iter().map(String::as_str),
         inserted_nodes.len() < nodes.len(),
     )?;
-    delta.finish(db, repository)?;
+    delta.finish(&mut graph_db, repository)?;
     // The live-symbol table follows the current head set's
     // episode, by the files this projection rewrote when it described the
     // previous one, and pins quotes that waited for this content.
@@ -632,8 +689,43 @@ pub fn persist_with_report(
             delta.dirty(),
         )?;
     }
-    write.commit()?;
+    sql_rows.commit()?;
+    graph_db.commit()?;
     Ok(true)
+}
+
+/// Roll the SQL row writes of `persist_with_report` back unless committed:
+/// the savepoint portion of the retired `graph_delta::ProjectionWrite`
+/// (triggers are gone; this is plain atomicity inside a caller's outer
+/// transaction).
+struct SqlRows<'a> {
+    db: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> SqlRows<'a> {
+    fn begin(db: &'a Connection) -> Result<Self> {
+        db.execute_batch("SAVEPOINT graphicle_graph_projection")?;
+        Ok(Self {
+            db,
+            committed: false,
+        })
+    }
+    fn commit(mut self) -> Result<()> {
+        self.db.execute_batch("RELEASE graphicle_graph_projection")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SqlRows<'_> {
+    fn drop(&mut self) {
+        if !self.committed && !self.db.is_autocommit() {
+            let _ = self
+                .db
+                .execute_batch("ROLLBACK TO graphicle_graph_projection; RELEASE graphicle_graph_projection");
+        }
+    }
 }
 
 type Digest = [u8; 16];
@@ -1081,6 +1173,22 @@ pub fn label_episode(
          ON CONFLICT(workspace,repo,label) DO UPDATE SET episode_id=excluded.episode_id,created_at=excluded.created_at",
         params![workspace, repository, label, episode, now()],
     )?;
+    // Transitional dual-write: temporal_graph resolves labels graph-side.
+    let mut graph_db = crate::store::graph_for(db)?.connection()?;
+    graph_db.begin()?;
+    crate::store_graph::rows(
+        &mut graph_db,
+        "MERGE (l:EpisodeLabel {workspace: $workspace, repository_id: $repository, label: $label})
+         SET l.episode = $episode, l.created_at = $created_at",
+        crate::store_graph::Params::from([
+            ("workspace".into(), crate::store_graph::json_to_value(&json!(workspace))),
+            ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+            ("label".into(), crate::store_graph::json_to_value(&json!(label))),
+            ("episode".into(), crate::store_graph::json_to_value(&json!(episode))),
+            ("created_at".into(), crate::store_graph::json_to_value(&json!(now()))),
+        ]),
+    )?;
+    graph_db.commit()?;
     Ok(())
 }
 
@@ -1390,16 +1498,19 @@ impl Store {
                     .ok_or_else(|| Error::bad("Expected relation names"))?,
             ),
         };
+        // Timeline assertions, aliases and hyperedges live in the graph
+        // store; episode rows and the resident graph are still SQL.
+        let mut graph_db = self.graph()?.connection()?;
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, repository)?;
             let identifier = s(&repository, "id");
-            let view = crate::temporal_graph::select(db, workspace, identifier, args)?;
+            let view = crate::temporal_graph::select(&mut graph_db, workspace, identifier, args)?;
             let episode = view.episode;
             let row = episode_row(db, identifier, &episode)?
                 .ok_or_else(|| Error::bad("Unknown graph episode for this repository"))?;
             let mut graph = resident(db, identifier, &episode)?;
             if args["canonical"] == true {
-                let aliases = crate::temporal_graph::aliases_at(db, identifier, view.valid, view.known)?;
+                let aliases = crate::temporal_graph::aliases_at(&mut graph_db, identifier, view.valid, view.known)?;
                 let mut owned = graph.into_graph();
                 graphicle_memory::graph::canonical::apply(&mut owned, &aliases)?;
                 graph = GraphHandle::new(owned);
@@ -1469,7 +1580,7 @@ impl Store {
                 .filter(|l| l["episode_id"] == json!(episode))
                 .map(|l| l["label"].clone())
                 .collect();
-            let (hyperedges,hyperedges_truncated)=crate::temporal_graph::hyperedges_at(db, identifier, view.valid, view.known, &graph)?;
+            let (hyperedges,hyperedges_truncated)=crate::temporal_graph::hyperedges_at(&mut graph_db, identifier, view.valid, view.known, &graph)?;
             Ok(json!({
                 "as_of": if view.metadata["selection"]=="episode" {json!(selector)} else {Value::Null},
                 "temporal": view.metadata,

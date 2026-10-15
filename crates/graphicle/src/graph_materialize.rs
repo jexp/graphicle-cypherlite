@@ -1,12 +1,19 @@
 //! Reuse a verified source tree between graph projections.
 //!
-//! SQLite remains authoritative. Cache files are hashed before reuse; changed
-//! blobs are verified and atomically replaced, and deleted paths disappear
-//! before extraction. The lock stays alive for the entire graph build. A busy
-//! cache uses an isolated temporary tree instead of racing another process.
-use crate::{Error, Result, store::path};
-use rusqlite::{Connection, params};
+//! The graph store remains authoritative: source blobs are the CAS nodes
+//! `(:Object {repository_id, sha256, content})`. Cache files are hashed
+//! before reuse; changed blobs are verified and atomically replaced, and
+//! deleted paths disappear before extraction. The lock stays alive for the
+//! entire graph build. A busy cache uses an isolated temporary tree instead
+//! of racing another process.
+use crate::{
+    Error, Result,
+    store::path,
+    store_graph::{Params, json_to_value, one},
+};
+use cypherlite::Connection;
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,6 +22,20 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
+
+/// The content of the CAS object, or `None` when the store does not hold it.
+fn object_content(db: &mut Connection, repository: &str, sha256: &str) -> Result<Option<String>> {
+    let mut params = Params::new();
+    params.insert("repository".into(), json_to_value(&json!(repository)));
+    params.insert("sha256".into(), json_to_value(&json!(sha256)));
+    Ok(one(
+        db,
+        "MATCH (o:Object {repository_id: $repository, sha256: $sha256})
+         RETURN o.content AS content",
+        params,
+    )?
+    .and_then(|row| row["content"].as_str().map(str::to_string)))
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
@@ -77,7 +98,7 @@ fn file_hash(path: &Path) -> Result<String> {
 }
 
 fn sync(
-    db: &Connection,
+    db: &mut Connection,
     repository: &str,
     heads: &BTreeMap<String, String>,
     tree: &mut SourceTree,
@@ -102,22 +123,14 @@ fn sync(
             fs::remove_dir(directory)?;
         }
     }
-    let mut query =
-        db.prepare_cached("SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?")?;
     for (relative, expected) in heads {
         let target = tree.root.join(relative);
         if target.is_file() && file_hash(&target)? == *expected {
             tree.report.reused += 1;
             continue;
         }
-        let content: String = query
-            .query_row(params![repository, expected], |row| row.get(0))
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::conflict("Head references a missing source object")
-                }
-                other => other.into(),
-            })?;
+        let content: String = object_content(db, repository, expected)?
+            .ok_or_else(|| Error::conflict("Head references a missing source object"))?;
         if format!("{:x}", Sha256::digest(content.as_bytes())) != *expected {
             return Err(Error::conflict(
                 "Source object does not match its content digest",
@@ -139,7 +152,7 @@ fn sync(
 }
 
 pub fn prepare(
-    db: &Connection,
+    db: &mut Connection,
     repository: &str,
     heads: &BTreeMap<String, String>,
     cache: Option<&Path>,
@@ -230,50 +243,64 @@ mod tests {
     // `crate::fork_guard::flock_sensitive` for its whole body, so no child
     // process holds a copy of a lock file it has closed.
 
-    fn database() -> Connection {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE repo_objects(repository_id TEXT,sha256 TEXT,content TEXT)")
-            .unwrap();
-        db
+    fn database() -> crate::store_graph::GraphStore {
+        crate::store_graph::GraphStore::open_in_memory().unwrap()
     }
 
-    fn heads(db: &Connection, files: &[(&str, &str)]) -> BTreeMap<String, String> {
-        files
+    fn heads(db: &crate::store_graph::GraphStore, files: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let heads: BTreeMap<String, String> = files
             .iter()
             .map(|(path, content)| {
-                let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-                db.execute(
-                    "INSERT INTO repo_objects VALUES('repo',?,?)",
-                    params![hash, content],
-                )
-                .unwrap();
-                ((*path).into(), hash)
+                ((*path).into(), format!("{:x}", Sha256::digest(content.as_bytes())))
             })
-            .collect()
+            .collect();
+        let objects: Vec<_> = files
+            .iter()
+            .map(|(_, content)| {
+                json!({"repository_id": "repo",
+                    "sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+                    "content": content, "bytes": content.len() as i64})
+            })
+            .collect();
+        db.transaction(|db| {
+            let mut params = Params::new();
+            params.insert("rows".into(), json_to_value(&json!(objects)));
+            crate::store_graph::rows(
+                db,
+                "UNWIND $rows AS row
+                 MERGE (o:Object {repository_id: row.repository_id, sha256: row.sha256})
+                 SET o += row",
+                params,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        heads
     }
 
     #[test]
     fn reuse_updates_removals_and_tampering_match_authoritative_blobs() {
         let _flock = crate::fork_guard::flock_sensitive();
-        let db = database();
+        let store = database();
+        let first = heads(&store, &[("a.py", "a = 1\n"), ("dir/b.py", "b = 2\n")]);
+        let mut db = store.connection().unwrap();
         let cache = TempDir::new().unwrap();
-        let first = heads(&db, &[("a.py", "a = 1\n"), ("dir/b.py", "b = 2\n")]);
-        let tree = prepare(&db, "repo", &first, Some(cache.path())).unwrap();
+        let tree = prepare(&mut db, "repo", &first, Some(cache.path())).unwrap();
         let root = tree.path().to_path_buf();
         assert_eq!(tree.report.written, 2);
         drop(tree);
-        let reused = prepare(&db, "repo", &first, Some(cache.path())).unwrap();
+        let reused = prepare(&mut db, "repo", &first, Some(cache.path())).unwrap();
         assert_eq!(reused.path(), root);
         assert_eq!((reused.report.written, reused.report.reused), (0, 2));
         drop(reused);
         fs::write(root.join("a.py"), "a = 9\n").unwrap();
-        let repaired = prepare(&db, "repo", &first, Some(cache.path())).unwrap();
+        let repaired = prepare(&mut db, "repo", &first, Some(cache.path())).unwrap();
         assert_eq!((repaired.report.written, repaired.report.reused), (1, 1));
         assert_eq!(fs::read_to_string(root.join("a.py")).unwrap(), "a = 1\n");
         drop(repaired);
         // Rename, deletion, and replacing a directory with a file.
-        let second = heads(&db, &[("c.py", "a = 1\n"), ("dir", "content\n")]);
-        let changed = prepare(&db, "repo", &second, Some(cache.path())).unwrap();
+        let second = heads(&store, &[("c.py", "a = 1\n"), ("dir", "content\n")]);
+        let changed = prepare(&mut db, "repo", &second, Some(cache.path())).unwrap();
         assert_eq!(changed.report.removed, 2);
         assert!(!root.join("a.py").exists());
         assert_eq!(fs::read_to_string(root.join("dir")).unwrap(), "content\n");
@@ -285,11 +312,12 @@ mod tests {
     #[test]
     fn concurrent_builder_gets_an_isolated_tree_and_bad_blobs_fail() {
         let _flock = crate::fork_guard::flock_sensitive();
-        let db = database();
+        let store = database();
+        let sources = heads(&store, &[("a.py", "value = 1\n")]);
+        let mut db = store.connection().unwrap();
         let cache = TempDir::new().unwrap();
-        let sources = heads(&db, &[("a.py", "value = 1\n")]);
-        let first = prepare(&db, "repo", &sources, Some(cache.path())).unwrap();
-        let second = prepare(&db, "repo", &sources, Some(cache.path())).unwrap();
+        let first = prepare(&mut db, "repo", &sources, Some(cache.path())).unwrap();
+        let second = prepare(&mut db, "repo", &sources, Some(cache.path())).unwrap();
         assert!(!second.report.cached);
         assert_ne!(first.path(), second.path());
         assert_eq!(
@@ -297,24 +325,35 @@ mod tests {
             "value = 1\n"
         );
         drop((first, second));
-        db.execute("UPDATE repo_objects SET content='corrupt'", [])
+        store
+            .transaction(|db| {
+                let mut params = Params::new();
+                params.insert("repository".into(), json_to_value(&json!("repo")));
+                crate::store_graph::rows(
+                    db,
+                    "MATCH (o:Object {repository_id: $repository}) SET o.content = 'corrupt'",
+                    params,
+                )?;
+                Ok(())
+            })
             .unwrap();
         fs::remove_file(cache.path().join("sources/a.py")).unwrap();
-        assert!(prepare(&db, "repo", &sources, Some(cache.path())).is_err());
+        assert!(prepare(&mut db, "repo", &sources, Some(cache.path())).is_err());
     }
 
     #[cfg(unix)]
     #[test]
     fn symlinks_cannot_redirect_cache_writes() {
         let _flock = crate::fork_guard::flock_sensitive();
-        let db = database();
+        let store = database();
         let cache = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret"), "untouched").unwrap();
         fs::create_dir_all(cache.path().join("sources")).unwrap();
         std::os::unix::fs::symlink(outside.path(), cache.path().join("sources/escape")).unwrap();
-        let sources = heads(&db, &[("escape/secret", "overwrite")]);
-        assert!(prepare(&db, "repo", &sources, Some(cache.path())).is_err());
+        let sources = heads(&store, &[("escape/secret", "overwrite")]);
+        let mut db = store.connection().unwrap();
+        assert!(prepare(&mut db, "repo", &sources, Some(cache.path())).is_err());
         assert_eq!(
             fs::read_to_string(outside.path().join("secret")).unwrap(),
             "untouched"

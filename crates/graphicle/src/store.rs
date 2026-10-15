@@ -6,13 +6,68 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+/// Open (or reuse) the graph store belonging to the SQLite store file
+/// `database` (`graphicle.graph/` beside it). Transitional, for migrated
+/// domains (projection/timeline/delta) whose call sites still hold a SQL
+/// connection.
+///
+/// The engine takes a single-process writer lease on a directory store, and
+/// this codebase still runs multi-process flows (CLI hooks beside a server),
+/// so opens are **transient**: a weak registry dedups concurrent opens in
+/// this process, the lease is released when the caller drops the store, and
+/// a "storage locked" open retries for up to 10 s (the busy-timeout the SQL
+/// store gets).
+pub fn graph_for(db: &Connection) -> Result<crate::store_graph::GraphStore> {
+    match db.path() {
+        Some(path) if !path.is_empty() => graph_store(Path::new(path)),
+        // In-memory SQL (unit tests of legacy SQL paths) gets a scratch
+        // graph; nothing written to it is expected to outlive the call.
+        _ => crate::store_graph::GraphStore::open_in_memory(),
+    }
+}
+
+fn graph_store(database: &Path) -> Result<crate::store_graph::GraphStore> {
+    use std::sync::Weak;
+    static STORES: OnceLock<Mutex<HashMap<PathBuf, Weak<crate::store_graph::GraphStore>>>> =
+        OnceLock::new();
+    // Key by canonical directory: the same folder reached through a symlink
+    // (e.g. /var vs /private/var) is one store.
+    let directory = database
+        .parent()
+        .ok_or_else(|| Error::bad("Database path has no parent"))?;
+    let directory = directory.canonicalize().unwrap_or_else(|_| directory.to_path_buf());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stores = STORES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(store) = stores.get(&directory).and_then(Weak::upgrade) {
+            return Ok((*store).clone());
+        }
+        match crate::store_graph::GraphStore::open(directory.join("graphicle.graph")) {
+            Ok(store) => {
+                stores.insert(directory.clone(), Arc::downgrade(&Arc::new(store.clone())));
+                return Ok(store);
+            }
+            Err(error) => {
+                if !error.to_string().contains("storage locked") || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                drop(stores);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
 
 /// A write transaction held longer than this is logged with its call site:
 /// every other writer waits for it, up to the 10-second busy timeout.
@@ -337,8 +392,10 @@ impl Store {
         db.execute_batch(include_str!("projection_schema.sql"))?;
         ensure_column(&db, "gf_episodes", "parent_episode", "TEXT")?;
         db.execute_batch(include_str!("temporal_schema.sql"))?;
-        crate::temporal_graph::migrate(&db)?;
-        crate::graph_delta::migrate(&db)?;
+        // The projection's SQL body still buckets rows by owner file; the
+        // group digests and triggers of graph_delta live in the graph store.
+        ensure_column(&db, "gf_nodes", "owner", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&db, "gf_edges", "owner", "TEXT NOT NULL DEFAULT ''")?;
         db.execute_batch(include_str!("product_schema.sql"))?;
         crate::work_state::migrate(&db)?;
         // Each folder's freshness record.
@@ -382,6 +439,12 @@ impl Store {
     pub fn with_limits(mut self, limits: crate::limits::Limits) -> Self {
         self.limits = Some(Arc::new(limits));
         self
+    }
+    /// The graph store beside the SQL store (`graphicle.graph/`). Opened
+    /// transiently per call — see [`graph_for`] for the lease discipline.
+    pub fn graph(&self) -> Result<crate::store_graph::GraphStore> {
+        let db = self.connect()?;
+        graph_for(&db)
     }
     /// The size limits in effect: those set with [`Store::with_limits`],
     /// else the environment's over Graphicle Core's defaults.

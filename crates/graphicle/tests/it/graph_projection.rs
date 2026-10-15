@@ -472,9 +472,14 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
         sorted_node_link(&graph_projection::load(&db, &f.repo, "one").unwrap()),
         sorted_node_link(&first)
     );
-    // Writes outside the projector invalidate fingerprints. An unchanged
-    // authoritative graph must restore the altered live row.
+    // Writes outside the projector invalidate fingerprints explicitly (the
+    // graph store has no triggers). An unchanged authoritative graph must
+    // restore the altered live row.
     db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
+    f.store
+        .graph().unwrap()
+        .transaction(|db| graphicle_runtime::graph_delta::invalidate(db, &f.repo, ["a.py"]))
+        .unwrap();
     graph_projection::persist_with_report(&db, &f.repo, "repair", &removed, Some(&json!({})))
         .unwrap();
     assert_eq!(stats("repair")["dirty_groups"], 1);
@@ -484,13 +489,24 @@ fn projection_fingerprints_skip_clean_groups_and_preserve_history() {
     );
     // Reopening an existing store preserves valid cache entries.
     drop(db);
-    let reopened = Store::open(f._dir.path()).unwrap().connect().unwrap();
-    let valid: i64 = reopened
-        .query_row(
-            "SELECT count(*) FROM gf_projection_groups WHERE repository_id=? AND length(digest)=32",
-            [&f.repo],
-            |r| r.get(0),
-        )
+    let reopened = Store::open(f._dir.path()).unwrap();
+    let valid = reopened
+        .graph().unwrap()
+        .read(|db| {
+            let mut params = graphicle_runtime::store_graph::Params::new();
+            params.insert(
+                "repository".into(),
+                graphicle_runtime::store_graph::json_to_value(&json!(f.repo)),
+            );
+            let row = graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (g:ProjectionGroup {repository_id: $repository})
+                 WHERE g.digest IS NOT NULL
+                 RETURN count(*) AS n",
+                params,
+            )?;
+            Ok(row.unwrap()["n"].as_i64().unwrap())
+        })
         .unwrap();
     assert_eq!(valid, 2);
 }
@@ -567,8 +583,13 @@ fn failed_projection_rolls_back_rows_and_restores_cache_invalidation() {
         sorted_node_link(&graph_projection::load(&db, &f.repo, "one").unwrap()),
         sorted_node_link(&original),
     );
-    // The failed projection must restore invalidation before an outer commit.
+    // The failed projection rolled its graph transaction back, and the
+    // out-of-band edit is invalidated explicitly before the repair run.
     db.execute("UPDATE gf_nodes SET attributes=json_set(attributes,'$.label','tampered') WHERE repository_id=? AND node_id='a' AND valid_to_episode IS NULL", [&f.repo]).unwrap();
+    f.store
+        .graph().unwrap()
+        .transaction(|db| graphicle_runtime::graph_delta::invalidate(db, &f.repo, ["a.py"]))
+        .unwrap();
     graph_projection::persist_with_report(&db, &f.repo, "repair", &original, Some(&json!({})))
         .unwrap();
     assert_eq!(

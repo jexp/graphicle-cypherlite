@@ -27,7 +27,7 @@ pub mod fresh;
 pub mod git_hooks;
 pub mod graph;
 pub mod graph_command;
-mod graph_delta;
+pub mod graph_delta;
 mod graph_materialize;
 pub mod graph_projection;
 pub mod graph_tools;
