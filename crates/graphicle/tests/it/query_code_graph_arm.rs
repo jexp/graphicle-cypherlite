@@ -452,7 +452,7 @@ fn a_recorded_episode_past_the_static_edge_bound_folds_its_edges() {
     .unwrap();
     let db = f.store.connect().unwrap();
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &f.repo).unwrap();
-    assert!(graphicle_runtime::graph_projection::persist(&db, &f.repo, &episode, &graph).unwrap());
+    assert!(graphicle_runtime::graph_projection::persist(&db, &f.store.graph(), &f.repo, &episode, &graph).unwrap());
     let packet = f.context("where is alpha called");
     assert_eq!(
         packet["graph_source"], "episode",

@@ -80,22 +80,36 @@ impl Fixture {
             )
             .unwrap()
     }
-    fn db(&self) -> rusqlite::Connection {
-        self.store.connect().unwrap()
+    fn graph(&self) -> std::sync::Arc<graphicle_runtime::store_graph::GraphStore> {
+        self.store.graph()
+    }
+    /// A graph read: rows of JSON objects (the moved dependency/staleness
+    /// tables are `:Artifact` nodes and `DEPENDS_ON` edges now).
+    fn gsql(&self, query: &str) -> Vec<serde_json::Value> {
+        self.graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    query,
+                    graphicle_runtime::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
     }
     fn stale(&self, kind: &str) -> Vec<String> {
-        let db = self.db();
-        let mut statement = db
-            .prepare("SELECT id FROM gf_stale WHERE workspace=? AND kind=? ORDER BY id")
-            .unwrap();
-        statement
-            .query_map(rusqlite::params![self.workspace, kind], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
+        let mut found: Vec<String> = self
+            .gsql(&format!(
+                "MATCH (a:Artifact:Stale {{workspace: '{}', kind: '{}'}}) RETURN a.id AS id ORDER BY id",
+                self.workspace, kind
+            ))
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        found
     }
     fn freshness(&self) -> invalidation::Freshness {
-        invalidation::freshness(&self.db(), &self.workspace).unwrap()
+        invalidation::freshness(&self.graph(), &self.workspace).unwrap()
     }
     /// `graph.impact` through the operation table, as HTTP, MCP and
     /// `graphicle call` run it: served by an installed extension (an extension),
@@ -115,29 +129,29 @@ impl Fixture {
 #[test]
 fn recorded_dependencies_invalidate_transitively_and_report_freshness() {
     let f = Fixture::new(&[("c.py", C)]);
-    let db = f.db();
+    let graph = &f.graph();
     let ws = f.workspace.as_str();
     // A synthetic file: committed files already own chunk dependencies.
     let file = invalidation::file_id(&f.repo, "virtual.py");
-    record(&db, ws, (CHUNK, "chunk-1"), (FILE, &file));
-    record(&db, ws, (EMBEDDING, "emb-1"), (CHUNK, "chunk-1"));
-    record(&db, ws, (GRAPH_NODE, "node-1"), (FILE, &file));
-    record(&db, ws, (SUMMARY, "sum-1"), (GRAPH_NODE, "node-1"));
-    record(&db, ws, (REPORT, "rep-1"), (SUMMARY, "sum-1"));
-    record(&db, ws, (REPORT, "rep-1"), (EMBEDDING, "emb-1"));
+    record(graph, ws, (CHUNK, "chunk-1"), (FILE, &file));
+    record(graph, ws, (EMBEDDING, "emb-1"), (CHUNK, "chunk-1"));
+    record(graph, ws, (GRAPH_NODE, "node-1"), (FILE, &file));
+    record(graph, ws, (SUMMARY, "sum-1"), (GRAPH_NODE, "node-1"));
+    record(graph, ws, (REPORT, "rep-1"), (SUMMARY, "sum-1"));
+    record(graph, ws, (REPORT, "rep-1"), (EMBEDDING, "emb-1"));
     // Unrelated artifact in the same workspace and a same-named one elsewhere.
-    record(&db, ws, (CHUNK, "chunk-other"), (FILE, "other:file"));
-    record(&db, "other-workspace", (CHUNK, "chunk-1"), (FILE, &file));
+    record(graph, ws, (CHUNK, "chunk-other"), (FILE, "other:file"));
+    record(graph, "other-workspace", (CHUNK, "chunk-1"), (FILE, &file));
 
     assert!(f.freshness().is_fresh());
-    let marked = invalidation::invalidate_source(&db, ws, (FILE, &file), "edited").unwrap();
+    let marked = invalidation::invalidate_source(graph, ws, (FILE, &file), "edited").unwrap();
     let mut kinds: Vec<_> = marked.iter().map(|(k, _)| k.as_str()).collect();
     kinds.sort_unstable();
     assert_eq!(kinds, vec![CHUNK, EMBEDDING, GRAPH_NODE, REPORT, SUMMARY]);
-    assert!(invalidation::is_stale(&db, ws, REPORT, "rep-1").unwrap());
-    assert!(!invalidation::is_stale(&db, ws, CHUNK, "chunk-other").unwrap());
-    assert!(!invalidation::is_stale(&db, "other-workspace", CHUNK, "chunk-1").unwrap());
-    assert!(!invalidation::is_stale(&db, ws, FILE, &file).unwrap());
+    assert!(invalidation::is_stale(graph, ws, REPORT, "rep-1").unwrap());
+    assert!(!invalidation::is_stale(graph, ws, CHUNK, "chunk-other").unwrap());
+    assert!(!invalidation::is_stale(graph, "other-workspace", CHUNK, "chunk-1").unwrap());
+    assert!(!invalidation::is_stale(graph, ws, FILE, &file).unwrap());
 
     let freshness = f.freshness();
     assert_eq!(freshness.stale_count, 5);
@@ -150,11 +164,11 @@ fn recorded_dependencies_invalidate_transitively_and_report_freshness() {
     assert!(serialized["oldest_since"].is_string());
 
     // Recomputing clears one marker; the rest stay.
-    assert!(invalidation::clear_stale(&db, ws, SUMMARY, "sum-1").unwrap());
-    assert!(!invalidation::clear_stale(&db, ws, SUMMARY, "sum-1").unwrap());
+    assert!(invalidation::clear_stale(graph, ws, SUMMARY, "sum-1").unwrap());
+    assert!(!invalidation::clear_stale(graph, ws, SUMMARY, "sum-1").unwrap());
     assert_eq!(f.freshness().stale_count, 4);
     assert!(
-        invalidation::freshness(&db, "other-workspace")
+        invalidation::freshness(graph, "other-workspace")
             .unwrap()
             .is_fresh()
     );
@@ -164,13 +178,12 @@ fn recorded_dependencies_invalidate_transitively_and_report_freshness() {
 fn committing_a_file_marks_its_graph_nodes_stale_and_context_reports_it() {
     let f = Fixture::new(&[("a.py", A_V1), ("b.py", B)]);
     // Chunks record their file dependency at commit time.
-    let chunk_deps: i64 = f
-        .db()
-        .query_row(
-            "SELECT count(*) FROM gf_dependencies WHERE workspace=? AND dependent_kind='chunk' AND source_kind='file'",
-            [&f.workspace],
-            |r| r.get(0),
-        )
+    let chunk_deps = f
+        .gsql(&format!(
+            "MATCH (c:Artifact {{workspace: '{}', kind: 'chunk'}})-[:DEPENDS_ON]->(:Artifact {{kind: 'file'}}) RETURN count(*) AS n",
+            f.workspace
+        ))[0]["n"]
+        .as_u64()
         .unwrap();
     assert!(chunk_deps >= 2, "{chunk_deps}");
 
@@ -179,17 +192,19 @@ fn committing_a_file_marks_its_graph_nodes_stale_and_context_reports_it() {
         .graph_project(&f.workspace, &f.key, &f.repo)
         .unwrap();
     assert_eq!(projection["replayed"], false);
-    let node_deps: Vec<(String, String)> = {
-        let db = f.db();
-        let mut statement = db
-            .prepare("SELECT dependent_id,source_id FROM gf_dependencies WHERE workspace=? AND dependent_kind='graph_node' AND source_kind='file'")
-            .unwrap();
-        statement
-            .query_map([&f.workspace], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
+    let node_deps: Vec<(String, String)> = f
+        .gsql(&format!(
+            "MATCH (d:Artifact {{workspace: '{}', kind: 'graph_node'}})-[:DEPENDS_ON]->(s:Artifact {{kind: 'file'}}) RETURN d.id AS dependent_id, s.id AS source_id",
+            f.workspace
+        ))
+        .iter()
+        .map(|row| {
+            (
+                row["dependent_id"].as_str().unwrap().to_string(),
+                row["source_id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
     assert!(
         !node_deps.is_empty(),
         "graph nodes must depend on their files"
@@ -328,16 +343,13 @@ fn removing_a_file_marks_dependents_stale() {
     let stale = f.stale(GRAPH_NODE);
     assert!(!stale.is_empty());
     let b_file = invalidation::file_id(&f.repo, "b.py");
-    let db = f.db();
     for node in &stale {
-        let source: String = db
-            .query_row(
-                "SELECT source_id FROM gf_dependencies WHERE workspace=? AND dependent_kind='graph_node' AND dependent_id=?",
-                rusqlite::params![f.workspace, node],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(source, b_file);
+        let rows = f.gsql(&format!(
+            "MATCH (d:Artifact {{workspace: '{}', kind: 'graph_node', id: '{}'}})-[:DEPENDS_ON]->(s:Artifact) RETURN s.id AS source_id",
+            f.workspace, node
+        ));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source_id"].as_str().unwrap(), b_file);
     }
 }
 
@@ -368,21 +380,20 @@ fn connector_document_updates_and_deletes_invalidate_dependents() {
     );
     let plan = invalidation::connector_document_id(&cid, "plan");
     let notes = invalidation::connector_document_id(&cid, "notes");
-    let db = f.db();
+    let graph = &f.graph();
     record(
-        &db,
+        graph,
         &f.workspace,
         (SUMMARY, "plan-summary"),
         (DOCUMENT, &plan),
     );
     record(
-        &db,
+        graph,
         &f.workspace,
         (SUMMARY, "notes-summary"),
         (DOCUMENT, &notes),
     );
-    record(&db, &f.workspace, (CHUNK, "plan-chunk"), (DOCUMENT, &plan));
-    drop(db);
+    record(graph, &f.workspace, (CHUNK, "plan-chunk"), (DOCUMENT, &plan));
 
     // Re-importing identical content is not a change.
     import(
@@ -417,21 +428,16 @@ fn memories_record_their_sources_and_go_stale_when_sources_change() {
         )
         .unwrap();
     let memory_id = s(&memory, "id").to_string();
-    let db = f.db();
-    let sources: Vec<String> = {
-        let mut statement = db
-            .prepare("SELECT source_id FROM gf_dependencies WHERE workspace=? AND dependent_kind=? AND dependent_id=?")
-            .unwrap();
-        statement
-            .query_map(rusqlite::params![f.workspace, MEMORY, memory_id], |r| {
-                r.get(0)
-            })
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
+    let mut sources: Vec<String> = f
+        .gsql(&format!(
+            "MATCH (d:Artifact {{workspace: '{}', kind: '{}', id: '{}'}})-[:DEPENDS_ON]->(s:Artifact) RETURN s.id AS source_id",
+            f.workspace, MEMORY, memory_id
+        ))
+        .iter()
+        .map(|row| row["source_id"].as_str().unwrap().to_string())
+        .collect();
+    sources.sort();
     assert_eq!(sources, vec![invalidation::file_id(&f.repo, "a.py")]);
-    drop(db);
     f.sync(&[("a.py", A_V2), ("b.py", B)]);
     assert_eq!(f.stale(MEMORY), vec![memory_id]);
 }
@@ -448,20 +454,19 @@ fn revocation_invalidates_answers_cached_for_the_principal() {
         )
         .unwrap();
     let hash = graphicle_memory::text::sha256(s(&credential, "capability").as_bytes());
-    let db = f.db();
+    let graph = &f.graph();
     record(
-        &db,
+        graph,
         &f.workspace,
         (invalidation::ANSWER, "answer-1"),
         (invalidation::PRINCIPAL, &hash),
     );
     record(
-        &db,
+        graph,
         &f.workspace,
         (invalidation::ANSWER, "answer-owner"),
         (invalidation::PRINCIPAL, "someone-else"),
     );
-    drop(db);
     f.store
         .revoke(&f.workspace, &f.key, s(&credential, "id"))
         .unwrap();
@@ -473,8 +478,8 @@ fn revocation_invalidates_answers_cached_for_the_principal() {
     assert_eq!(status["freshness"]["by_kind"]["answer"], 1);
 }
 
-fn record(db: &rusqlite::Connection, ws: &str, dependent: (&str, &str), source: (&str, &str)) {
-    invalidation::record_dependency(db, ws, dependent, source).unwrap();
+fn record(graph: &graphicle_runtime::store_graph::GraphStore, ws: &str, dependent: (&str, &str), source: (&str, &str)) {
+    invalidation::record_dependency(graph, ws, dependent, source).unwrap();
 }
 
 #[test]
@@ -484,15 +489,21 @@ fn re_projection_keeps_dependencies_of_unchanged_nodes_and_drops_closed_ones() {
         .graph_project(&f.workspace, &f.key, &f.repo)
         .unwrap();
     let deps = |f: &Fixture| -> Vec<(String, String)> {
-        let db = f.db();
-        let mut statement = db
-            .prepare("SELECT dependent_id,source_id FROM gf_dependencies WHERE workspace=? AND dependent_kind='graph_node' AND source_kind='file' ORDER BY dependent_id,source_id")
-            .unwrap();
-        statement
-            .query_map([&f.workspace], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
+        let mut found: Vec<(String, String)> = f
+            .gsql(&format!(
+                "MATCH (d:Artifact {{workspace: '{}', kind: 'graph_node'}})-[:DEPENDS_ON]->(s:Artifact {{kind: 'file'}}) RETURN d.id AS dependent_id, s.id AS source_id ORDER BY dependent_id, source_id",
+                f.workspace
+            ))
+            .iter()
+            .map(|row| {
+                (
+                    row["dependent_id"].as_str().unwrap().to_string(),
+                    row["source_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
     };
     let before = deps(&f);
     let b_file = invalidation::file_id(&f.repo, "b.py");

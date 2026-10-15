@@ -1213,14 +1213,14 @@ fn store_vectors(
         for (row, _) in rows.iter().zip(vectors) {
             let embedding = format!("{}:{}", job.repository, s(row, "identity"));
             crate::invalidation::record_document_dependencies(
-                db,
+                &worker.store.graph(),
                 &job.workspace,
                 &job.repository,
                 (crate::invalidation::EMBEDDING, &embedding),
                 [s(row, "origin")],
             )?;
             crate::invalidation::clear_stale(
-                db,
+                &worker.store.graph(),
                 &job.workspace,
                 crate::invalidation::EMBEDDING,
                 &embedding,

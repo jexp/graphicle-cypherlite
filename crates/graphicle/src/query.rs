@@ -1544,7 +1544,7 @@ pub fn project_packet(
             arm
         })
     };
-    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"));
+    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))?;
     if crate::observer::KeyMode::parse(args.get("note_keys"))?.is_some() {
         rankings[crate::observer::NOTE_KEYS] = json!(crate::observer::notes_for(
             db,
@@ -1569,7 +1569,7 @@ pub fn project_packet(
     }
     packet["model_calls"] = json!(packet["model_calls"].as_u64().unwrap_or(0) + dense_calls);
     packet["freshness"] = json!(crate::invalidation::repository_freshness(
-        db,
+        graph_store,
         &p.workspace,
         s(repository, "id")
     )?);
@@ -1586,7 +1586,7 @@ impl Store {
                 "draft_memories":snap.memories.iter().filter(|m|m["state"]=="draft").count(),"source_state":snap.state,"native_runtime":{"enabled":true,"language":"rust","service_version":env!("CARGO_PKG_VERSION"),"core_version":graphicle_memory::VERSION},
                 "structural_revision":graphicle_memory::structure::REVISION,"graph":snap.graph,"automatic_model_calls":observed,
                 "write_lock":crate::store::lock_report(),
-                "freshness":crate::invalidation::repository_freshness(db,&p.workspace,s(&repository,"id"))?}))
+                "freshness":crate::invalidation::repository_freshness(&self.graph(),&p.workspace,s(&repository,"id"))?}))
         })
     }
     pub fn read_project_source(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {

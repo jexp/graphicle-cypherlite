@@ -351,7 +351,7 @@ impl Store {
             })
             .collect();
             crate::invalidation::permissions_changed(
-                db,
+                &self.graph(),
                 workspace,
                 None,
                 &sources,
@@ -374,10 +374,10 @@ impl Store {
                 if crate::deletion::forgotten(db,s(&connector,"id"),string(doc,"id",500)?)? {skipped+=1;continue;}
                 stage(db,&connector,&scan,doc)?;
             }
-            let generation=activate(db,&connector,&scan,mode=="snapshot")?;
+            let generation=activate(db,&self.graph(),&connector,&scan,mode=="snapshot")?;
             if let Some(removed)=args["deleted_ids"].as_array(){for doc in removed {let doc=doc.as_str().ok_or_else(||Error::bad("Invalid deleted source ID"))?;db.execute("UPDATE am_connector_docs SET present=0 WHERE connector_id=? AND id=?",params![s(&connector,"id"),doc])?;
-                crate::invalidation::document_changed(db,workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
-                crate::observer::forget_document(db,workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;}}
+                crate::invalidation::document_changed(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
+                crate::observer::forget_document(db,&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;}}
             crate::doc_links::after_sync(db,s(&repository,"id"),s(&connector,"id"),p)?;
             Ok(json!({"imported":documents.len()-skipped,"forgotten_skipped":skipped,"generation":generation,"mode":mode}))
         })
@@ -492,7 +492,13 @@ pub(crate) fn stage(db: &Connection, connector: &Value, scan: &str, doc: &Value)
     }
     Ok(())
 }
-pub(crate) fn activate(db: &Connection, connector: &Value, scan: &str, full: bool) -> Result<i64> {
+pub(crate) fn activate(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    connector: &Value,
+    scan: &str,
+    full: bool,
+) -> Result<i64> {
     let identifier = s(connector, "id");
     let generation = connector["generation"].as_i64().unwrap_or(0) + 1;
     let current: i64 = db.query_row(
@@ -528,13 +534,14 @@ pub(crate) fn activate(db: &Connection, connector: &Value, scan: &str, full: boo
         });
         if !unchanged {
             crate::invalidation::document_changed(
-                db,
+                graph,
                 &workspace,
                 &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
                 "connector_document_updated",
             )?;
             crate::observer::forget_document(
                 db,
+                graph,
                 &workspace,
                 &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
             )?;
@@ -559,13 +566,14 @@ pub(crate) fn activate(db: &Connection, connector: &Value, scan: &str, full: boo
             params![identifier, generation],
         )? {
             crate::invalidation::document_changed(
-                db,
+                graph,
                 &workspace,
                 &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
                 "connector_document_removed",
             )?;
             crate::observer::forget_document(
                 db,
+                graph,
                 &workspace,
                 &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
             )?;
@@ -1130,7 +1138,7 @@ pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
     let generation = if complete {
         Some(jobs::guarded(&worker.store, job, |db, p, _| {
             ensure_connector(db, &connector)?;
-            let generation = activate(db, &connector, s(&cursor, "scan_id"), true)?;
+            let generation = activate(db, &worker.store.graph(), &connector, s(&cursor, "scan_id"), true)?;
             crate::doc_links::after_sync(db, &job.repository, s(&connector, "id"), p)?;
             Ok(generation)
         })?)

@@ -21,7 +21,11 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
 - `GraphStore::open(path)` opens (or creates) a CypherLite **directory
   store** (WAL + snapshots) at `path` — beside, not instead of,
   `reviews.sqlite3` until the migration completes. Symlink paths are
-  refused. `GraphStore::path()` returns it.
+  refused. `GraphStore::path()` returns it. The engine's writer lease is
+  exclusive, so a second open of the same path **in this process** shares
+  the live engine through a per-process registry, and an open that finds the
+  lease held by **another process** follows the store read-only (reads pin
+  snapshots; writes fail with a clear error) instead of failing.
 - `GraphStore::open_in_memory()` is the `:memory:` mode that replaces
   rusqlite's `open_in_memory` in tests and transient processing (staging,
   expansion scratch).
@@ -139,6 +143,25 @@ graph type is inert).
   property set is still settling in wave 2, and no `DEFAULT` declarations
   (parse error in v0.12.2 — writers set `created_at` and counters
   explicitly).
+
+## Migrated modules
+
+- **`invalidation.rs`** (dependency index + staleness): `(:Artifact
+  {workspace, kind, id})-[:DEPENDS_ON {recorded_at}]->(:Artifact)`; the
+  invalidation walk is one `[:DEPENDS_ON*1..]` MATCH; staleness is a `:Stale`
+  marker label (with `stale_reason`/`stale_since` properties) so freshness
+  scans are label filters and clearing is one `REMOVE` of label + properties.
+  Public functions take `&GraphStore`; the few that still read SQL tables
+  (`repo_chunks`, `gf_nodes`, `repo_projects`) take both connections.
+- **`symbols.rs`** (reviewed memory anchored to code symbols): live symbols
+  are `:SymbolHead` nodes (not `:Symbol`, so whole-table replacement never
+  touches the code graph), the table's episode is a `:SymbolState` node,
+  exact moves are `:SymbolMove` nodes, and pins are
+  `(:Memory)-[:PINNED_TO {relpath, sha256, byte_start, byte_end, state, …}]->(:SymbolHead)`
+  — a pending pin points at the repository's `stable_id: ""` anchor until
+  resolved (the resolved links are the pin's `symbols` property, stringified
+  JSON: the engine has no map/list-of-map properties). Read paths still
+  threaded by SQL connections resolve the store with `store::graph_for`.
 
 ## Value-mapping conventions
 

@@ -573,7 +573,8 @@ pub fn save(
     })?;
     store::invalidate(db, repository)?;
     let workspace = crate::invalidation::workspace_of(db, repository)?;
-    crate::invalidation::record_memory(db, &workspace, repository, &identifier, data)?;
+    let graph = crate::store::graph_for(db)?;
+    crate::invalidation::record_memory(&graph, &workspace, repository, &identifier, data)?;
     // Quotes written before their code was projected wait to
     // be pinned to their symbols.
     crate::symbols::record_pins(db, repository, &identifier, data)?;

@@ -33,6 +33,7 @@ fn still_present(
 /// receipt's `removed`.
 fn delete_project(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     p: &store::Principal,
     identifier: &str,
     mut removed: Value,
@@ -47,11 +48,13 @@ fn delete_project(
     .collect();
     crate::projection::enqueue(db, identifier, "project_deleted")?;
     removed["references"] =
-        deletion::forget_project_references(db, &p.workspace, identifier, &connectors)?;
+        deletion::forget_project_references(db, graph, &p.workspace, identifier, &connectors)?;
     if let Some(cache) = crate::graph_projection::cache_root(db, identifier) {
         crate::graph_materialize::purge(&cache)?;
     }
     db.execute("DELETE FROM repo_projects WHERE id=?", [identifier])?;
+    // The project's document links live in the graph store: no cascade there.
+    crate::doc_links::drop_project(db, identifier)?;
     graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
     deletion::project_receipt(db, p, identifier, &connectors, removed)
 }
@@ -182,10 +185,10 @@ impl Store {
                     let copies=crate::folders::scratch_projects(db,identifier)?;
                     let mut scratch=Vec::with_capacity(copies.len());
                     for copy in &copies {
-                        scratch.push(delete_project(db,p,copy,json!({}))?);
+                        scratch.push(delete_project(db,&self.graph(),p,copy,json!({}))?);
                     }
                     let removed=if copies.is_empty() {json!({})} else {json!({"pr_scratch_projects":copies})};
-                    let receipt=delete_project(db,p,identifier,removed)?;
+                    let receipt=delete_project(db,&self.graph(),p,identifier,removed)?;
                     let mut result=json!({"deleted":true,"local_backups_are_separate":true,"receipt":receipt});
                     if !scratch.is_empty() {result["pr_scratch_projects"]=json!(scratch);}
                     Ok(result)

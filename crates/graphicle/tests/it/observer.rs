@@ -434,16 +434,12 @@ async fn observer_notes_are_deleted_when_their_source_changes_or_is_removed() {
         "a changed or removed source must not keep derived notes"
     );
     assert_eq!(reflections(), 0, "nor a reflection built from it");
-    let db = f.store.connect().unwrap();
-    let edges: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_dependencies WHERE dependent_kind='observer_note'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let edges = graphicle_runtime::invalidation::dependencies(&f.store.graph(), &f.workspace)
+        .unwrap()
+        .iter()
+        .filter(|e| e.dependent_kind == "observer_note")
+        .count();
     assert_eq!(edges, 0, "dependency edges are removed with the notes");
-    drop(db);
     let rebuilt = f.run(&m, args).await;
     assert_eq!(rebuilt["result"]["units"]["total"], 1, "{rebuilt}");
     assert_eq!(f.note_rows(), [("file:session-0001.txt".to_string(), 1)]);

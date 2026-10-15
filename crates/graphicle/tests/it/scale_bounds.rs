@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct Fixture {
-    dir: TempDir,
+    _dir: TempDir,
     store: Store,
     workspace: String,
     key: String,
@@ -26,7 +26,7 @@ impl Fixture {
             .unwrap();
         let repo = s(&registered, "id").to_string();
         Self {
-            dir,
+            _dir: dir,
             store,
             workspace,
             key,
