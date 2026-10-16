@@ -1453,21 +1453,24 @@ fn documents_of(db: &Connection, project: &Project) -> Result<Vec<Document>> {
             input: String::new(),
         });
     }
-    for row in rows(
-        db,
-        "SELECT d.connector_id,d.id,d.sha256,json_extract(d.metadata,'$.code_spans') AS spans,c.kind,c.name \
-         FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id \
-         WHERE c.repository_id=? AND c.state='active' AND d.present=1 \
-         AND coalesce(json_extract(d.metadata,'$.provider_metadata.schema'),'')<>? ORDER BY d.connector_id,d.id",
-        params![project.id, SDK_SESSION_SCHEMA],
-    )? {
+    for row in graph_of(db)?.read(|gdb| {
+        store_graph::rows(
+            gdb,
+            "MATCH (d:ConnectorDoc {repository_id: $repo, present: true})-[:FROM]->(c:Connector {state: 'active'}) \
+             RETURN d.connector_id AS connector_id, d.id AS id, d.sha256 AS sha256, d.metadata AS metadata, c.kind AS kind, c.name AS name \
+             ORDER BY d.connector_id, d.id",
+            gparams([("repo", json!(project.id.clone()))]),
+        )
+    })? {
         if agent_sessions(s(&row, "kind"), s(&row, "name")) {
             continue;
         }
-        let spans = row["spans"]
-            .as_str()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or(Value::Null);
+        let metadata: Value =
+            serde_json::from_str(s(&row, "metadata")).unwrap_or(Value::Null);
+        if metadata["provider_metadata"]["schema"].as_str() == Some(SDK_SESSION_SCHEMA) {
+            continue;
+        }
+        let spans = metadata.get("code_spans").cloned().unwrap_or(Value::Null);
         found.push(Document {
             project: project.id.clone(),
             id: format!("connector:{}:{}", s(&row, "connector_id"), s(&row, "id")),
@@ -1650,7 +1653,7 @@ fn plan(db: &Connection, workspace: &str) -> Result<Plan> {
             .read(|db| {
                 store_graph::rows(
                     db,
-                    "MATCH (d:ConnectorDoc {repository_id: $repo}) \
+                    "MATCH (d:ConnectorDoc {repository_id: $repo}) WHERE d.source_kind IS NOT NULL \
                      RETURN d.id AS document_id, d.input AS input, d.dependencies AS dependencies",
                     gparams([("repo", json!(project.id))]),
                 )
@@ -1793,12 +1796,15 @@ fn compute_one(
 ) -> Result<Option<Computed>> {
     let content = match (&document.path, &document.connector) {
         (Some(_), _) => object(db, &project.id, &document.sha)?,
-        (None, Some((connector, id))) => one(
-            db,
-            "SELECT content FROM am_connector_docs WHERE connector_id=? AND id=?",
-            params![connector, id],
-        )?
-        .map(|row| s(&row, "content").to_string()),
+        (None, Some((connector, id))) => graph_of(db)?
+            .read(|gdb| {
+                store_graph::one(
+                    gdb,
+                    "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id}) RETURN d.content AS content",
+                    gparams([("connector", json!(connector)), ("id", json!(id))]),
+                )
+            })?
+            .map(|row| s(&row, "content").to_string()),
         _ => None,
     };
     let Some(content) = content else {
@@ -1979,12 +1985,14 @@ fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
             crate::store_content::head_sha(&graph, &document.project, path)?
                 .map(|sha256| json!({"sha256":sha256}))
         }
-        (None, Some((connector, id))) => one(
-            db,
-            "SELECT d.sha256 FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id \
-             WHERE d.connector_id=? AND d.id=? AND d.present=1 AND c.state='active'",
-            params![connector, id],
-        )?,
+        (None, Some((connector, id))) => graph_of(db)?.read(|gdb| {
+            store_graph::one(
+                gdb,
+                "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id, present: true})-[:FROM]->(c:Connector {state: 'active'}) \
+                 RETURN d.sha256 AS sha256",
+                gparams([("connector", json!(connector)), ("id", json!(id))]),
+            )
+        })?,
         _ => None,
     };
     Ok(row.map(|row| s(&row, "sha256").to_string()))
@@ -2117,28 +2125,44 @@ pub fn after_sync(
     connector: &str,
     p: &Principal,
 ) -> Result<Value> {
-    let Some(row) = one(
-        db,
-        "SELECT kind,name FROM am_connectors WHERE id=? AND repository_id=?",
-        params![connector, repository],
-    )?
+    let graph = graph_of(db)?;
+    let Some(row) = graph.read(|db| {
+        store_graph::one(
+            db,
+            "MATCH (c:Connector {id: $id, repository_id: $repo}) RETURN c.kind AS kind, c.name AS name",
+            gparams([("id", json!(connector)), ("repo", json!(repository))]),
+        )
+    })?
     else {
         return Ok(Value::Null);
     };
     let read = !agent_sessions(s(&row, "kind"), s(&row, "name"))
-        && one(
-            db,
-            "SELECT 1 AS yes FROM am_connector_docs WHERE connector_id=? AND present=1 \
-             AND coalesce(json_extract(metadata,'$.provider_metadata.schema'),'')<>? LIMIT 1",
-            params![connector, SDK_SESSION_SCHEMA],
-        )?
-        .is_some();
-    let linked = graph_of(db)?
+        && graph
+            .read(|db| {
+                store_graph::rows(
+                    db,
+                    "MATCH (d:ConnectorDoc {connector_id: $connector, present: true}) \
+                     RETURN d.metadata AS metadata",
+                    gparams([("connector", json!(connector))]),
+                )
+            })?
+            .iter()
+            .any(|row| {
+                serde_json::from_str::<Value>(s(row, "metadata"))
+                    .is_ok_and(|metadata| {
+                        metadata["provider_metadata"]["schema"].as_str()
+                            != Some(SDK_SESSION_SCHEMA)
+                    })
+            });
+    // Link rows of this connector's documents that remain to be removed:
+    // their own nodes carry the row state (`source_kind`) and the connector
+    // as `connector` (content documents carry it as `connector_id`).
+    let linked = graph
         .read(|db| {
             store_graph::one(
                 db,
                 "MATCH (d:ConnectorDoc {repository_id: $repo, connector: $connector}) \
-                 RETURN 1 AS yes LIMIT 1",
+                 WHERE d.source_kind IS NOT NULL RETURN 1 AS yes LIMIT 1",
                 gparams([("repo", json!(repository)), ("connector", json!(connector))]),
             )
         })?
@@ -2570,12 +2594,15 @@ fn linkable(db: &Connection, id: &str, session: bool) -> Result<bool> {
     if session {
         return Ok(false);
     }
-    Ok(one(
-        db,
-        "SELECT kind,name FROM am_connectors WHERE id=?",
-        [connector],
-    )?
-    .is_some_and(|row| !agent_sessions(s(&row, "kind"), s(&row, "name"))))
+    Ok(graph_of(db)?
+        .read(|gdb| {
+            store_graph::one(
+                gdb,
+                "MATCH (c:Connector {id: $id}) RETURN c.kind AS kind, c.name AS name",
+                gparams([("id", json!(connector))]),
+            )
+        })?
+        .is_some_and(|row| !agent_sessions(s(&row, "kind"), s(&row, "name"))))
 }
 
 /// The producers whose rows this program reads: its own, and those of the
@@ -3289,7 +3316,7 @@ fn coverage(
     for source in graph.read(|db| {
         store_graph::rows(
             db,
-            "MATCH (d:ConnectorDoc {repository_id: $repo}) \
+            "MATCH (d:ConnectorDoc {repository_id: $repo}) WHERE d.source_kind IS NOT NULL \
              RETURN d.id AS document_id, d.source_kind AS source_kind, \
              d.document_sha256 AS document_sha256, d.`counts.omitted` AS omitted",
             gparams([("repo", json!(project))]),
@@ -3316,14 +3343,20 @@ fn coverage(
     }
     // Documents the job reads that it has not read yet ([`linkable`], with
     // the project's agent-session connectors read once).
-    let sessions: HashSet<String> = rows(
-        db,
-        "SELECT id FROM am_connectors WHERE repository_id=? AND kind='jsonl' AND name=?",
-        params![project, crate::capture::CONNECTOR_NAME],
-    )?
-    .iter()
-    .map(|row| s(row, "id").to_string())
-    .collect();
+    let sessions: HashSet<String> = graph_of(db)?
+        .read(|gdb| {
+            store_graph::rows(
+                gdb,
+                "MATCH (c:Connector {repository_id: $repo, kind: 'jsonl', name: $name}) RETURN c.id AS id",
+                gparams([
+                    ("repo", json!(project)),
+                    ("name", json!(crate::capture::CONNECTOR_NAME)),
+                ]),
+            )
+        })?
+        .iter()
+        .map(|row| s(row, "id").to_string())
+        .collect();
     for (document, found) in listed.iter().filter(|(id, _)| !read.contains(*id)) {
         let unread = match document.strip_prefix("file:") {
             Some(path) => format_of(path).is_some(),

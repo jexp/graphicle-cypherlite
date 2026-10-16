@@ -1641,7 +1641,7 @@ fn an_import_while_the_link_job_runs_queues_another_and_graph_link_relinks() {
     // `graph.link` relinks on request.
     f.graph_write(&[
         "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() DELETE l",
-        "MATCH (d:ConnectorDoc) DELETE d",
+        "MATCH (d:ConnectorDoc) WHERE d.source_kind IS NOT NULL DELETE d",
     ]);
     let linked = f.store.graph_link(&f.workspace, &f.key).unwrap();
     assert_eq!(linked["documents"]["relinked"], 2, "{linked}");
@@ -1801,7 +1801,7 @@ fn an_upgraded_store_links_its_documents_at_the_next_drain() {
     // As a store from before the move looks: no link rows, no state.
     f.graph_write(&[
         "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() DELETE l",
-        "MATCH (d:ConnectorDoc) DELETE d",
+        "MATCH (d:ConnectorDoc) WHERE d.source_kind IS NOT NULL DELETE d",
         "MATCH (c:DocLinkCheckpoint) DELETE c",
         "MATCH (t:DocLinkState) DELETE t",
     ]);

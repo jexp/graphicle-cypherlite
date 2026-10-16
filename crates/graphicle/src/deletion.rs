@@ -60,6 +60,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// statements inside it).
 type Graph<'a> = &'a mut cypherlite::Connection;
 
+
 /// The SQLite implementation, kept while sibling modules still write SQL:
 /// their callers run it, and the `Store`-facing entry points fall back to it
 /// when the receipt or content lives there. Deleted once the store holds no
@@ -948,7 +949,7 @@ fn source_rows(
         out.insert(name, found);
     }
     let repo = gparams([("repo", json!(repository))]);
-    let per_repository: [(&'static str, &'static str, &'static str, Matches); 9] = [
+    let per_repository: [(&'static str, &'static str, &'static str, Matches); 8] = [
         ("originals", "OriginalDocument", "source_id", |v, sc| sc.source(v)),
         ("memories", "Memory", "data", cites),
         ("observer_notes", "Observation", "source_id", |v, sc| sc.source(v)),
@@ -957,7 +958,6 @@ fn source_rows(
         ("document_reads", "DocumentRead", "source_id", |v, sc| sc.source(v)),
         ("anchors", "AnchorEdge", "attributes.document_id", |v, sc| sc.source(v)),
         ("hints", "Hint", "target", |v, sc| sc.source(v)),
-        ("doc_links", "DocLink", "document_id", |v, sc| sc.source(v)),
     ];
     for (name, label, key, keep) in per_repository {
         let found = walk(
@@ -971,18 +971,24 @@ fn source_rows(
         )?;
         out.insert(name, found);
     }
-    out.insert(
-        "doc_link_sources",
-        walk(
-            db,
-            "DocLinkSource",
-            "n.repository_id = $repo",
-            "document_id",
-            repo.clone(),
-            |v| scope.source(v),
-            false,
-        )?,
-    );
+    // Mention links are `(:ConnectorDoc)-[:LINKS_TO]->(...)` edges on the
+    // link rows' own nodes: `source_kind` marks such a node, and its id is
+    // the document's source id (`connector:<id>:<doc>`, `file:<path>`).
+    let mut doc_links = 0usize;
+    let mut doc_link_sources = 0usize;
+    for row in rows(
+        db,
+        "MATCH (d:ConnectorDoc {repository_id: $repo}) WHERE d.source_kind IS NOT NULL \
+         OPTIONAL MATCH (d)-[l:LINKS_TO]->() RETURN d.id AS id, count(l) AS links",
+        repo.clone(),
+    )? {
+        if scope.source(s(&row, "id")) {
+            doc_link_sources += 1;
+            doc_links += row["links"].as_u64().unwrap_or(0) as usize;
+        }
+    }
+    out.insert("doc_links", doc_links);
+    out.insert("doc_link_sources", doc_link_sources);
     // Served-evidence and outcome records whose lists name the documents
     // (the lists are list-of-scalar properties; older writers stringified
     // them — both read).
@@ -1588,16 +1594,15 @@ pub fn forget(
         true,
     )?;
     // The documents' mention links and what they were computed from
-    // (`(:ConnectorDoc)-[:LINKS_TO]->(:Symbol)`, §2.5).
+    // (`(:ConnectorDoc)-[:LINKS_TO]->(:Symbol)`, §2.5): the edges and the
+    // link rows' own nodes, whose ids are the documents' source ids.
     let mut doc_links = 0;
-    for rel_type in ["LINKS_TO", "LINK_SOURCE"] {
+    {
         let mut ids = Vec::new();
         for row in rows(
             db,
-            &format!(
-                "MATCH ()-[r:{rel_type}]->() WHERE r.repository_id = $repo \
-                 RETURN id(r) AS rid, r.document_id AS document"
-            ),
+            "MATCH (d:ConnectorDoc {repository_id: $repo})-[r:LINKS_TO]->() \
+             RETURN id(r) AS rid, d.id AS document",
             repo(),
         )? {
             if scope.source(s(&row, "document")) {
@@ -1606,10 +1611,27 @@ pub fn forget(
         }
         if !ids.is_empty() {
             db.query_with_params(
-                &format!("MATCH ()-[r:{rel_type}]->() WHERE id(r) IN $ids DELETE r"),
+                "MATCH ()-[r:LINKS_TO]->() WHERE id(r) IN $ids DELETE r",
                 gparams([("ids", json!(ids))]),
             )?;
             doc_links += ids.len();
+        }
+        let sources: Vec<String> = rows(
+            db,
+            "MATCH (d:ConnectorDoc {repository_id: $repo}) WHERE d.source_kind IS NOT NULL \
+             RETURN d.id AS id",
+            repo(),
+        )?
+        .iter()
+        .filter(|row| scope.source(s(row, "id")))
+        .map(|row| s(row, "id").to_string())
+        .collect();
+        if !sources.is_empty() {
+            db.query_with_params(
+                "MATCH (d:ConnectorDoc {repository_id: $repo}) \
+                 WHERE d.source_kind IS NOT NULL AND d.id IN $ids DELETE d",
+                gparams([("repo", json!(repository)), ("ids", json!(sources))]),
+            )?;
         }
     }
     // Served-evidence and outcome lists naming the documents: strip the

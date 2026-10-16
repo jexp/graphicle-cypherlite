@@ -55,7 +55,7 @@ fn event(db: &mut cypherlite::Connection, repository: &str, kind: &str, data: Va
         params(&[
             ("repo", json!(repository)),
             ("kind", json!(kind)),
-            ("data", data),
+            ("data", json!(data.to_string())),
             ("at", json!(now())),
         ]),
     )?;
@@ -328,21 +328,32 @@ fn storage_prune(
         // snapshots.
         let source_id = crate::store_graph::s(&original, "source_id").to_string();
         let sha = crate::store_graph::s(&original, "sha256").to_string();
-        // ConnectorDoc metadata is flattened onto dotted properties
-        // (`d.`metadata.provider_metadata.original_sha256``; verified on
-        // v0.12.2 — map-typed properties are rejected, dotted names are not).
-        let current = one(
-            db,
-            "MATCH (d:ConnectorDoc {repository_id: $repo, id: $source_id, present: true}) \
-             WHERE d.`metadata.provider_metadata.original_sha256` = $sha \
-             RETURN d.id AS id LIMIT 1",
-            params(&[
-                ("repo", json!(identifier)),
-                ("source_id", json!(source_id)),
-                ("sha", json!(sha)),
-            ]),
-        )?
-        .is_some();
+        // The connector document this original belongs to: its id is the raw
+        // document id (the `connector:<connector>:<id>` form is the link
+        // rows' node), and its metadata is one JSON text property.
+        let current = source_id
+            .strip_prefix("connector:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(connector, document)| {
+                one(
+                    db,
+                    "MATCH (d:ConnectorDoc {repository_id: $repo, connector_id: $connector, id: $document, present: true}) \
+                     RETURN d.metadata AS metadata LIMIT 1",
+                    params(&[
+                        ("repo", json!(identifier)),
+                        ("connector", json!(connector)),
+                        ("document", json!(document)),
+                    ]),
+                )
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    serde_json::from_str::<Value>(crate::store_graph::s(&row, "metadata")).ok()
+                })
+                .is_some_and(|metadata| {
+                    metadata["provider_metadata"]["original_sha256"].as_str() == Some(sha.as_str())
+                })
+            });
         if !current && !objects.contains(crate::store_graph::s(&original, "text_sha256")) {
             originals_freed += original["bytes"].as_u64().unwrap_or(0);
             db.query_with_params(
