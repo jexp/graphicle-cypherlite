@@ -23,23 +23,24 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
   `reviews.sqlite3` until the migration completes. Symlink paths are
   refused. `GraphStore::path()` returns it. The engine's writer lease is
   exclusive, so a second open of the same path **in this process** shares
-  the live engine through a per-process registry, and an open that finds the
-  lease held by **another process** follows the store read-only (reads pin
-  snapshots; writes fail with a clear error) instead of failing.
+  the live engine through a per-process registry (keyed by the canonical
+  store path), and an open that finds the lease held by **another process**
+  busy-retries for up to 30 s, as SQLite's busy timeout did.
 - `GraphStore::open_in_memory()` is the `:memory:` mode that replaces
   rusqlite's `open_in_memory` in tests and transient processing (staging,
-  expansion scratch). An in-memory store holds its engine for good (dropping
-  it would lose the data).
-- `GraphStore` is cheap to clone; clones share one handle. The engine takes
-  an exclusive writer lease on a durable store, so a durable `GraphStore`
-  holds the engine open **only while an operation runs** (a `Weak` upgraded
-  per use): idle stores hold no lease, so a second process — a `graphicle
-  sync` beside a running `graphicle mcp`, a reopened store in-process — can
-  work the same store, as it could with SQLite. A contended (re)open waits
-  behind the holder for up to 30 s (the SQL store's busy timeout was 10 s).
+  expansion scratch).
+- `GraphStore` is cheap to clone; clones share one location. The engine
+  takes a single-process writer lease on a durable store, so a durable
+  store is **not held open**: the engine opens on first use, is shared
+  through a process-wide registry, and is reaped after a 250 ms idle grace
+  (engine open replays state, so bursts of work share one open), releasing
+  the writer lease; a busy `storage locked` answer from another process
+  mid-write is retried for up to 30 s. A hook or CLI child process can
+  therefore work beside a running server; keep transactions short, since a
+  live connection holds the lease.
 - `store.checkpoint()` flushes the WAL into a snapshot (maintenance/backup
-  paths); `store.database()` exposes the raw `cypherlite::Database` for
-  snapshot/clone work.
+  paths); `store.database()` returns the transiently opened
+  `Arc<cypherlite::Database>` for snapshot/clone work.
 
 ## Connections: one per worker thread, never one per request
 
@@ -48,9 +49,10 @@ let store = GraphStore::open_in_memory()?;                      // ephemeral, fo
 spawns a 64 MiB-stack worker thread (migration doc §6 item 6); dropping one
 tears down the engine's shared state, which is ruinously expensive per call.
 **Never create one per request.** The `transaction`/`read` helpers below
-check a connection out of the store handle's pool and return it afterwards
-(the pool lives and dies with the handle, so an idle store still holds no
-engine and releases the writer lease exactly as before); they are the right
+check a connection out of the engine registry entry's pool and return it
+afterwards (the pool lives and dies with the registry entry, so a reaped
+engine takes its idle connections with it and an idle process still
+releases the writer lease exactly as before); they are the right
 granularity for request handlers. Code with its own long-lived worker (the
 job runner) should hold one `Connection` and pass `&mut` to the query
 helpers directly. A closure that re-enters `transaction`/`read` on the same

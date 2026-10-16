@@ -6,10 +6,10 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -347,6 +347,31 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     Ok(graph)
 }
 
+/// Read-only handles, by canonical directory: the same one-handle-per-
+/// directory sharing as [`GRAPHS`], for callers that never write (agent
+/// hooks beside a running server). A read-only open takes shared locks and
+/// never the writer lease, so it neither blocks nor is blocked by a writer.
+static GRAPHS_READ_ONLY: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::GraphStore>>> =
+    Mutex::new(BTreeMap::new());
+
+/// The read-only counterpart of [`graph_in`]: the store must already exist
+/// (nothing is created or migrated), and the handle never takes the writer
+/// lease, so a hook can read beside a running server.
+fn graph_in_read_only(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
+    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    let mut registry = GRAPHS_READ_ONLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(graph);
+    }
+    let graph = Arc::new(crate::store_graph::GraphStore::open_read_only(
+        key.join("reviews.graph"),
+    )?);
+    registry.insert(key, Arc::downgrade(&graph));
+    Ok(graph)
+}
+
 /// The graph store paired with a SQL [`Connection`]: `reviews.graph` beside
 /// the connection's database file (shared through the registry in
 /// [`graph_in`]). Errors for an in-memory connection.
@@ -365,6 +390,20 @@ pub fn graph_for(db: &Connection) -> Result<Arc<crate::store_graph::GraphStore>>
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::bad("Database path has no parent directory"))?;
     graph_in(&directory)
+}
+
+/// The read-only counterpart of [`graph_for`] for callers that never write
+/// (the guard hooks): no writer lease, no schema DDL, no creation.
+pub fn graph_for_read_only(db: &Connection) -> Result<Arc<crate::store_graph::GraphStore>> {
+    let path = db
+        .path()
+        .ok_or_else(|| Error::bad("An in-memory SQL connection has no paired graph store"))?;
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let directory = resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Error::bad("Database path has no parent directory"))?;
+    graph_in_read_only(&directory)
 }
 
 impl Store {
@@ -407,7 +446,7 @@ impl Store {
         ensure_column(&db, "gf_nodes", "owner", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&db, "gf_edges", "owner", "TEXT NOT NULL DEFAULT ''")?;
         db.execute_batch(include_str!("product_schema.sql"))?;
-        crate::work_state::migrate(&db)?;
+        // Work state lives in the graph store (see store_graph.rs).
         // Each folder's freshness record.
         crate::fresh::migrate(&db)?;
         // Documents' mention links to code symbols.
@@ -607,7 +646,7 @@ impl Store {
                 Ok(())
             })?;
             // Cached answers produced under the revoked credential are no longer current.
-            let revoked_sources=credential_sources(db,workspace,credential)?;
+            let revoked_sources=credential_sources(self,db,workspace,credential)?;
             crate::invalidation::permissions_changed(&self.graph(),workspace,Some(&hash),&revoked_sources,"credential_revoked")?;
             Ok(json!({"revoked":true,"sources":revoked_sources}))
         })
@@ -996,48 +1035,135 @@ impl Store {
 /// provider identities. Both are joins on the identifier, never text search
 /// over the JSON, so `cred-a` does not match `cred-ab`.
 pub fn credential_sources(
+    store: &Store,
     db: &Connection,
     workspace: &str,
     credential: &str,
 ) -> Result<Vec<String>> {
     let mut sources = BTreeSet::new();
-    for row in rows(
-        db,
-        "SELECT d.connector_id,d.id FROM am_connector_docs d \
-         JOIN am_connectors c ON c.id=d.connector_id \
-         JOIN repo_projects r ON r.id=c.repository_id \
-         JOIN json_each(d.acl,'$.credentials') reader \
-         WHERE r.workspace_id=? AND d.present=1 AND reader.value=?",
-        params![workspace, credential],
-    )? {
-        sources.insert(crate::invalidation::connector_document_id(
-            s(&row, "connector_id"),
-            s(&row, "id"),
-        ));
-    }
-    for row in rows(
-        db,
-        "SELECT DISTINCT d.connector_id,d.id FROM am_connector_docs d \
-         JOIN am_connectors c ON c.id=d.connector_id \
-         JOIN repo_projects r ON r.id=c.repository_id \
-         JOIN am_source_permissions p ON p.connector_id=d.connector_id AND p.source_id=d.id \
-         JOIN json_each(p.principals) grant_ \
-         JOIN am_provider_identities i ON i.workspace_id=r.workspace_id AND i.provider=c.kind AND i.credential_id=? \
-         LEFT JOIN am_provider_emails e ON e.workspace_id=i.workspace_id AND e.provider=i.provider AND e.external_id=i.external_id \
-         LEFT JOIN am_oauth_accounts o ON o.workspace_id=i.workspace_id AND o.provider=i.provider AND o.external_id=i.external_id AND o.state='active' \
-         WHERE r.workspace_id=? AND d.present=1 AND ( \
-            (json_extract(grant_.value,'$.type')='user' AND json_extract(grant_.value,'$.id')=i.external_id) OR \
-            (json_extract(grant_.value,'$.type')='email' AND coalesce(json_extract(grant_.value,'$.email'),'')!='' \
-             AND lower(json_extract(grant_.value,'$.email')) IN (lower(coalesce(e.email,'')),lower(coalesce(o.email,'')))))",
-        params![credential, workspace],
-    )? {
-        sources.insert(crate::invalidation::connector_document_id(
-            s(&row, "connector_id"),
-            s(&row, "id"),
-        ));
-    }
+    let projects: Vec<String> =
+        rows(db, "SELECT id FROM repo_projects WHERE workspace_id=?", [workspace])?
+            .iter()
+            .map(|r| s(r, "id").to_string())
+            .collect();
+    let connectors: Vec<Value> = store.graph().read(|db| {
+        crate::store_graph::rows(
+            db,
+            "MATCH (c:Connector) WHERE c.repository_id IN $projects RETURN c.id AS id, c.kind AS kind",
+            crate::store_graph::Params::from([(
+                "projects".into(),
+                crate::store_graph::json_to_value(&json!(projects)),
+            )]),
+        )
+    })?;
+    let ids: Vec<String> = connectors.iter().map(|c| s(c, "id").to_string()).collect();
+    store.graph().read(|db| {
+        for row in crate::store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {present: true}) WHERE d.connector_id IN $connectors AND $credential IN d.acl_credentials RETURN d.connector_id AS connector_id, d.id AS id",
+            crate::store_graph::Params::from([
+                ("connectors".into(), crate::store_graph::json_to_value(&json!(ids))),
+                ("credential".into(), crate::store_graph::json_to_value(&json!(credential))),
+            ]),
+        )? {
+            sources.insert(crate::invalidation::connector_document_id(
+                s(&row, "connector_id"),
+                s(&row, "id"),
+            ));
+        }
+        // Provider-side grants: the credential's verified identities of each
+        // connector's provider, then user/email grants naming them.
+        let identities = crate::store_graph::rows(
+            db,
+            "MATCH (i:ProviderIdentity {workspace_id: $workspace, credential_id: $credential}) RETURN i.provider AS provider, i.external_id AS external_id",
+            crate::store_graph::Params::from([
+                ("workspace".into(), crate::store_graph::json_to_value(&json!(workspace))),
+                ("credential".into(), crate::store_graph::json_to_value(&json!(credential))),
+            ]),
+        )?;
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let mut emails: std::collections::BTreeMap<(String, String), String> = Default::default();
+        for row in crate::store_graph::rows(
+            db,
+            "MATCH (e:ProviderEmail {workspace_id: $workspace}) RETURN e.provider AS provider, e.external_id AS external_id, e.email AS email              UNION ALL              MATCH (o:OAuthAccount {workspace_id: $workspace, state: 'active'}) RETURN o.provider AS provider, o.external_id AS external_id, o.email AS email",
+            crate::store_graph::Params::from([("workspace".into(), crate::store_graph::json_to_value(&json!(workspace)))]),
+        )? {
+            let email = s(&row, "email").to_lowercase();
+            if !email.is_empty() {
+                emails.insert(
+                    (s(&row, "provider").to_string(), s(&row, "external_id").to_string()),
+                    email,
+                );
+            }
+        }
+        let permissions = crate::store_graph::rows(
+            db,
+            "MATCH (sp:SourcePermission) WHERE sp.connector_id IN $connectors RETURN sp.connector_id AS connector_id, sp.source_id AS source_id, sp.principals AS principals",
+            crate::store_graph::Params::from([(
+                "connectors".into(),
+                crate::store_graph::json_to_value(&json!(
+                    connectors.iter().map(|c| s(c, "id").to_string()).collect::<Vec<_>>()
+                )),
+            )]),
+        )?;
+        let kind_of: BTreeMap<&str, &str> = connectors
+            .iter()
+            .map(|c| (s(c, "id"), s(c, "kind")))
+            .collect();
+        let present: BTreeSet<(String, String)> = crate::store_graph::rows(
+            db,
+            "MATCH (d:ConnectorDoc {present: true}) WHERE d.connector_id IN $connectors RETURN d.connector_id AS connector_id, d.id AS id",
+            crate::store_graph::Params::from([(
+                "connectors".into(),
+                crate::store_graph::json_to_value(&json!(
+                    connectors.iter().map(|c| s(c, "id").to_string()).collect::<Vec<_>>()
+                )),
+            )]),
+        )?
+        .iter()
+        .map(|row| (s(row, "connector_id").to_string(), s(row, "id").to_string()))
+        .collect();
+        for permission in permissions {
+            let key = (
+                s(&permission, "connector_id").to_string(),
+                s(&permission, "source_id").to_string(),
+            );
+            if !present.contains(&key) {
+                continue;
+            }
+            let provider = kind_of.get(s(&permission, "connector_id")).copied().unwrap_or("");
+            let grants: Value =
+                serde_json::from_str(s(&permission, "principals")).unwrap_or(Value::Null);
+            for identity in &identities {
+                if s(identity, "provider") != provider {
+                    continue;
+                }
+                let external = s(identity, "external_id");
+                let email = emails
+                    .get(&(provider.to_string(), external.to_string()))
+                    .cloned()
+                    .unwrap_or_default();
+                let granted = grants.as_array().into_iter().flatten().any(|grant| {
+                    (grant["type"] == "user" && grant["id"] == external)
+                        || (grant["type"] == "email"
+                            && !email.is_empty()
+                            && s(grant, "email").eq_ignore_ascii_case(&email))
+                });
+                if granted {
+                    sources.insert(crate::invalidation::connector_document_id(
+                        &key.0, &key.1,
+                    ));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })?;
     Ok(sources.into_iter().collect())
 }
+
 
 /// Additive column migration for tables created by an earlier schema:
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column

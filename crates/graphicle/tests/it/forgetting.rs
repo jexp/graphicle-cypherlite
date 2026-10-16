@@ -221,12 +221,9 @@ impl Fixture {
         if key.exists() {
             std::fs::copy(key, dir.path().join("vault.key")).unwrap();
         }
-        // The graph store is a directory of its own: checkpoint, then copy.
-        self.store.graph().checkpoint().unwrap();
-        copy_dir(
-            &self._dir.path().join("reviews.graph"),
-            &dir.path().join("reviews.graph"),
-        );
+        // The connector/account domain lives in the graph store beside the
+        // SQLite file; a fork carries it too.
+        crate::copy_graph(&self.store, dir.path());
         Self {
             store: Store::open(dir.path()).unwrap(),
             _dir: dir,
@@ -541,9 +538,9 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
     assert_same_world(&a, &b);
     // The comparison covers the derived state, not an empty shell.
     let covered = a.state();
+    // The connector tables moved to the graph store; the SQL state covers
+    // the rest.
     for table in [
-        "am_connector_docs",
-        "am_connector_versions",
         "am_observer_notes",
         "am_vectors",
         "repo_memories",
@@ -559,6 +556,17 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
             "{table}: {covered:#}"
         );
     }
+    assert!(
+        crate::gql_one(
+            &a.store,
+            "MATCH (d:ConnectorDoc) RETURN count(d) AS n",
+            Default::default()
+        )
+        .and_then(|row| row["n"].as_u64())
+        .unwrap_or(0)
+            > 0,
+        "the graph store holds connector documents"
+    );
     assert_eq!(answers, work(&b, &m, &[&chat]).await);
     assert!(
         !answers

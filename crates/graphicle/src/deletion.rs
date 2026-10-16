@@ -437,33 +437,46 @@ pub fn document_hash(connector: &str, document: &str) -> String {
 /// Most documents one forget request (and one receipt) names.
 pub const MAX_SCOPE_DOCUMENTS: usize = MAX_DOCUMENTS;
 
-/// Whether an incoming connector document was forgotten earlier. Legacy
-/// ingestion path: the connectors module still writes and consults the SQL
-/// tombstones table; it migrates to `ForgottenSource` nodes with the
-/// connectors module.
+/// Whether an incoming connector document was forgotten earlier.
+/// Tombstones live in the graph store (the connector they name is there).
 pub(crate) fn forgotten(
-    db: &rusqlite::Connection,
+    db: &mut cypherlite::Connection,
     connector: &str,
     document: &str,
 ) -> Result<bool> {
     let session = crate::capture::document_session_marker(document)
         .map(|marker| tombstone(connector, &marker));
-    Ok(crate::store::one(
+    let mut hashes = vec![tombstone(connector, document)];
+    if let Some(session) = session {
+        hashes.push(session);
+    }
+    Ok(crate::store_graph::one(
         db,
-        "SELECT 1 AS yes FROM am_forgotten_sources WHERE connector_id=? AND id_hash IN (?,?) LIMIT 1",
-        rusqlite::params![connector, tombstone(connector, document), session],
+        "MATCH (f:ForgottenSource {connector_id: $connector}) WHERE f.id_hash IN $hashes RETURN f.id_hash AS id_hash LIMIT 1",
+        crate::store_graph::Params::from([
+            ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+            ("hashes".into(), crate::store_graph::json_to_value(&json!(hashes))),
+        ]),
     )?
     .is_some())
 }
 
 /// Block a connector document id before it exists (the later turns of a
 /// forgotten agent session) with the same one-way tombstone a forgotten
-/// document leaves, so no identifier is kept. Legacy SQL path; migrates with
-/// the connectors module.
-pub(crate) fn block(db: &rusqlite::Connection, connector: &str, document: &str) -> Result<()> {
-    db.execute(
-        "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-        rusqlite::params![connector, tombstone(connector, document), now()],
+/// document leaves, so no identifier is kept.
+pub(crate) fn block(
+    db: &mut cypherlite::Connection,
+    connector: &str,
+    document: &str,
+) -> Result<()> {
+    crate::store_graph::write(
+        db,
+        "MERGE (f:ForgottenSource {connector_id: $connector, id_hash: $hash}) SET f.forgotten_at=$now",
+        crate::store_graph::Params::from([
+            ("connector".into(), crate::store_graph::json_to_value(&json!(connector))),
+            ("hash".into(), crate::store_graph::json_to_value(&json!(tombstone(connector, document)))),
+            ("now".into(), crate::store_graph::json_to_value(&json!(now()))),
+        ]),
     )?;
     Ok(())
 }

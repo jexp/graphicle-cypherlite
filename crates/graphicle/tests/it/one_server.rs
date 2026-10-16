@@ -658,8 +658,7 @@ fn repo_names_only_readable_projects_and_never_a_github_slug() {
     let folder = TempDir::new().unwrap();
     let folder_path = folder.path().canonicalize().unwrap();
     {
-        let db = f.store.connect().unwrap();
-        graphicle_runtime::folders::record(&db, &f.workspace, &other, &folder_path).unwrap();
+        graphicle_runtime::folders::record(&f.store.graph(), &f.workspace, &other, &folder_path).unwrap();
     }
     let mut app = f.app();
     let read = |app: &App, token: &str, repo: &str| -> Result<Value, String> {

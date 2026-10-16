@@ -1,7 +1,12 @@
 //! Workspace-bound authenticated encryption for provider secrets.
+//!
+//! Secrets live in the graph store as `(:Secret {id, workspace_id, name,
+//! ciphertext, nonce, updated_at})` nodes; ciphertext and nonce are base64
+//! strings (the graph value model has no byte-string type).
 use crate::{
     Error, Result, id, now,
-    store::{Store, one, s},
+    store::{Store, s},
+    store_graph::{self as graph, Params, b64d, b64e, json_to_value},
     string,
 };
 use aes_gcm::{
@@ -9,7 +14,6 @@ use aes_gcm::{
     aead::{Aead, Payload},
 };
 use rand::{RngCore, rngs::OsRng};
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 
@@ -72,34 +76,38 @@ impl Store {
                 },
             )
             .map_err(|_| Error::bad("Credential encryption failed"))?;
-        self.transaction(|db| {
-            db.execute(
-                "INSERT INTO am_secrets VALUES(?,?,?,?,?,?)",
-                params![
-                    identifier,
-                    workspace,
-                    name,
-                    ciphertext,
-                    nonce.as_slice(),
-                    now()
-                ],
+        self.graph().transaction(|db| {
+            graph::write(
+                db,
+                "CREATE (s:Secret {id: $id, workspace_id: $workspace, name: $name, ciphertext: $ciphertext, nonce: $nonce, updated_at: $updated_at})",
+                Params::from([
+                    ("id".into(), json_to_value(&json!(identifier))),
+                    ("workspace".into(), json_to_value(&json!(workspace))),
+                    ("name".into(), json_to_value(&json!(name))),
+                    ("ciphertext".into(), json_to_value(&json!(b64e(&ciphertext)))),
+                    ("nonce".into(), json_to_value(&json!(b64e(&nonce)))),
+                    ("updated_at".into(), json_to_value(&json!(now()))),
+                ]),
             )?;
             Ok(())
         })?;
         Ok(identifier)
     }
     pub fn secret(&self, workspace: &str, identifier: &str) -> Result<String> {
-        let db = self.connect()?;
-        let mut stmt = db.prepare(
-            "SELECT name,ciphertext,nonce FROM am_secrets WHERE workspace_id=? AND id=?",
-        )?;
-        let mut rows = stmt.query(params![workspace, identifier])?;
-        let row = rows
-            .next()?
-            .ok_or_else(|| Error::bad("Stored credential is unavailable"))?;
-        let name: String = row.get(0)?;
-        let bytes: Vec<u8> = row.get(1)?;
-        let nonce: Vec<u8> = row.get(2)?;
+        let row = self.graph().read(|db| {
+            graph::one(
+                db,
+                "MATCH (s:Secret {workspace_id: $workspace, id: $id}) RETURN s.name AS name, s.ciphertext AS ciphertext, s.nonce AS nonce",
+                Params::from([
+                    ("workspace".into(), json_to_value(&json!(workspace))),
+                    ("id".into(), json_to_value(&json!(identifier))),
+                ]),
+            )
+        })?
+        .ok_or_else(|| Error::bad("Stored credential is unavailable"))?;
+        let name = s(&row, "name").to_string();
+        let bytes = b64d(s(&row, "ciphertext"))?;
+        let nonce = b64d(s(&row, "nonce"))?;
         if nonce.len() != 12 {
             return Err(Error::bad("Credential integrity check failed"));
         }
@@ -131,25 +139,83 @@ impl Store {
             .authorized(workspace, token, "admin", |_, _| Ok(()))
             .is_err()
         {
-            self.connect()?
-                .execute("DELETE FROM am_secrets WHERE id=?", [&identifier])?;
+            self.graph().transaction(|db| {
+                graph::write(
+                    db,
+                    "MATCH (s:Secret {id: $id}) DELETE s",
+                    Params::from([("id".into(), json_to_value(&json!(identifier)))]),
+                )
+            })?;
             return Err(Error::denied());
         }
         Ok(json!({"id":identifier,"credential_ref":format!("secret:{identifier}"),"stored":true}))
     }
     pub fn list_credentials(&self, workspace: &str, token: &str) -> Result<Value> {
-        self.authorized(workspace,token,"admin",|db,_|Ok(json!(crate::store::rows(db,"SELECT id,name,updated_at FROM am_secrets WHERE workspace_id=? AND name NOT LIKE 'oauth-verifier:%' ORDER BY name",[workspace])?)))
+        self.authorized(workspace, token, "admin", |_, _| {
+            Ok(json!(self.graph().read(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (s:Secret {workspace_id: $workspace})
+                     WHERE NOT s.name STARTS WITH 'oauth-verifier:'
+                     RETURN s.id AS id, s.name AS name, s.updated_at AS updated_at
+                     ORDER BY s.name",
+                    Params::from([("workspace".into(), json_to_value(&json!(workspace)))]),
+                )
+            })?))
+        })
     }
     pub fn remove_credential(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace,token,"admin",|db,_|{
             let reference=string(args,"credential_ref",100)?;let identifier=reference.strip_prefix("secret:").ok_or_else(||Error::bad("Expected stored credential reference"))?;
-            let projects=crate::store::rows(db,"SELECT DISTINCT repository_id FROM am_connectors WHERE repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?) AND (credential_env=? OR credential_env IN (SELECT 'oauth:'||id FROM am_oauth_accounts WHERE workspace_id=? AND token_secret=?))",params![workspace,reference,workspace,identifier])?;
-            db.execute("UPDATE am_connectors SET state='paused',last_sync=NULL,generation=generation+1 WHERE repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?) AND credential_env IN (SELECT 'oauth:'||id FROM am_oauth_accounts WHERE workspace_id=? AND token_secret=?)",params![workspace,workspace,identifier])?;
-            let n=db.execute("DELETE FROM am_secrets WHERE workspace_id=? AND id=?",params![workspace,identifier])?;
-            // A removed secret immediately stops every connector referencing it.
-            db.execute("UPDATE am_connectors SET state='paused',last_sync=NULL,generation=generation+1 WHERE repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?) AND credential_env=?",params![workspace,reference])?;
-            for project in projects{crate::jobs::clear_model_cache(&self.graph(),s(&project,"repository_id"))?;crate::store::invalidate(db,s(&project,"repository_id"))?;}
-            Ok(json!({"removed":n>0}))
+            let projects=crate::store::rows(db,"SELECT id FROM repo_projects WHERE workspace_id=?",[workspace])?.iter().map(|r| s(r,"id").to_string()).collect::<Vec<_>>();
+            let (affected, removed) = self.graph().transaction(|gdb| {
+                let oauth_refs: Vec<String> = graph::rows(
+                    gdb,
+                    "MATCH (a:OAuthAccount {workspace_id: $workspace, token_secret: $secret}) RETURN a.id AS id",
+                    Params::from([
+                        ("workspace".into(), json_to_value(&json!(workspace))),
+                        ("secret".into(), json_to_value(&json!(identifier))),
+                    ]),
+                )?
+                .iter()
+                .map(|r| format!("oauth:{}", s(r, "id")))
+                .collect();
+                let affected: Vec<String> = graph::rows(
+                    gdb,
+                    "MATCH (c:Connector) WHERE c.repository_id IN $projects AND (c.credential_env = $reference OR c.credential_env IN $oauth_refs) RETURN DISTINCT c.repository_id AS repository_id",
+                    Params::from([
+                        ("projects".into(), json_to_value(&json!(projects))),
+                        ("reference".into(), json_to_value(&json!(reference))),
+                        ("oauth_refs".into(), json_to_value(&json!(oauth_refs))),
+                    ]),
+                )?
+                .iter()
+                .map(|r| s(r, "repository_id").to_string())
+                .collect();
+                // A removed secret immediately stops every connector referencing it.
+                graph::write(
+                    gdb,
+                    "MATCH (c:Connector) WHERE c.repository_id IN $projects AND (c.credential_env = $reference OR c.credential_env IN $oauth_refs) SET c.state='paused', c.last_sync=NULL, c.generation=c.generation+1",
+                    Params::from([
+                        ("projects".into(), json_to_value(&json!(projects))),
+                        ("reference".into(), json_to_value(&json!(reference))),
+                        ("oauth_refs".into(), json_to_value(&json!(oauth_refs))),
+                    ]),
+                )?;
+                let removed = graph::write(
+                    gdb,
+                    "MATCH (s:Secret {workspace_id: $workspace, id: $id}) DELETE s",
+                    Params::from([
+                        ("workspace".into(), json_to_value(&json!(workspace))),
+                        ("id".into(), json_to_value(&json!(identifier))),
+                    ]),
+                )?
+                .nodes_deleted
+                    > 0;
+                Ok((affected, removed))
+            })?;
+            for project in affected{crate::jobs::clear_model_cache(&self.graph(),&project)?;crate::store::invalidate(db,&project)?;}
+            Ok(json!({"removed":removed}))
         })
     }
     pub fn resolve_credential(&self, workspace: &str, reference: &str) -> Result<String> {
@@ -157,11 +223,16 @@ impl Store {
             return self.secret(workspace, identifier);
         }
         if let Some(identifier) = reference.strip_prefix("oauth:") {
-            let account = one(
-                &self.connect()?,
-                "SELECT * FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND state='active'",
-                params![workspace, identifier],
-            )?
+            let account = self.graph().read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, state: 'active'}) RETURN a.token_secret AS token_secret, a.refresh_secret AS refresh_secret, a.expires_at AS expires_at",
+                    Params::from([
+                        ("workspace".into(), json_to_value(&json!(workspace))),
+                        ("id".into(), json_to_value(&json!(identifier))),
+                    ]),
+                )
+            })?
             .ok_or_else(|| Error::bad("Connected account is unavailable"))?;
             if account["expires_at"]
                 .as_str()

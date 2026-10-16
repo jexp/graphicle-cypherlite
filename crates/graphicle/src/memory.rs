@@ -1,7 +1,7 @@
-use crate::store::{self, Principal, Store, decode, one, repo, rows, s};
+use crate::store::{self, Principal, Store, decode, repo, rows, s};
 use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result, digest, id, integer, native, now, string};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,44 +74,64 @@ pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<V
     // The Python host's workspace-source links
     // (`repo_evidence_links` over `sources`) are no longer read; nothing in
     // this program writes them. Their tables stay.
-    for mut row in rows(
-        db,
-        "SELECT d.*,c.name AS connector_name,c.kind,c.config,c.last_sync,c.credential_env,p.principals AS synced_principals,p.checked_at AS permission_checked_at,p.complete AS permission_complete,p.generation AS permission_generation FROM am_connector_docs d JOIN am_connectors c ON c.id=d.connector_id LEFT JOIN am_source_permissions p ON p.connector_id=d.connector_id AND p.source_id=d.id WHERE c.repository_id=? AND c.state='active' AND d.present=1 ORDER BY d.connector_id,d.id",
-        [identifier],
-    )? {
-        decode(&mut row, "acl")?;
+    // The connector domain lives in the graph store (`store::graph_for`).
+    let graph = crate::store::graph_for(db)?;
+    for mut row in graph.read(|db| {
+        store_graph::rows(
+            db,
+            "MATCH (c:Connector {repository_id: $repository, state: 'active'})<-[:FROM]-(d:ConnectorDoc {present: true}) \
+             OPTIONAL MATCH (sp:SourcePermission {connector_id: d.connector_id}) WHERE sp.source_id = d.id \
+             RETURN d.connector_id AS connector_id, d.id AS id, d.content AS content, d.sha256 AS sha256, d.metadata AS metadata, \
+                    d.acl_readers AS acl_readers, d.acl_credentials AS acl_credentials, d.generation AS generation, \
+                    c.name AS connector_name, c.kind AS kind, c.config AS config, c.last_sync AS last_sync, c.credential_env AS credential_env, \
+                    sp.principals AS synced_principals, sp.checked_at AS permission_checked_at, sp.complete AS permission_complete, sp.generation AS permission_generation \
+             ORDER BY d.connector_id, d.id",
+            store_graph::Params::from([("repository".into(), store_graph::json_to_value(&json!(identifier)))]),
+        )
+    })? {
         decode(&mut row, "metadata")?;
         decode(&mut row, "config")?;
+        row["acl"] = json!({"workspace_readers":row["acl_readers"],"credentials":row["acl_credentials"]});
         if !acl_allows(&row["acl"], p) {
             continue;
         }
         if let Some(secret) = s(&row, "credential_env").strip_prefix("secret:")
-            && one(
-                db,
-                "SELECT id FROM am_secrets WHERE workspace_id=? AND id=?",
-                params![p.workspace, secret],
-            )?
+            && graph.read(|db| {
+                store_graph::one(
+                    db,
+                    "MATCH (sc:Secret {workspace_id: $workspace, id: $id}) RETURN sc.id AS id",
+                    store_graph::Params::from([
+                        ("workspace".into(), store_graph::json_to_value(&json!(p.workspace))),
+                        ("id".into(), store_graph::json_to_value(&json!(secret))),
+                    ]),
+                )
+            })?
             .is_none()
         {
             continue;
         }
         if let Some(account) = s(&row, "credential_env").strip_prefix("oauth:")
-            && one(
-                db,
-                "SELECT id FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND state='active'",
-                params![p.workspace, account],
-            )?
+            && graph.read(|db| {
+                store_graph::one(
+                    db,
+                    "MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, state: 'active'}) RETURN a.id AS id",
+                    store_graph::Params::from([
+                        ("workspace".into(), store_graph::json_to_value(&json!(p.workspace))),
+                        ("id".into(), store_graph::json_to_value(&json!(account))),
+                    ]),
+                )
+            })?
             .is_none()
         {
             continue;
         }
         if row["permission_generation"] == row["generation"] && row["synced_principals"].is_string()
         {
-            row["metadata"]["provider_permissions"] = json!({"principals":serde_json::from_str::<Value>(s(&row,"synced_principals"))?,"complete":row["permission_complete"]==1,"checked_at":row["permission_checked_at"]});
+            row["metadata"]["provider_permissions"] = json!({"principals":serde_json::from_str::<Value>(s(&row,"synced_principals"))?,"complete":row["permission_complete"],"checked_at":row["permission_checked_at"]});
         }
         if row["config"]["permission_mode"] == "provider"
             && !crate::permissions::allows(
-                db,
+                &graph,
                 &p.workspace,
                 s(&row, "kind"),
                 &row["metadata"]["provider_permissions"],

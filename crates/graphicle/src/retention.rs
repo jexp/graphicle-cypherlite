@@ -705,10 +705,7 @@ impl Store {
             if !crate::maintenance::project_episodes_on_graph(&graph, &identifier)? {
                 return legacy::stats(db, &identifier);
             }
-            let snapshot_bytes = graph
-                .database()
-                .snapshot_data_bytes()
-                .ok();
+            let snapshot_bytes = graph.database().snapshot_data_bytes().ok();
             graph.read(|g| stats(g, &identifier, snapshot_bytes))
         })
     }

@@ -101,17 +101,38 @@ impl Store {
         config: &model::Config,
         connector: Option<&str>,
     ) -> Result<Vec<Value>> {
-        let connectors = {
-            let db = self.connect()?;
-            rows(
-                &db,
-                "SELECT c.id,c.repository_id,c.config,c.generation,p.workspace_id,w.capability_hash FROM am_connectors c JOIN repo_projects p ON p.id=c.repository_id JOIN workspaces w ON w.id=p.workspace_id WHERE c.state='active' AND json_type(c.config,'$.observe')='object' AND (?1 IS NULL OR c.id=?1) ORDER BY c.id",
-                [connector],
-            )?
-        };
+        // Connector rows live in the graph store; the workspace side of the
+        // join stays in SQL until the ownership spine migrates.
+        let mut connectors = self.graph().read(|db| {
+            crate::store_graph::rows(
+                db,
+                "MATCH (c:Connector {state: 'active'}) RETURN c.id AS id, c.repository_id AS repository_id, c.config AS config, c.generation AS generation ORDER BY c.id",
+                crate::store_graph::Params::new(),
+            )
+        })?;
+        connectors.retain(|c| {
+            (connector.is_none() || Some(s(c, "id")) == connector)
+                && serde_json::from_str::<Value>(s(c, "config"))
+                    .map(|config| config["observe"].is_object())
+                    .unwrap_or(false)
+        });
         let mut decisions = Vec::new();
         for mut connector in connectors {
             decode(&mut connector, "config")?;
+            let ids = self
+                .connect()?
+                .query_row(
+                    "SELECT p.workspace_id, w.capability_hash FROM repo_projects p JOIN workspaces w ON w.id=p.workspace_id WHERE p.id=?",
+                    [s(&connector, "repository_id")],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                );
+            match ids {
+                Ok((workspace, hash)) => {
+                    connector["workspace_id"] = Value::String(workspace);
+                    connector["capability_hash"] = Value::String(hash);
+                }
+                Err(_) => continue,
+            }
             let decision = crate::settings::configuration(
                 self,
                 s(&connector, "workspace_id"),

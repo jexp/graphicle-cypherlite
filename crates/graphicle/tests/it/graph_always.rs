@@ -1448,14 +1448,18 @@ fn mcp_on_sigterm_finishes_the_job_in_hand_and_leaves_none_running() {
     let session = Session::start(&home, &data, &folder);
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = state(&store);
+    let mut session = Some(session);
     while seen == "queued" {
-        assert!(
-            Instant::now() < deadline,
-            "mcp did not start the projection"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+        if Instant::now() >= deadline {
+            let mut s = session.take().unwrap();
+            let _ = s.child.kill();
+            let (status, stderr) = s.wait();
+            panic!("mcp did not start the projection; status={status} stderr={stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(1000));
         seen = state(&store);
     }
+    let session = session.take().unwrap();
     let signalled_while_running = seen == "running";
     let killed = crate::fork_guard::spawn(
         Command::new("kill")
@@ -1471,7 +1475,7 @@ fn mcp_on_sigterm_finishes_the_job_in_hand_and_leaves_none_running() {
     let (status, stderr) = session.wait();
     assert!(status.success(), "{status:?}: {stderr}");
     assert_eq!(running_jobs(&store), 0, "{stderr}");
-    assert_eq!(state(&store), "complete");
+    assert_eq!(state(&store), "complete", "{stderr}");
     assert!(
         store
             .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))

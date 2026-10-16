@@ -42,6 +42,9 @@ pub struct GraphStore {
 
 struct StoreInner {
     location: StoreLocation,
+    /// Opened for reads only (shared locks, no writer lease, no schema
+    /// DDL): a hook or CLI that reads beside a running writer.
+    read_only: bool,
     /// The open engine while at least one operation holds it; dropped (and
     /// the writer lease released) when idle.
     engine: Mutex<std::sync::Weak<Database>>,
@@ -82,12 +85,40 @@ impl GraphStore {
         let store = Self {
             inner: Arc::new(StoreInner {
                 location: StoreLocation::Path(path.to_path_buf()),
+                read_only: false,
                 engine: Mutex::new(std::sync::Weak::new()),
                 pool: Mutex::new(Vec::new()),
             }),
         };
         store.apply_schema()?;
         Ok(store)
+    }
+    /// Open the directory store at `path` for reads only: shared locks, no
+    /// writer lease, no schema DDL, no creation — an agent hook or CLI that
+    /// only reads beside a running writer (which holds the lease). The
+    /// engine still drops when idle and reopens per use, as with
+    /// [`GraphStore::open`]. Errors when the store does not exist; a write
+    /// through the handle fails in the engine.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path.is_symlink() {
+            return Err(Error::bad("Graph store cannot be a symlink"));
+        }
+        if path.to_str().is_none() {
+            return Err(Error::bad("Graph store path is not valid UTF-8"));
+        }
+        Ok(Self {
+            inner: Arc::new(StoreInner {
+                location: StoreLocation::Path(path.to_path_buf()),
+                read_only: true,
+                engine: Mutex::new(std::sync::Weak::new()),
+                pool: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+    /// Whether the handle only reads (see [`GraphStore::open_read_only`]).
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only
     }
     /// An ephemeral in-memory store (tests, transient processing). Applies
     /// the same schema as [`GraphStore::open`]. The engine is held for the
@@ -96,6 +127,7 @@ impl GraphStore {
         let store = Self {
             inner: Arc::new(StoreInner {
                 location: StoreLocation::Memory(Arc::new(Database::open(":memory:")?)),
+                read_only: false,
                 engine: Mutex::new(std::sync::Weak::new()),
                 pool: Mutex::new(Vec::new()),
             }),
@@ -124,7 +156,12 @@ impl GraphStore {
                         if let Some(database) = slot.upgrade() {
                             return Ok(database);
                         }
-                        match Database::open(uri) {
+                        let opened = if self.inner.read_only {
+                            Database::open_read_only(uri)
+                        } else {
+                            Database::open(uri)
+                        };
+                        match opened {
                             Ok(database) => {
                                 let database = Arc::new(database);
                                 *slot = Arc::downgrade(&database);
@@ -547,4 +584,25 @@ fn crate_relative(file: &str) -> &str {
         return &file[at + 1..];
     }
     file
+}
+
+/// Run a write statement, returning the engine's counters.
+pub fn write(db: &mut Connection, cypher: &str, params: Params) -> Result<cypherlite::QueryStats> {
+    Ok(db.query_with_params(cypher, params)?.stats)
+}
+
+/// Bytes as a base64 string: the engine's `Value` has no byte-string
+/// variant, so byte columns are stored as base64 text (see
+/// `docs/store-api.md`, value-mapping conventions).
+pub fn b64e(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The inverse of [`b64e`].
+pub fn b64d(text: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|_| Error::bad("Stored bytes are not valid base64"))
 }

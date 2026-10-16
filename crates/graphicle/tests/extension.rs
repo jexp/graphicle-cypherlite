@@ -676,7 +676,7 @@ fn backups_are_scrubbed_by_the_extension_too() {
     })
     .unwrap();
     drop(live);
-    let dir = f.store.directory.join("backup.graph");
+    let dir = f.store.directory.join("backup.graph()");
     f.store.backup(&dir).unwrap();
     let count = |store: &GraphStore| -> i64 {
         store
@@ -981,17 +981,22 @@ async fn provider_permissions_of_a_sync_come_from_the_extension() {
         .unwrap();
     assert_eq!(status["state"], "complete", "{status}");
     assert_eq!(seen.0.lock().unwrap().as_slice(), ["issues"]);
-    let metadata: String = f
+    let metadata: Value = f
         .store
-        .connect()
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.metadata AS metadata",
+                graphicle_runtime::store_graph::Params::from([(
+                    "connector".into(),
+                    graphicle_runtime::store_graph::json_to_value(&json!(s(&connector, "id"))),
+                )]),
+            )
+        })
         .unwrap()
-        .query_row(
-            "SELECT metadata FROM am_connector_docs WHERE connector_id=?",
-            [s(&connector, "id")],
-            |r| r.get(0),
-        )
+        .and_then(|row| serde_json::from_str(row["metadata"].as_str().unwrap_or("null")).ok())
         .unwrap();
-    let metadata: Value = serde_json::from_str(&metadata).unwrap();
     let permissions = &metadata["provider_permissions"];
     assert_eq!(
         permissions["probe_doc"], "org/project:issue:1",

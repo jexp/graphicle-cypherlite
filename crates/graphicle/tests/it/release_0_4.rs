@@ -286,14 +286,12 @@ async fn atlassian_full_scan_keeps_comments_dates_and_handles_revocation() {
             .await;
         assert_eq!(probe["state"], "complete", "{probe}");
         assert_eq!(probe["result"]["evidence"], "local_fixture_response");
-        let db = f.store.connect().unwrap();
         let texts = serde_json::to_string(
-            &store::rows(
-                &db,
-                "SELECT content FROM am_connector_docs WHERE connector_id=?",
-                [s(&c, "id")],
-            )
-            .unwrap(),
+            &crate::gql(
+                &f.store,
+                "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.content AS content",
+                graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(s(&c, "id")))]),
+            ),
         )
         .unwrap();
         if kind == "jira" {
@@ -304,13 +302,13 @@ async fn atlassian_full_scan_keeps_comments_dates_and_handles_revocation() {
             assert!(texts.contains("Mira is vegetarian"));
             assert!(texts.contains("author-2"));
         }
-        let last_sync = |db: &rusqlite::Connection| -> Option<String> {
-            db.query_row(
-                "SELECT last_sync FROM am_connectors WHERE id=?",
-                [s(&c, "id")],
-                |r| r.get(0),
+        let last_sync = || -> Option<String> {
+            crate::gql_one(
+                &f.store,
+                "MATCH (c:Connector {id: $id}) RETURN c.last_sync AS last_sync",
+                graphicle_runtime::store_graph::Params::from([crate::gp("id", json!(s(&c, "id")))]),
             )
-            .unwrap()
+            .and_then(|row| row["last_sync"].as_str().map(str::to_string))
         };
         // A rate limit is not a denial: the synced documents stay available.
         state.rate_limited.store(true, Ordering::SeqCst);
@@ -322,7 +320,7 @@ async fn atlassian_full_scan_keeps_comments_dates_and_handles_revocation() {
             .await;
         assert_ne!(limited["state"], "complete");
         assert!(s(&limited, "error").contains("rate limited"), "{limited}");
-        assert!(last_sync(&db).is_some());
+        assert!(last_sync().is_some());
         state.rate_limited.store(false, Ordering::SeqCst);
         state.fail.store(true, Ordering::SeqCst);
         let failed = f
@@ -332,7 +330,7 @@ async fn atlassian_full_scan_keeps_comments_dates_and_handles_revocation() {
             )
             .await;
         assert_ne!(failed["state"], "complete");
-        assert!(last_sync(&db).is_none());
+        assert!(last_sync().is_none());
         state.fail.store(false, Ordering::SeqCst);
     }
     assert!(

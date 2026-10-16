@@ -138,7 +138,9 @@ fn project_name(db: &rusqlite::Connection, id: &str) -> Option<String> {
 /// creating, migrating or writing anything.
 pub fn project_of_folder(directory: &Path, folder: &Path) -> Option<(String, String)> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
+    let graph =
+        crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
     let name = project_name(&db, &found.id)?;
     Some((found.id, name))
 }
@@ -174,26 +176,25 @@ pub fn project_with_graph(
     file: Option<&Path>,
 ) -> Option<GraphFolder> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
-    // The live-symbol nodes live in the graph store; a hook must not create
-    // it for a folder that never had one, and a store held by a running
-    // server refuses the open — both read the graph's open nodes instead.
+    // The folder mapping and the live-symbol nodes live in the graph store;
+    // a hook must not create it for a folder that never had one, and a store
+    // held by a running server refuses the open — a missing graph file
+    // answers "no graph" here, and the callers below read the graph's open
+    // nodes instead.
     let graph = directory
         .join("reviews.graph")
         .exists()
-        .then(|| crate::store_graph::GraphStore::open(directory.join("reviews.graph")).ok())
-        .flatten();
-    let built = graph
-        .as_ref()
-        .and_then(|graph| crate::symbols::has_symbol_state(graph, &found.id).ok())
+        .then(|| crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok())
+        .flatten()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
+    let built = crate::symbols::has_symbol_state(&graph, &found.id)
+        .ok()
         .unwrap_or(false);
     let symbol = if built {
-        graph
-            .as_ref()
-            .and_then(|graph| crate::symbols::has_symbol_heads(graph, &found.id).ok())?
+        crate::symbols::has_symbol_heads(&graph, &found.id).ok()?
     } else {
         // Live symbol versions of the projection (graph store).
-        let store = crate::store::graph_for(&db).ok()?;
+        let store = crate::store::graph_for_read_only(&db).ok()?;
         store
             .read(|g| {
                 let mut symbol = false;

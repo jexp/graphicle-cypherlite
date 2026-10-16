@@ -1,13 +1,74 @@
 //! Read-only source adapters with resumable staging and atomic activation.
+//!
+//! Connector state lives in the graph store: `(:Connector)-[:OF]->(:Project)`,
+//! `(:ConnectorDoc)-[:FROM]->(:Connector)` with the ACL as properties
+//! (`acl_readers`, `acl_credentials` — a list, so read-time checks are list
+//! membership, not `json_each` joins), plus `ConnectorStage`,
+//! `ConnectorVersion`, `SourcePermission` and `OriginalDocument` nodes
+//! (`cypherlite-migration.md` §2.5). Cross-cutting side effects that still
+//! live in SQL (invalidation, the model cache, observer state) run in their
+//! own SQLite transaction right after the graph transaction commits.
 use crate::{Error, Result, digest, id, integer, now, string};
 use crate::{
     jobs::{self, Job, Worker},
     memory, model,
-    store::{self, Store, decode, one, repo, rows, s},
+    store::{self, Store, one, repo, s},
+    store_graph::{self as graph, Params, b64e, json_to_value},
 };
+use cypherlite::Connection as GConnection;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The `RETURN` projection standing in for `SELECT * FROM am_connectors`:
+/// config and cursor come back as decoded maps, not JSON text.
+const CONNECTOR_COLS: &str = "c.id AS id, c.repository_id AS repository_id, c.name AS name, c.kind AS kind, c.config AS config, c.credential_env AS credential_env, c.state AS state, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error, c.created_at AS created_at";
+
+/// An ACL object as the doc/stage node carries it: a readers flag and a
+/// credential id list (list property; membership predicates read it).
+fn acl_parts(acl: &Value) -> (bool, Vec<String>) {
+    (
+        acl["workspace_readers"] == true,
+        acl["credentials"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// A JSON column as a graph string property: the engine stores scalars and
+/// lists of scalars, no maps, so config/metadata/cursor JSON is text again.
+fn jtext(value: &Value) -> Result<cypherlite::Value> {
+    Ok(cypherlite::Value::String(serde_json::to_string(value)?.into()))
+}
+
+/// A connector row with its `config` and `cursor` text columns decoded.
+fn decoded(mut connector: Value) -> Result<Value> {
+    store::decode(&mut connector, "config")?;
+    store::decode(&mut connector, "cursor")?;
+    Ok(connector)
+}
+
+/// One connector by id, from outside a graph transaction (crate-internal
+/// callers with only the store in hand, e.g. `documents::import_binary`).
+pub(crate) fn get_connector_pub(store: &graph::GraphStore, identifier: &str) -> Result<Option<Value>> {
+    store.read(|db| get_connector(db, identifier))
+}
+
+/// One connector by id (any state), decoded; `None` when absent.
+fn get_connector(db: &mut GConnection, identifier: &str) -> Result<Option<Value>> {
+    graph::one(
+        db,
+        &format!("MATCH (c:Connector {{id: $id}}) RETURN {CONNECTOR_COLS}"),
+        Params::from([("id".into(), json_to_value(&json!(identifier)))]),
+    )?
+    .map(decoded)
+    .transpose()
+}
 
 /// Why a connector in `permission_mode: provider` cannot sync in this
 /// program: no installed extension syncs provider permissions. Its documents
@@ -189,16 +250,25 @@ impl Store {
         // Extension work first (for example provider-permission refreshes).
         let scheduled = crate::extension::installed().schedule(self)?;
         let provider_sync = provider_permission_sync();
-        self.transaction(|db| {
+        let connectors = self.graph().read(|db| {
+            graph::rows(
+                db,
+                &format!(
+                    "MATCH (c:Connector) WHERE c.state='active' AND c.kind<>'jsonl' RETURN {CONNECTOR_COLS}"
+                ),
+                Params::new(),
+            )
+        })?;
+        self.transaction(|_db| {
             let mut count=scheduled;
-            for mut connector in rows(db,"SELECT c.*,w.capability_hash,p.workspace_id FROM am_connectors c JOIN repo_projects p ON p.id=c.repository_id JOIN workspaces w ON w.id=p.workspace_id WHERE c.state='active' AND c.kind!='jsonl'",[])? {
-                decode(&mut connector,"config")?;
+            for connector in connectors {
+                let connector=decoded(connector)?;
                 let interval=connector["config"]["sync_every_seconds"].as_i64().unwrap_or(0);
                 if interval<300 {continue;}
                 // Without provider-permission sync such a connector cannot sync here.
                 if connector["config"]["permission_mode"]=="provider" && !provider_sync {continue;}
                 let recent=self.graph().read(|g|crate::store_graph::one(g,"MATCH (j:Job {repository_id: $repo, kind: 'connector', connector_id: $cid}) RETURN j.state AS state, j.updated_at AS updated_at, j.result AS result ORDER BY j.created_at DESC, j.id DESC LIMIT 1",crate::store_graph::params(&json!({"repo": s(&connector, "repository_id"), "cid": s(&connector, "id")}))))?;
-                let waiting=connector["cursor"].as_str().is_some_and(|s|s!="null");
+                let waiting=!connector["cursor"].is_null();
                 if let Some(recent)=&recent {
                     if ["queued","running","retry"].contains(&s(recent,"state")){continue;}
                     let since=chrono::DateTime::parse_from_rfc3339(s(recent,"updated_at")).map(|t|chrono::Utc::now().signed_duration_since(t).num_seconds()).unwrap_or(i64::MAX);
@@ -226,13 +296,17 @@ impl Store {
     pub fn connector_schedule(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace,token,"admin",|db,p| {
             repo(db,p,string(args,"repository_id",100)?)?;
-            let mut connector=one(db,"SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND kind!='jsonl'",params![s(args,"repository_id"),string(args,"connector_id",100)?])?.ok_or_else(||Error::bad("Remote connector unavailable"))?;
-            decode(&mut connector,"config")?;
-            connector["config"]["sync_every_seconds"]=json!(integer(args,"sync_every_seconds",0,604800)?);
-            validate_config(s(&connector,"kind"),&connector["config"])?;
-            db.execute("UPDATE am_connectors SET config=?,cursor=NULL,generation=generation+1 WHERE id=?",params![connector["config"].to_string(),s(&connector,"id")])?;
-            db.execute("DELETE FROM am_connector_stage WHERE connector_id=?",[s(&connector,"id")])?;
-            Ok(json!({"scheduled":connector["config"]["sync_every_seconds"]!=0,"sync_every_seconds":connector["config"]["sync_every_seconds"],"automatic_model_calls":connector["config"].get("observe").is_some()}))
+            let interval=integer(args,"sync_every_seconds",0,604800)?;
+            self.graph().transaction(|gdb| {
+                let connector=graph::one(gdb,&format!("MATCH (c:Connector {{repository_id: $repository, id: $id}}) WHERE c.kind<>'jsonl' RETURN {CONNECTOR_COLS}"),Params::from([("repository".into(),json_to_value(&args["repository_id"])),("id".into(),json_to_value(&args["connector_id"]))]))?.ok_or_else(||Error::bad("Remote connector unavailable"))?;
+                let mut connector=decoded(connector)?;
+                string(args,"connector_id",100)?;
+                connector["config"]["sync_every_seconds"]=json!(interval);
+                validate_config(s(&connector,"kind"),&connector["config"])?;
+                graph::write(gdb,"MATCH (c:Connector {id: $id}) SET c.config=$config, c.cursor=NULL, c.generation=c.generation+1",Params::from([("id".into(),json_to_value(&connector["id"])),("config".into(),jtext(&connector["config"])?)]))?;
+                graph::write(gdb,"MATCH (s:ConnectorStage {connector_id: $id}) DELETE s",Params::from([("id".into(),json_to_value(&connector["id"]))]))?;
+                Ok(json!({"scheduled":connector["config"]["sync_every_seconds"]!=0,"sync_every_seconds":connector["config"]["sync_every_seconds"],"automatic_model_calls":connector["config"].get("observe").is_some()}))
+            })
         })
     }
     /// Set (`observe`: a policy) or clear (`observe`: null) a connector's
@@ -241,17 +315,19 @@ impl Store {
     pub fn connector_observe(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace,token,"admin",|db,p| {
             repo(db,p,string(args,"repository_id",100)?)?;
-            let mut connector=one(db,"SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND state='active'",params![s(args,"repository_id"),string(args,"connector_id",100)?])?.ok_or_else(||Error::bad("Connector unavailable"))?;
-            decode(&mut connector,"config")?;
-            match args.get("observe") {
-                Some(Value::Null) => {connector["config"].as_object_mut().map(|c|c.remove("observe"));}
-                Some(policy) => connector["config"]["observe"]=policy.clone(),
-                None => return Err(Error::bad("Give an observe policy, or null to clear it")),
-            }
-            validate_config(s(&connector,"kind"),&connector["config"])?;
-            db.execute("UPDATE am_connectors SET config=? WHERE id=?",params![connector["config"].to_string(),s(&connector,"id")])?;
-            let policy=connector["config"].get("observe").cloned();
-            Ok(json!({"connector_id":connector["id"],"automatic_model_calls":policy.is_some(),"observe":policy}))
+            self.graph().transaction(|gdb| {
+                let connector=graph::one(gdb,&format!("MATCH (c:Connector {{repository_id: $repository, id: $id, state: 'active'}}) RETURN {CONNECTOR_COLS}"),Params::from([("repository".into(),json_to_value(&args["repository_id"])),("id".into(),json_to_value(&args["connector_id"]))]))?.ok_or_else(||Error::bad("Connector unavailable"))?;
+                let mut connector=decoded(connector)?;
+                match args.get("observe") {
+                    Some(Value::Null) => {connector["config"].as_object_mut().map(|c|c.remove("observe"));}
+                    Some(policy) => connector["config"]["observe"]=policy.clone(),
+                    None => return Err(Error::bad("Give an observe policy, or null to clear it")),
+                }
+                validate_config(s(&connector,"kind"),&connector["config"])?;
+                graph::write(gdb,"MATCH (c:Connector {id: $id}) SET c.config=$config",Params::from([("id".into(),json_to_value(&connector["id"])),("config".into(),jtext(&connector["config"])?)]))?;
+                let policy=connector["config"].get("observe").cloned();
+                Ok(json!({"connector_id":connector["id"],"automatic_model_calls":policy.is_some(),"observe":policy}))
+            })
         })
     }
     pub fn connector_add(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
@@ -261,20 +337,40 @@ impl Store {
             let credential=args["credential_ref"].as_str().or(args["credential_env"].as_str());
             if kind!="jsonl" && credential.is_none(){return Err(Error::bad("Connect an account or choose a saved source credential"));}
             if credential.is_some_and(|v|v.is_empty() || v.len()>100 || !v.bytes().all(|b|b.is_ascii_alphanumeric() || b"_:-".contains(&b))) {return Err(Error::bad("Invalid credential reference"));}
-            if let Some(reference)=credential.filter(|v|v.starts_with("secret:"))&& one(db,"SELECT id FROM am_secrets WHERE workspace_id=? AND id=?",params![workspace,&reference[7..]])?.is_none(){return Err(Error::denied());}
-            if let Some(reference)=credential.filter(|v|v.starts_with("oauth:")) {let provider=if ["jira","confluence"].contains(&kind){"atlassian"}else{kind};if one(db,"SELECT id FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND provider=? AND state='active'",params![workspace,&reference[6..],provider])?.is_none(){return Err(Error::denied());}}
-            let identifier=id();db.execute("INSERT INTO am_connectors(id,repository_id,name,kind,config,credential_env,state,created_at) VALUES(?,?,?,?,?,?,'active',?)",params![identifier,s(&repository,"id"),name,kind,config.to_string(),credential,now()])?;
-            Ok(json!({"id":identifier,"name":name,"kind":kind,"state":"active","sharing":"explicit_workspace_policy","provider_permissions_synced":false}))
+            self.graph().transaction(|gdb| {
+                if let Some(reference)=credential.filter(|v|v.starts_with("secret:"))&& graph::one(gdb,"MATCH (s:Secret {workspace_id: $workspace, id: $id}) RETURN s.id AS id",Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(&reference[7..])))]))?.is_none(){return Err(Error::denied());}
+                if let Some(reference)=credential.filter(|v|v.starts_with("oauth:")) {let provider=if ["jira","confluence"].contains(&kind){"atlassian"}else{kind};if graph::one(gdb,"MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, provider: $provider, state: 'active'}) RETURN a.id AS id",Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(&reference[6..]))),("provider".into(),json_to_value(&json!(provider)))]))?.is_none(){return Err(Error::denied());}}
+                let identifier=id();
+                graph::write(gdb,"MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: $kind, config: $config, credential_env: $credential, state: 'active', generation: 0, created_at: $now})-[:OF]->(p)",Params::from([
+                    ("id".into(),json_to_value(&json!(identifier))),
+                    ("repository".into(),json_to_value(&json!(s(&repository,"id")))),
+                    ("workspace".into(),json_to_value(&repository["workspace_id"])),
+                    ("project_key".into(),json_to_value(&repository["project_key"])),
+                    ("project_name".into(),json_to_value(&repository["name"])),
+                    ("name".into(),json_to_value(&json!(name))),
+                    ("kind".into(),json_to_value(&json!(kind))),
+                    ("config".into(),jtext(&config)?),
+                    ("credential".into(),credential.map(|c|json_to_value(&json!(c))).unwrap_or(cypherlite::Value::Null)),
+                    ("now".into(),json_to_value(&json!(now()))),
+                ]))?;
+                Ok(json!({"id":identifier,"name":name,"kind":kind,"state":"active","sharing":"explicit_workspace_policy","provider_permissions_synced":false}))
+            })
         })
     }
     pub fn connector_list(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace,token,"admin",|db,p| {
-            let repository=repo(db,p,string(args,"repository_id",100)?)?;let mut values=rows(db,"SELECT id,name,kind,state,config,cursor,generation,last_sync,error FROM am_connectors WHERE repository_id=? ORDER BY name",[s(&repository,"id")])?;
-            for value in &mut values {decode(value,"config")?;let cursor:Value=value["cursor"].as_str().map(serde_json::from_str).transpose()?.unwrap_or(Value::Null);value["pending_scan"]=json!(!cursor.is_null());value["cursor"]=cursor.get("index").cloned().unwrap_or(Value::Null);
+            let repository=repo(db,p,string(args,"repository_id",100)?)?;
+            let mut values=self.graph().read(|gdb|graph::rows(gdb,&format!("MATCH (c:Connector {{repository_id: $repository}}) RETURN c.id AS id, c.name AS name, c.kind AS kind, c.state AS state, c.config AS config, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error ORDER BY c.name"),Params::from([("repository".into(),json_to_value(&json!(s(&repository,"id"))))])))?;
+            for value in &mut values {
+                store::decode(value,"config")?;store::decode(value,"cursor")?;
+                let cursor=value["cursor"].clone();value["pending_scan"]=json!(!cursor.is_null());value["cursor"]=cursor.get("index").cloned().unwrap_or(Value::Null);
                 let max_age=value["config"]["max_age_seconds"].as_i64().unwrap_or(86400).max(60);
                 value["source_snapshot_expired"]=json!(value["kind"]!="jsonl" && value["last_sync"].as_str().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).is_none_or(|t|chrono::Utc::now().signed_duration_since(t).num_seconds()>max_age));
                 let max_permission_age=value["config"]["permission_max_age_seconds"].as_i64().unwrap_or(300);
-                let mut permissions=one(db,"SELECT count(*) AS sources,coalesce(sum(CASE WHEN p.complete=1 AND p.generation=d.generation THEN 1 ELSE 0 END),0) AS checked,min(p.checked_at) AS oldest_check FROM am_connector_docs d LEFT JOIN am_source_permissions p ON p.connector_id=d.connector_id AND p.source_id=d.id WHERE d.connector_id=? AND d.present=1",[s(value,"id")])?.unwrap();
+                let mut permissions=self.graph().read(|gdb| {
+                    graph::one(gdb,"MATCH (d:ConnectorDoc {connector_id: $id, present: true}) OPTIONAL MATCH (p:SourcePermission {connector_id: $id}) WHERE p.source_id = d.id RETURN count(d) AS sources, sum(CASE WHEN p.complete=true AND p.generation=d.generation THEN 1 ELSE 0 END) AS checked, min(p.checked_at) AS oldest_check",Params::from([("id".into(),json_to_value(&value["id"]))]))
+                })?.unwrap_or_else(||json!({"sources":0,"checked":0,"oldest_check":null}));
+                if permissions["checked"].is_null() {permissions["checked"]=json!(0);}
                 let fresh=permissions["oldest_check"].as_str().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).is_some_and(|t|chrono::Utc::now().signed_duration_since(t).num_seconds()<=max_permission_age);
                 value["provider_permissions_synced"]=json!(value["config"]["permission_mode"]=="provider" && permissions["sources"].as_i64().unwrap_or(0)>0 && permissions["checked"]==permissions["sources"] && fresh);
                 permissions["max_age_seconds"]=json!(max_permission_age);value["permissions"]=permissions;
@@ -301,12 +397,17 @@ impl Store {
             }
             let content = p.role == "owner" && args["include_content"] == true;
             let mut versions = Vec::new();
-            for mut row in rows(
-                db,
-                "SELECT sha256,content,metadata,created_at FROM am_connector_versions WHERE connector_id=? AND id=? ORDER BY created_at,sha256",
-                params![connector, document],
-            )? {
-                decode(&mut row, "metadata")?;
+            for mut row in self.graph().read(|gdb| {
+                graph::rows(
+                    gdb,
+                    "MATCH (v:ConnectorVersion {connector_id: $connector, id: $document}) RETURN v.sha256 AS sha256, v.content AS content, v.metadata AS metadata, v.created_at AS created_at ORDER BY v.created_at, v.sha256",
+                    Params::from([
+                        ("connector".into(), json_to_value(&json!(connector))),
+                        ("document".into(), json_to_value(&json!(document))),
+                    ]),
+                )
+            })? {
+                store::decode(&mut row, "metadata")?;
                 let mut version = json!({"sha256":row["sha256"],"created_at":row["created_at"],
                     "title":row["metadata"]["title"],"bytes":s(&row, "content").len()});
                 if content {
@@ -321,39 +422,59 @@ impl Store {
         self.authorized(workspace, token, "admin", |db, p| {
             repo(db, p, string(args, "repository_id", 100)?)?;
             validate_acl(db, workspace, &args["acl"])?;
-            let mut connector = one(
-                db,
-                "SELECT * FROM am_connectors WHERE repository_id=? AND id=?",
-                params![s(args, "repository_id"), string(args, "connector_id", 100)?],
-            )?
-            .ok_or_else(|| Error::bad("Connector unavailable"))?;
-            decode(&mut connector, "config")?;
-            connector["config"]["acl"] = args["acl"].clone();
-            db.execute(
-                "UPDATE am_connectors SET config=?,cursor=NULL,generation=generation+1 WHERE id=?",
-                params![connector["config"].to_string(), s(&connector, "id")],
-            )?;
-            db.execute(
-                "UPDATE am_connector_docs SET acl=? WHERE connector_id=?",
-                params![args["acl"].to_string(), s(&connector, "id")],
-            )?;
-            db.execute(
-                "DELETE FROM am_connector_stage WHERE connector_id=?",
-                [s(&connector, "id")],
-            )?;
+            let sources = self.graph().transaction(|gdb| {
+                let connector = graph::one(
+                    gdb,
+                    &format!(
+                        "MATCH (c:Connector {{repository_id: $repository, id: $id}}) RETURN {CONNECTOR_COLS}"
+                    ),
+                    Params::from([
+                        ("repository".into(), json_to_value(&args["repository_id"])),
+                        ("id".into(), json_to_value(&args["connector_id"])),
+                    ]),
+                )?
+                .ok_or_else(|| Error::bad("Connector unavailable"))?;
+                let mut connector = decoded(connector)?;
+                string(args, "connector_id", 100)?;
+                connector["config"]["acl"] = args["acl"].clone();
+                let (readers, credentials) = acl_parts(&args["acl"]);
+                graph::write(
+                    gdb,
+                    "MATCH (c:Connector {id: $id}) SET c.config=$config, c.cursor=NULL, c.generation=c.generation+1",
+                    Params::from([
+                        ("id".into(), json_to_value(&connector["id"])),
+                        ("config".into(), jtext(&connector["config"])?),
+                    ]),
+                )?;
+                graph::write(
+                    gdb,
+                    "MATCH (d:ConnectorDoc {connector_id: $id}) SET d.acl_readers=$readers, d.acl_credentials=$credentials",
+                    Params::from([
+                        ("id".into(), json_to_value(&connector["id"])),
+                        ("readers".into(), json_to_value(&json!(readers))),
+                        ("credentials".into(), json_to_value(&json!(credentials))),
+                    ]),
+                )?;
+                graph::write(
+                    gdb,
+                    "MATCH (s:ConnectorStage {connector_id: $id}) DELETE s",
+                    Params::from([("id".into(), json_to_value(&connector["id"]))]),
+                )?;
+                let sources: Vec<String> = graph::rows(
+                    gdb,
+                    "MATCH (d:ConnectorDoc {connector_id: $id, present: true}) RETURN d.id AS id",
+                    Params::from([("id".into(), json_to_value(&connector["id"]))]),
+                )?
+                .iter()
+                .map(|row| {
+                    crate::invalidation::connector_document_id(s(&connector, "id"), s(row, "id"))
+                })
+                .collect();
+                Ok(sources)
+            })?;
             // Cached model input and output may include now-private data.
             crate::jobs::clear_model_cache(&self.graph(), s(args, "repository_id"))?;
             store::invalidate(db, s(args, "repository_id"))?;
-            let sources: Vec<String> = rows(
-                db,
-                "SELECT id FROM am_connector_docs WHERE connector_id=? AND present=1",
-                [s(&connector, "id")],
-            )?
-            .iter()
-            .map(|row| {
-                crate::invalidation::connector_document_id(s(&connector, "id"), s(row, "id"))
-            })
-            .collect();
             crate::invalidation::permissions_changed(
                 &self.graph(),
                 workspace,
@@ -367,21 +488,38 @@ impl Store {
     pub fn import_documents(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace,token,"collect",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;
-            let mut connector=one(db,"SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND kind='jsonl' AND state='active'",params![s(&repository,"id"),string(args,"connector_id",100)?])?.ok_or_else(||Error::bad("Create a JSONL source connector first"))?;
-            decode(&mut connector,"config")?;
+            let connector=self.graph().read(|gdb|graph::one(gdb,&format!("MATCH (c:Connector {{repository_id: $repository, id: $id, kind: 'jsonl', state: 'active'}}) RETURN {CONNECTOR_COLS}"),Params::from([("repository".into(),json_to_value(&json!(s(&repository,"id")))),("id".into(),json_to_value(&args["connector_id"]))])))?.ok_or_else(||Error::bad("Create a JSONL source connector first"))?;
+            let connector=decoded(connector)?;
+            string(args,"connector_id",100)?;
             if !memory::acl_allows(&connector["config"]["acl"],p){return Err(Error::denied());}
             let documents=args["documents"].as_array().filter(|v|v.len()<=5000).ok_or_else(||Error::bad("Expected at most 5,000 documents"))?;
             let mode=args["mode"].as_str().unwrap_or("delta");if !["delta","snapshot"].contains(&mode){return Err(Error::bad("Use delta or snapshot import mode"));}
-            let scan=id();let mut seen=BTreeSet::new();let mut skipped=0;
+            let scan=id();let mut seen=BTreeSet::new();let mut skipped=0;let mut to_stage=Vec::new();
             for doc in documents {
                 if !seen.insert(string(doc,"id",500)?){return Err(Error::bad("Duplicate imported document ID"));}
-                if crate::deletion::forgotten(db,s(&connector,"id"),string(doc,"id",500)?)? {skipped+=1;continue;}
-                stage(db,&connector,&scan,doc)?;
+                if self.graph().read(|gdb| crate::deletion::forgotten(gdb,s(&connector,"id"),string(doc,"id",500)?))? {skipped+=1;continue;}
+                to_stage.push(doc);
             }
-            let generation=activate(db,&self.graph(),&connector,&scan,mode=="snapshot")?;
-            if let Some(removed)=args["deleted_ids"].as_array(){for doc in removed {let doc=doc.as_str().ok_or_else(||Error::bad("Invalid deleted source ID"))?;db.execute("UPDATE am_connector_docs SET present=0 WHERE connector_id=? AND id=?",params![s(&connector,"id"),doc])?;
-                crate::invalidation::document_changed(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
-                crate::observer::forget_document(db,&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;}}
+            self.graph().transaction(|gdb| {
+                for doc in &to_stage {
+                    stage(gdb,&connector,&scan,doc)?;
+                }
+                Ok(())
+            })?;
+            let generation = activate(&self.graph(),db,&connector,&scan,mode=="snapshot")?;
+            if let Some(removed)=args["deleted_ids"].as_array(){
+                let removed: Vec<String> = removed.iter().map(|doc|doc.as_str().ok_or_else(||Error::bad("Invalid deleted source ID")).map(str::to_string)).collect::<Result<_>>()?;
+                self.graph().transaction(|gdb| {
+                    for doc in &removed {
+                        graph::write(gdb,"MATCH (d:ConnectorDoc {connector_id: $connector, id: $id}) SET d.present=false",Params::from([("connector".into(),json_to_value(&json!(s(&connector,"id")))),("id".into(),json_to_value(&json!(doc)))]))?;
+                    }
+                    Ok(())
+                })?;
+                for doc in &removed {
+                    crate::invalidation::document_changed(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
+                    crate::observer::forget_document(db,&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;
+                }
+            }
             crate::doc_links::after_sync(self,db,s(&repository,"id"),s(&connector,"id"),p)?;
             Ok(json!({"imported":documents.len()-skipped,"forgotten_skipped":skipped,"generation":generation,"mode":mode}))
         })
@@ -426,10 +564,15 @@ fn item_label(item: &Value) -> Value {
     Value::Null
 }
 
-pub(crate) fn stage(db: &Connection, connector: &Value, scan: &str, doc: &Value) -> Result<()> {
+pub(crate) fn stage(
+    gdb: &mut GConnection,
+    connector: &Value,
+    scan: &str,
+    doc: &Value,
+) -> Result<()> {
     let identifier = string(doc, "id", 500)?;
     // A forgotten document stays forgotten, even if its provider still has it.
-    if crate::deletion::forgotten(db, s(connector, "id"), identifier)? {
+    if crate::deletion::forgotten(gdb, s(connector, "id"), identifier)? {
         return Ok(());
     }
     let content = doc["content"]
@@ -472,19 +615,29 @@ pub(crate) fn stage(db: &Connection, connector: &Value, scan: &str, doc: &Value)
     if metadata.to_string().len() > 64000 {
         return Err(Error::bad("Source metadata is too large"));
     }
-    db.execute(
-        "INSERT OR REPLACE INTO am_connector_stage VALUES(?,?,?,?,?,?,?)",
-        params![
-            s(connector, "id"),
-            scan,
-            identifier,
-            content,
-            sha,
-            metadata.to_string(),
-            connector["config"]["acl"].to_string()
-        ],
+    let (readers, credentials) = acl_parts(&connector["config"]["acl"]);
+    graph::write(
+        gdb,
+        "MERGE (s:ConnectorStage {connector_id: $connector, scan_id: $scan, id: $id}) SET s.content=$content, s.content_bytes=$bytes, s.sha256=$sha, s.metadata=$metadata, s.acl_readers=$readers, s.acl_credentials=$credentials",
+        Params::from([
+            ("connector".into(), json_to_value(&connector["id"])),
+            ("scan".into(), json_to_value(&json!(scan))),
+            ("id".into(), json_to_value(&json!(identifier))),
+            ("content".into(), json_to_value(&json!(content))),
+            ("bytes".into(), cypherlite::Value::Int(content.len() as i64)),
+            ("sha".into(), json_to_value(&json!(sha))),
+            ("metadata".into(), jtext(&metadata)?),
+            ("readers".into(), json_to_value(&json!(readers))),
+            ("credentials".into(), json_to_value(&json!(credentials))),
+        ]),
     )?;
-    let bytes:i64=db.query_row("SELECT coalesce(sum(length(CAST(content AS BLOB))),0) FROM am_connector_stage WHERE connector_id=?",[s(connector,"id")],|r|r.get(0))?;
+    let bytes = graph::one(
+        gdb,
+        "MATCH (s:ConnectorStage {connector_id: $connector}) RETURN coalesce(sum(s.content_bytes),0) AS bytes",
+        Params::from([("connector".into(), json_to_value(&connector["id"]))]),
+    )?
+    .and_then(|row| row["bytes"].as_i64())
+    .unwrap_or(0);
     // Earlier builds: 64 MiB.
     let cap = crate::limits::current().connector_snapshot_bytes;
     if usize::try_from(bytes).unwrap_or(usize::MAX) > cap {
@@ -497,104 +650,161 @@ pub(crate) fn stage(db: &Connection, connector: &Value, scan: &str, doc: &Value)
     Ok(())
 }
 pub(crate) fn activate(
-    db: &Connection,
     graph: &crate::store_graph::GraphStore,
+    db: &Connection,
     connector: &Value,
     scan: &str,
     full: bool,
 ) -> Result<i64> {
     let identifier = s(connector, "id");
     let generation = connector["generation"].as_i64().unwrap_or(0) + 1;
-    let current: i64 = db.query_row(
-        "SELECT generation FROM am_connectors WHERE id=?",
-        [identifier],
-        |r| r.get(0),
-    )?;
-    if current + 1 != generation {
-        return Err(Error::conflict("Another connector sync completed first"));
-    }
     let workspace = crate::invalidation::workspace_of(db, s(connector, "repository_id"))?;
-    for row in rows(
-        db,
-        "SELECT * FROM am_connector_stage WHERE connector_id=? AND scan_id=?",
-        params![identifier, scan],
-    )? {
-        let mut previous = one(
-            db,
-            "SELECT sha256,metadata FROM am_connector_docs WHERE connector_id=? AND id=? AND present=1",
-            params![identifier, s(&row, "id")],
-        )?;
-        if let Some(previous) = &mut previous {
-            decode(previous, "metadata")?;
+    // Documents whose content or scope-affecting metadata changed, and those
+    // a full scan dropped: invalidated after the write commits (the
+    // invalidation helpers open their own graph transactions, so they
+    // cannot run inside this one).
+    let (changed, removed) = graph.transaction(|gdb| {
+        let mut changed: Vec<String> = Vec::new();
+        let mut removed: Vec<String> = Vec::new();
+        let current = graph::one(
+            gdb,
+            "MATCH (c:Connector {id: $id}) RETURN c.generation AS generation",
+            Params::from([("id".into(), json_to_value(&json!(identifier)))]),
+        )?
+        .and_then(|row| row["generation"].as_i64())
+        .unwrap_or(0);
+        if current + 1 != generation {
+            return Err(Error::conflict("Another connector sync completed first"));
         }
-        let metadata: Value = serde_json::from_str(s(&row, "metadata"))?;
-        // Date, title and provider permissions affect the source version even
-        // when its text is unchanged. Ignore sync-only observed_at timestamps.
-        let unchanged = previous.as_ref().is_some_and(|previous| {
-            previous["sha256"] == row["sha256"]
-                && ["title", "source_timestamp", "provider_permissions"]
-                    .iter()
-                    .all(|key| previous["metadata"][key] == metadata[key])
-        });
-        if !unchanged {
-            crate::invalidation::document_changed(
-                graph,
-                &workspace,
-                &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
-                "connector_document_updated",
-            )?;
-            crate::observer::forget_document(
-                db,
-                graph,
-                &workspace,
-                &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
-            )?;
-        }
-        db.execute(
-            "INSERT OR IGNORE INTO am_connector_versions VALUES(?,?,?,?,?,?)",
-            params![
-                identifier,
-                s(&row, "id"),
-                s(&row, "sha256"),
-                s(&row, "content"),
-                s(&row, "metadata"),
-                now()
-            ],
-        )?;
-        db.execute("INSERT INTO am_connector_docs VALUES(?,?,?,?,?,?,1,?) ON CONFLICT(connector_id,id) DO UPDATE SET content=excluded.content,sha256=excluded.sha256,metadata=excluded.metadata,acl=excluded.acl,present=1,generation=excluded.generation",params![identifier,s(&row,"id"),s(&row,"content"),s(&row,"sha256"),s(&row,"metadata"),s(&row,"acl"),generation])?;
-    }
-    if full {
-        for row in rows(
-            db,
-            "SELECT id FROM am_connector_docs WHERE connector_id=? AND generation!=? AND present=1",
-            params![identifier, generation],
+        for row in graph::rows(
+            gdb,
+            "MATCH (s:ConnectorStage {connector_id: $connector, scan_id: $scan}) RETURN s.id AS id, s.content AS content, s.sha256 AS sha256, s.metadata AS metadata, s.acl_readers AS acl_readers, s.acl_credentials AS acl_credentials",
+            Params::from([
+                ("connector".into(), json_to_value(&json!(identifier))),
+                ("scan".into(), json_to_value(&json!(scan))),
+            ]),
         )? {
-            crate::invalidation::document_changed(
-                graph,
-                &workspace,
-                &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
-                "connector_document_removed",
+            let previous = graph::one(
+                gdb,
+                "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id, present: true}) RETURN d.sha256 AS sha256, d.metadata AS metadata",
+                Params::from([
+                    ("connector".into(), json_to_value(&json!(identifier))),
+                    ("id".into(), json_to_value(&row["id"])),
+                ]),
             )?;
-            crate::observer::forget_document(
-                db,
-                graph,
-                &workspace,
-                &crate::invalidation::connector_document_id(identifier, s(&row, "id")),
+            let metadata: Value = serde_json::from_str(s(&row, "metadata"))?;
+            let previous = previous
+                .map(|mut row| {
+                    store::decode(&mut row, "metadata")?;
+                    Ok::<_, Error>(row)
+                })
+                .transpose()?;
+            // Date, title and provider permissions affect the source version even
+            // when its text is unchanged. Ignore sync-only observed_at timestamps.
+            let unchanged = previous.as_ref().is_some_and(|previous| {
+                previous["sha256"] == row["sha256"]
+                    && ["title", "source_timestamp", "provider_permissions"]
+                        .iter()
+                        .all(|key| previous["metadata"][key] == metadata[key])
+            });
+            if !unchanged {
+                changed.push(s(&row, "id").to_string());
+            }
+            graph::write(
+                gdb,
+                "MERGE (v:ConnectorVersion {connector_id: $connector, id: $id, sha256: $sha}) SET v.content=$content, v.metadata=$metadata, v.created_at=$now",
+                Params::from([
+                    ("connector".into(), json_to_value(&json!(identifier))),
+                    ("id".into(), json_to_value(&row["id"])),
+                    ("sha".into(), json_to_value(&row["sha256"])),
+                    ("content".into(), json_to_value(&row["content"])),
+                    ("metadata".into(), jtext(&metadata)?),
+                    ("now".into(), json_to_value(&json!(now()))),
+                ]),
+            )?;
+            graph::write(
+                gdb,
+                "MATCH (c:Connector {id: $connector}) MERGE (d:ConnectorDoc {connector_id: $connector, id: $id}) MERGE (d)-[:FROM]->(c) SET d.content=$content, d.content_bytes=$bytes, d.sha256=$sha256, d.metadata=$metadata, d.acl_readers=$readers, d.acl_credentials=$credentials, d.present=true, d.generation=$generation",
+                Params::from([
+                    ("connector".into(), json_to_value(&json!(identifier))),
+                    ("id".into(), json_to_value(&row["id"])),
+                    ("content".into(), json_to_value(&row["content"])),
+                    ("bytes".into(), cypherlite::Value::Int(s(&row, "content").len() as i64)),
+                    ("sha256".into(), json_to_value(&row["sha256"])),
+                    ("metadata".into(), jtext(&metadata)?),
+                    ("readers".into(), json_to_value(&row["acl_readers"])),
+                    ("credentials".into(), json_to_value(&row["acl_credentials"])),
+                    ("generation".into(), cypherlite::Value::Int(generation)),
+                ]),
             )?;
         }
-        db.execute(
-            "UPDATE am_connector_docs SET present=0 WHERE connector_id=? AND generation!=?",
-            params![identifier, generation],
+        if full {
+            for row in graph::rows(
+                gdb,
+                "MATCH (d:ConnectorDoc {connector_id: $connector, present: true}) WHERE d.generation <> $generation RETURN d.id AS id",
+                Params::from([
+                    ("connector".into(), json_to_value(&json!(identifier))),
+                    ("generation".into(), cypherlite::Value::Int(generation)),
+                ]),
+            )? {
+                removed.push(s(&row, "id").to_string());
+            }
+            graph::write(
+                gdb,
+                "MATCH (d:ConnectorDoc {connector_id: $connector, present: true}) WHERE d.generation <> $generation SET d.present=false",
+                Params::from([
+                    ("connector".into(), json_to_value(&json!(identifier))),
+                    ("generation".into(), cypherlite::Value::Int(generation)),
+                ]),
+            )?;
+        }
+        graph::write(
+            gdb,
+            "MATCH (c:Connector {id: $id}) SET c.cursor=NULL, c.last_sync=$now, c.generation=$generation, c.error=NULL",
+            Params::from([
+                ("id".into(), json_to_value(&json!(identifier))),
+                ("now".into(), json_to_value(&json!(now()))),
+                ("generation".into(), cypherlite::Value::Int(generation)),
+            ]),
+        )?;
+        graph::write(
+            gdb,
+            "MATCH (s:ConnectorStage {connector_id: $connector, scan_id: $scan}) DELETE s",
+            Params::from([
+                ("connector".into(), json_to_value(&json!(identifier))),
+                ("scan".into(), json_to_value(&json!(scan))),
+            ]),
+        )?;
+        Ok((changed, removed))
+    })?;
+    for doc in &changed {
+        crate::invalidation::document_changed(
+            graph,
+            &workspace,
+            &crate::invalidation::connector_document_id(identifier, doc),
+            "connector_document_updated",
+        )?;
+        crate::observer::forget_document(
+            db,
+            graph,
+            &workspace,
+            &crate::invalidation::connector_document_id(identifier, doc),
         )?;
     }
-    db.execute(
-        "UPDATE am_connectors SET cursor=NULL,last_sync=?,generation=?,error=NULL WHERE id=?",
-        params![now(), generation, identifier],
-    )?;
-    db.execute(
-        "DELETE FROM am_connector_stage WHERE connector_id=? AND scan_id=?",
-        params![identifier, scan],
-    )?;
+    for doc in &removed {
+        crate::invalidation::document_changed(
+            graph,
+            &workspace,
+            &crate::invalidation::connector_document_id(identifier, doc),
+            "connector_document_removed",
+        )?;
+        crate::observer::forget_document(
+            db,
+            graph,
+            &workspace,
+            &crate::invalidation::connector_document_id(identifier, doc),
+        )?;
+    }
     crate::jobs::clear_model_cache(graph, s(connector, "repository_id"))?;
     store::invalidate(db, s(connector, "repository_id"))?;
     Ok(generation)
@@ -713,11 +923,14 @@ impl Remote<'_> {
         ]
         .contains(&status)
         {
+            self.worker.store.graph().transaction(|db| {
+                graph::write(
+                    db,
+                    "MATCH (c:Connector {id: $id}) SET c.last_sync=NULL",
+                    Params::from([("id".into(), json_to_value(&self.connector["id"]))]),
+                )
+            })?;
             self.worker.store.transaction(|db| {
-                db.execute(
-                    "UPDATE am_connectors SET last_sync=NULL WHERE id=?",
-                    [s(self.connector, "id")],
-                )?;
                 store::invalidate(db, &self.job.repository)?;
                 Ok(())
             })?;
@@ -775,11 +988,14 @@ impl Remote<'_> {
         ]
         .contains(&response.status())
         {
+            self.worker.store.graph().transaction(|db| {
+                graph::write(
+                    db,
+                    "MATCH (c:Connector {id: $id}) SET c.last_sync=NULL",
+                    Params::from([("id".into(), json_to_value(&self.connector["id"]))]),
+                )
+            })?;
             self.worker.store.transaction(|db| {
-                db.execute(
-                    "UPDATE am_connectors SET last_sync=NULL WHERE id=?",
-                    [s(self.connector, "id")],
-                )?;
                 store::invalidate(db, &self.job.repository)?;
                 Ok(())
             })?;
@@ -862,15 +1078,23 @@ pub fn notion_text(
 
 /// A bounded, read-only diagnostic. It never treats one account's access as team ACL proof.
 pub async fn probe(worker: &Worker, job: &Job) -> Result<Value> {
-    let mut connector = jobs::guarded(&worker.store, job, |db, _, _| {
-        one(
-            db,
-            "SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND state='active'",
-            params![job.repository, string(&job.payload, "connector_id", 100)?],
-        )?
+    let connector_id = string(&job.payload, "connector_id", 100)?.to_string();
+    let connector = jobs::guarded(&worker.store, job, |_, _, _| {
+        worker.store.graph().read(|db| {
+            graph::one(
+                db,
+                &format!(
+                    "MATCH (c:Connector {{repository_id: $repository, id: $id, state: 'active'}}) RETURN {CONNECTOR_COLS}"
+                ),
+                Params::from([
+                    ("repository".into(), json_to_value(&json!(job.repository))),
+                    ("id".into(), json_to_value(&json!(connector_id))),
+                ]),
+            )
+        })?
         .ok_or_else(|| Error::bad("Connector unavailable"))
+        .and_then(decoded)
     })?;
-    decode(&mut connector, "config")?;
     let kind = s(&connector, "kind");
     let cfg = &connector["config"];
     let default = match kind {
@@ -1009,8 +1233,8 @@ pub async fn probe(worker: &Worker, job: &Job) -> Result<Value> {
         }
         _ => unreachable!(),
     };
-    jobs::guarded(&worker.store, job, |db, _, _| {
-        ensure_connector(db, &connector)
+    jobs::guarded(&worker.store, job, |_, _, _| {
+        worker.store.graph().transaction(|db| ensure_connector(db, &connector))
     })?;
     Ok(
         json!({"status":"connected","kind":kind,"identity":identity,"target":target,"requests":remote.calls,"checked_at":now(),
@@ -1021,16 +1245,23 @@ pub async fn probe(worker: &Worker, job: &Job) -> Result<Value> {
 }
 
 pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
-    let mut connector = jobs::guarded(&worker.store, job, |db, _, _| {
-        one(
-            db,
-            "SELECT * FROM am_connectors WHERE repository_id=? AND id=? AND state='active'",
-            params![job.repository, string(&job.payload, "connector_id", 100)?],
-        )?
+    let connector_id = string(&job.payload, "connector_id", 100)?.to_string();
+    let connector = jobs::guarded(&worker.store, job, |_, _, _| {
+        worker.store.graph().read(|db| {
+            graph::one(
+                db,
+                &format!(
+                    "MATCH (c:Connector {{repository_id: $repository, id: $id, state: 'active'}}) RETURN {CONNECTOR_COLS}"
+                ),
+                Params::from([
+                    ("repository".into(), json_to_value(&json!(job.repository))),
+                    ("id".into(), json_to_value(&json!(connector_id))),
+                ]),
+            )
+        })?
         .ok_or_else(|| Error::bad("Connector unavailable"))
+        .and_then(decoded)
     })?;
-    decode(&mut connector, "config")?;
-    decode(&mut connector, "cursor")?;
     let kind = s(&connector, "kind");
     if kind == "jsonl" {
         return Err(Error::bad("Use document import for JSONL sources"));
@@ -1125,12 +1356,14 @@ pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
             };
             doc["provider_permissions"] = permissions;
         }
-        jobs::guarded(&worker.store, job, |db, _, _| {
-            ensure_connector(db, &connector)?;
-            if let Some(doc) = &document {
-                stage(db, &connector, s(&cursor, "scan_id"), doc)?;
-            }
-            Ok(())
+        jobs::guarded(&worker.store, job, |_, _, _| {
+            worker.store.graph().transaction(|gdb| {
+                ensure_connector(gdb, &connector)?;
+                if let Some(doc) = &document {
+                    stage(gdb, &connector, s(&cursor, "scan_id"), doc)?;
+                }
+                Ok(())
+            })
         })?;
         cursor["index"] = json!(index + 1);
         save_cursor(worker, job, &connector, &cursor)?;
@@ -1140,8 +1373,10 @@ pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
             == cursor["items"].as_array().unwrap().len();
     let generation = if complete {
         Some(jobs::guarded(&worker.store, job, |db, p, _| {
-            ensure_connector(db, &connector)?;
-            let generation = activate(db, &worker.store.graph(), &connector, s(&cursor, "scan_id"), true)?;
+            worker.store.graph().transaction(|gdb| {
+                ensure_connector(gdb, &connector)
+            })?;
+            let generation = activate(&worker.store.graph(), db, &connector, s(&cursor, "scan_id"), true)?;
             crate::doc_links::after_sync(&worker.store, db, &job.repository, s(&connector, "id"), p)?;
             Ok(generation)
         })?)
@@ -1169,29 +1404,36 @@ fn skip(cursor: &mut Value, item: &Value, error: &Error) {
         listed.push(json!({"item":item_label(item),"reason":error.message}));
     }
 }
-pub fn ensure_connector(db: &Connection, connector: &Value) -> Result<()> {
-    let current = one(
+pub fn ensure_connector(db: &mut GConnection, connector: &Value) -> Result<()> {
+    let current = graph::one(
         db,
-        "SELECT generation,config,state FROM am_connectors WHERE id=?",
-        [s(connector, "id")],
+        "MATCH (c:Connector {id: $id}) RETURN c.generation AS generation, c.config AS config, c.state AS state",
+        Params::from([("id".into(), json_to_value(&connector["id"]))]),
     )?
     .ok_or_else(|| Error::conflict("Connector removed"))?;
+    let config: Value = serde_json::from_str(s(&current, "config"))?;
     if current["state"] != "active"
         || current["generation"] != connector["generation"]
-        || serde_json::from_str::<Value>(s(&current, "config"))? != connector["config"]
+        || config != connector["config"]
     {
         return Err(Error::conflict("Connector changed during sync"));
     }
     Ok(())
 }
 fn save_cursor(worker: &Worker, job: &Job, connector: &Value, cursor: &Value) -> Result<()> {
-    jobs::guarded(&worker.store, job, |db, _, _| {
-        ensure_connector(db, connector)?;
-        db.execute(
-            "UPDATE am_connectors SET cursor=? WHERE id=?",
-            params![cursor.to_string(), s(connector, "id")],
-        )?;
-        Ok(())
+    jobs::guarded(&worker.store, job, |_, _, _| {
+        worker.store.graph().transaction(|db| {
+            ensure_connector(db, connector)?;
+            graph::write(
+                db,
+                "MATCH (c:Connector {id: $id}) SET c.cursor=$cursor",
+                Params::from([
+                    ("id".into(), json_to_value(&connector["id"])),
+                    ("cursor".into(), jtext(cursor)?),
+                ]),
+            )?;
+            Ok(())
+        })
     })
 }
 pub fn segment(value: &str) -> String {
@@ -1761,31 +2003,41 @@ async fn drive_document(remote: &mut Remote<'_>, item: &Value) -> Result<Option<
             _=>return Err(Error::bad(format!("Drive format {mime} is not supported by an installed document parser")))
         };
         parsing = crate::documents::extract(&name, &bytes)?;
-        jobs::guarded(&remote.worker.store, remote.job, |db, _, _| {
-            let used:i64=db.query_row("SELECT coalesce(sum(length(bytes)),0) FROM am_original_documents WHERE repository_id=?",[&remote.job.repository],|r|r.get(0))?;
-            let cap = crate::limits::current().retained_original_bytes;
-            if usize::try_from(used + bytes.len() as i64).unwrap_or(usize::MAX) > cap {
-                return Err(Error::bad(format!(
-                    "Original document storage exceeds {}; prune retained versions, or raise the limit with {}",
-                    crate::limits::size(cap),
-                    crate::limits::raise("retained_original_bytes")
-                )));
-            }
-            db.execute(
-                "INSERT OR IGNORE INTO am_original_documents VALUES(?,?,?,?,?,?,?,?,?)",
-                params![
-                    remote.job.repository,
-                    s(remote.connector, "id"),
-                    format!("connector:{}:{file_id}", s(remote.connector, "id")),
-                    s(&parsing, "original_sha256"),
-                    name,
-                    s(&parsing, "parser"),
-                    s(&parsing, "text_sha256"),
-                    bytes,
-                    now()
-                ],
-            )?;
-            Ok(())
+        jobs::guarded(&remote.worker.store, remote.job, |_, _, _| {
+            remote.worker.store.graph().transaction(|db| {
+                let used = graph::one(
+                    db,
+                    "MATCH (o:OriginalDocument {repository_id: $repository}) RETURN coalesce(sum(o.bytes_len),0) AS used",
+                    Params::from([("repository".into(), json_to_value(&json!(remote.job.repository)))]),
+                )?
+                .and_then(|row| row["used"].as_i64())
+                .unwrap_or(0);
+                let cap = crate::limits::current().retained_original_bytes;
+                if usize::try_from(used + bytes.len() as i64).unwrap_or(usize::MAX) > cap {
+                    return Err(Error::bad(format!(
+                        "Original document storage exceeds {}; prune retained versions, or raise the limit with {}",
+                        crate::limits::size(cap),
+                        crate::limits::raise("retained_original_bytes")
+                    )));
+                }
+                graph::write(
+                    db,
+                    "MERGE (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) SET o.connector_id=$connector, o.name=$name, o.parser=$parser, o.text_sha256=$text_sha, o.bytes=$bytes, o.bytes_len=$bytes_len, o.created_at=$now",
+                    Params::from([
+                        ("repository".into(), json_to_value(&json!(remote.job.repository))),
+                        ("source".into(), json_to_value(&json!(format!("connector:{}:{file_id}", s(remote.connector, "id"))))),
+                        ("sha".into(), json_to_value(&parsing["original_sha256"])),
+                        ("connector".into(), json_to_value(&remote.connector["id"])),
+                        ("name".into(), json_to_value(&json!(name))),
+                        ("parser".into(), json_to_value(&parsing["parser"])),
+                        ("text_sha".into(), json_to_value(&parsing["text_sha256"])),
+                        ("bytes".into(), json_to_value(&json!(b64e(&bytes)))),
+                        ("bytes_len".into(), cypherlite::Value::Int(bytes.len() as i64)),
+                        ("now".into(), json_to_value(&json!(now()))),
+                    ]),
+                )?;
+                Ok(())
+            })
         })?;
         s(&parsing, "text").to_string()
     };

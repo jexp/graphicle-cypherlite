@@ -364,23 +364,32 @@ fn source_reverification_requires_tombstones_and_checks_historical_rows() {
         .unwrap()["receipt"]
         .clone();
     assert_eq!(f.verify(&receipt)["verified_local"], true);
-    f.sql(
-        "INSERT INTO am_connector_versions VALUES(?1,'plan','old',?2,'{}','2026-01-01')",
-        rusqlite::params![connector, SECRET],
+    // Versions live in the graph store; a retained historical copy fails
+    // verification until it goes.
+    crate::gql_write(
+        &f.store,
+        "CREATE (v:ConnectorVersion {connector_id: $connector, id: 'plan', sha256: 'old', content: $content, metadata: '{}', created_at: '2026-01-01'})",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("connector", json!(connector)),
+            crate::gp("content", json!(SECRET)),
+        ]),
     );
     assert_eq!(
         f.verify(&receipt)["verified_local"],
         false,
         "a historical copy still retains the forgotten source"
     );
-    f.sql(
-        "DELETE FROM am_connector_versions WHERE connector_id=?",
-        [&connector],
+    crate::gql_write(
+        &f.store,
+        "MATCH (v:ConnectorVersion {connector_id: $connector}) DELETE v",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
     );
     assert_eq!(f.verify(&receipt)["verified_local"], true);
-    f.sql(
-        "DELETE FROM am_forgotten_sources WHERE connector_id=?",
-        [&connector],
+    // Tombstones live in the graph store beside the connector's data.
+    crate::gql_write(
+        &f.store,
+        "MATCH (f:ForgottenSource {connector_id: $connector}) DELETE f",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
     );
     assert_eq!(
         f.verify(&receipt)["verified_local"],

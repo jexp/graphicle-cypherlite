@@ -12,7 +12,7 @@ use crate::{
     store::{self, Principal, Store, authorize_hash, decode, one, repo, s},
     store_graph::{self as graph, GraphStore},
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, LazyLock,
@@ -51,8 +51,8 @@ static READY_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
 
 // The candidate list for leasing. The provider-permission filter of the old
 // SQL query (a `connector` job whose connector syncs provider permissions
-// waits for a program that can run it) is applied in Rust against the SQL
-// store: `am_connectors` has not migrated yet, so it cannot join here.
+// waits for a program that can run it) is applied in Rust against the graph
+// store, where connectors live, so it cannot join here.
 static LEASE_JOB_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "MATCH (j:Job) WHERE j.state IN ['queued','retry'] AND j.not_before <= $now AND NOT j.kind IN $excluded AND j.kind IN $known AND ($repo IS NULL OR (j.repository_id = $repo AND j.kind = $kind)) AND {RUNNING_CONFLICT} RETURN j.id AS id, j.repository_id AS repository_id, j.workspace_id AS workspace_id, j.kind AS kind, j.principal_hash AS principal_hash, j.payload AS payload ORDER BY j.priority DESC, j.created_at LIMIT 100"
@@ -211,7 +211,8 @@ pub const UNKNOWN_KIND: &str = "Waiting for a Graphicle edition that runs this k
 /// which needs an extension that syncs provider permissions. Such a job is
 /// never leased here, so a program that can run it still finds it queued.
 pub fn unavailable(
-    db: &Connection,
+    store: &Store,
+    _db: &Connection,
     repository: &str,
     kind: &str,
     payload: &Value,
@@ -227,12 +228,23 @@ pub fn unavailable(
     }
     let provider = match kind {
         PERMISSIONS => true,
-        "connector" => one(
-            db,
-            "SELECT 1 AS provider FROM am_connectors WHERE repository_id=? AND id=? AND json_extract(config,'$.permission_mode')='provider'",
-            params![repository, s(payload, "connector_id")],
-        )?
-        .is_some(),
+        "connector" => store
+            .graph()
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.config AS config",
+                    crate::store_graph::Params::from([
+                        ("repository".into(), crate::store_graph::json_to_value(&json!(repository))),
+                        ("id".into(), crate::store_graph::json_to_value(&payload["connector_id"])),
+                    ]),
+                )
+            })?
+            .is_some_and(|c| {
+                serde_json::from_str::<Value>(s(&c, "config"))
+                    .map(|c| c["permission_mode"] == "provider")
+                    .unwrap_or(false)
+            }),
         _ => false,
     };
     Ok(provider.then(|| crate::connectors::PROVIDER_SYNC_UNAVAILABLE.to_string()))
@@ -664,7 +676,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
                         db,
                         &p,
                         identifier,
-                        "retention.graph",
+                        "retention.graph()",
                         "graph_by_products",
                         json!({"retention": retention, "trigger": "projection"}),
                         removed.clone(),
@@ -689,7 +701,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
                         g,
                         &p,
                         identifier,
-                        "retention.graph",
+                        "retention.graph()",
                         "graph_by_products",
                         json!({"retention": retention, "trigger": "projection"}),
                         removed.clone(),
@@ -1014,7 +1026,7 @@ pub fn guarded_read<T>(
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
 fn still_valid(store: &Store, db: &Connection, job: &Job) -> Result<(Principal, Value)> {
-    check_lease(&store.graph(), &job.id, &job.lease)?;
+        check_lease(&store.graph(), &job.id, &job.lease)?;
     let p = authorize_hash(
         db,
         &job.workspace,
@@ -1199,7 +1211,7 @@ pub fn queue(
         });
     let repository = repo(db, p, string(args, "repository_id", 100)?)?;
     let identifier = s(&repository, "id");
-    if let Some(reason) = unavailable(db, identifier, kind, args)? {
+    if let Some(reason) = unavailable(store, db, identifier, kind, args)? {
         return Err(Error::bad(reason));
     }
     if args.to_string().len() > 65536 {
@@ -1291,11 +1303,18 @@ pub fn queue(
             "SELECT count(*) AS count,max(created_at) AS latest FROM am_observer_notes WHERE repository_id=?",
             [identifier],
         )?,
-        "connector" | "permissions" | "connector_probe" => one(
-            db,
-            "SELECT generation,cursor FROM am_connectors WHERE repository_id=? AND id=?",
-            params![identifier, string(args, "connector_id", 100)?],
-        )?,
+        "connector" | "permissions" | "connector_probe" => store
+            .graph()
+            .read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.generation AS generation, c.cursor AS cursor",
+                    crate::store_graph::Params::from([
+                        ("repository".into(), crate::store_graph::json_to_value(&json!(identifier))),
+                        ("id".into(), crate::store_graph::json_to_value(&json!(string(args, "connector_id", 100)?))),
+                    ]),
+                )
+            })?,
         _ => None,
     };
     payload["progress"] = json!(progress);
@@ -1397,7 +1416,7 @@ impl Store {
                 if args["job_id"].as_str().is_some_and(|j|s(&row,"id")!=j) {continue;}
                 decode(&mut row,"result")?;decode(&mut row,"payload")?;
                 // Work this program cannot run waits for one that can.
-                if ["queued","retry"].contains(&s(&row,"state")) && let Some(reason)=unavailable(db,s(&repository,"id"),s(&row,"kind"),&row["payload"])? {row["waiting_for"]=json!(reason);}
+                if ["queued","retry"].contains(&s(&row,"state")) && let Some(reason)=unavailable(self,db,s(&repository,"id"),s(&row,"kind"),&row["payload"])? {row["waiting_for"]=json!(reason);}
                 // An unsupported kind names its unit, whatever its state.
                 if let Some(archived)=crate::archived::kind(s(&row,"kind")) {row["archived"]=json!(archived.listing());}
                 // Job answers can include private evidence. Recheck the caller's
@@ -1582,18 +1601,27 @@ impl Store {
                 continue;
             };
             decode(&mut row, "payload")?;
-            // The connector table is still SQL: a provider-permission
-            // connector sync waits for a program that can run it.
+            // A provider-mode connector job stays queued for a program that
+            // syncs provider permissions (the connector lives in the graph
+            // store).
             if !provider_sync
                 && s(&row, "kind") == "connector"
-                && self.read(|db| {
-                    Ok(one(
-                        db,
-                        "SELECT 1 AS provider FROM am_connectors WHERE repository_id=? AND id=? AND json_extract(config,'$.permission_mode')='provider'",
-                        params![s(&row, "repository_id"), s(&row["payload"], "connector_id")],
-                    )?
-                    .is_some())
-                })?
+                && graph
+                    .read(|g| {
+                        crate::store_graph::one(
+                            g,
+                            "MATCH (c:Connector {repository_id: $repository, id: $id}) RETURN c.config AS config",
+                            crate::store_graph::Params::from([
+                                ("repository".into(), crate::store_graph::json_to_value(&json!(s(&row, "repository_id")))),
+                                ("id".into(), crate::store_graph::json_to_value(&json!(s(&row["payload"], "connector_id")))),
+                            ]),
+                        )
+                    })?
+                    .is_some_and(|c| {
+                        serde_json::from_str::<Value>(s(&c, "config"))
+                            .map(|c| c["permission_mode"] == "provider")
+                            .unwrap_or(false)
+                    })
             {
                 continue;
             }

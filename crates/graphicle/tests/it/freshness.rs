@@ -311,15 +311,24 @@ fn many_changes_or_a_slow_sync_give_a_stale_note_and_leave_the_store() {
         std::fs::remove_file(h.app.join(format!("gen{i}.py"))).unwrap();
     }
     h.sync();
-    h.store()
-        .transaction(|db| {
-            db.execute(
-                "UPDATE repo_folders SET freshness=json_set(freshness,'$.scan_ms',5000) WHERE repository_id=?",
-                [&project],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    // The freshness record lives on the folder's graph node.
+    let record = crate::gql_one(
+        &h.store(),
+        "MATCH (f:Folder {repository_id: $repository}) RETURN f.freshness AS freshness",
+        graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(project))]),
+    )
+    .unwrap();
+    let mut updated: Value =
+        serde_json::from_str(record["freshness"].as_str().unwrap()).unwrap();
+    updated["scan_ms"] = json!(5000);
+    crate::gql_write(
+        &h.store(),
+        "MATCH (f:Folder {repository_id: $repository}) SET f.freshness=$freshness",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("repository", json!(project)),
+            crate::gp("freshness", json!(updated.to_string())),
+        ]),
+    );
     std::fs::write(h.app.join("a.py"), A_V2).unwrap();
     let slow = h.json(&["context", "what does run call"]);
     assert_eq!(slow["folder_freshness"]["reason"], "slow_sync", "{slow:#}");
@@ -408,16 +417,13 @@ fn sync_quiet_prints_nothing_and_does_nothing_when_nothing_changed() {
     h.graph_current(&project);
     let (first, syncs, _) = h.state(&project);
     let record = || -> Value {
-        h.store()
-            .read(|db| {
-                let text: String = db.query_row(
-                    "SELECT freshness FROM repo_folders WHERE repository_id=?",
-                    [&project],
-                    |r| r.get(0),
-                )?;
-                Ok(serde_json::from_str(&text).unwrap())
-            })
-            .unwrap()
+        let text = crate::gql_one(
+            &h.store(),
+            "MATCH (f:Folder {repository_id: $repository}) RETURN f.freshness AS freshness",
+            graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(project))]),
+        )
+        .unwrap();
+        serde_json::from_str(text["freshness"].as_str().unwrap()).unwrap()
     };
     let recorded = record();
     assert_eq!(recorded["snapshot"], first, "{recorded}");
@@ -730,15 +736,23 @@ fn an_unchanged_sync_converts_no_document_again() {
     assert_eq!(parser(), "kept");
     // A record of an earlier build: the page is converted again.
     let project = s(&first, "repository_id").to_string();
-    store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE repo_folders SET freshness=json_remove(freshness,'$.converter') WHERE repository_id=?",
-                [&project],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    let current = crate::gql_one(
+        &store,
+        "MATCH (f:Folder {repository_id: $repository}) RETURN f.freshness AS freshness",
+        graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(project.clone()))]),
+    )
+    .unwrap();
+    let mut record: Value =
+        serde_json::from_str(current["freshness"].as_str().unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("converter");
+    crate::gql_write(
+        &store,
+        "MATCH (f:Folder {repository_id: $repository}) SET f.freshness=$freshness",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("repository", json!(project)),
+            crate::gp("freshness", json!(record.to_string())),
+        ]),
+    );
     let third = sync(&mut session);
     same(&first, &third);
     assert_eq!(parser(), "html2text");

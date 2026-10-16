@@ -3,15 +3,19 @@
 //! when a document's provider permissions are missing, incomplete or older
 //! than the connector allows, for example in a store whose provider
 //! permissions no installed extension keeps current.
+//!
+//! The account side lives in the graph store: `(:ProviderIdentity)`,
+//! `(:OAuthAccount)`, `(:ProviderEmail)`. A grant matches by list membership
+//! against the principal's identities — no `json_each` joins.
 use crate::{
     Result,
-    store::{Principal, rows, s},
+    store::{Principal, s},
+    store_graph::{self as graph, GraphStore, Params, json_to_value},
 };
-use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub fn allows(
-    db: &Connection,
+    store: &GraphStore,
     workspace: &str,
     provider: &str,
     permission: &Value,
@@ -34,21 +38,34 @@ pub fn allows(
     if p.role == "owner" {
         return Ok(true);
     }
-    let identities = rows(
-        db,
-        "SELECT external_id FROM am_provider_identities WHERE workspace_id=? AND provider=? AND credential_id=?",
-        params![workspace, provider, p.credential],
-    )?;
-    let mut accounts = rows(
-        db,
-        "SELECT external_id,email FROM am_oauth_accounts WHERE workspace_id=? AND provider=? AND state='active'",
-        params![workspace, provider],
-    )?;
-    accounts.extend(rows(
-        db,
-        "SELECT external_id,email FROM am_provider_emails WHERE workspace_id=? AND provider=?",
-        params![workspace, provider],
-    )?);
+    let (identities, accounts) = store.read(|db| {
+        let identities = graph::rows(
+            db,
+            "MATCH (i:ProviderIdentity {workspace_id: $workspace, provider: $provider, credential_id: $credential}) RETURN i.external_id AS external_id",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("provider".into(), json_to_value(&json!(provider))),
+                ("credential".into(), json_to_value(&json!(p.credential))),
+            ]),
+        )?;
+        let mut accounts = graph::rows(
+            db,
+            "MATCH (a:OAuthAccount {workspace_id: $workspace, provider: $provider, state: 'active'}) RETURN a.external_id AS external_id, a.email AS email",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("provider".into(), json_to_value(&json!(provider))),
+            ]),
+        )?;
+        accounts.extend(graph::rows(
+            db,
+            "MATCH (e:ProviderEmail {workspace_id: $workspace, provider: $provider}) RETURN e.external_id AS external_id, e.email AS email",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("provider".into(), json_to_value(&json!(provider))),
+            ]),
+        )?);
+        Ok((identities, accounts))
+    })?;
     for grant in permission["principals"].as_array().into_iter().flatten() {
         if grant["type"] == "anyone" {
             return Ok(true);

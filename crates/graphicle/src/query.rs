@@ -1581,7 +1581,7 @@ impl Store {
     pub fn project_status(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace,token,"read",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;let snap=snapshot(db,&self.graph(),&repository,p)?;
-            let observed:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM am_connectors WHERE repository_id=? AND state='active' AND json_type(config,'$.observe')='object')",[s(&repository,"id")],|r|r.get(0))?;
+            let observed:bool=self.graph().read(|db|crate::store_graph::rows(db,"MATCH (c:Connector {repository_id: $repository, state: 'active'}) RETURN c.config AS config",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&repository["id"]))])))?.iter().any(|c|serde_json::from_str::<Value>(crate::store_graph::s(c,"config")).map(|c|c["observe"].is_object()).unwrap_or(false));
             Ok(json!({"repository":repository,"files":snap.documents.iter().filter(|d|d["source_kind"]=="repository_file").count(),
                 "evidence_sources":snap.documents.len(),"memories":snap.memories.len(),"stale_memories":snap.memories.iter().filter(|m|m["stale"]==true).count(),
                 "draft_memories":snap.memories.iter().filter(|m|m["state"]=="draft").count(),"source_state":snap.state,"native_runtime":{"enabled":true,"language":"rust","service_version":env!("CARGO_PKG_VERSION"),"core_version":graphicle_memory::VERSION},

@@ -2801,7 +2801,7 @@ fn below(path: &str, prefix: &str) -> bool {
 fn nested_prefixes(db: &Connection, repos: &[Linkable]) -> Result<HashMap<String, Vec<String>>> {
     let mut folders: Vec<(&str, PathBuf)> = Vec::with_capacity(repos.len());
     for repo in repos {
-        if let Some(folder) = crate::folders::current_folder(db, &repo.id)? {
+        if let Some(folder) = crate::folders::current_folder(&*crate::store::graph_for(db)?, &repo.id)? {
             folders.push((repo.id.as_str(), folder));
         }
     }

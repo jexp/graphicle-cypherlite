@@ -61,18 +61,34 @@ impl Fixture {
             .capture_transcript(self.ws(), self.key(), &self.repo, client, transcript)
             .unwrap()
     }
-    /// `(id, content and metadata)` of every row of a connector table.
+    /// `(id, content and metadata)` of every node of a connector label
+    /// (the SQL-era table name maps to the graph label).
     fn stored(&self, table: &str) -> Vec<(String, String)> {
-        let db = self.store.connect().unwrap();
-        let mut statement = db
-            .prepare(&format!(
-                "SELECT id,content||' '||metadata FROM {table} ORDER BY id"
-            ))
-            .unwrap();
-        statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        let label = match table {
+            "am_connector_docs" => "ConnectorDoc",
+            "am_connector_versions" => "ConnectorVersion",
+            "am_connector_stage" => "ConnectorStage",
+            other => panic!("{other} is a graph label now"),
+        };
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    &format!(
+                        "MATCH (n:{label}) RETURN n.id AS id, n.content AS content, n.metadata AS metadata ORDER BY n.id"
+                    ),
+                    Default::default(),
+                )
+            })
             .unwrap()
-            .map(Result::unwrap)
+            .iter()
+            .map(|row| {
+                (
+                    s(row, "id").to_string(),
+                    format!("{} {}", s(row, "content"), s(row, "metadata")),
+                )
+            })
             .collect()
     }
     fn source_id(&self, connector: &str, document: &str) -> String {
@@ -327,13 +343,19 @@ fn claude_code_turns_are_captured_once_under_the_policy() {
 impl Fixture {
     fn connector_count(&self) -> i64 {
         self.store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (c:Connector {repository_id: $repository}) RETURN count(c) AS n",
+                    graphicle_runtime::store_graph::Params::from([(
+                        "repository".into(),
+                        graphicle_runtime::store_graph::json_to_value(&json!(self.repo)),
+                    )]),
+                )
+            })
             .unwrap()
-            .query_row(
-                "SELECT count(*) FROM am_connectors WHERE repository_id=?",
-                [&self.repo],
-                |r| r.get(0),
-            )
+            .and_then(|row| row["n"].as_i64())
             .unwrap()
     }
 }
@@ -1068,9 +1090,16 @@ fn work_state_goes_with_its_project() {
         .unwrap();
     let count = || -> i64 {
         f.store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (w:WorkState) RETURN count(w) AS n",
+                    Default::default(),
+                )
+            })
             .unwrap()
-            .query_row("SELECT count(*) FROM am_work_state", [], |row| row.get(0))
+            .and_then(|row| row["n"].as_i64())
             .unwrap()
     };
     assert_eq!(count(), 1);
