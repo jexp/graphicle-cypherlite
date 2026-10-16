@@ -872,12 +872,20 @@ fn derived(repository: &str, scope: &Scope, kind: &str, id: &str) -> bool {
 
 /// Dependency-index relationship ids (`(:Artifact)-[:DEPENDS_ON]->(:Source)`)
 /// naming or derived from the forgotten documents.
-fn index_edges(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Result<Vec<i64>> {
+/// `(edge, dependent node, source node)` internal ids of each in-scope
+/// dependency-index relationship.
+fn index_edges(
+    db: Graph,
+    workspace: &str,
+    repository: &str,
+    scope: &Scope,
+) -> Result<Vec<(i64, i64, i64)>> {
     let mut out = Vec::new();
     for row in rows(
         db,
         "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Artifact) \
-         RETURN id(r) AS rid, a.kind AS dependent_kind, a.id AS dependent_id, \
+         RETURN id(r) AS rid, id(a) AS dependent, id(src) AS source, \
+         a.kind AS dependent_kind, a.id AS dependent_id, \
          src.kind AS source_kind, src.id AS source_id",
         gparams([("ws", json!(workspace))]),
     )? {
@@ -889,7 +897,11 @@ fn index_edges(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> R
                 s(&row, "dependent_id"),
             )
         {
-            out.push(row["rid"].as_i64().unwrap_or_default());
+            out.push((
+                row["rid"].as_i64().unwrap_or_default(),
+                row["dependent"].as_i64().unwrap_or_default(),
+                row["source"].as_i64().unwrap_or_default(),
+            ));
         }
     }
     Ok(out)
@@ -1526,15 +1538,29 @@ pub fn forget(
     }
     let vectors = passages.len();
     for (label, identity) in passages {
-        db.query_with_params(
-            "MATCH (n:$($label) {repository_id: $repo, id: $identity}) \
-             REMOVE n.embedding, n.embedding_model_key",
-            gparams([
-                ("label", json!(label)),
-                ("repo", json!(repository)),
-                ("identity", json!(identity)),
-            ]),
-        )?;
+        if label == "Chunk" {
+            // A stub Chunk exists only to carry its embedding
+            // (vector::delete_embeddings deletes it): it goes with the
+            // forgotten passage. Content chunks carry no `id`.
+            db.query_with_params(
+                "MATCH (n:Chunk {repository_id: $repo, id: $identity}) \
+                 WHERE n.embedding IS NOT NULL DETACH DELETE n",
+                gparams([
+                    ("repo", json!(repository)),
+                    ("identity", json!(identity)),
+                ]),
+            )?;
+        } else {
+            db.query_with_params(
+                "MATCH (n:$($label) {repository_id: $repo, id: $identity}) \
+                 REMOVE n.embedding, n.embedding_model_key",
+                gparams([
+                    ("label", json!(label)),
+                    ("repo", json!(repository)),
+                    ("identity", json!(identity)),
+                ]),
+            )?;
+        }
     }
     // An extraction read whose drafts were just removed must run again.
     let mut read_ids = Vec::new();
@@ -1710,11 +1736,28 @@ pub fn forget(
         stripped.insert(legacy, changed);
     }
     // The dependency index follows the artifacts.
-    let edge_ids = index_edges(db, workspace, repository, scope)?;
+    let edge_rows = index_edges(db, workspace, repository, scope)?;
+    let edge_ids: Vec<i64> = edge_rows.iter().map(|(rid, _, _)| *rid).collect();
     if !edge_ids.is_empty() {
         db.query_with_params(
             "MATCH ()-[r:DEPENDS_ON]->() WHERE id(r) IN $ids DELETE r",
             gparams([("ids", json!(edge_ids))]),
+        )?;
+    }
+    // The index's artifact nodes of the forgotten documents and of the
+    // derived artifacts that went with them: once edge-less, the entry
+    // itself is residue.
+    let endpoint_ids: Vec<i64> = edge_rows
+        .iter()
+        .flat_map(|(_, a, b)| [*a, *b])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !endpoint_ids.is_empty() {
+        db.query_with_params(
+            "MATCH (a:Artifact) WHERE id(a) IN $ids AND NOT (a)-[:DEPENDS_ON]-() \
+             DETACH DELETE a",
+            gparams([("ids", json!(endpoint_ids))]),
         )?;
     }
     let edges = edge_ids.len();
@@ -1845,7 +1888,7 @@ pub fn receipt(
     p: &Principal,
     repository: &Value,
     operation: &str,
-    plan: Plan,
+    plan: &Plan,
     started: &str,
     forgotten: Value,
     erased: Value,
@@ -1862,7 +1905,7 @@ pub fn policy_receipt(
     p: &Principal,
     repository: &Value,
     operation: &str,
-    plan: Plan,
+    plan: &Plan,
     started: &str,
     forgotten: Value,
     erased: Value,
@@ -2406,10 +2449,18 @@ fn append(
          RETURN r.sequence AS sequence, r.digest AS digest ORDER BY r.sequence DESC LIMIT 1",
         gparams([("ws", json!(workspace))]),
     )?;
+    let sql_last: i64 = sql
+        .query_row(
+            "SELECT coalesce(max(sequence),0) FROM am_deletion_receipts WHERE workspace_id=?",
+            [workspace],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     let sequence = last
         .as_ref()
         .and_then(|r| r["sequence"].as_i64())
         .unwrap_or(0)
+        .max(sql_last)
         + 1;
     receipt["id"] = json!(id());
     receipt["sequence"] = json!(sequence);

@@ -117,9 +117,17 @@ fn delete_project(
     // The SQL store cascaded from repo_projects; on the graph the cascade is
     // explicit: everything scoped to the project, then the project itself.
     db.query_with_params(
-        "MATCH (n) WHERE n.repository_id = $repo DETACH DELETE n",
+        "MATCH (n) WHERE n.repository_id = $repo AND NOT n:DeletionReceipt DETACH DELETE n",
         params(&[("repo", json!(identifier))]),
     )?;
+    // Connector-scoped nodes (versions, stage, permissions) key on the
+    // connector, not the project.
+    if !connectors.is_empty() {
+        db.query_with_params(
+            "MATCH (n) WHERE n.connector_id IN $connectors DETACH DELETE n",
+            params(&[("connectors", json!(connectors))]),
+        )?;
+    }
     db.query_with_params(
         "MATCH (n)-[:OF|IN_PROJECT|PART_OF]->(:Project {id: $repo}) DETACH DELETE n",
         params(&[("repo", json!(identifier))]),
@@ -185,7 +193,6 @@ fn apply_source_retention(
             )?;
             let sql_erased = deletion::legacy::erase(sql, identifier, &scope)?;
             let receipt = graph.transaction(|g| {
-                let forget_plan = deletion::plan(g, sql, &p.workspace, identifier, &scope)?;
                 let mut forgotten =
                     deletion::forget(g, &p.workspace, identifier, &scope, since.as_deref())?;
                 let mut erased = deletion::erase(g, identifier, &scope)?;
@@ -204,7 +211,7 @@ fn apply_source_retention(
                     p,
                     repository,
                     "retention.forget",
-                    forget_plan,
+                    &planned,
                     &started,
                     forgotten,
                     erased,
@@ -728,8 +735,7 @@ impl Store {
                         let sql_erased=deletion::legacy::erase(db,&identifier,&scope)?;
                         return graph.transaction(|g| {
                             let started=now();
-                            let plan=deletion::plan(g,db,&p.workspace,&identifier,&scope)?;
-                            let since=plan.since().map(str::to_string);
+                            let since=planned.since().map(str::to_string);
                             let mut forgotten=deletion::forget(g,&p.workspace,&identifier,&scope,since.as_deref())?;
                             let mut erased=deletion::erase(g,&identifier,&scope)?;
                             deletion::merge_removed(&mut forgotten,&sql_forgotten);
@@ -738,7 +744,7 @@ impl Store {
                             graphicle_memory::cache::clear(&identifier).map_err(Error::bad)?;
                             let derived=forgotten["memories"].clone();
                             event(g,&identifier,"source_forgotten",json!({"derived_records_removed":derived}))?;
-                            let receipt=deletion::receipt(g,db,p,&repository,operation,plan,&started,forgotten,erased)?;
+                            let receipt=deletion::receipt(g,db,p,&repository,operation,&planned,&started,forgotten,erased)?;
                             Ok(json!({"deleted":true,"derived_records_removed":derived,"local_backups_are_separate":true,"receipt":receipt}))
                         });
                     }
