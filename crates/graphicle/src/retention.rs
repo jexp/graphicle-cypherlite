@@ -507,7 +507,7 @@ impl Store {
                             connector,
                             batch.iter().map(|d| (*d).clone()).collect(),
                         );
-                        let forget = crate::deletion::plan(g, &p.workspace, identifier, &scope)?;
+                        let forget = crate::deletion::plan(g, db, &p.workspace, identifier, &scope)?;
                         for (table, n) in forget.rows() {
                             *removes.entry(table).or_default() += n;
                         }

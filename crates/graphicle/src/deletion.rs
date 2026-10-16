@@ -876,7 +876,7 @@ fn index_edges(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> R
     let mut out = Vec::new();
     for row in rows(
         db,
-        "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Source) \
+        "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Artifact) \
          RETURN id(r) AS rid, a.kind AS dependent_kind, a.id AS dependent_id, \
          src.kind AS source_kind, src.id AS source_id",
         gparams([("ws", json!(workspace))]),
@@ -954,7 +954,7 @@ fn source_rows(
         ("memories", "Memory", "data", cites),
         ("observer_notes", "Observation", "source_id", |v, sc| sc.source(v)),
         ("observer_reflections", "MentalModel", "sources", lists),
-        ("vectors", "Chunk", "identity", |v, sc| sc.passage(v)),
+        ("vectors", "Chunk", "id", |v, sc| sc.passage(v)),
         ("document_reads", "DocumentRead", "source_id", |v, sc| sc.source(v)),
         ("anchors", "AnchorEdge", "attributes.document_id", |v, sc| sc.source(v)),
         ("hints", "Hint", "target", |v, sc| sc.source(v)),
@@ -1078,7 +1078,13 @@ impl Plan {
     }
 }
 
-pub fn plan(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Result<Plan> {
+pub fn plan(
+    db: Graph,
+    sql: &rusqlite::Connection,
+    workspace: &str,
+    repository: &str,
+    scope: &Scope,
+) -> Result<Plan> {
     let prefix = scope.prefix();
     let mut sources = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
@@ -1130,16 +1136,52 @@ pub fn plan(db: Graph, workspace: &str, repository: &str, scope: &Scope) -> Resu
         .filter_map(|t| excerpt(t))
         .take(FINGERPRINTS)
         .collect();
+    // The store is mid-migration: connector data is graph-resident, but the
+    // observer, overlay and product tables are still SQL. A verified plan
+    // covers both.
+    let mut rows = source_rows(db, workspace, repository, scope)?;
+    merge_counts(
+        &mut rows,
+        legacy::source_rows(sql, workspace, repository, scope)?,
+    );
+    let mut visible_since = since_visible(db, repository, since.as_deref(), None)?;
+    merge_counts(
+        &mut visible_since,
+        legacy::since_visible(sql, repository, since.as_deref(), None)?,
+    );
     Ok(Plan {
         scope: scope.clone(),
         sources: sources.len(),
         sources_digest: digest(&json!(sources)),
         texts: texts.len(),
         fingerprints,
-        rows: source_rows(db, workspace, repository, scope)?,
-        visible_since: since_visible(db, repository, since.as_deref(), None)?,
+        rows,
+        visible_since,
         since,
     })
+}
+
+/// Add `extra`'s per-kind counts into `into` (same legacy row names).
+fn merge_counts(into: &mut BTreeMap<&'static str, usize>, extra: BTreeMap<&'static str, usize>) {
+    for (kind, n) in extra {
+        *into.entry(kind).or_insert(0) += n;
+    }
+}
+
+/// Sum the numeric entries of `extra` into `into` (the `forget` result
+/// shape: flat counts plus a nested `since_visible` count map).
+pub(crate) fn merge_removed(into: &mut Value, extra: &Value) {
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        if key == "since_visible" {
+            for (kind, n) in value.as_object().into_iter().flatten() {
+                let entry = &mut into["since_visible"][kind];
+                *entry = json!(entry.as_u64().unwrap_or(0) + n.as_u64().unwrap_or(0));
+            }
+        } else if let Some(n) = value.as_u64() {
+            let entry = &mut into[key];
+            *entry = json!(entry.as_u64().unwrap_or(0) + n);
+        }
+    }
 }
 
 /// A model draft written while the forgotten documents were visible, whatever
@@ -1474,7 +1516,7 @@ pub fn forget(
     for label in ["Chunk", "Entity"] {
         for row in rows(
             db,
-            "MATCH (n:$($label) {repository_id: $repo}) RETURN n.identity AS identity",
+            "MATCH (n:$($label) {repository_id: $repo}) RETURN n.id AS identity",
             gparams([("label", json!(label)), ("repo", json!(repository))]),
         )? {
             if scope.passage(s(&row, "identity")) {
@@ -1485,8 +1527,8 @@ pub fn forget(
     let vectors = passages.len();
     for (label, identity) in passages {
         db.query_with_params(
-            "MATCH (n:$($label) {repository_id: $repo, identity: $identity}) \
-             REMOVE n.embedding, n.model_key",
+            "MATCH (n:$($label) {repository_id: $repo, id: $identity}) \
+             REMOVE n.embedding, n.embedding_model_key",
             gparams([
                 ("label", json!(label)),
                 ("repo", json!(repository)),
@@ -1790,40 +1832,6 @@ fn visible_documents(db: Graph, repository: &str, scope: &Scope) -> Result<usize
     .count())
 }
 
-/// Queued external cleanups of the project (the durable
-/// `ProjectionCleanup` queue, retained by design until cleanup completes).
-fn external(db: Graph, repository: &str) -> Result<Vec<Value>> {
-    rows(
-        db,
-        "MATCH (c:ProjectionCleanup {scope: $repo}) \
-         RETURN c.id AS id, c.kind AS kind, c.revision AS revision, c.state AS state \
-         ORDER BY c.kind, c.id",
-        gparams([("repo", json!(repository))]),
-    )
-}
-
-/// A captured external cleanup is done once its node completed at (or after)
-/// the captured revision; revisions only grow.
-fn external_now(db: Graph, captured: &Value) -> Result<(Vec<Value>, bool)> {
-    let mut pending = false;
-    let mut out = Vec::new();
-    for cleanup in captured.as_array().into_iter().flatten() {
-        let row = one(
-            db,
-            "MATCH (c:ProjectionCleanup {id: $id}) \
-             RETURN c.revision AS revision, c.state AS state, c.error AS error",
-            gparams([("id", json!(s(cleanup, "id")))]),
-        )?;
-        let done = row.as_ref().is_some_and(|r| {
-            r["state"] == "complete" && r["revision"].as_i64() >= cleanup["revision"].as_i64()
-        });
-        pending |= !done;
-        out.push(json!({"id":cleanup["id"],"kind":cleanup["kind"],"captured_revision":cleanup["revision"],
-            "state":row.as_ref().map_or(json!("unknown"),|r|r["state"].clone()),"error":row.map_or(Value::Null,|r|r["error"].clone()),"complete":done}));
-    }
-    Ok((out, pending))
-}
-
 fn empty(scan: &Value) -> bool {
     scan["matches"].as_array().is_some_and(Vec::is_empty)
 }
@@ -1833,6 +1841,7 @@ fn empty(scan: &Value) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn receipt(
     db: Graph,
+    sql: &rusqlite::Connection,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1841,7 +1850,7 @@ pub fn receipt(
     forgotten: Value,
     erased: Value,
 ) -> Result<Value> {
-    policy_receipt(db, p, repository, operation, plan, started, forgotten, erased, None)
+    policy_receipt(db, sql, p, repository, operation, plan, started, forgotten, erased, None)
 }
 
 /// [`receipt`] for a deletion a retention policy chose: the receipt also
@@ -1849,6 +1858,7 @@ pub fn receipt(
 #[allow(clippy::too_many_arguments)]
 pub fn policy_receipt(
     db: Graph,
+    sql: &rusqlite::Connection,
     p: &Principal,
     repository: &Value,
     operation: &str,
@@ -1860,11 +1870,25 @@ pub fn policy_receipt(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let scope = &plan.scope;
-    let remaining = source_rows(db, &p.workspace, identifier, scope)?;
-    let tainted = since_visible(db, identifier, plan.since(), Some(started))?;
+    // Verified deletion covers both stores: connector data is graph-resident,
+    // the observer, overlay and product tables are still SQL.
+    let mut remaining = source_rows(db, &p.workspace, identifier, scope)?;
+    merge_counts(
+        &mut remaining,
+        legacy::source_rows(sql, &p.workspace, identifier, scope)?,
+    );
+    let mut tainted = since_visible(db, identifier, plan.since(), Some(started))?;
+    merge_counts(
+        &mut tainted,
+        legacy::since_visible(sql, identifier, plan.since(), Some(started))?,
+    );
     let labels = catalog(db)?;
+    let tables = legacy::tables(sql)?;
     let ids = if scope.whole() {
-        references(db, &labels, &[scope.prefix()], (identifier, &p.workspace), &[], false)?
+        merge_scans(
+            references(db, &labels, &[scope.prefix()], (identifier, &p.workspace), &[], false)?,
+            legacy::references(sql, &tables, &[scope.prefix()], (identifier, &p.workspace), &[], false)?,
+        )
     } else {
         let existing: BTreeSet<String> = rows(
             db,
@@ -1874,12 +1898,22 @@ pub fn policy_receipt(
         .iter()
         .map(|r| format!("{}{}", scope.prefix(), s(r, "id")))
         .collect();
-        document_references(db, &labels, scope, &existing, (identifier, &p.workspace))?
+        merge_scans(
+            document_references(db, &labels, scope, &existing, (identifier, &p.workspace))?,
+            legacy::document_references(sql, &tables, scope, &existing, (identifier, &p.workspace))?,
+        )
     };
     let text = verbatim(db, &labels, &plan.fingerprints, identifier)?;
+    let sql_text = legacy::verbatim(sql, &tables, &plan.fingerprints, identifier)?;
+    let mut text_matches = text["matches"].as_array().cloned().unwrap_or_default();
+    text_matches.extend(sql_text["matches"].as_array().cloned().unwrap_or_default());
+    let text = json!({"fingerprints":text["fingerprints"],
+        "tables_scanned":text["tables_scanned"].as_u64().unwrap_or(0)+sql_text["tables_scanned"].as_u64().unwrap_or(0),
+        "matches":text_matches});
     let visible = visible_documents(db, identifier, scope)?;
     let snapshot = state(db, &p.workspace, identifier)?;
-    let cleanups = external(db, identifier)?;
+    // External cleanups are queued in the SQL store (projection.rs).
+    let cleanups = legacy::external(sql, identifier)?;
     let clean = remaining.values().chain(tainted.values()).all(|n| *n == 0)
         && empty(&ids)
         && empty(&text)
@@ -1908,13 +1942,25 @@ pub fn policy_receipt(
         "reimport_blocked":!scope.whole(),
         "external_cleanup":cleanups,
         "verified_local":clean,"external_pending":pending,"complete":clean && !pending,
-        "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
+        "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot",
+            "secure_delete":legacy::secure_delete(sql)?}
     });
     if let Some(policy) = policy {
         receipt["policy"] = policy.clone();
         receipt["policy_digest"] = json!(digest(policy));
     }
-    append(db, &p.workspace, identifier, operation, &scope.connector, receipt)
+    append(db, sql, &p.workspace, identifier, operation, &scope.connector, receipt)
+}
+
+/// Merge two `{"tables_scanned": n, "matches": [...]}` scans (graph labels
+/// and SQL legacy tables).
+fn merge_scans(graph: Value, sql: Value) -> Value {
+    let mut matches = graph["matches"].as_array().cloned().unwrap_or_default();
+    matches.extend(sql["matches"].as_array().cloned().unwrap_or_default());
+    json!({
+        "tables_scanned": graph["tables_scanned"].as_u64().unwrap_or(0)+sql["tables_scanned"].as_u64().unwrap_or(0),
+        "matches": matches,
+    })
 }
 
 /// One-way name of a removed node key (a memory id, a pruned object).
@@ -1933,6 +1979,7 @@ pub fn key_hash(operation: &str, key: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn rows_receipt(
     db: Graph,
+    sql: &rusqlite::Connection,
     p: &Principal,
     repository: &str,
     operation: &str,
@@ -1997,7 +2044,7 @@ pub fn rows_receipt(
         "verified_local":clean,"external_pending":false,"complete":clean,
         "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
     });
-    append(db, &p.workspace, repository, operation, target, receipt)
+    append(db, sql, &p.workspace, repository, operation, target, receipt)
 }
 
 /// The label a legacy table name maps to (lossy helper for receipt fields,
@@ -2147,10 +2194,11 @@ pub fn forget_project_references(
 ) -> Result<Value> {
     let mut edges = 0;
     let mut stale = 0;
+    let mut artifacts = 0;
     for prefix in project_patterns(repository, connectors) {
         let found = rows(
             db,
-            "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Source) \
+            "MATCH (a:Artifact {workspace: $ws})-[r:DEPENDS_ON]->(src:Artifact) \
              WHERE a.id STARTS WITH $prefix OR src.id STARTS WITH $prefix RETURN id(r) AS rid",
             gparams([("ws", json!(workspace)), ("prefix", json!(prefix))]),
         )?;
@@ -2162,6 +2210,18 @@ pub fn forget_project_references(
             )?;
             edges += ids.len();
         }
+        // The project's own artifacts (its files and chunks) are
+        // workspace-scoped nodes keyed `<repository>:<path>`: they go with
+        // the project, their edges already gone.
+        let mut owned = Vec::new();
+        for row in rows(
+            db,
+            "MATCH (a:Artifact {workspace: $ws}) WHERE a.id STARTS WITH $prefix RETURN id(a) AS nid",
+            gparams([("ws", json!(workspace)), ("prefix", json!(prefix.clone()))]),
+        )? {
+            owned.push(row["nid"].as_i64().unwrap_or_default());
+        }
+        artifacts += detach_ids(db, "Artifact", &owned)?;
         let mut ids = Vec::new();
         for row in rows(
             db,
@@ -2180,7 +2240,7 @@ pub fn forget_project_references(
         "n.workspace = $ws AND n.repo = $repo",
         gparams([("ws", json!(workspace)), ("repo", json!(repository))]),
     )?;
-    Ok(json!({"dependency_edges":edges,"stale_markers":stale,"episode_labels":labels}))
+    Ok(json!({"dependency_edges":edges,"dependency_nodes":artifacts,"stale_markers":stale,"episode_labels":labels}))
 }
 
 fn project_patterns(repository: &str, connectors: &[String]) -> Vec<String> {
@@ -2261,6 +2321,7 @@ fn project_rows(
 /// its own receipt).
 pub fn project_receipt(
     db: Graph,
+    sql: &rusqlite::Connection,
     p: &Principal,
     repository: &str,
     connectors: &[String],
@@ -2268,12 +2329,45 @@ pub fn project_receipt(
 ) -> Result<Value> {
     let labels = catalog(db)?;
     let remaining = project_rows(db, &labels, repository, connectors)?;
+    // The SQL side: the project row's delete cascaded, but a table without
+    // the cascade is residue and is reported, not hidden.
+    let mut sql_checked = 0;
+    let mut sql_matches = Vec::new();
+    let tables = legacy::tables(sql)?;
+    for table in &tables {
+        if !table.columns.contains("repository_id") {
+            continue;
+        }
+        sql_checked += 1;
+        let n: i64 = sql.query_row(
+            &format!(
+                "SELECT count(*) FROM \"{}\" WHERE repository_id=?",
+                table.name
+            ),
+            [repository],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            sql_matches.push(json!({"table":table.name,"column":"repository_id","rows":n}));
+        }
+    }
+    let mut remaining_matches = remaining["matches"].as_array().cloned().unwrap_or_default();
+    remaining_matches.extend(sql_matches);
+    let remaining = json!({
+        "columns_checked":remaining["columns_checked"].as_u64().unwrap_or(0)+sql_checked,
+        "matches":remaining_matches,
+    });
     let patterns = std::iter::once(repository.to_string())
         .chain(connectors.iter().map(|c| format!("connector:{c}:")))
         .collect::<Vec<_>>();
     let retained = retained(db)?;
-    let ids = references(db, &labels, &patterns, (repository, &p.workspace), &retained, true)?;
-    let cleanups = external(db, repository)?;
+    let retained_tables: Vec<&str> = retained.iter().map(|l| table_of(l)).collect();
+    let ids = merge_scans(
+        references(db, &labels, &patterns, (repository, &p.workspace), &retained, true)?,
+        legacy::references(sql, &tables, &patterns, (repository, &p.workspace), &retained_tables, true)?,
+    );
+    // External cleanups are queued in the SQL store (projection.rs).
+    let cleanups = legacy::external(sql, repository)?;
     let clean = empty(&remaining) && empty(&ids);
     let pending = cleanups.iter().any(|c| c["state"] != "complete");
     let receipt = json!({
@@ -2286,7 +2380,7 @@ pub fn project_receipt(
         "verified_local":clean,"external_pending":pending,"complete":clean && !pending,
         "not_covered":NOT_COVERED,"storage":{"engine":"cypherlite","durability":"wal+snapshot"}
     });
-    append(db, &p.workspace, repository, "project.delete", repository, receipt)
+    append(db, sql, &p.workspace, repository, "project.delete", repository, receipt)
 }
 
 /// Link a receipt into the workspace chain and store it: the §2.5
@@ -2299,6 +2393,7 @@ pub fn project_receipt(
 /// canonical JSON, stringified (the engine stores no map-valued properties).
 fn append(
     db: Graph,
+    sql: &rusqlite::Connection,
     workspace: &str,
     repository: &str,
     operation: &str,
@@ -2332,7 +2427,7 @@ fn append(
             ("repo", json!(repository)),
             ("op", json!(operation)),
             ("target", json!(target)),
-            ("body", json!(body)),
+            ("body", json!(&body)),
             ("digest", json!(hash)),
             ("previous", receipt["previous"].clone()),
             ("at", json!(now())),
@@ -2350,12 +2445,63 @@ fn append(
             ]),
         )?;
     }
+    // The SQL mirror of the chain (am_deletion_receipts): same body, so a
+    // rewrite of either store breaks verification.
+    sql.execute(
+        "INSERT INTO am_deletion_receipts(id,workspace_id,sequence,repository_id,operation,target,body,digest,previous,created_at) \
+         VALUES(?,?,?,?,?,?,?,?,?,?)",
+        rusqlite::params![
+            s(&receipt, "id"),
+            workspace,
+            sequence,
+            repository,
+            operation,
+            target,
+            body.as_str(),
+            hash.as_str(),
+            receipt["previous"].as_str(),
+            now()
+        ],
+    )?;
     receipt["digest"] = json!(hash);
     Ok(receipt)
 }
 
-/// Recompute every digest and link of the workspace's receipt chain.
-fn chain(db: Graph, workspace: &str) -> Result<Value> {
+/// Recompute every digest and link of the workspace's receipt chain, in the
+/// graph store and in its SQL mirror (`am_deletion_receipts`): a rewrite of
+/// either breaks the chain.
+fn chain(db: Graph, sql: &rusqlite::Connection, workspace: &str) -> Result<Value> {
+    let sql = chain_sql(sql, workspace)?;
+    let graph = chain_graph(db, workspace)?;
+    let intact = graph["intact"] == true
+        && sql["intact"] == true
+        && sql["length"] == graph["length"];
+    Ok(json!({"length":graph["length"],"intact":intact,"head":graph["head"]}))
+}
+
+/// The SQL mirror's half of [`chain`].
+fn chain_sql(db: &rusqlite::Connection, workspace: &str) -> Result<Value> {
+    let mut previous = Value::Null;
+    let mut intact = true;
+    let mut length = 0i64;
+    for row in crate::store::rows(
+        db,
+        "SELECT sequence,body,digest FROM am_deletion_receipts WHERE workspace_id=? ORDER BY sequence",
+        [workspace],
+    )? {
+        length += 1;
+        let body: Value = serde_json::from_str(s(&row, "body"))?;
+        intact &= row["sequence"] == json!(length)
+            && body["sequence"] == row["sequence"]
+            && body["previous"] == previous
+            && digest(&body) == s(&row, "digest");
+        previous = row["digest"].clone();
+    }
+    Ok(json!({"length":length,"intact":intact,"head":previous}))
+}
+
+/// The graph store's half of [`chain`].
+fn chain_graph(db: Graph, workspace: &str) -> Result<Value> {
     let mut previous = Value::Null;
     let mut intact = true;
     let mut length = 0i64;
@@ -2438,8 +2584,16 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
             let current = match s(&receipt, "operation") {
                 "connector.delete" => {
                     let scope = Scope::connector(s(&receipt, "target"));
-                    let remaining = source_rows(g, workspace, &repository, &scope)?;
-                    let ids = references(g, &labels, &[scope.prefix()], (&repository, workspace), &[], false)?;
+                    let mut remaining = source_rows(g, workspace, &repository, &scope)?;
+                    merge_counts(
+                        &mut remaining,
+                        legacy::source_rows(db, workspace, &repository, &scope)?,
+                    );
+                    let tables = legacy::tables(db)?;
+                    let ids = merge_scans(
+                        references(g, &labels, &[scope.prefix()], (&repository, workspace), &[], false)?,
+                        legacy::references(db, &tables, &[scope.prefix()], (&repository, workspace), &[], false)?,
+                    );
                     // Caches refill with unrelated work, so only the deleted
                     // sources' own rows and references are re-checked.
                     let visible = if project.is_some() {
@@ -2495,6 +2649,37 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
                     })
                     .count();
                     reappeared.insert("originals", originals);
+                    // Historical rows of the SQL half count too: a store
+                    // mid-migration can hold the documents there.
+                    for (name, table, key) in [
+                        ("documents", "am_connector_docs", "id"),
+                        ("versions", "am_connector_versions", "id"),
+                        ("staged", "am_connector_stage", "id"),
+                        ("permissions", "am_source_permissions", "source_id"),
+                    ] {
+                        let count = crate::store::rows(
+                            db,
+                            &format!("SELECT {key} AS id FROM {table} WHERE connector_id=?"),
+                            [connector],
+                        )?
+                        .iter()
+                        .filter(|d| hashes.contains(tombstone(connector, s(d, "id")).as_str()))
+                        .count();
+                        *reappeared.entry(name).or_insert(0) += count;
+                    }
+                    let sql_originals = crate::store::rows(
+                        db,
+                        "SELECT source_id FROM am_original_documents WHERE repository_id=?",
+                        [&repository],
+                    )?
+                    .iter()
+                    .filter(|d| {
+                        s(d, "source_id")
+                            .strip_prefix(&prefix)
+                            .is_some_and(|id| hashes.contains(tombstone(connector, id).as_str()))
+                    })
+                    .count();
+                    *reappeared.entry("originals").or_insert(0) += sql_originals;
                     let tombstones = rows(
                         g,
                         "MATCH (f:ForgottenSource {connector_id: $connector}) RETURN f.id_hash AS id_hash",
@@ -2524,10 +2709,32 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
                         .filter_map(|c| c.as_str().map(str::to_string))
                         .collect();
                     let remaining = project_rows(g, &labels, &repository, &connectors)?;
+                    let mut sql_matches = remaining["matches"].as_array().cloned().unwrap_or_default();
+                    let mut sql_checked = remaining["columns_checked"].as_u64().unwrap_or(0);
+                    let tables = legacy::tables(db)?;
+                    for table in &tables {
+                        if !table.columns.contains("repository_id") {
+                            continue;
+                        }
+                        sql_checked += 1;
+                        let n: i64 = db.query_row(
+                            &format!("SELECT count(*) FROM \"{}\" WHERE repository_id=?", table.name),
+                            [&repository],
+                            |r| r.get(0),
+                        )?;
+                        if n > 0 {
+                            sql_matches.push(json!({"table":table.name,"column":"repository_id","rows":n}));
+                        }
+                    }
+                    let remaining = json!({"columns_checked":sql_checked,"matches":sql_matches});
                     let mut patterns = vec![repository.clone()];
                     patterns.extend(connectors.iter().map(|c| format!("connector:{c}:")));
                     let retained = retained(g)?;
-                    let ids = references(g, &labels, &patterns, (&repository, workspace), &retained, true)?;
+                    let retained_tables: Vec<&str> = retained.iter().map(|l| table_of(l)).collect();
+                    let ids = merge_scans(
+                        references(g, &labels, &patterns, (&repository, workspace), &retained, true)?,
+                        legacy::references(db, &tables, &patterns, (&repository, workspace), &retained_tables, true)?,
+                    );
                     json!({"verified_local":empty(&remaining) && empty(&ids),"project_rows":remaining,"source_ids":ids})
                 }
                 "memory.delete" => {
@@ -2557,8 +2764,9 @@ pub fn verify(store: &Store, workspace: &str, token: &str, args: &Value) -> Resu
                 }
                 _ => return Err(Error::bad("Unknown deletion receipt")),
             };
-            let (cleanups, pending) = external_now(g, &receipt["external_cleanup"])?;
-            let chain = chain(g, workspace)?;
+            // External cleanups are queued in the SQL store (projection.rs).
+            let (cleanups, pending) = legacy::external_now(db, &receipt["external_cleanup"])?;
+            let chain = chain(g, db, workspace)?;
             let verified = current["verified_local"] == true;
             Ok(json!({"receipt":receipt,"chain":chain,"current":current,"external_cleanup":cleanups,
                 "verified_local":verified,"external_pending":pending,
@@ -2583,7 +2791,6 @@ pub fn list(store: &Store, workspace: &str, token: &str) -> Result<Value> {
         return legacy::list(store, workspace, token);
     }
     store.authorized_read(workspace, token, "admin", |db, _| {
-        let _ = db;
         let graph = graph_store(store)?;
         graph.read(|g| {
             let receipts: Vec<Value> = rows(
@@ -2605,7 +2812,7 @@ pub fn list(store: &Store, workspace: &str, token: &str) -> Result<Value> {
                 r
             })
             .collect();
-            Ok(json!({"receipts":receipts,"chain":chain(g, workspace)?}))
+            Ok(json!({"receipts":receipts,"chain":chain(g, db, workspace)?}))
         })
     })
 }
@@ -2702,10 +2909,16 @@ mod tests {
     #[test]
     fn receipts_form_a_hash_chained_next_linked_list_per_workspace() {
         let store = GraphStore::open_in_memory().unwrap();
+        let sql = rusqlite::Connection::open_in_memory().unwrap();
+        sql.execute_batch(
+            "CREATE TABLE am_deletion_receipts(id TEXT PRIMARY KEY, workspace_id TEXT, sequence INTEGER, repository_id TEXT, operation TEXT, target TEXT, body TEXT, digest TEXT, previous TEXT, created_at TEXT)",
+        )
+        .unwrap();
         store
             .transaction(|db| {
                 let first = append(
                     db,
+                    &sql,
                     "w1",
                     "r1",
                     "memory.delete",
@@ -2714,6 +2927,7 @@ mod tests {
                 )?;
                 let second = append(
                     db,
+                    &sql,
                     "w1",
                     "r1",
                     "memory.delete",
@@ -2726,6 +2940,7 @@ mod tests {
                 // Another workspace runs its own chain.
                 let other = append(
                     db,
+                    &sql,
                     "w2",
                     "r9",
                     "project.delete",
@@ -2739,10 +2954,10 @@ mod tests {
             .unwrap();
         store
             .read(|db| {
-                let status = chain(db, "w1")?;
+                let status = chain(db, &sql, "w1")?;
                 assert_eq!(status["length"], json!(2));
                 assert_eq!(status["intact"], json!(true), "{status}");
-                assert_eq!(chain(db, "w2")?["length"], json!(1));
+                assert_eq!(chain(db, &sql, "w2")?["length"], json!(1));
                 Ok(())
             })
             .unwrap();

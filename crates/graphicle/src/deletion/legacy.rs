@@ -188,10 +188,10 @@ pub(crate) fn block(db: &Connection, connector: &str, document: &str) -> Result<
     Ok(())
 }
 
-struct Table {
-    name: String,
-    text: Vec<String>,
-    columns: BTreeSet<String>,
+pub(crate) struct Table {
+    pub(crate) name: String,
+    pub(crate) text: Vec<String>,
+    pub(crate) columns: BTreeSet<String>,
 }
 
 fn quote(name: &str) -> String {
@@ -231,7 +231,7 @@ fn delete_rowids(db: &Connection, table: &str, rowids: &[i64]) -> Result<usize> 
 
 /// Every ordinary table with its text columns. FTS indexes (derived from
 /// repository files only) and the receipts themselves are excluded.
-fn tables(db: &Connection) -> Result<Vec<Table>> {
+pub(crate) fn tables(db: &Connection) -> Result<Vec<Table>> {
     let all = rows(
         db,
         "SELECT name,coalesce(sql,'') AS sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -337,7 +337,7 @@ fn matching(
 
 /// Exact references to deleted ids in every table in scope. Tables holding
 /// connectors' originals are checked structurally instead.
-fn references(
+pub(crate) fn references(
     db: &Connection,
     tables: &[Table],
     patterns: &[String],
@@ -365,7 +365,7 @@ fn references(
 
 /// References to forgotten document ids. A substring hit counts unless it is
 /// the start of a longer id of a document that still exists (`a` inside `a:b`).
-fn document_references(
+pub(crate) fn document_references(
     db: &Connection,
     tables: &[Table],
     scope: &Scope,
@@ -415,7 +415,7 @@ fn names_any(text: &str, ids: &[String], existing: &BTreeSet<String>) -> bool {
 }
 
 /// Verbatim excerpts of deleted text in this project's derived tables.
-fn verbatim(
+pub(crate) fn verbatim(
     db: &Connection,
     tables: &[Table],
     fingerprints: &[String],
@@ -465,11 +465,11 @@ fn excerpt(content: &str) -> Option<String> {
         .then(|| window.to_string())
 }
 
-fn secure_delete(db: &Connection) -> Result<bool> {
+pub(crate) fn secure_delete(db: &Connection) -> Result<bool> {
     Ok(db.query_row("PRAGMA secure_delete", [], |r| r.get::<_, i64>(0))? == 1)
 }
 
-fn external(db: &Connection, repository: &str) -> Result<Vec<Value>> {
+pub(crate) fn external(db: &Connection, repository: &str) -> Result<Vec<Value>> {
     rows(
         db,
         "SELECT id,kind,revision,state FROM am_projection_cleanup WHERE scope=? ORDER BY kind,id",
@@ -479,7 +479,7 @@ fn external(db: &Connection, repository: &str) -> Result<Vec<Value>> {
 
 /// A captured external cleanup is done once its row completed at (or after)
 /// the captured revision; revisions only grow.
-fn external_now(db: &Connection, captured: &Value) -> Result<(Vec<Value>, bool)> {
+pub(crate) fn external_now(db: &Connection, captured: &Value) -> Result<(Vec<Value>, bool)> {
     let mut pending = false;
     let mut out = Vec::new();
     for cleanup in captured.as_array().into_iter().flatten() {
@@ -580,7 +580,7 @@ fn index_markers(
 }
 
 /// Rows derived from or naming the forgotten documents, by kind.
-fn source_rows(
+pub(crate) fn source_rows(
     db: &Connection,
     workspace: &str,
     repository: &str,
@@ -612,7 +612,7 @@ fn source_rows(
         )?;
         out.insert(name, found.len());
     }
-    let per_repository: [(&'static str, &str, Matches); 12] = [
+    let per_repository: [(&'static str, &str, Matches); 10] = [
         (
             "originals",
             "SELECT rowid,source_id FROM am_original_documents WHERE repository_id=?",
@@ -653,18 +653,9 @@ fn source_rows(
             "SELECT rowid,target FROM gf_hints WHERE repository_id=?",
             |v, sc| sc.source(v),
         ),
-        // A forgotten document's mention links and what they
-        // were computed from.
-        (
-            "doc_links",
-            "SELECT rowid,document_id FROM gf_doc_links WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
-        (
-            "doc_link_sources",
-            "SELECT rowid,document_id FROM gf_doc_link_sources WHERE repository_id=?",
-            |v, sc| sc.source(v),
-        ),
+        // Mention links and their inputs live in the graph store
+        // (doc_links::migrate dropped gf_doc_links*); the graph half of the
+        // deletion counts them.
         (
             "served",
             "SELECT rowid,served FROM gf_served WHERE repository_id=?",
@@ -693,7 +684,7 @@ fn source_rows(
 
 /// Rows of the artifacts listed in [`SINCE_VISIBLE`] dated from `since` (and
 /// before `until`, when given).
-fn since_visible(
+pub(crate) fn since_visible(
     db: &Connection,
     repository: &str,
     since: Option<&str>,
@@ -1200,17 +1191,9 @@ pub fn forget(
         |v| scope.source(v),
     )?;
     let hints = delete_rowids(db, "gf_hints", &hints)?;
-    // The documents' mention links and their inputs.
-    let mut doc_links = 0;
-    for table in ["gf_doc_links", "gf_doc_link_sources"] {
-        let found = select_rowids(
-            db,
-            &format!("SELECT rowid,document_id FROM {table} WHERE repository_id=?"),
-            [repository],
-            |v| scope.source(v),
-        )?;
-        doc_links += delete_rowids(db, table, &found)?;
-    }
+    // The documents' mention links and their inputs are graph-resident
+    // (doc_links::migrate dropped gf_doc_links*); the graph half removed them.
+    let doc_links = 0;
     let mut stripped = BTreeMap::new();
     for (table, column) in [("gf_served", "served"), ("gf_outcomes", "targets")] {
         let mut changed = 0;

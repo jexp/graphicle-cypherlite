@@ -699,6 +699,7 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
                     let remaining = crate::retention::remaining(g, identifier, &retention)?;
                     Some(crate::deletion::rows_receipt(
                         g,
+                        db,
                         &p,
                         identifier,
                         "retention.graph()",

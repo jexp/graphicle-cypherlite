@@ -161,7 +161,7 @@ impl Store {
                     purge_derived_cache(&graph,db,identifier)?;
                     let keys:Vec<String>=deleted.iter().cloned().collect();
                     let remaining=graph.read(|g| crate::deletion::memory_rows(g,identifier,&keys))?;
-                    let receipt=graph.read(|g| crate::deletion::rows_receipt(g,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining.clone(),true))?;
+                    let receipt=graph.read(|g| crate::deletion::rows_receipt(g,db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining.clone(),true))?;
                     Ok(json!({"deleted":deleted.len(),"transitive":true,"receipt":receipt}))
                 },
                 // An agent's proposal is always a draft citing exact quotes of

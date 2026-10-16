@@ -128,8 +128,11 @@ fn delete_project(
         "MATCH (p:Project {id: $repo}) DETACH DELETE p",
         params(&[("repo", json!(identifier))]),
     )?;
+    // The SQL side still holds the project's registration and its legacy
+    // rows; deleting the project row cascades to them.
+    sql.execute("DELETE FROM repo_projects WHERE id=?", [identifier])?;
     graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
-    deletion::project_receipt(db, p, identifier, &connectors, removed)
+    deletion::project_receipt(db, sql, p, identifier, &connectors, removed)
 }
 
 /// `retention.apply` with `sources`: forget the documents the policy selects
@@ -138,7 +141,7 @@ fn delete_project(
 /// echo the `plan_hash` of `retention.preview`, so exactly the previewed
 /// documents are forgotten.
 fn apply_source_retention(
-    db: &mut cypherlite::Connection,
+    graph: &GraphStore,
     sql: &rusqlite::Transaction<'_>,
     p: &store::Principal,
     repository: &Value,
@@ -146,7 +149,8 @@ fn apply_source_retention(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let policy = crate::retention::SourcePolicy::from_args(args)?;
-    let plan = crate::retention::source_plan(db, p, repository, &policy, chrono::Utc::now())?;
+    let plan = graph
+        .read(|g| crate::retention::source_plan(g, p, repository, &policy, chrono::Utc::now()))?;
     if args["plan_hash"].as_str() != Some(plan.plan_hash.as_str()) {
         return Err(Error::conflict(
             "The retention plan changed or was not previewed; run retention.preview and pass its plan_hash",
@@ -161,34 +165,54 @@ fn apply_source_retention(
             let scope =
                 Scope::document_set(connector, batch.iter().map(|d| (*d).clone()).collect());
             let started = now();
-            let forget_plan = deletion::plan(db, &p.workspace, identifier, &scope)?;
-            if forget_plan.sources() == 0 {
+            let planned =
+                graph.read(|g| deletion::plan(g, sql, &p.workspace, identifier, &scope))?;
+            if planned.sources() == 0 {
                 continue;
             }
             crate::projection::enqueue(sql, identifier, "source_forgotten")?;
-            let since = forget_plan.since().map(str::to_string);
-            let forgotten =
-                deletion::forget(db, &p.workspace, identifier, &scope, since.as_deref())?;
-            let erased = deletion::erase(db, identifier, &scope)?;
-            graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
-            event(
-                db,
+            let since = planned.since().map(str::to_string);
+            // The SQL half (observer, overlay and product tables) goes before
+            // the graph transaction: its forget opens graph transactions of
+            // its own.
+            let sql_forgotten = deletion::legacy::forget(
+                sql,
+                graph,
+                &p.workspace,
                 identifier,
-                "source_forgotten",
-                json!({"derived_records_removed":forgotten["memories"],"retention":true}),
+                &scope,
+                since.as_deref(),
             )?;
+            let sql_erased = deletion::legacy::erase(sql, identifier, &scope)?;
+            let receipt = graph.transaction(|g| {
+                let forget_plan = deletion::plan(g, sql, &p.workspace, identifier, &scope)?;
+                let mut forgotten =
+                    deletion::forget(g, &p.workspace, identifier, &scope, since.as_deref())?;
+                let mut erased = deletion::erase(g, identifier, &scope)?;
+                deletion::merge_removed(&mut forgotten, &sql_forgotten);
+                deletion::merge_removed(&mut erased, &sql_erased);
+                graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
+                event(
+                    g,
+                    identifier,
+                    "source_forgotten",
+                    json!({"derived_records_removed":forgotten["memories"],"retention":true}),
+                )?;
+                deletion::policy_receipt(
+                    g,
+                    sql,
+                    p,
+                    repository,
+                    "retention.forget",
+                    forget_plan,
+                    &started,
+                    forgotten,
+                    erased,
+                    Some(&policy_value),
+                )
+            })?;
             forgotten_documents += batch.len();
-            receipts.push(deletion::policy_receipt(
-                db,
-                p,
-                repository,
-                "retention.forget",
-                forget_plan,
-                &started,
-                forgotten,
-                erased,
-                Some(&policy_value),
-            )?);
+            receipts.push(receipt);
         }
     }
     Ok(json!({
@@ -206,6 +230,7 @@ fn apply_source_retention(
 /// finished syncs and unreferenced original documents, and sign a receipt
 /// over what was pruned.
 fn storage_prune(
+    sql: &rusqlite::Connection,
     db: &mut cypherlite::Connection,
     p: &store::Principal,
     repository: &Value,
@@ -383,6 +408,7 @@ fn storage_prune(
         let removed = json!({"repo_snapshots":snapshots_removed.len(),"repo_objects":objects_removed.len(),"repo_syncs":syncs_removed,"am_original_documents":originals_removed.len(),"bytes":freed+originals_freed});
         result["receipt"] = deletion::rows_receipt(
             db,
+            sql,
             p,
             identifier,
             "storage.prune",
@@ -690,19 +716,29 @@ impl Store {
                     if operation!="connector.state" {
                         let scope=if operation=="connector.delete" {Scope::connector(connector)} else {Scope::documents(connector,&args["document_ids"])?};
                         // Capture coverage first; forget, erase, verify and sign in one transaction.
+                        // The SQL half (observer, overlay and product tables)
+                        // goes before the graph transaction: its forget opens
+                        // graph transactions of its own.
+                        let sql_plan=deletion::legacy::plan(db,&p.workspace,&identifier,&scope)?;
+                        let planned=graph.read(|g| deletion::plan(g,db,&p.workspace,&identifier,&scope))?;
+                        if operation=="source.forget" && planned.sources()==0 && sql_plan.sources()==0 {return Err(Error::bad("None of these documents exist in this connector"));}
+                        crate::projection::enqueue(db,&identifier,if operation=="connector.delete" {"connector_deleted"} else {"source_forgotten"})?;
+                        let sql_since=planned.since().map(str::to_string);
+                        let sql_forgotten=deletion::legacy::forget(db,&graph,&p.workspace,&identifier,&scope,sql_since.as_deref())?;
+                        let sql_erased=deletion::legacy::erase(db,&identifier,&scope)?;
                         return graph.transaction(|g| {
                             let started=now();
-                            let plan=deletion::plan(g,&p.workspace,&identifier,&scope)?;
-                            if operation=="source.forget" && plan.sources()==0 {return Err(Error::bad("None of these documents exist in this connector"));}
-                            crate::projection::enqueue(db,&identifier,if operation=="connector.delete" {"connector_deleted"} else {"source_forgotten"})?;
+                            let plan=deletion::plan(g,db,&p.workspace,&identifier,&scope)?;
                             let since=plan.since().map(str::to_string);
-                            let forgotten=deletion::forget(g,&p.workspace,&identifier,&scope,since.as_deref())?;
-                            let erased=deletion::erase(g,&identifier,&scope)?;
+                            let mut forgotten=deletion::forget(g,&p.workspace,&identifier,&scope,since.as_deref())?;
+                            let mut erased=deletion::erase(g,&identifier,&scope)?;
+                            deletion::merge_removed(&mut forgotten,&sql_forgotten);
+                            deletion::merge_removed(&mut erased,&sql_erased);
                             // In-process features and layouts of forgotten text go now, not at expiry.
                             graphicle_memory::cache::clear(&identifier).map_err(Error::bad)?;
                             let derived=forgotten["memories"].clone();
                             event(g,&identifier,"source_forgotten",json!({"derived_records_removed":derived}))?;
-                            let receipt=deletion::receipt(g,p,&repository,operation,plan,&started,forgotten,erased)?;
+                            let receipt=deletion::receipt(g,db,p,&repository,operation,plan,&started,forgotten,erased)?;
                             Ok(json!({"deleted":true,"derived_records_removed":derived,"local_backups_are_separate":true,"receipt":receipt}))
                         });
                     }
@@ -752,7 +788,7 @@ impl Store {
                 "storage.prune"=>{
                     let on_graph = graph.read(|g| one(g,"MATCH (n {repository_id: $repo}) WHERE n:Snapshot OR n:Object OR n:OriginalDocument RETURN 1 AS x LIMIT 1",params(&[("repo",json!(&identifier))])))?.is_some();
                     if on_graph {
-                        graph.transaction(|g| storage_prune(g,p,&repository,args))
+                        graph.transaction(|g| storage_prune(db,g,p,&repository,args))
                     } else {
                         storage_prune_sql(db,p,&repository,args)
                     }
@@ -761,7 +797,7 @@ impl Store {
                     if args.get("sources").is_some_and(|v|!v.is_null()) {
                         let on_graph = graph.read(|g| one(g,"MATCH (c:Connector {repository_id: $repo}) RETURN 1 AS x LIMIT 1",params(&[("repo",json!(&identifier))])))?.is_some();
                         if on_graph {
-                            return graph.transaction(|g| apply_source_retention(g,db,p,&repository,args));
+                            return apply_source_retention(&graph,db,p,&repository,args);
                         }
                         return apply_source_retention_sql(db,&graph,p,&repository,args);
                     }
@@ -782,7 +818,7 @@ impl Store {
                         let removed=result["deleted"].clone();
                         if removed.as_object().is_some_and(|counts|counts.values().any(|n|n.as_u64().unwrap_or(0)>0)) {
                             let remaining=crate::retention::remaining(g,&identifier,&retention)?;
-                            result["receipt"]=deletion::rows_receipt(g,p,&identifier,"retention.graph","graph_by_products",json!(retention),removed,&[],remaining,false)?;
+                            result["receipt"]=deletion::rows_receipt(g,db,p,&identifier,"retention.graph","graph_by_products",json!(retention),removed,&[],remaining,false)?;
                         }
                         Ok(result)
                     })
