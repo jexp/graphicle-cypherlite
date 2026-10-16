@@ -636,37 +636,72 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         }
         // Bound the per-episode by-products (coverage, closed cross edges,
         // unresolved calls) to the configured retention; never nodes/edges.
-        // A trim that removed rows is receipted like any other deletion.
+        // They live on the graph store now, so the trim runs there; a trim
+        // that removed rows is receipted like any other deletion.
         let retention = crate::retention::Retention::from_env();
-        out["retention"] = match crate::retention::apply(db, identifier, &retention) {
-            Ok(applied) => {
+        let trimmed = crate::maintenance::graph_store(store).and_then(|graph| {
+            if !crate::maintenance::project_episodes_on_graph(&graph, identifier)? {
+                // The project's by-products still live in the legacy SQL
+                // store: trim and sign there.
+                let applied = crate::retention::legacy::apply(db, identifier, &retention)?;
                 let removed = applied["deleted"].clone();
                 let any = removed
                     .as_object()
                     .is_some_and(|counts| counts.values().any(|n| n.as_u64().unwrap_or(0) > 0));
-                if any {
-                    let signed = crate::retention::remaining(db, identifier, &retention).and_then(
-                        |remaining| {
-                            crate::deletion::rows_receipt(
-                                db,
-                                &p,
-                                identifier,
-                                "retention.graph",
-                                "graph_by_products",
-                                json!({"retention": retention, "trigger": "projection"}),
-                                removed.clone(),
-                                &[],
-                                remaining,
-                                false,
-                            )
-                        },
-                    );
+                let signed = if any {
+                    let remaining = crate::retention::legacy::remaining(db, identifier, &retention)?;
+                    Some(crate::deletion::legacy::rows_receipt(
+                        db,
+                        &p,
+                        identifier,
+                        "retention.graph",
+                        "graph_by_products",
+                        json!({"retention": retention, "trigger": "projection"}),
+                        removed.clone(),
+                        &[],
+                        remaining,
+                        false,
+                    ))
+                } else {
+                    None
+                };
+                return Ok((applied, signed));
+            }
+            graph.transaction(|g| {
+                let applied = crate::retention::apply(g, identifier, &retention)?;
+                let removed = applied["deleted"].clone();
+                let any = removed
+                    .as_object()
+                    .is_some_and(|counts| counts.values().any(|n| n.as_u64().unwrap_or(0) > 0));
+                let signed = if any {
+                    let remaining = crate::retention::remaining(g, identifier, &retention)?;
+                    Some(crate::deletion::rows_receipt(
+                        g,
+                        &p,
+                        identifier,
+                        "retention.graph",
+                        "graph_by_products",
+                        json!({"retention": retention, "trigger": "projection"}),
+                        removed.clone(),
+                        &[],
+                        remaining,
+                        false,
+                    ))
+                } else {
+                    None
+                };
+                Ok((applied, signed))
+            })
+        });
+        out["retention"] = match trimmed {
+            Ok((applied, signed)) => {
+                if let Some(signed) = signed {
                     out["retention_receipt"] = match signed {
                         Ok(receipt) => receipt["id"].clone(),
                         Err(error) => json!({"error": error.message}),
                     };
                 }
-                removed
+                applied["deleted"].clone()
             }
             Err(error) => json!({"error": error.message}),
         };

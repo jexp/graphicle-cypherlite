@@ -156,12 +156,13 @@ impl Store {
                     let memories=memory::list(db,&self.graph(),&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     // The memory, its dependents and everything naming them go in one transaction, with a hash-chained receipt.
-                    let (deleted,counts)=crate::deletion::delete_memories(db,&self.graph(),&p.workspace,identifier,&memories,memory_id)?;
-                    crate::vector::clear_embeddings(&self.graph(), identifier)?;
-                    purge_derived_cache(&self.graph(),db,identifier)?;
+                    let graph=self.graph();
+                    let (deleted,counts)=graph.transaction(|g| crate::deletion::delete_memories(g,&p.workspace,identifier,&memories,memory_id))?;
+                    crate::vector::clear_embeddings(&graph, identifier)?;
+                    purge_derived_cache(&graph,db,identifier)?;
                     let keys:Vec<String>=deleted.iter().cloned().collect();
-                    let remaining=crate::deletion::memory_rows(db,&self.graph(),identifier,&keys)?;
-                    let receipt=crate::deletion::rows_receipt(db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining,true)?;
+                    let remaining=graph.read(|g| crate::deletion::memory_rows(g,identifier,&keys))?;
+                    let receipt=graph.read(|g| crate::deletion::rows_receipt(g,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining.clone(),true))?;
                     Ok(json!({"deleted":deleted.len(),"transitive":true,"receipt":receipt}))
                 },
                 // An agent's proposal is always a draft citing exact quotes of

@@ -933,7 +933,9 @@ fn folder_locations_do_not_change_the_deletion_state() {
                 let aliases: i64 =
                     db.query_row("SELECT count(*) FROM repo_folders", [], |r| r.get(0))?;
                 Ok((
-                    graphicle_runtime::deletion::state(db, &f.store.graph(), f.ws(), &project)?,
+                    f.store
+                        .graph()
+                        .read(|g| graphicle_runtime::deletion::state(g, f.ws(), &project))?,
                     aliases,
                 ))
             })

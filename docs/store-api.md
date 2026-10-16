@@ -208,18 +208,23 @@ graph type is inert).
 
 ## Value-mapping conventions
 
-- **JSON text columns — correction from the memory-pipeline node (verified
-  on v0.12.2): a property value cannot be a map** (`InvalidPropertyType`;
-  only scalars and lists of scalars store). `SET n += $map` works as a
-  property-set *merge*, and **dotted property names** work everywhere —
-  `SET n.`data.foo` = $v`, `WHERE n.`data.foo` = $v`, index declarations —
-  so a JSON column with a known, fixed shape flattens into `data.foo`
-  properties. Payloads with genuinely dynamic keys or arrays of objects
-  (memory/claim/entity `data`, revision journals) stay **stringified JSON
-  in a String property**, decoded at the module boundary exactly as
-  `store::decode` did for SQL. `json_to_value`/`value_to_json` remain the
-  parameter/result bridge (parameters and UNWIND rows may be maps; that is
-  not property storage).
+- **JSON text columns ↔ maps/lists**: what SQL stored as a JSON `TEXT`
+  column becomes a `Value::Map`/`Value::List` property directly
+  (`json_to_value` at the boundary); `value_to_json` round-trips it. Only
+  payloads the module treats as opaque blobs stay stringified.
+  **Correction (verified on v0.12.2, deletion-maintenance work): a map
+  cannot be stored AS a property value** — `CREATE (n {meta: {…}})` and
+  `SET n.meta = $map` fail with `InvalidPropertyType`; only scalars and
+  lists of scalars are valid property values. Maps work as *property sets*
+  (`SET n += $row` merges the map's entries) and as parameters. JSON object
+  columns with **known keys are flattened onto dotted properties**:
+  `SET n.`metadata.provider_metadata.original_sha256` = $v` writes,
+  `WHERE n.`metadata.provider_metadata.original_sha256` = $v` filters, and
+  `CREATE INDEX i FOR (n) ON (n.`metadata…`)` indexes (backtick-quote the
+  dotted key — all verified). Keep a stringified-JSON string property only
+  for genuinely dynamic/unbounded keys or arrays of objects (e.g.
+  `Memory.data`, snapshot manifests). `json_to_value` must not be used to
+  store a JSON object as one property until the engine accepts map values.
 - **Ids are STRINGs.** A graph-type `UUID` declaration enforces *string*
   values and rejects `uuid()` results (spike E2 quirk), so ids are declared
   `IS STRING` and passed as strings — which is what graphicle's text ids

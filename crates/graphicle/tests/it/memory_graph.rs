@@ -442,13 +442,11 @@ fn memory_delete_cascades_through_the_graph() {
         .unwrap();
     assert_eq!(remaining[0]["n"], 0);
     // The verification agrees the rows are gone.
-    let left = deletion::memory_rows(
-        &f.store.connect().unwrap(),
-        &f.store.graph(),
-        &f.repo,
-        std::slice::from_ref(&id),
-    )
-    .unwrap();
+    let left = f
+        .store
+        .graph()
+        .read(|g| deletion::memory_rows(g, &f.repo, std::slice::from_ref(&id)))
+        .unwrap();
     assert_eq!(left["repo_memories"], 0);
     assert_eq!(left["am_vectors"], 0);
 }

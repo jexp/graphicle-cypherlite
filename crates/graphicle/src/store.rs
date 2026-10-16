@@ -428,10 +428,9 @@ impl Store {
         // Projects earlier `graphicle pr` runs registered are PR scratch
         // copies: they no longer make imports ambiguous.
         crate::graph_projection::mark_legacy_pr_projects(&db)?;
-        // Extension tables last: they may reference core tables. Stores
-        // keep every table, so an edition without an extension ignores its
-        // tables.
-        crate::extension::installed().migrate(&db)?;
+        // Extension structures migrated to the graph store: they run from
+        // `GraphStore::apply_schema` (`Extension::migrate` takes the graph
+        // store now), after the core graph type and indexes.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
