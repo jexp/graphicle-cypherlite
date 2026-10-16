@@ -724,7 +724,7 @@ pub(crate) fn activate(
             )?;
             graph::write(
                 gdb,
-                "MATCH (c:Connector {id: $connector}) MERGE (d:ConnectorDoc {connector_id: $connector, id: $id}) MERGE (d)-[:FROM]->(c) SET d.content=$content, d.content_bytes=$bytes, d.sha256=$sha256, d.metadata=$metadata, d.acl_readers=$readers, d.acl_credentials=$credentials, d.present=true, d.generation=$generation",
+                "MATCH (c:Connector {id: $connector}) MERGE (d:ConnectorDoc {repository_id: c.repository_id, connector_id: $connector, id: $id}) MERGE (d)-[:FROM]->(c) SET d.content=$content, d.content_bytes=$bytes, d.sha256=$sha256, d.metadata=$metadata, d.acl_readers=$readers, d.acl_credentials=$credentials, d.present=true, d.generation=$generation",
                 Params::from([
                     ("connector".into(), json_to_value(&json!(identifier))),
                     ("id".into(), json_to_value(&row["id"])),
