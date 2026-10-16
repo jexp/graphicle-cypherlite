@@ -1280,12 +1280,23 @@ pub fn erase(db: &Connection, repository: &str, scope: &Scope) -> Result<Value> 
         "originals",
         delete_rowids(db, "am_original_documents", &originals)?,
     );
-    let stamp = now();
-    for hash in scope.hashes() {
-        db.execute(
-            "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
-            params![connector, hash, stamp],
-        )?;
+    // Tombstones of a connector the SQL store does not hold (graph-era
+    // connectors) live in the graph store only; the foreign key to
+    // am_connectors admits no row here.
+    let sql_connector = one(
+        db,
+        "SELECT 1 AS yes FROM am_connectors WHERE id=?",
+        [connector],
+    )?
+    .is_some();
+    if sql_connector {
+        let stamp = now();
+        for hash in scope.hashes() {
+            db.execute(
+                "INSERT OR IGNORE INTO am_forgotten_sources VALUES(?,?,?)",
+                params![connector, hash, stamp],
+            )?;
+        }
     }
     Ok(json!(out))
 }
