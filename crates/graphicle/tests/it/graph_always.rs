@@ -161,7 +161,7 @@ impl Fixture {
     }
     fn episodes(&self) -> usize {
         self.store
-            .read(|db| graph_projection::episodes(db, &self.repo))
+            .read(|db| graph_projection::episodes(&crate::gstore(db), &self.repo))
             .unwrap()
             .len()
     }
@@ -269,14 +269,10 @@ fn while_a_sync_waits_for_its_projection_the_arm_reads_the_latest_episode() {
     // An episode recorded without its source manifest (older stores) cannot
     // be checked per file: the arm is skipped and says so.
     let latest = f.current();
-    f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE gf_episodes SET attributes=json_remove(attributes,'$.source_heads') WHERE repository_id=?",
-            [&f.repo],
-        )
-        .unwrap();
+    let db = f.store.connect().unwrap();
+    crate::rewrite_episode_attributes(&db, &f.repo, |attributes| {
+        attributes.as_object_mut().unwrap().remove("source_heads");
+    });
     f.sync(&[("a.py", A_V1), ("b.py", "def run():\n    return 0\n")]);
     let unknown = f.context("who calls beta");
     let arm = &unknown["code_graph"];
@@ -972,14 +968,12 @@ async fn basic_answers_from_sources_when_the_code_graph_cannot_be_read() {
     f.drain();
     let episode = f.current();
     // The recorded episode cannot be reopened, and no copy is resident.
-    f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-            [&f.repo],
-        )
-        .unwrap();
+    let db = f.store.connect().unwrap();
+    crate::gwrite(
+        &db,
+        "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+        &[("r", json!(f.repo))],
+    );
     graphicle::session::registry().close(&graph_projection::graph_ref(&f.repo, &episode));
     let m = provider().await;
     let packet = f
@@ -1274,7 +1268,7 @@ fn sync_builds_the_graph_now_later_or_in_the_background() {
     let store = Store::open(&data).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !store
-        .read(|db| graph_projection::is_recorded(db, &project, &episode))
+        .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
         .unwrap()
     {
         assert!(
@@ -1389,7 +1383,7 @@ fn mcp_builds_a_waiting_graph_at_start_and_leaves_no_job_running() {
     let store = Store::open(&data).unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     while !store
-        .read(|db| graph_projection::is_recorded(db, &project, &episode))
+        .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
         .unwrap()
     {
         assert!(Instant::now() < deadline, "mcp did not build {episode}");
@@ -1480,7 +1474,7 @@ fn mcp_on_sigterm_finishes_the_job_in_hand_and_leaves_none_running() {
     assert_eq!(state(&store), "complete");
     assert!(
         store
-            .read(|db| graph_projection::is_recorded(db, &project, &episode))
+            .read(|db| graph_projection::is_recorded(&crate::gstore(db), &project, &episode))
             .unwrap()
     );
     // Not an assertion on timing: a fast machine may finish first.

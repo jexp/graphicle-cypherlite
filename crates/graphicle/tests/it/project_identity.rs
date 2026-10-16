@@ -136,7 +136,7 @@ impl Fixture {
         self.store
             .read(|db| {
                 let episode = graph_projection::current_episode(db, repository)?;
-                let graph = graph_projection::resident(db, repository, &episode)?;
+                let graph = graph_projection::resident(&crate::gstore(db), repository, &episode)?;
                 Ok(graph
                     .nodes()
                     .iter()
@@ -664,11 +664,12 @@ fn a_nested_project_owns_the_packages_under_its_folder() {
     let reasons: Vec<String> = f
         .store
         .read(|db| {
-            Ok(graphicle_runtime::store::rows(
+            Ok(crate::grows(
                 db,
-                "SELECT reason FROM gf_cross_unresolved WHERE source_repository_id=? AND valid_to_episode IS NULL",
-                [&application],
-            )?
+                "MATCH (u:UnresolvedCross {source_repository_id:$r}) \
+                 WHERE u.valid_to_episode IS NULL RETURN u.reason AS reason",
+                &[("r", json!(application))],
+            )
             .iter()
             .map(|row| s(row, "reason").to_string())
             .collect())

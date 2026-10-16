@@ -403,11 +403,11 @@ pub fn ensure(
     }
     let heads = crate::store::heads(db, repository)?;
     if graph_projection::episode_of(&heads) != episode
-        || !graph_projection::is_recorded(db, repository, episode)?
+        || !graph_projection::is_recorded(&*crate::store::graph_for(db)?, repository, episode)?
     {
         return Ok(false);
     }
-    let handle = graph_projection::resident(db, repository, episode)?;
+    let handle = graph_projection::resident(gstore, repository, episode)?;
     let graph: &Graph = &handle;
     replace(db, gstore, repository, episode, rows_of(graph, &heads, None), None)?;
     Ok(true)
@@ -733,9 +733,13 @@ fn describe(
         return Ok(None);
     };
     let heads = manifest.get_or_insert_with(|| {
-        graph_projection::stored_episode_heads(db, repository, episode)
-            .ok()
-            .flatten()
+        graph_projection::stored_episode_heads(
+            &*crate::store::graph_for(db).ok()?,
+            repository,
+            episode,
+        )
+        .ok()
+        .flatten()
     });
     Ok(heads
         .as_ref()

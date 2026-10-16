@@ -194,7 +194,7 @@ impl Home {
             let recorded = store
                 .read(|db| {
                     let episode = graph_projection::current_episode(db, project)?;
-                    graph_projection::is_recorded(db, project, &episode)
+                    graph_projection::is_recorded(&crate::gstore(db), project, &episode)
                 })
                 .unwrap();
             if recorded {

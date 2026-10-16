@@ -214,13 +214,15 @@ fn parallel_relations_between_one_pair_are_persisted_and_reloaded() {
         "{}",
         built.to_node_link("links")
     );
-    // Both relations are separate rows keyed by relation, not one folded edge.
-    let keys: Vec<String> = graphicle_runtime::store::rows(
+    // Both relations are separate relationships keyed by relation, not one
+    // folded edge.
+    let keys: Vec<String> = crate::grows(
         &db,
-        "SELECT key FROM gf_edges WHERE repository_id=? AND source='m_outer' AND target='m_outer_inner' AND valid_to_episode IS NULL ORDER BY key",
-        [&f.repo],
+        "MATCH (a:Symbol {repository_id:$r, node_id:'m_outer'})-[r]->(b:Symbol {node_id:'m_outer_inner'}) \
+         WHERE r.valid_from_episode IS NOT NULL AND r.valid_to_episode IS NULL \
+         RETURN r.key AS key ORDER BY r.key",
+        &[("r", json!(f.repo))],
     )
-    .unwrap()
     .iter()
     .map(|r| s(r, "key").to_string())
     .collect();
@@ -233,7 +235,7 @@ fn parallel_relations_between_one_pair_are_persisted_and_reloaded() {
         1
     );
     // The reconstructed episode carries both relations and equals the build.
-    let loaded = graph_projection::load(&db, &f.repo, &episode).unwrap();
+    let loaded = graph_projection::load(&crate::gstore(&db), &f.repo, &episode).unwrap();
     assert!(loaded.is_multigraph());
     assert_eq!(
         relations(&loaded, "m_outer", "m_outer_inner"),
@@ -291,30 +293,56 @@ fn every_persisted_edge_is_traceable_to_its_origin() {
         "aaa111",
     );
     f.project();
-    let edges = f.count("SELECT count(*) FROM gf_edges WHERE repository_id=?");
+    // Versioned relationships (live and `*_HIST`), with provenance carried
+    // as relationship properties (the gf_edge_sources join table is gone).
+    let all_edges = "MATCH (a:Symbol {repository_id:$r})-[r]->(b:Symbol) \
+        WHERE r.valid_from_episode IS NOT NULL RETURN count(r) AS n";
+    let edges = crate::grows(&f.db(), all_edges, &[("r", json!(f.repo))])[0]["n"]
+        .as_i64()
+        .unwrap();
     assert!(edges >= 3);
-    let traced = f.count(
-        "SELECT count(*) FROM gf_edges e JOIN gf_edge_sources x ON x.repository_id=e.repository_id AND x.edge_row_id=e.id WHERE e.repository_id=? AND x.relpath!='' AND x.derivation!=''",
-    );
-    assert_eq!(traced, edges);
-    let calls = graphicle_runtime::store::one(
+    let traced = crate::grows(
         &f.db(),
-        "SELECT x.relpath,x.source_location,x.derivation FROM gf_edges e JOIN gf_edge_sources x ON x.edge_row_id=e.id WHERE e.repository_id=? AND e.source='n_go' AND e.relation='calls'",
-        [&f.repo],
+        "MATCH (a:Symbol {repository_id:$r})-[r]->(b:Symbol) \
+         WHERE r.valid_from_episode IS NOT NULL AND r.relpath <> '' AND r.derivation <> '' \
+         RETURN count(r) AS n",
+        &[("r", json!(f.repo))],
+    )[0]["n"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(traced, edges);
+    let calls = crate::grows(
+        &f.db(),
+        "MATCH (a:Symbol {repository_id:$r, node_id:'n_go'})-[r]->(b:Symbol) \
+         WHERE r.relation = 'calls' \
+         RETURN r.relpath AS relpath, r.source_location AS source_location, r.derivation AS derivation \
+         LIMIT 1",
+        &[("r", json!(f.repo))],
     )
-    .unwrap()
+    .into_iter()
+    .next()
     .unwrap();
     assert_eq!(calls["relpath"], "n.py");
     assert!(s(&calls, "source_location").starts_with('L'), "{calls}");
-    // Edge rows persist after their episode is superseded; provenance stays.
+    // Relationships persist after their episode is superseded; provenance
+    // stays on the `*_HIST` type.
     f.commit(&[("m.py", NESTED)], "bbb222");
     f.project();
-    let total = f.count("SELECT count(*) FROM gf_edges WHERE repository_id=?");
+    let total = crate::grows(&f.db(), all_edges, &[("r", json!(f.repo))])[0]["n"]
+        .as_i64()
+        .unwrap();
     assert!(total >= edges);
-    assert_eq!(
-        f.count("SELECT count(*) FROM gf_edge_sources WHERE repository_id=?"),
-        total
-    );
+    let unprovenanced = crate::grows(
+        &f.db(),
+        "MATCH (a:Symbol {repository_id:$r})-[r]->(b:Symbol) \
+         WHERE r.valid_from_episode IS NOT NULL \
+           AND (r.relpath IS NULL OR r.source_location IS NULL OR r.derivation IS NULL) \
+         RETURN count(r) AS n",
+        &[("r", json!(f.repo))],
+    )[0]["n"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(unprovenanced, 0);
 }
 
 #[test]
@@ -324,7 +352,8 @@ fn identical_tree_under_a_new_sha_labels_the_existing_episode() {
     assert_eq!(committed["replayed"], false);
     assert_eq!(f.drain_jobs().len(), 1);
     let db = f.db();
-    let episode = resolve_episode(&db, &f.workspace, &f.repo, "aaa111").unwrap();
+    let episode =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap();
     // Same tree, new commit: the sync layer replays without a sync id and the
     // existing episode gains the new sha without any explicit label call.
     let replay = f.prepare(&[("m.py", NESTED)], "ccc333");
@@ -333,7 +362,7 @@ fn identical_tree_under_a_new_sha_labels_the_existing_episode() {
     assert_eq!(replay["projection_job"]["replayed"], true, "{replay}");
     assert!(f.drain_jobs().is_empty());
     assert_eq!(
-        resolve_episode(&db, &f.workspace, &f.repo, "ccc333").unwrap(),
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "ccc333").unwrap(),
         episode
     );
     assert_eq!(
@@ -348,7 +377,7 @@ fn identical_tree_under_a_new_sha_labels_the_existing_episode() {
     assert_eq!(back["replayed"], false);
     f.drain_jobs();
     assert_eq!(
-        resolve_episode(&db, &f.workspace, &f.repo, "eee555").unwrap(),
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "eee555").unwrap(),
         episode
     );
     assert_eq!(
@@ -357,7 +386,7 @@ fn identical_tree_under_a_new_sha_labels_the_existing_episode() {
     );
     // Every sha that was synced resolves.
     for sha in ["aaa111", "ccc333", "ddd444", "eee555"] {
-        resolve_episode(&db, &f.workspace, &f.repo, sha)
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, sha)
             .unwrap_or_else(|e| panic!("{sha}: {}", e.message));
     }
 }
@@ -379,9 +408,10 @@ fn replay_before_projection_requeues_a_skipped_projection_job() {
     let results = f.drain_jobs();
     assert_eq!(results.len(), 1, "{results:?}");
     let db = f.db();
-    let episode = resolve_episode(&db, &f.workspace, &f.repo, "ccc333").unwrap();
+    let episode =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "ccc333").unwrap();
     assert_eq!(
-        resolve_episode(&db, &f.workspace, &f.repo, "aaa111").unwrap(),
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap(),
         episode
     );
 }
@@ -394,8 +424,9 @@ async fn as_of_by_commit_sha_reconstructs_history_and_impact_accepts_selectors()
     f.commit(&[("m.py", NESTED_V2)], "bbb222");
     f.drain_jobs();
     let db = f.db();
-    let first = resolve_episode(&db, &f.workspace, &f.repo, "aaa111").unwrap();
-    let second = resolve_episode(&db, &f.workspace, &f.repo, "bbb222").unwrap();
+    let first = resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "aaa111").unwrap();
+    let second =
+        resolve_episode(&db, &crate::gstore(&db), &f.workspace, &f.repo, "bbb222").unwrap();
     assert_ne!(first, second);
 
     let old = f
@@ -508,7 +539,7 @@ fn parent_episode_links_history_as_recorded() {
         "ddd444",
     );
     let e3 = s(&f.project(), "episode").to_string();
-    let listed = graph_projection::episodes(&f.db(), &f.repo).unwrap();
+    let listed = graph_projection::episodes(&crate::gstore(&f.db()), &f.repo).unwrap();
     let parents: Vec<(String, Value)> = listed
         .iter()
         .map(|e| (s(e, "episode").to_string(), e["parent_episode"].clone()))
@@ -541,7 +572,7 @@ fn single_valued_inheritance_change_records_a_contradiction() {
     );
     let e1 = s(&f.project(), "episode").to_string();
     let db = f.db();
-    let g1 = graph_projection::load(&db, &f.repo, &e1).unwrap();
+    let g1 = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     let child_id = g1
         .nodes()
         .iter()
@@ -549,7 +580,7 @@ fn single_valued_inheritance_change_records_a_contradiction() {
         .map(|n| n.id.clone())
         .unwrap_or_else(|| panic!("{}", g1.to_node_link("links")));
     assert_eq!(
-        graph_projection::contradictions(&db, &f.repo, None).unwrap(),
+        graph_projection::contradictions(&crate::gstore(&db), &f.repo, None).unwrap(),
         Vec::<Value>::new()
     );
 
@@ -562,31 +593,41 @@ fn single_valued_inheritance_change_records_a_contradiction() {
         "bbb222",
     );
     let e2 = s(&f.project(), "episode").to_string();
-    let marks = graph_projection::contradictions(&db, &f.repo, Some(&e2)).unwrap();
+    let marks = graph_projection::contradictions(&crate::gstore(&db), &f.repo, Some(&e2)).unwrap();
     assert_eq!(marks.len(), 1, "{marks:?}");
     let mark = &marks[0];
     assert_eq!(mark["relation"], "inherits");
     assert_eq!(mark["subject"], child_id);
     assert!(s(mark, "old_target").ends_with("base"), "{mark}");
     assert!(s(mark, "new_target").ends_with("other"), "{mark}");
-    // The old edge row was closed by this episode and the new one opened.
-    let old: Value = graphicle_runtime::store::one(
+    // The old edge was type-flipped to INHERITS_HIST by this episode and the
+    // new one opened live; the marker names both by their edge reference.
+    assert!(
+        s(mark, "old_edge").contains(s(mark, "old_target")),
+        "{mark}"
+    );
+    assert!(
+        s(mark, "new_edge").contains(s(mark, "new_target")),
+        "{mark}"
+    );
+    let old = crate::grows(
         &db,
-        "SELECT valid_to_episode FROM gf_edges WHERE id=?",
-        [mark["old_edge_row_id"].as_i64().unwrap()],
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(old["valid_to_episode"], json!(e2));
-    let new: Value = graphicle_runtime::store::one(
+        "MATCH (a:Symbol {repository_id:$r})-[r:INHERITS_HIST]->(b:Symbol) \
+         WHERE r.valid_to_episode = $e RETURN r.valid_to_episode AS valid_to",
+        &[("r", json!(f.repo)), ("e", json!(e2))],
+    );
+    assert_eq!(old.len(), 1, "{old:?}");
+    assert_eq!(old[0]["valid_to"], json!(e2));
+    let new = crate::grows(
         &db,
-        "SELECT valid_from_episode,valid_to_episode FROM gf_edges WHERE id=?",
-        [mark["new_edge_row_id"].as_i64().unwrap()],
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(new["valid_from_episode"], json!(e2));
-    assert!(new["valid_to_episode"].is_null());
+        "MATCH (a:Symbol {repository_id:$r})-[r:INHERITS]->(b:Symbol) \
+         WHERE r.valid_from_episode = $e \
+         RETURN r.valid_from_episode AS valid_from, r.valid_to_episode AS valid_to",
+        &[("r", json!(f.repo)), ("e", json!(e2))],
+    );
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["valid_from"], json!(e2));
+    assert!(new[0]["valid_to"].is_null());
     let view = f
         .store
         .graph_as_of(&f.workspace, &f.key, &f.repo, &json!({"as_of":e2}))
@@ -615,13 +656,19 @@ fn multi_valued_relations_never_record_contradictions() {
     let e2 = s(&f.project(), "episode").to_string();
     let db = f.db();
     // Both old edges were closed by disappearance...
-    let closed = f.count(&format!(
-        "SELECT count(*) FROM gf_edges WHERE repository_id=? AND valid_to_episode='{e2}' AND relation IN ('inherits','calls') AND source IN ('m_child','m_run')"
-    ));
+    let closed = crate::grows(
+        &db,
+        "MATCH (a:Symbol {repository_id:$r})-[r]->(b:Symbol) \
+         WHERE r.valid_to_episode = $e AND r.relation IN ['inherits','calls'] \
+           AND a.node_id IN ['m_child','m_run'] RETURN count(r) AS n",
+        &[("r", json!(f.repo)), ("e", json!(e2))],
+    )[0]["n"]
+        .as_i64()
+        .unwrap();
     assert_eq!(closed, 2);
     // ...and nothing was marked as contradicted.
     assert_eq!(
-        graph_projection::contradictions(&db, &f.repo, None).unwrap(),
+        graph_projection::contradictions(&crate::gstore(&db), &f.repo, None).unwrap(),
         Vec::<Value>::new()
     );
 }

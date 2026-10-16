@@ -198,10 +198,10 @@ pub fn episode_graph(graph: &Graph, episode: &str) -> Value {
 pub fn source_graph(db: &Connection, repository: &Value, p: &Principal) -> Result<Value> {
     let id = s(repository, "id");
     let episode = graph_projection::current_episode(db, id)?;
-    if !graph_projection::is_recorded(db, id, &episode)? {
+    if !graph_projection::is_recorded(&*crate::store::graph_for(db)?, id, &episode)? {
         return legacy_graph(db, repository, p);
     }
-    match graph_projection::resident(db, id, &episode) {
+    match graph_projection::resident(&*crate::store::graph_for(db)?, id, &episode) {
         Ok(handle) => Ok(episode_graph(&handle, &episode)),
         Err(error) => {
             let mut graph = legacy_graph(db, repository, p)?;

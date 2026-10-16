@@ -245,10 +245,21 @@ fn reading(
     let heads = crate::store::heads(db, repository)?;
     let current = graph_projection::episode_of(&heads);
     let episode = match as_of {
-        Some(selector) => {
-            graph_projection::resolve_episode(db, &p.workspace, repository, selector)?
+        Some(selector) => graph_projection::resolve_episode(
+            db,
+            &*crate::store::graph_for(db)?,
+            &p.workspace,
+            repository,
+            selector,
+        )?,
+        None if graph_projection::is_recorded(
+            &*crate::store::graph_for(db)?,
+            repository,
+            &current,
+        )? =>
+        {
+            current.clone()
         }
-        None if graph_projection::is_recorded(db, repository, &current)? => current.clone(),
         None => match one(
             db,
             "SELECT episode FROM gf_episodes WHERE repository_id=? ORDER BY sequence DESC LIMIT 1",
@@ -263,7 +274,11 @@ fn reading(
             }
         },
     };
-    let recorded = graph_projection::stored_episode_heads(db, repository, &episode)?;
+    let recorded = graph_projection::stored_episode_heads(
+        &*crate::store::graph_for(db)?,
+        repository,
+        &episode,
+    )?;
     Ok(Reading {
         episode,
         current,
@@ -320,7 +335,7 @@ pub fn resident(db: &Connection, repository: &str, episode: &str) -> Result<Arc<
     if let Some(found) = held(repository, episode) {
         return Ok(found);
     }
-    let mut graph = graph_projection::load(db, repository, episode)?;
+    let mut graph = graph_projection::load(&*crate::store::graph_for(db)?, repository, episode)?;
     let communities = graphicle::cluster::cluster(&graph, 1.0, None, "auto")?;
     let labels = graphicle::cluster::label_communities_by_hub(&graph, &communities);
     // The community numbers the engine's export writes (`community`), so the

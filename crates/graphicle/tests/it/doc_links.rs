@@ -261,7 +261,7 @@ fn markdown_mentions_link_where_the_engine_resolves_them() {
         .store
         .read(|db| {
             let episode = graph_projection::current_episode(db, &repo)?;
-            let handle = graph_projection::resident(db, &repo, &episode)?;
+            let handle = graph_projection::resident(&crate::gstore(db), &repo, &episode)?;
             let graph: &graphicle::graph::Graph = &handle;
             let text = |i: usize, key: &str| {
                 graph.nodes()[i]
@@ -1934,11 +1934,12 @@ fn a_project_whose_episode_cannot_be_read_leaves_the_others_linking() {
         .read(|db| graph_projection::current_episode(db, &broken))
         .unwrap();
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&broken],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(broken))],
+            );
             Ok(())
         })
         .unwrap();
@@ -2073,7 +2074,7 @@ fn outcomes_across_projects_say_nothing_of_projects_a_reader_cannot_read() {
             .store
             .read(|db| {
                 let episode = graph_projection::current_episode(db, &shown)?;
-                let handle = graph_projection::resident(db, &shown, &episode)?;
+                let handle = graph_projection::resident(&crate::gstore(db), &shown, &episode)?;
                 let graph: &graphicle::graph::Graph = &handle;
                 Ok(graph
                     .nodes()
@@ -2290,12 +2291,14 @@ async fn basic_answers_and_mcp_recall_take_the_switch() {
         .store
         .read(|db| graph_projection::current_episode(db, &repo))
         .unwrap();
+    // Corrupt the episode's attributes in the authoritative graph store.
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&repo],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(repo))],
+            );
             Ok(())
         })
         .unwrap();

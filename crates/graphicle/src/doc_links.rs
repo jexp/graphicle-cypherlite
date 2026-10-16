@@ -847,7 +847,12 @@ impl Index {
     /// The episode's manifest (path → sha256), read once.
     fn manifest(&self, db: &Connection) -> Result<Option<&BTreeMap<String, String>>> {
         if self.manifest.get().is_none() {
-            let loaded = graph_projection::episode_heads(db, &self.repository, &self.episode)?;
+            let loaded = graph_projection::episode_heads(
+                db,
+                &*crate::store::graph_for(db)?,
+                &self.repository,
+                &self.episode,
+            )?;
             let _ = self.manifest.set(loaded);
         }
         Ok(self.manifest.get().and_then(Option::as_ref))
@@ -1124,9 +1129,8 @@ impl Changed {
 }
 
 /// Note a node row's label and the base name of its file.
-fn note_row(found: &mut HashSet<String>, label: rusqlite::types::ValueRef<'_>, owner: &str) {
-    if let rusqlite::types::ValueRef::Text(text) = label {
-        let text = String::from_utf8_lossy(text);
+fn note_row(found: &mut HashSet<String>, label: Option<&str>, owner: &str) {
+    if let Some(text) = label {
         let label = symbol_label(text.trim());
         if !label.is_empty() {
             found.insert(label.to_string());
@@ -1135,6 +1139,38 @@ fn note_row(found: &mut HashSet<String>, label: rusqlite::types::ValueRef<'_>, o
     if let Some(base) = posix(owner).rsplit('/').next().filter(|b| !b.is_empty()) {
         found.insert(base.to_string());
     }
+}
+
+/// The versions of a project's symbols (label from the version's canonical
+/// attributes, owner, validity window), read from the graph store.
+fn symbol_versions(
+    db: &Connection,
+    project: &str,
+) -> Result<Vec<(Option<String>, String, String, Option<String>)>> {
+    let mut g = crate::store::graph_for(db)?.connection()?;
+    let rows = crate::store_graph::rows(
+        &mut g,
+        "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:SymbolVersion) \
+         RETURN v.data AS data, v.owner AS owner, \
+         v.valid_from_episode AS valid_from, v.valid_to_episode AS valid_to",
+        crate::store_graph::Params::from([(
+            "r".to_string(),
+            cypherlite::Value::String(project.into()),
+        )]),
+    )?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let data: Value =
+                serde_json::from_str(crate::store::s(row, "data")).unwrap_or(Value::Null);
+            (
+                data["label"].as_str().map(str::to_string),
+                crate::store::s(row, "owner").to_string(),
+                crate::store::s(row, "valid_from").to_string(),
+                row["valid_to"].as_str().map(str::to_string),
+            )
+        })
+        .collect())
 }
 
 /// `project`'s recorded episodes and their sequence numbers.
@@ -1167,25 +1203,16 @@ fn labels_at(db: &Connection, project: &str, episode: &str) -> Result<Arc<HashSe
     let at = *known
         .get(episode)
         .ok_or_else(|| Error::bad("Unknown graph episode for this repository"))?;
-    // The latest episode's nodes are the live rows; an older one's are
-    // read as of it, as `graph_projection::load` reads them.
-    let sql = if known.values().all(|&sequence| sequence <= at) {
-        "SELECT json_extract(attributes,'$.label'),owner,valid_from_episode,valid_to_episode \
-         FROM gf_nodes WHERE repository_id=? AND valid_to_episode IS NULL"
-    } else {
-        "SELECT json_extract(attributes,'$.label'),owner,valid_from_episode,valid_to_episode \
-         FROM gf_nodes WHERE repository_id=?"
-    };
-    let mut select = db.prepare_cached(sql)?;
-    let mut listed = select.query([project])?;
+    // A version is as of the episode when its window covers it, as
+    // `graph_projection::load` reads them.
     let mut found = HashSet::new();
-    while let Some(row) = listed.next()? {
-        let from: String = row.get(2)?;
-        let to: Option<String> = row.get(3)?;
+    for (label, owner, from, to) in symbol_versions(db, project)? {
         let live = known.get(&from).is_some_and(|&f| f <= at)
-            && to.is_none_or(|to| known.get(&to).is_some_and(|&t| t > at));
+            && to
+                .as_deref()
+                .is_none_or(|to| known.get(to).is_some_and(|&t| t > at));
         if live {
-            note_row(&mut found, row.get_ref(0)?, &row.get::<_, String>(1)?);
+            note_row(&mut found, label.as_deref(), &owner);
         }
     }
     let found = Arc::new(found);
@@ -1218,15 +1245,18 @@ fn changed(
     let (Some(&a), Some(&b)) = (known.get(from), known.get(to)) else {
         return Ok(Changed::All);
     };
-    let mut select = db.prepare_cached(
-        "SELECT json_extract(attributes,'$.label'),owner FROM gf_nodes WHERE repository_id=?1 AND (\
-         valid_from_episode IN (SELECT episode FROM gf_episodes WHERE repository_id=?1 AND sequence>?2 AND sequence<=?3) \
-         OR valid_to_episode IN (SELECT episode FROM gf_episodes WHERE repository_id=?1 AND sequence>?2 AND sequence<=?3))",
-    )?;
-    let mut listed = select.query(params![project, a.min(b), a.max(b)])?;
+    // Every version opened or closed between the two episodes' sequences.
+    let (low, high) = (a.min(b), a.max(b));
+    let in_range = |episode: &str| {
+        known
+            .get(episode)
+            .is_some_and(|&sequence| sequence > low && sequence <= high)
+    };
     let mut found = HashSet::new();
-    while let Some(row) = listed.next()? {
-        note_row(&mut found, row.get_ref(0)?, &row.get::<_, String>(1)?);
+    for (label, owner, from, to) in symbol_versions(db, project)? {
+        if in_range(&from) || to.as_deref().is_some_and(&in_range) {
+            note_row(&mut found, label.as_deref(), &owner);
+        }
     }
     Ok(Changed::Names(Arc::new(found)))
 }
@@ -1494,9 +1524,14 @@ impl Checker<'_> {
         if !self.manifests.contains_key(&index) {
             let project = &self.projects[index];
             let found = project.episode.as_ref().and_then(|episode| {
-                graph_projection::episode_heads(self.db, &project.id, episode)
-                    .ok()
-                    .flatten()
+                graph_projection::episode_heads(
+                    self.db,
+                    &*crate::store::graph_for(self.db).ok()?,
+                    &project.id,
+                    episode,
+                )
+                .ok()
+                .flatten()
             });
             self.manifests.insert(index, found);
         }
@@ -1689,7 +1724,9 @@ fn open(db: &Connection, project: &Project, views: &mut HashMap<String, View>) {
         return;
     }
     let view = match &project.episode {
-        Some(episode) => match graph_projection::resident(db, &project.id, episode) {
+        Some(episode) => match crate::store::graph_for(db)
+            .and_then(|store| graph_projection::resident(&store, &project.id, episode))
+        {
             Ok(graph) => View::Ready(Box::new(Index::new(&project.id, episode, graph))),
             Err(_) => View::Unavailable,
         },

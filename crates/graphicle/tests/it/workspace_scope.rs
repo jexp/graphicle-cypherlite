@@ -451,12 +451,9 @@ fn an_import_whose_other_end_changed_is_withheld_not_lifted() {
     let args = json!({"question":ABOUT_THE_SHOP,"scope":"workspace","repository_id":shop});
     for damaged in [false, true] {
         if damaged {
-            f.db()
-                .execute(
-                    "UPDATE gf_episodes SET attributes=json_set(attributes,'$.source_heads',5) WHERE repository_id=?1",
-                    [&money],
-                )
-                .unwrap();
+            crate::rewrite_episode_attributes(&f.db(), &money, |attributes| {
+                attributes["source_heads"] = json!(5);
+            });
         }
         let packet = f.context(&f.key, args.clone());
         let report = &packet["workspace"]["cross_repo"];

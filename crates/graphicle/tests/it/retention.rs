@@ -111,7 +111,14 @@ impl Fixture {
             .unwrap();
         self.drain_jobs();
         let db = self.store.connect().unwrap();
-        graph_projection::resolve_episode(&db, &self.workspace, &self.repo, sha).unwrap()
+        graph_projection::resolve_episode(
+            &db,
+            &crate::gstore(&db),
+            &self.workspace,
+            &self.repo,
+            sha,
+        )
+        .unwrap()
     }
     fn drain_jobs(&self) {
         while let Some(job) = self.store.lease_job().unwrap() {
@@ -235,7 +242,7 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
     let stored = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NULL");
     assert!(stored > 0, "fixture must produce ambiguous receiver calls");
     assert_eq!(attributes["unresolved_calls_count"], stored);
-    let graph = graph_projection::load(&db, &f.repo, &e1).unwrap();
+    let graph = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     let calls = graph.attributes()["unresolved_calls"].as_array().unwrap();
     assert_eq!(calls.len() as i64, stored);
     assert!(calls.iter().all(|c| c["caller"].is_string()), "{calls:#?}");
@@ -251,7 +258,7 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
     assert_ne!(e1, e2);
     let closed = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NOT NULL");
     assert_eq!(closed, stored);
-    let previous = graph_projection::load(&db, &f.repo, &e1).unwrap();
+    let previous = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     assert_eq!(
         previous.attributes()["unresolved_calls"]
             .as_array()
@@ -373,7 +380,7 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
             "episode {n} unresolved {unresolved}"
         );
         // Graph history itself is never trimmed.
-        let graph = graph_projection::load(&db, &f.repo, episode).unwrap();
+        let graph = graph_projection::load(&crate::gstore(&db), &f.repo, episode).unwrap();
         assert!(graph.node_count() > 0);
     }
 
@@ -443,7 +450,7 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         assert!(old.get("uncovered_changed").is_none(), "{old:#}");
     }
     // The previous episode lost its unresolved calls: the loaded graph says so.
-    let stale = graph_projection::load(&db, &f.repo, &episodes[23]).unwrap();
+    let stale = graph_projection::load(&crate::gstore(&db), &f.repo, &episodes[23]).unwrap();
     assert_eq!(
         stale.attributes()["unresolved_calls"]
             .as_array()

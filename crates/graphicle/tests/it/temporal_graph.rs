@@ -1,15 +1,15 @@
 //! The bitemporal timeline reads of `graph.as_of` (`valid_at`, `known_at`,
-//! `branch`), historical aliases and hyperedges. Rows that the earlier
-//! assertion writers (`graph.observe`, `graph.hyperedge`, `graph.commit`; see
-//! unit `git-ancestry-writes`) recorded in older stores are seeded
-//! directly, as those writers stored them.
+//! `branch`), historical aliases and hyperedges. Assertions live in the
+//! graph store (`Assertion`/`Alias`/`Hyperedge` nodes); the projection rows
+//! and episode registry the views resolve against are still written by
+//! `graph_projection::persist` (episodes are graph-native
+//! the projection rewrite lands).
 use graphicle::graph::Graph;
 use graphicle_runtime::{
     graph_projection,
     store::{Store, s},
     temporal_graph,
 };
-use rusqlite::params;
 use serde_json::{Value, json};
 
 struct Fixture {
@@ -42,14 +42,19 @@ impl Fixture {
         }
     }
     fn episode(&self, content: &str) -> String {
-        self.store.transaction(|db| {
-            let sha=graphicle_memory::text::sha256(content.as_bytes());
-            db.execute("INSERT OR IGNORE INTO repo_objects VALUES(?,?,?,?)",params![self.repo,sha,content,content.len() as i64])?;
-            db.execute("INSERT OR REPLACE INTO repo_heads VALUES(?,?,?)",params![self.repo,"a.py",sha])?;
-            let episode=graph_projection::current_episode(db,&self.repo)?;
-            let graph=Graph::from_node_link(&json!({"directed":true,"multigraph":true,"nodes":[{"id":"a","label":content,"stable_id":"a"},{"id":"b","label":"b","stable_id":"b"}],"links":[{"source":"a","target":"b","key":"calls","relation":"calls"}]}),"links")?;
-            graph_projection::persist(db,&self.store.graph(),&self.repo,&episode,&graph)?;Ok(episode)
-        }).unwrap()
+        let episode = self
+            .store
+            .transaction(|db| {
+                let sha = graphicle_memory::text::sha256(content.as_bytes());
+                db.execute("INSERT OR IGNORE INTO repo_objects VALUES(?,?,?,?)", rusqlite::params![self.repo, sha, content, content.len() as i64])?;
+                db.execute("INSERT OR REPLACE INTO repo_heads VALUES(?,?,?)", rusqlite::params![self.repo, "a.py", sha])?;
+                let episode = graph_projection::current_episode(db, &self.repo)?;
+                let graph = Graph::from_node_link(&json!({"directed":true,"multigraph":true,"nodes":[{"id":"a","label":content,"stable_id":"a"},{"id":"b","label":"b","stable_id":"b"}],"links":[{"source":"a","target":"b","key":"calls","relation":"calls"}]}), "links")?;
+                graph_projection::persist(db, &crate::gstore(db), &self.repo, &episode, &graph)?;
+                Ok(episode)
+            })
+            .unwrap();
+        episode
     }
     fn view(&self, args: Value) -> Value {
         self.store
@@ -68,6 +73,7 @@ fn retroactive_correction_preserves_what_was_known_and_branch_scope() {
     let (first, second) = ("2021-01-01T00:00:00Z", "2021-01-02T00:00:00Z");
     let at = |s| temporal_graph::instant(s).unwrap();
     f.store
+        .graph()
         .transaction(|db| {
             for (episode, recorded) in [(&a, first), (&b, second)] {
                 temporal_graph::observe(
@@ -122,6 +128,7 @@ fn recurring_graphs_preserve_the_gap_and_exact_time_zone_boundaries() {
     let b = f.episode("def a(): return 2\n");
     let at = |s| temporal_graph::instant(s).unwrap();
     f.store
+        .graph()
         .transaction(|db| {
             for (episode, valid, known) in [
                 (&a, "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
@@ -165,9 +172,10 @@ fn recurring_graphs_preserve_the_gap_and_exact_time_zone_boundaries() {
 #[test]
 fn historical_aliases_and_hyperedges_survive_retraction_without_future_leakage() {
     let f = Fixture::new();
-    f.episode("def a(): return 1\n");
+    let episode = f.episode("def a(): return 1\n");
     let at = temporal_graph::instant("2020-01-01T00:00:00Z").unwrap();
     f.store
+        .graph()
         .transaction(|db| {
             let proposal = json!({"id":"p","from_node":"a","to_node":"b"});
             temporal_graph::alias_event(db, &f.repo, &proposal, true, at, at + 10)?;
@@ -181,22 +189,31 @@ fn historical_aliases_and_hyperedges_survive_retraction_without_future_leakage()
     // A hyperedge created, then retracted, at the same valid time.
     let (created, retracted) = (at + 10, at + 20);
     f.store
+        .graph()
         .transaction(|db| {
-            let episode = graph_projection::current_episode(db, &f.repo)?;
+            let edge = json!({"hyperedge_id":"contract","episode":episode,"relation":"requires",
+                "members":["a","b"],"attributes":{}});
             for (active, recorded) in [(true, created), (false, retracted)] {
-                db.execute(
-                    "INSERT INTO gf_hyperedges(repository_id,hyperedge_id,episode,relation,members,attributes,active,valid_us,recorded_us) VALUES(?,?,?,?,?,?,?,?,?)",
-                    params![f.repo, "contract", episode, "requires", r#"["a","b"]"#, "{}", active, at, recorded],
-                )?;
+                temporal_graph::hyperedge_event(db, &f.repo, &edge, active, at, recorded)?;
             }
-            let graph = graph_projection::load(db, &f.repo, &episode)?;
-            let known = |recorded| temporal_graph::hyperedges_at(db, &f.repo, at, recorded, &graph);
-            assert!(known(created - 1)?.0.is_empty());
-            assert_eq!(known(created)?.0.len(), 1);
-            assert!(known(retracted)?.0.is_empty());
             Ok(())
         })
         .unwrap();
+    let graph = f
+        .store
+        .transaction(|db| {
+            let episode = graph_projection::current_episode(db, &f.repo)?;
+            graph_projection::load(&crate::gstore(db), &f.repo, &episode)
+        })
+        .unwrap();
+    let known = |recorded| {
+        f.store
+            .graph()
+            .read(|db| temporal_graph::hyperedges_at(db, &f.repo, at, recorded, &graph))
+    };
+    assert!(known(created - 1).unwrap().0.is_empty());
+    assert_eq!(known(created).unwrap().0.len(), 1);
+    assert!(known(retracted).unwrap().0.is_empty());
 }
 
 #[test]
@@ -220,13 +237,17 @@ fn malformed_temporal_selectors_are_rejected_and_hyperedges_report_truncation() 
             "{args}"
         );
     }
-    f.store.transaction(|db| {
-        for i in 0..1001 {
-            db.execute("INSERT INTO gf_hyperedges(repository_id,hyperedge_id,episode,relation,members,attributes,active,valid_us,recorded_us) VALUES(?,?,?,?,?,?,1,0,0)",
-                params![f.repo,format!("h{i:04}"),episode,"requires",r#"["a","b"]"#,"{}"])?;
-        }
-        Ok(())
-    }).unwrap();
+    f.store
+        .graph()
+        .transaction(|db| {
+            for i in 0..1001 {
+                let edge = json!({"hyperedge_id":format!("h{i:04}"),"episode":episode,
+                    "relation":"requires","members":["a","b"],"attributes":{}});
+                temporal_graph::hyperedge_event(db, &f.repo, &edge, true, 0, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
     let view = f.view(json!({}));
     assert_eq!(view["hyperedges"].as_array().unwrap().len(), 1000);
     assert_eq!(view["hyperedges_truncated"], true);

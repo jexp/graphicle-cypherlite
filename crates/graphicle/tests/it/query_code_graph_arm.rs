@@ -225,17 +225,12 @@ fn a_skipped_arm_reports_projection_state_and_episode_lag() {
     let status = |f: &Fixture| f.context("where is beta defined")["code_graph"].clone();
     let set_job = |state: &str| {
         f.store
-            .graph()
-            .transaction(|db| {
-                graphicle_runtime::store_graph::rows(
-                    db,
-                    "MATCH (j:Job {kind: 'project', repository_id: $repo}) SET j.state=$state",
-                    graphicle_runtime::store_graph::params(
-                        &json!({"state": state, "repo": f.repo}),
-                    ),
-                )?;
-                Ok(())
-            })
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE am_jobs SET state=? WHERE kind='project' AND repository_id=?",
+                rusqlite::params![state, f.repo],
+            )
             .unwrap();
     };
     // Synced, never projected: the sync queued the projection. The job is
@@ -284,14 +279,10 @@ fn a_skipped_arm_reports_projection_state_and_episode_lag() {
     // An episode recorded without its source manifest (an older store): the
     // arm is skipped and the lag is unknown. A query reads the stored
     // manifest only; it never searches the retained sync manifests for one.
-    f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE gf_episodes SET attributes=json_remove(attributes,'$.source_heads') WHERE repository_id=?",
-            [&f.repo],
-        )
-        .unwrap();
+    let db = f.store.connect().unwrap();
+    crate::rewrite_episode_attributes(&db, &f.repo, |attributes| {
+        attributes.as_object_mut().unwrap().remove("source_heads");
+    });
     let unknown = status(&f);
     assert_eq!(unknown["status"], "no_episode", "{unknown}");
     assert_eq!(unknown["latest_episode"]["episode"], projected["episode"]);
@@ -457,7 +448,16 @@ fn a_recorded_episode_past_the_static_edge_bound_folds_its_edges() {
     .unwrap();
     let db = f.store.connect().unwrap();
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &f.repo).unwrap();
-    assert!(graphicle_runtime::graph_projection::persist(&db, &f.store.graph(), &f.repo, &episode, &graph).unwrap());
+    assert!(
+        graphicle_runtime::graph_projection::persist(
+            &db,
+            &crate::gstore(&db),
+            &f.repo,
+            &episode,
+            &graph
+        )
+        .unwrap()
+    );
     let packet = f.context("where is alpha called");
     assert_eq!(
         packet["graph_source"], "episode",

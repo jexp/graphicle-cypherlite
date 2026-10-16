@@ -6,10 +6,10 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     panic::Location,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -355,7 +355,7 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
 /// callers still thread a SQL `&Connection` resolve their [`GraphStore`]
 /// here instead of growing a parameter all the way up; new code should
 /// take a `&GraphStore` argument.
-pub(crate) fn graph_for(db: &Connection) -> Result<Arc<crate::store_graph::GraphStore>> {
+pub fn graph_for(db: &Connection) -> Result<Arc<crate::store_graph::GraphStore>> {
     let path = db
         .path()
         .ok_or_else(|| Error::bad("An in-memory SQL connection has no paired graph store"))?;
@@ -402,8 +402,10 @@ impl Store {
         db.execute_batch(include_str!("projection_schema.sql"))?;
         ensure_column(&db, "gf_episodes", "parent_episode", "TEXT")?;
         db.execute_batch(include_str!("temporal_schema.sql"))?;
-        crate::temporal_graph::migrate(&db)?;
-        crate::graph_delta::migrate(&db)?;
+        // The projection's SQL body still buckets rows by owner file; the
+        // group digests and triggers of graph_delta live in the graph store.
+        ensure_column(&db, "gf_nodes", "owner", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&db, "gf_edges", "owner", "TEXT NOT NULL DEFAULT ''")?;
         db.execute_batch(include_str!("product_schema.sql"))?;
         crate::work_state::migrate(&db)?;
         // Each folder's freshness record.
