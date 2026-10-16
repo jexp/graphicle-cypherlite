@@ -60,16 +60,29 @@ pub(crate) fn memory_row(
 pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
     let identifier = s(repository, "id");
     let mut output = Vec::new();
+    // Heads and contents come from the graph content store; the binary-file
+    // metadata (`am_binary_heads`, a converters domain table) stays SQL and
+    // joins in memory on (path, source sha).
+    let mut binaries: std::collections::HashMap<(String, String), Value> = std::collections::HashMap::new();
     for row in rows(
         db,
-        "SELECT h.path,h.sha256,o.content,b.original_sha,b.parser FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 LEFT JOIN am_binary_heads b ON b.repository_id=h.repository_id AND b.path=h.path AND b.source_sha=h.sha256 WHERE h.repository_id=? ORDER BY h.path",
+        "SELECT path,original_sha,parser,source_sha FROM am_binary_heads WHERE repository_id=?",
         [identifier],
     )? {
+        binaries.insert(
+            (s(&row, "path").to_string(), s(&row, "source_sha").to_string()),
+            row,
+        );
+    }
+    let graph = crate::store::graph_for(db)?;
+    for row in crate::store_content::head_documents(&graph, identifier)? {
         let path = s(&row, "path");
+        let key = (path.to_string(), s(&row, "sha256").to_string());
+        let binary = binaries.get(&key);
         output.push(json!({"id":format!("file:{path}"),"path":path,"title":path,"source_kind":"repository_file",
             "sha256":row["sha256"],"snapshot":repository["snapshot"],"version":row["sha256"],
             "content":row["content"],"recorded_at":null,"observed_at":repository["updated_at"],
-            "authority":"original_repository_source","url":null,"metadata":{"original_sha256":row["original_sha"],"parser":row["parser"]}}));
+            "authority":"original_repository_source","url":null,"metadata":{"original_sha256":binary.map(|b|b["original_sha"].clone()),"parser":binary.map(|b|b["parser"].clone())}}));
     }
     // The Python host's workspace-source links
     // (`repo_evidence_links` over `sources`) are no longer read; nothing in

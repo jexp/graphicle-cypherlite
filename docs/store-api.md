@@ -115,6 +115,25 @@ let text = s(&first.unwrap(), "text"); // "" when absent, like store::s
   the spike measured it ~300× slower than plain batched UNWIND on
   `:memory:` in v0.12.2 (spike E6).
 
+## Migrated domains
+
+- **Content store (`store_content`)** — the `repo_*` tables (objects, heads,
+  parses, chunks, snapshots, syncs, events) and the sync protocol
+  (`Store::sync_prepare/sync_upload/sync_commit`, `sync.abort`, `history`)
+  execute as Cypher on `GraphStore` (migration plan §2.2:
+  `Project-[:HAS_OBJECT]->Object` CAS, `File-[:HEAD]->Object`,
+  `File-[:PARSED_AS]->Parse`, `Chunk-[:PART_OF]->Object` with the
+  `chunk_text` fulltext index, `Snapshot/Sync/Event-[:OF]->Project`).
+  `sync_prepare`/`sync_commit` plan with one `UNWIND $rows` statement per
+  entity kind; the head swap is a single graph transaction. `Store` carries
+  the graph as `store.graph()`; deeply nested helpers that still take the
+  SQL `Connection` resolve the same store through `store::graph_for(db)`
+  (`reviews.graph` beside the connection's database file, shared through
+  the per-directory registry — transitional, it goes away as the remaining
+  domains migrate).
+  Parse data, manifests and event payloads stay stringified JSON (dynamic or
+  unbounded keys; the engine has no map-typed properties).
+
 ## Schema at open (DDL, idempotent)
 
 Every open applies the schema; a second open of the same store is a no-op

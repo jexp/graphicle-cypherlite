@@ -845,6 +845,7 @@ impl Store {
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir_all(crate::store_graph::backup_sidecar(path));
         }
         result
     }

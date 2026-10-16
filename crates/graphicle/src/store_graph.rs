@@ -341,6 +341,32 @@ enum Attempt<T> {
     Failed(Error),
 }
 
+/// Copy the graph store directory `source` to `dest` (which must not
+/// exist). The engine clones from a frozen read-only open, which a live
+/// writer does not block — backup and test forks use this without closing
+/// the store.
+pub fn clone_store(source: &Path, dest: &Path) -> Result<()> {
+    let source = source
+        .to_str()
+        .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
+    let dest = dest
+        .to_str()
+        .ok_or_else(|| Error::bad("Graph store path is not valid UTF-8"))?;
+    Ok(cypherlite::Database::clone(
+        source,
+        dest,
+        cypherlite::CloneOptions::default(),
+    )?)
+}
+
+/// The backup sidecar of a SQL backup file (`backup.sqlite3` →
+/// `backup.sqlite3.graph`).
+pub fn backup_sidecar(backup: &Path) -> PathBuf {
+    let mut sidecar = backup.as_os_str().to_owned();
+    sidecar.push(".graph");
+    PathBuf::from(sidecar)
+}
+
 /// Hand-written constraint names from the spike's fallback list that overlap
 /// labels the graph type manages; dropped before promotion (the graph type
 /// wins over hand-written constraints on the same label).
@@ -405,6 +431,20 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX chunk_path IF NOT EXISTS FOR (c:Chunk) ON (c.path)",
     "CREATE INDEX mem_lookup IF NOT EXISTS FOR (m:Memory) ON (m.kind)",
     "CREATE FULLTEXT INDEX chunk_text IF NOT EXISTS FOR (c:Chunk) ON EACH [c.index_text]",
+    // Content store (store_content): the lookup keys of the remaining
+    // single-row reads and updates. Bulk paths scan once per statement
+    // instead; MERGE/property-MATCH without an index is superlinear in
+    // store size on v0.12.2 (measured in store_content's perf probes).
+    "CREATE INDEX obj_key IF NOT EXISTS FOR (o:Object) ON (o.repository_id, o.sha256)",
+    "CREATE INDEX file_key IF NOT EXISTS FOR (f:File) ON (f.repository_id, f.path)",
+    "CREATE INDEX parse_key IF NOT EXISTS FOR (p:Parse) ON (p.repository_id, p.path)",
+    "CREATE INDEX chunk_key IF NOT EXISTS FOR (c:Chunk) ON (c.repository_id, c.path)",
+    "CREATE INDEX sync_id IF NOT EXISTS FOR (s:Sync) ON (s.id)",
+    "CREATE INDEX sync_repo IF NOT EXISTS FOR (s:Sync) ON (s.repository_id)",
+    "CREATE INDEX snap_key IF NOT EXISTS FOR (s:Snapshot) ON (s.repository_id, s.sha256)",
+    "CREATE INDEX event_repo IF NOT EXISTS FOR (e:Event) ON (e.repository_id)",
+    "CREATE INDEX counter_key IF NOT EXISTS FOR (c:Counter) ON (c.repository_id, c.name)",
+    "CREATE INDEX proj_id IF NOT EXISTS FOR (p:Project) ON (p.id)",
     "CREATE FULLTEXT INDEX mem_text IF NOT EXISTS FOR (m:Memory) ON EACH [m.title, m.body]",
     "CREATE FULLTEXT INDEX doc_text IF NOT EXISTS FOR (d:ConnectorDoc) ON EACH [d.content]",
     // Invalidation and symbol-link modules (invalidation.rs, symbols.rs).

@@ -79,6 +79,7 @@ mod cache_review;
 mod capture;
 mod code_relationships;
 mod core_limits;
+mod cross_process;
 mod cross_repo;
 mod deletion;
 mod doc_links;

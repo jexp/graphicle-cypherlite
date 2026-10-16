@@ -154,26 +154,37 @@ impl Home {
 
     /// The project's snapshot, completed syncs and head paths.
     fn state(&self, project: &str) -> (String, i64, Vec<String>) {
-        self.store()
+        let store = self.store();
+        let snapshot: String = store
             .read(|db| {
-                let snapshot: String = db.query_row(
+                Ok(db.query_row(
                     "SELECT snapshot FROM repo_projects WHERE id=?",
                     [project],
                     |r| r.get(0),
-                )?;
-                let syncs: i64 = db.query_row(
-                    "SELECT count(*) FROM repo_syncs WHERE repository_id=? AND state='complete'",
-                    [project],
-                    |r| r.get(0),
-                )?;
-                let mut statement =
-                    db.prepare("SELECT path FROM repo_heads WHERE repository_id=? ORDER BY path")?;
-                let heads = statement
-                    .query_map([project], |r| r.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((snapshot, syncs, heads))
+                )?)
+            })
+            .unwrap();
+        // Syncs and heads live in the graph content store.
+        let syncs: i64 = store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (s:Sync {repository_id:$repo}) WHERE s.state='complete' RETURN count(s) AS n",
+                    graphicle_runtime::store_graph::Params::from([(
+                        "repo".to_string(),
+                        graphicle_runtime::store_graph::json_to_value(&json!(project)),
+                    )]),
+                )
             })
             .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap_or(0);
+        let heads: Vec<String> = graphicle_runtime::store_content::heads(&store.graph(), project)
+            .unwrap()
+            .into_keys()
+            .collect();
+        (snapshot, syncs, heads)
     }
 
     /// Sync the repository and return its project.
@@ -766,15 +777,12 @@ fn an_unchanged_sync_converts_no_document_again() {
     let fourth = sync(&mut session);
     assert_ne!(fourth["snapshot"], first["snapshot"]);
     assert_eq!(parser(), "html2text");
-    let text: String = store
-        .read(|db| {
-            Ok(db.query_row(
-                "SELECT o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=? AND h.path='guide.html'",
-                [&project],
-                |row| row.get(0),
-            )?)
-        })
-        .unwrap();
+    let sha = graphicle_runtime::store_content::heads(&store.graph(), &project).unwrap()["guide.html"]
+        .clone();
+    let text: String =
+        graphicle_runtime::store_content::object_content(&store.graph(), &project, &sha)
+            .unwrap()
+            .unwrap();
     assert!(text.contains("Beta runs first."), "{text}");
 }
 

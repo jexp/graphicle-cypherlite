@@ -7,7 +7,7 @@
 //! its manifest and content in batches under the request caps.
 use graphicle_runtime::limits::{Limits, grouped};
 use graphicle_runtime::local;
-use graphicle_runtime::store::{Store, rows, s};
+use graphicle_runtime::store::{Store, s};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -49,15 +49,20 @@ impl Fixture {
     fn analysis(&self, repository: &str, path: &str) -> (String, Value) {
         let row = self
             .store
+            .graph()
             .read(|db| {
-                rows(
+                graphicle_runtime::store_graph::one(
                     db,
-                    "SELECT p.revision,p.data FROM repo_parses p JOIN repo_heads h ON h.repository_id=p.repository_id AND h.path=p.path AND h.sha256=p.sha256 WHERE h.repository_id=? AND h.path=?",
-                    rusqlite::params![repository, path],
+                    "MATCH (f:File {repository_id:$repo, path:$path})-[:HEAD]->(o:Object) \
+                     MATCH (f)-[:PARSED_AS]->(p:Parse) WHERE p.sha256=o.sha256 \
+                     RETURN p.revision AS revision, p.data AS data",
+                    graphicle_runtime::store_graph::Params::from([
+                        ("repo".to_string(), graphicle_runtime::store_graph::json_to_value(&json!(repository))),
+                        ("path".to_string(), graphicle_runtime::store_graph::json_to_value(&json!(path))),
+                    ]),
                 )
             })
             .unwrap()
-            .pop()
             .unwrap_or_else(|| panic!("no analysis of {path}"));
         (
             s(&row, "revision").to_string(),
@@ -205,10 +210,29 @@ fn an_oversized_file_of_each_kind_is_listed_and_searchable_and_the_sync_succeeds
     // folder, and only those: the complete analysis of the normal file is
     // not redone (its marked row survives).
     f.store
+        .graph()
         .transaction(|db| {
-            db.execute(
-                "UPDATE repo_parses SET data=json_set(data,'$.marked',1) WHERE path='normal.py'",
-                [],
+            let found = graphicle_runtime::store_graph::rows(
+                db,
+                "MATCH (p:Parse {path:'normal.py'}) RETURN p.sha256 AS sha256, p.data AS data",
+                graphicle_runtime::store_graph::Params::new(),
+            )?;
+            let updated: Vec<Value> = found
+                .iter()
+                .map(|row| {
+                    let mut data: Value = serde_json::from_str(s(row, "data")).unwrap();
+                    data["marked"] = json!(1);
+                    json!({"sha256":row["sha256"],"data":data.to_string()})
+                })
+                .collect();
+            graphicle_runtime::store_graph::rows(
+                db,
+                "UNWIND $rows AS row \
+                 MATCH (p:Parse {path:'normal.py', sha256:row.sha256}) SET p.data=row.data",
+                graphicle_runtime::store_graph::Params::from([(
+                    "rows".to_string(),
+                    graphicle_runtime::store_graph::json_to_value(&json!(updated)),
+                )]),
             )?;
             Ok(())
         })
@@ -305,17 +329,7 @@ fn a_manifest_in_parts_commits_nothing_until_the_commit_and_retries_are_idempote
         json!({"path":path,"sha256":graphicle_memory::text::sha256(content.as_bytes()),"bytes":content.len()})
     };
     let heads = || {
-        f.store
-            .read(|db| {
-                Ok(rows(
-                    db,
-                    "SELECT count(*) AS n FROM repo_heads WHERE repository_id=?",
-                    [&repository],
-                )?[0]["n"]
-                    .as_i64()
-                    .unwrap())
-            })
-            .unwrap()
+        graphicle_runtime::store_content::file_count(&f.store.graph(), &repository).unwrap()
     };
     let call = |operation: &str, mut args: Value| {
         args["repository_id"] = json!(repository);

@@ -634,11 +634,19 @@ fn reviewed_memories_of_each_project_are_fused_and_name_their_project() {
 fn a_project_that_cannot_be_read_is_left_out_and_reported() {
     let (f, shop, money) = Fixture::shop_and_money();
     // The library's stored bytes no longer match their hashes.
-    f.db()
-        .execute(
-            "UPDATE repo_objects SET content=content||'# damaged' WHERE repository_id=?1",
-            [&money],
-        )
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::rows(
+                db,
+                "MATCH (o:Object {repository_id:$repo}) SET o.content = o.content + '# damaged' RETURN count(o) AS n",
+                graphicle_runtime::store_graph::Params::from([(
+                    "repo".to_string(),
+                    graphicle_runtime::store_graph::json_to_value(&serde_json::json!(money)),
+                )]),
+            )?;
+            Ok(())
+        })
         .unwrap();
     for args in [
         json!({"question":ABOUT_THE_SHOP,"scope":"workspace"}),

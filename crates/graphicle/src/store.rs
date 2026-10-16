@@ -1,5 +1,5 @@
 //! Native ownership of the same source/revision tables used by the original host.
-use crate::{Error, Result, digest, id, integer, native, now, string};
+use crate::{Error, Result, digest, id, integer, native, now, store_content, string};
 use rusqlite::{
     Connection, OptionalExtension, Params, Transaction, TransactionBehavior, params,
     types::ValueRef,
@@ -285,27 +285,10 @@ fn transient_failure(message: &str) -> bool {
 /// The files of `repository`'s current heads whose structure analysis was
 /// limited (`[{path, limit, reason}]`) or skipped (`[{path, reason}]`), in
 /// path order. Complete analyses carry `structure::REVISION`, so only the
-/// others are read.
-pub fn analysis_report(db: &Connection, repository: &str) -> Result<(Vec<Value>, Vec<Value>)> {
-    let mut statement = db.prepare_cached(
-        "SELECT h.path,p.data FROM repo_heads h JOIN repo_parses p ON p.repository_id=h.repository_id AND p.path=h.path AND p.sha256=h.sha256 WHERE h.repository_id=? AND p.revision!=? ORDER BY h.path",
-    )?;
-    let rows = statement.query_map(
-        params![repository, graphicle_memory::structure::REVISION],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )?;
-    let (mut limited, mut skipped) = (Vec::new(), Vec::new());
-    for row in rows {
-        let (path, data) = row?;
-        let analysis: Value = serde_json::from_str(&data)?;
-        if analysis.get("skipped").is_some() {
-            skipped.push(json!({"path":path,"reason":analysis["issues"][0]}));
-        } else if let Some(limit) = analysis["limited"].as_str() {
-            let reason = graphicle_memory::structure::limit_issues(&analysis).join("; ");
-            limited.push(json!({"path":path,"limit":limit,"reason":reason}));
-        }
-    }
-    Ok((limited, skipped))
+/// others are read. The parses live in the graph store: see
+/// [`store_content::analysis_report`].
+pub fn analysis_report(store: &crate::store_graph::GraphStore, repository: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+    store_content::analysis_report(store, repository)
 }
 
 /// The open graph stores of this process, by directory: the engine's
@@ -657,6 +640,7 @@ impl Store {
             if let Some(row)=one(db,"SELECT id FROM repo_projects WHERE workspace_id=? AND project_key=?",params![workspace,key])? {repo(db,p,s(&row,"id"))?;return Ok(json!({"id":row["id"],"replayed":true}));}
             let identifier=id();let stamp=now();
             db.execute("INSERT INTO repo_projects(id,workspace_id,project_key,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",params![identifier,workspace,key,name,stamp,stamp])?;
+            store_content::register_project(&self.graph(),&json!({"id":identifier,"workspace_id":workspace,"project_key":key,"name":name}))?;
             Ok(json!({"id":identifier,"replayed":false}))
         })
     }
@@ -718,13 +702,20 @@ impl Store {
             return Err(Error::bad("Invalid bounded metadata"));
         }
         let limited = graphicle_memory::structure::limited_revision(&limits.analysis());
-        self.authorized(workspace,token,"collect",|db,p| {
-            let repository=repo(db,p,string(args,"repository_id",100)?)?;
+        let graph = self.graph();
+        // Only the project row is SQL here; the sync protocol's own state is
+        // all graph. The row is read under a short read snapshot so the SQL
+        // write lock is never held across a graph transaction (a held lock
+        // starved concurrent syncs past the busy timeout).
+        let repository=self.authorized_read(workspace,token,"collect",|db,p| {
+            repo(db,p,string(args,"repository_id",100)?)
+        })?;
+        {
             let identifier=s(&repository,"id");
             // Earlier parts' entries, the snapshot the sync started from, and its metadata.
             let (mut files,expected,metadata)=match continued {
                 Some(sync_id)=>{
-                    let sync=one(db,"SELECT * FROM repo_syncs WHERE repository_id=? AND id=?",params![identifier,sync_id])?.ok_or_else(||Error::bad("Sync not found"))?;
+                    let sync=store_content::sync_get(&graph,identifier,sync_id)?.ok_or_else(||Error::bad("Sync not found"))?;
                     if s(&sync,"state")!="preparing" {return Err(Error::conflict("Sync is not waiting for more of its manifest"));}
                     (serde_json::from_str::<BTreeMap<String,Value>>(s(&sync,"manifest"))?,s(&sync,"expected_snapshot").to_string(),s(&sync,"metadata").to_string())
                 }
@@ -740,59 +731,60 @@ impl Store {
             if files.len()>limits.project_files || bytes>limits.project_bytes {
                 return Err(crate::limits::project_refusal(files.len(),bytes,false,&limits));
             }
-            let unfinished=|db:&Connection|->Result<()>{
-                let count:i64=db.query_row("SELECT count(*) FROM repo_syncs WHERE repository_id=? AND state IN ('pending','preparing')",[identifier],|r|r.get(0))?;
-                if count>=20{return Err(Error::conflict("Abort an unfinished sync before adding another"));}
+            let unfinished=||->Result<()>{
+                if store_content::syncs_unfinished(&graph,identifier)?>=20{return Err(Error::conflict("Abort an unfinished sync before adding another"));}
                 Ok(())
             };
             if !complete {
                 let manifest=graphicle_memory::text::canonical(&json!(files));
                 let sync_id=match continued {
-                    Some(sync_id)=>{db.execute("UPDATE repo_syncs SET manifest=? WHERE id=?",params![manifest,sync_id])?;sync_id.to_string()}
-                    None=>{unfinished(db)?;let sync_id=id();db.execute("INSERT INTO repo_syncs VALUES(?,?,?,?,?,?,?,?)",params![sync_id,identifier,expected,"",manifest,metadata,"preparing",now()])?;sync_id}
+                    Some(sync_id)=>{store_content::sync_update(&graph,sync_id,&json!({"manifest":manifest}))?;sync_id.to_string()}
+                    None=>{unfinished()?;let sync_id=id();store_content::sync_create(&graph,&repository,&sync_id,&json!({"expected_snapshot":expected,"snapshot":"","manifest":manifest,"metadata":metadata,"state":"preparing"}))?;sync_id}
                 };
                 return Ok(json!({"sync_id":sync_id,"manifest_complete":false,"files":files.len()}));
             }
             if s(&repository,"snapshot")!=expected {return Err(Error::conflict("Repository changed during scanning"));}
             let files=json!(files);
             let snapshot=digest(&files);
-            let outdated:i64=db.query_row("SELECT count(*) FROM repo_heads h LEFT JOIN repo_parses p ON p.repository_id=h.repository_id AND p.path=h.path AND p.sha256=h.sha256 WHERE h.repository_id=? AND (p.revision IS NULL OR p.revision NOT IN (?,?))",params![identifier,graphicle_memory::structure::REVISION,limited],|r|r.get(0))?;
+            let outdated=store_content::outdated_heads(&graph,identifier,[graphicle_memory::structure::REVISION,&limited])?;
             if s(&repository,"snapshot")==snapshot && outdated==0 {
-                if let Some(sync_id)=continued {db.execute("DELETE FROM repo_syncs WHERE id=?",[sync_id])?;}
+                if let Some(sync_id)=continued {store_content::sync_delete(&graph,sync_id)?;}
                 // Identical tree, possibly a new commit identity: the existing
-                // episode still gains the sha from this sync's metadata.
+                // episode still gains the sha from this sync's metadata. The
+                // enqueue is SQL; re-read the project row under the write
+                // lock and re-verify the snapshot there.
                 let metadata:Value=serde_json::from_str(&metadata)?;
-                let projection=crate::jobs::enqueue_projection(self,db,identifier,p,&snapshot,&metadata)?;
+                let projection=self.authorized(workspace,token,"collect",|db,p| {
+                    let repository=repo(db,p,string(args,"repository_id",100)?)?;
+                    if s(&repository,"snapshot")!=snapshot {return Err(Error::conflict("Repository changed during scanning"));}
+                    crate::jobs::enqueue_projection(self,db,s(&repository,"id"),p,&snapshot,&metadata)
+                })?;
                 return Ok(json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}));
             }
-            let mut missing=Vec::new();
-            let mut exists=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM repo_objects WHERE repository_id=? AND sha256=? AND bytes=?)")?;
-            for (name,item) in files.as_object().unwrap() {
-                if !exists.query_row(params![identifier,s(item,"sha256"),item["bytes"].as_i64()],|r|r.get::<_,bool>(0))? {missing.push(name.clone());}
-            }
-            drop(exists);
+            // One UNWIND round trip, replacing the per-file SELECT EXISTS loop.
+            let entries:Vec<Value>=files.as_object().unwrap().iter().map(|(name,item)|json!({"path":name,"sha256":item["sha256"],"bytes":item["bytes"]})).collect();
+            let missing=store_content::missing_objects(&graph,identifier,&json!(entries))?;
             let manifest=graphicle_memory::text::canonical(&files);
             let sync_id=match continued {
-                Some(sync_id)=>{db.execute("UPDATE repo_syncs SET snapshot=?,manifest=?,state='pending' WHERE id=?",params![snapshot,manifest,sync_id])?;sync_id.to_string()}
-                None=>{unfinished(db)?;let sync_id=id();db.execute("INSERT INTO repo_syncs VALUES(?,?,?,?,?,?,?,?)",params![sync_id,identifier,expected,snapshot,manifest,metadata,"pending",now()])?;sync_id}
+                Some(sync_id)=>{store_content::sync_update(&graph,sync_id,&json!({"snapshot":snapshot,"manifest":manifest,"state":"pending"}))?;sync_id.to_string()}
+                None=>{unfinished()?;let sync_id=id();store_content::sync_create(&graph,&repository,&sync_id,&json!({"expected_snapshot":expected,"snapshot":snapshot,"manifest":manifest,"metadata":metadata,"state":"pending"}))?;sync_id}
             };
             Ok(json!({"snapshot":snapshot,"sync_id":sync_id,"missing":missing,"replayed":false}))
-        })
+        }
     }
     /// Send content for a pending sync (`sync.upload`): 1 to
     /// [`crate::limits::UPLOAD_FILES`] files whose text matches the manifest,
     /// at most [`crate::limits::REQUEST_BYTES`] of text unless it is one file.
     pub fn sync_upload(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         let limits = self.limits()?;
-        self.authorized(workspace, token, "collect", |db, p| {
-            let repository = repo(db, p, string(args, "repository_id", 100)?)?;
+        let graph = self.graph();
+        let repository = self.authorized_read(workspace, token, "collect", |db, p| {
+            repo(db, p, string(args, "repository_id", 100)?)
+        })?;
+        {
             let identifier = s(&repository, "id");
-            let sync = one(
-                db,
-                "SELECT * FROM repo_syncs WHERE repository_id=? AND id=?",
-                params![identifier, string(args, "sync_id", 100)?],
-            )?
-            .ok_or_else(|| Error::bad("Sync not found"))?;
+            let sync = store_content::sync_get(&graph, identifier, string(args, "sync_id", 100)?)?
+                .ok_or_else(|| Error::bad("Sync not found"))?;
             if s(&sync, "state") != "pending" {
                 return Err(Error::conflict("Sync is not pending"));
             }
@@ -802,6 +794,7 @@ impl Store {
                 .filter(|v| !v.is_empty() && v.len() <= crate::limits::UPLOAD_FILES)
                 .ok_or_else(|| Error::bad("Upload 1–1,000 files"))?;
             let mut accepted = Vec::new();
+            let mut objects = Vec::new();
             let mut sent = 0usize;
             for file in files {
                 let name = path(string(file, "path", 1000)?)?;
@@ -821,17 +814,11 @@ impl Store {
                 {
                     return Err(Error::conflict("Source does not match its manifest"));
                 }
-                db.execute(
-                    "INSERT OR IGNORE INTO repo_objects VALUES(?,?,?,?)",
-                    params![identifier, sha, content, content.len()],
-                )?;
+                objects.push(json!({"sha256":sha,"content":content,"bytes":content.len()}));
                 accepted.push(name.to_string());
             }
-            let bytes: i64 = db.query_row(
-                "SELECT coalesce(sum(bytes),0) FROM repo_objects WHERE repository_id=?",
-                [identifier],
-                |r| r.get(0),
-            )?;
+            store_content::put_objects(&graph, &repository, &json!(objects))?;
+            let bytes = store_content::retained_bytes(&graph, identifier)?;
             let retained = limits.retained_bytes();
             if usize::try_from(bytes).unwrap_or(usize::MAX) > retained {
                 return Err(Error::bad(format!(
@@ -840,7 +827,7 @@ impl Store {
                 )));
             }
             Ok(json!({"accepted":accepted,"snapshot_activated":false}))
-        })
+        }
     }
     /// Activate a pending sync's snapshot (`sync.commit`). New content is
     /// analysed and chunked in batches outside the write lock; those rows are
@@ -855,15 +842,15 @@ impl Store {
         let analysis_limits = limits.analysis_request();
         let limited = graphicle_memory::structure::limited_revision(&limits.analysis());
         let current = [graphicle_memory::structure::REVISION, limited.as_str()];
+        // One graph handle for the whole commit (each open replays the WAL;
+        // the handle also pins the engine's writer lease for the operation).
+        let graph = self.graph();
         // Plan the commit from a complete authorized snapshot.
-        let (sync, documents) = self.authorized(workspace, token, "collect", |db, p| {
+        let (sync, documents) = self.authorized_read(workspace, token, "collect", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let sync = one(
-                db,
-                "SELECT * FROM repo_syncs WHERE repository_id=? AND id=?",
-                params![s(&repository, "id"), string(args, "sync_id", 100)?],
-            )?
-            .ok_or_else(|| Error::bad("Sync not found"))?;
+            let sync =
+                store_content::sync_get(&graph, s(&repository, "id"), string(args, "sync_id", 100)?)?
+                    .ok_or_else(|| Error::bad("Sync not found"))?;
             match s(&sync, "state") {
                 "aborted" => return Err(Error::conflict("Sync was aborted")),
                 "preparing" => {
@@ -876,38 +863,32 @@ impl Store {
             let manifest: Value = serde_json::from_str(s(&sync, "manifest"))?;
             let identifier = s(&repository, "id");
             // Analysis and chunking are pure functions of `(path, content)`
-            // and keyed by `(path, sha256)` in their tables, so an object
-            // whose rows already exist at the current revision is carried
-            // over; only new content is verified, loaded and parsed.
-            let mut documents: Vec<SyncDocument> = Vec::new();
-            let mut parsed = db.prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM repo_parses WHERE repository_id=? AND path=? AND sha256=? AND revision IN (?,?))",
-            )?;
-            let mut chunked = db.prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM repo_chunks WHERE repository_id=? AND path=? AND sha256=?)",
-            )?;
-            let mut exists = db.prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM repo_objects WHERE repository_id=? AND sha256=?)",
-            )?;
-            for (path, item) in manifest
+            // and keyed by `(path, sha256)` in the graph, so an object whose
+            // parse/chunk nodes already exist at the current revision is
+            // carried over; only new content is verified, loaded and parsed.
+            // One UNWIND statement replaces the per-file SELECT EXISTS loops.
+            let entries: Vec<Value> = manifest
                 .as_object()
                 .ok_or_else(|| Error::bad("Invalid stored manifest"))?
-            {
-                let sha = s(item, "sha256");
-                if !exists.query_row(params![identifier, sha], |r| r.get::<_, bool>(0))? {
+                .iter()
+                .map(|(path, item)| json!({"path":path,"sha256":item["sha256"]}))
+                .collect();
+            let plan = store_content::commit_plan(
+                &graph,
+                identifier,
+                &json!(entries),
+                [current[0], current[1]],
+            )?;
+            let mut documents: Vec<SyncDocument> = Vec::new();
+            for row in plan {
+                if row["present"] != true {
                     return Err(Error::conflict("Upload missing sources before committing"));
                 }
-                let analyzed: bool = parsed.query_row(
-                    params![identifier, path, sha, current[0], current[1]],
-                    |r| r.get(0),
-                )?;
-                let has_chunks: bool =
-                    chunked.query_row(params![identifier, path, sha], |r| r.get(0))?;
                 documents.push(SyncDocument {
-                    path: path.clone(),
-                    sha: sha.to_string(),
-                    analyze: !analyzed,
-                    chunk: !has_chunks,
+                    path: s(&row, "path").to_string(),
+                    sha: s(&row, "sha256").to_string(),
+                    analyze: row["parsed"] != true,
+                    chunk: row["chunked"] != true,
                 });
             }
             Ok((sync, documents))
@@ -919,26 +900,33 @@ impl Store {
             // without holding the write lock.
             let contents = self.authorized_read(workspace, token, "collect", |db, p| {
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                let mut load = db.prepare_cached(
-                    "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                )?;
+                let identifier = s(&repository, "id");
                 let (mut contents, mut bytes) = (Vec::new(), 0);
-                for document in &work[start..] {
-                    if contents.len() == COMMIT_BATCH_FILES || bytes >= crate::limits::REQUEST_BYTES
-                    {
-                        break;
+                let mut pending = &work[start..];
+                // Contents load one UNWIND statement per group instead of one
+                // SELECT per file; group size bounds the transient memory.
+                while !pending.is_empty()
+                    && contents.len() < COMMIT_BATCH_FILES
+                    && bytes < crate::limits::REQUEST_BYTES
+                {
+                    let group = &pending[..pending.len().min(32)];
+                    let shas: Vec<String> = group.iter().map(|d| d.sha.clone()).collect();
+                    let loaded = store_content::object_contents(&graph, identifier, &shas)?;
+                    for (document, content) in group.iter().zip(loaded) {
+                        if contents.len() == COMMIT_BATCH_FILES
+                            || bytes >= crate::limits::REQUEST_BYTES
+                        {
+                            break;
+                        }
+                        let content = content
+                            .ok_or_else(|| Error::conflict("Upload missing sources before committing"))?;
+                        if graphicle_memory::text::sha256(content.as_bytes()) != document.sha {
+                            return Err(Error::bad("Source integrity check failed"));
+                        }
+                        bytes += content.len();
+                        contents.push(content);
                     }
-                    let content: String = load
-                        .query_row(params![s(&repository, "id"), document.sha], |r| r.get(0))
-                        .optional()?
-                        .ok_or_else(|| {
-                            Error::conflict("Upload missing sources before committing")
-                        })?;
-                    if graphicle_memory::text::sha256(content.as_bytes()) != document.sha {
-                        return Err(Error::bad("Source integrity check failed"));
-                    }
-                    bytes += content.len();
-                    contents.push(content);
+                    pending = &pending[group.len()..];
                 }
                 Ok(contents)
             })?;
@@ -966,62 +954,78 @@ impl Store {
                 })
                 .collect::<Result<_>>()?;
             drop(contents);
-            self.authorized(workspace, token, "collect", |db, p| {
-                let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                let identifier = s(&repository, "id");
-                let state: String = db.query_row(
-                    "SELECT state FROM repo_syncs WHERE id=? AND repository_id=?",
-                    params![s(&sync, "id"), identifier],
-                    |r| r.get(0),
-                )?;
-                if state == "aborted" {
-                    return Err(Error::conflict("Sync was aborted"));
-                }
-                let mut insert_parse = db.prepare_cached("INSERT OR REPLACE INTO repo_parses VALUES(?,?,?,?,?)")?;
-                let mut insert_chunk = db.prepare_cached("INSERT OR IGNORE INTO repo_chunks(repository_id,path,sha256,line,end_line,index_text) VALUES(?,?,?,?,?,?)")?;
-                for (document, (analysis, chunks)) in batch.iter().zip(&rows) {
-                    if let Some((revision, analysis)) = analysis {
-                        insert_parse.execute(params![identifier, document.path, document.sha, revision, analysis])?;
-                    }
-                    for (line, end_line, text) in chunks {
-                        insert_chunk.execute(params![identifier, document.path, document.sha, line, end_line, text])?;
-                    }
-                }
-                Ok(())
+            // Parses and chunks are pure graph writes; only authorization
+            // and the abort check need the store here, both read-only. The
+            // SQL write lock is never held across a graph transaction.
+            let repository = self.authorized_read(workspace, token, "collect", |db, p| {
+                repo(db, p, string(args, "repository_id", 100)?)
             })?;
+            let identifier = s(&repository, "id");
+            let state = store_content::sync_state(&graph, identifier, s(&sync, "id"))?
+                .ok_or_else(|| Error::bad("Sync not found"))?;
+            if state == "aborted" {
+                return Err(Error::conflict("Sync was aborted"));
+            }
+            let mut parses = Vec::new();
+            let mut chunks = Vec::new();
+            for (document, (analysis, file_chunks)) in batch.iter().zip(&rows) {
+                if let Some((revision, analysis)) = analysis {
+                    parses.push(json!({"path":document.path,"sha256":document.sha,
+                        "revision":revision,"data":analysis}));
+                }
+                for (line, end_line, text) in file_chunks {
+                    chunks.push(json!({"path":document.path,"sha256":document.sha,
+                        "line":line,"end_line":end_line,"index_text":text}));
+                }
+            }
+            if !parses.is_empty() {
+                store_content::put_parses(&graph, &repository, &json!(parses))?;
+            }
+            if !chunks.is_empty() {
+                store_content::put_chunks(&graph, &repository, &json!(chunks))?;
+            }
             start += batch.len();
         }
+        // The head swap (one graph transaction) commits before the SQL part
+        // starts: the SQL write lock is never held across graph work, and the
+        // SQL transaction re-verifies the snapshot before its side effects.
+        // The two stores cannot commit atomically until the remaining domains
+        // migrate; a lost race leaves the graph ahead, which the next sync's
+        // replay path reconciles.
+        let repository=self.authorized_read(workspace,token,"collect",|db,p| {
+            repo(db,p,string(args,"repository_id",100)?)
+        })?;
+        let identifier=s(&repository,"id");
+        let state=store_content::sync_state(&graph,identifier,s(&sync,"id"))?.ok_or_else(||Error::bad("Sync not found"))?;
+        if state=="complete" {return Ok(json!({"snapshot":sync["snapshot"],"current_snapshot":repository["snapshot"],"replayed":true}));}
+        if state!="pending" || repository["snapshot"]!=sync["expected_snapshot"] {return Err(Error::conflict("A newer sync finished first"));}
+        let before=store_content::heads(&graph,identifier)?;
+        let changed:Vec<String>=documents.iter().filter(|d|before.get(&d.path)!=Some(&d.sha)).map(|d|d.path.clone()).collect();
+        let present:BTreeSet<&str>=documents.iter().map(|d|d.path.as_str()).collect();
+        let removed:Vec<_>=before.keys().filter(|path|!present.contains(path.as_str())).cloned().collect();
+        let manifest_docs:Vec<Value>=documents.iter().map(|d|json!({"path":d.path,"sha256":d.sha})).collect();
+        store_content::activate(&graph,&repository,&sync,&json!(manifest_docs),&changed,&removed)?;
+        let changed_paths:BTreeSet<&str>=changed.iter().map(String::as_str).collect();
+        let changed_docs:Vec<(String,String)>=documents.iter().filter(|d|changed_paths.contains(d.path.as_str())).map(|d|(d.path.clone(),d.sha.clone())).collect();
+        let chunk_lines=store_content::chunk_lines_for(&graph,identifier,&changed_docs)?;
+        let (limited,skipped)=store_content::analysis_report(&graph,identifier)?;
         self.authorized(workspace,token,"collect",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;let identifier=s(&repository,"id");
-            let state:String=db.query_row("SELECT state FROM repo_syncs WHERE id=? AND repository_id=?",params![s(&sync,"id"),identifier],|r|r.get(0))?;
-            if state=="complete" {return Ok(json!({"snapshot":sync["snapshot"],"current_snapshot":repository["snapshot"],"replayed":true}));}
-            if state!="pending" || repository["snapshot"]!=sync["expected_snapshot"] {return Err(Error::conflict("A newer sync finished first"));}
-            let before=heads(db,identifier)?;
-            let changed:Vec<String>=documents.iter().filter(|d|before.get(&d.path)!=Some(&d.sha)).map(|d|d.path.clone()).collect();
-            let present:BTreeSet<&str>=documents.iter().map(|d|d.path.as_str()).collect();
-            let removed:Vec<_>=before.keys().filter(|path|!present.contains(path.as_str())).cloned().collect();
-            db.execute("DELETE FROM repo_heads WHERE repository_id=?",[identifier])?;
-            let mut insert_head=db.prepare_cached("INSERT INTO repo_heads VALUES(?,?,?)")?;
-            for document in &documents {insert_head.execute(params![identifier,document.path,document.sha])?;}
-            drop(insert_head);
-            db.execute("INSERT OR IGNORE INTO repo_snapshots VALUES(?,?,?,?,?)",params![identifier,s(&sync,"snapshot"),s(&sync,"manifest"),s(&sync,"metadata"),now()])?;
+            if repository["snapshot"]!=sync["expected_snapshot"] {return Err(Error::conflict("A newer sync finished first"));}
             db.execute("UPDATE repo_projects SET snapshot=?,generation=generation+1,metadata=?,updated_at=? WHERE id=?",params![s(&sync,"snapshot"),s(&sync,"metadata"),now(),identifier])?;
-            db.execute("UPDATE repo_syncs SET state='complete' WHERE id=?",[s(&sync,"id")])?;
             invalidate(db,identifier)?;
-            // One engine open per commit: `Store::graph()` opens transiently
-            // (the writer lease is process-exclusive), so loops share it.
-            let gstore=&self.graph();
+            // The commit's graph handle (`graph` above) is shared by the
+            // invalidation loops; the event was already written by
+            // `store_content::activate` with the head swap.
+            let gstore=&graph;
             for path in changed.iter().chain(&removed) {crate::invalidation::file_changed(gstore,&p.workspace,identifier,path,"repository_commit")?;crate::observer::forget_source(db,gstore,&p.workspace,identifier,&format!("file:{path}"))?;}
-            let changed_paths:BTreeSet<&str>=changed.iter().map(String::as_str).collect();
-            for document in documents.iter().filter(|d|changed_paths.contains(d.path.as_str())) {crate::invalidation::record_file_chunks(db,gstore,&p.workspace,identifier,&document.path,&document.sha)?;}
-            event(db,identifier,"synced",json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed}))?;
+            for key in &changed_docs {let lines=chunk_lines.get(key).cloned().unwrap_or_default();crate::invalidation::record_file_chunks(gstore,&p.workspace,identifier,&key.0,&lines)?;}
             // Every commit yields a graph episode labelled with its commit identity.
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);
             let projection=crate::jobs::enqueue_projection(self,db,identifier,p,s(&sync,"snapshot"),&metadata)?;
             // A head set that was already projected (a file edited, then restored) gets no new projection to clear the markers above.
             crate::graph_projection::clear_stale_when_current(db,gstore,identifier)?;
             let mut result=json!({"snapshot":sync["snapshot"],"changed":changed,"removed":removed,"files":documents.len(),"replayed":false,"projection_job":projection});
-            let (limited,skipped)=analysis_report(db,identifier)?;
             if !limited.is_empty() {result["limited"]=json!(limited);}
             if !skipped.is_empty() {result["skipped"]=json!(skipped);}
             Ok(result)
@@ -1253,22 +1257,18 @@ pub fn repo(db: &Connection, p: &Principal, identifier: &str) -> Result<Value> {
     decode(&mut row, "metadata")?;
     Ok(row)
 }
+/// The current heads of `repository`: path → sha256. Heads live in the
+/// graph content store; the SQL parameter stays only so the domains still
+/// being migrated keep their signatures — the query runs on the graph.
 pub fn heads(db: &Connection, repository: &str) -> Result<BTreeMap<String, String>> {
-    Ok(rows(
-        db,
-        "SELECT path,sha256 FROM repo_heads WHERE repository_id=?",
-        [repository],
-    )?
-    .iter()
-    .map(|v| (s(v, "path").into(), s(v, "sha256").into()))
-    .collect())
+    let graph = graph_for(db)?;
+    store_content::heads(&graph, repository)
 }
+/// Append to the project's event log. Events live in the graph content
+/// store; like [`heads`], the SQL parameter is transitional.
 pub fn event(db: &Connection, repository: &str, kind: &str, value: Value) -> Result<()> {
-    db.execute(
-        "INSERT INTO repo_events(repository_id,kind,data,created_at) VALUES(?,?,?,?)",
-        params![repository, kind, value.to_string(), now()],
-    )?;
-    Ok(())
+    let graph = graph_for(db)?;
+    store_content::append_event(&graph, repository, kind, &value)
 }
 pub fn invalidate(db: &Connection, repository: &str) -> Result<()> {
     crate::projection::enqueue(db, repository, "source_or_permission_state_changed")?;
