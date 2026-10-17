@@ -15,9 +15,10 @@ dependency in the runtime:
    `crates/graphicle/src/migrate/*.cypher` load the CSVs with
    `LOAD CSV WITH HEADERS` and upsert with `MERGE`, `MATCH`ing the nodes a
    relationship hangs off (credentials to their workspace, projects to
-   their workspace, objects to their project). Each section carries a
-   count query; the command compares it against the export manifest and
-   fails the migration on any mismatch.
+   their workspace, objects to their project, commits to their parents,
+   assertions to their project). Each section carries a count query; the
+   command compares it against the export manifest and fails the migration
+   on any mismatch.
 
 ## Usage
 
@@ -54,13 +55,26 @@ python3 scripts/migrate/export_store.py reviews.sqlite3 /tmp/export
 | Objects | `repo_objects` | `(:Project)-[:HAS_OBJECT]->(:Object)` |
 | Memories | `repo_memories` | `(:Memory)` (scoped by `repository_id`) |
 | Symbols | `gf_nodes` (live rows only) | `(:Symbol)-[:HAS_VERSION]->(:SymbolVersion:Live)` |
+| Commits | `gf_commits`, `gf_commit_parents` | `(:Commit)-[:PARENT {position}]->(:Commit)` (`object` as base64) |
+| Timeline | `gf_timeline` | `(:Assertion)-[:ON_TIMELINE]->(:Project)` (rowid carried as `seq`) |
+| OAuth accounts | `am_oauth_accounts` | `(:OAuthAccount)` (secret-id references only) |
+| Provider identities | `am_provider_identities` | `(:ProviderIdentity)` |
+| Provider emails | `am_provider_emails` | `(:ProviderEmail)` |
 
 ## What is not imported
 
-- **History.** Expired `gf_nodes` versions, closed edges, episodes,
-  revisions (`repo_memory_revisions`), event logs, and deletion receipts
-  are not carried over; re-running a sync/projection rebuilds derived
-  history. Only the live state moves.
+- **Projected history.** Expired `gf_nodes` versions, closed edges,
+  episodes, revisions (`repo_memory_revisions`), event logs, and deletion
+  receipts are not carried over; re-running a sync/projection rebuilds
+  derived history. Only the live state moves. Commit history is the
+  exception: a commit is a fact about the repository, not a projection, so
+  `gf_commits`/`gf_commit_parents` are migrated.
+- **Secrets.** `am_secrets` is intentionally left behind: the graph store
+  keeps secrets as workspace-key-encrypted `(:Secret)` nodes, and a
+  plaintext SQLite vault cannot be re-keyed into the new store.
+  `(:OAuthAccount)` nodes keep their `token_secret`/`refresh_secret`
+  references (and the columns' data), but the referenced secrets do not
+  exist, so connected accounts must be reconnected after migrating.
 - **Everything not listed above** (runs, jobs, connectors, claims,
   entities, vectors, coverage, …) stays behind in the SQLite file. If you
   need more domains, extend `DOMAINS` in `export_store.py` and add a
