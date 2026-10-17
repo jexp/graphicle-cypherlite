@@ -40,7 +40,12 @@ pub struct GraphStore {
     inner: Arc<StoreInner>,
 }
 
-struct StoreInner {
+/// Shared across clones; the store.rs registry keys on this (not the
+/// `GraphStore` wrapper) so any live clone — which shares the pooled
+/// connections pinning the engine's writer lease — keeps the registry
+/// entry upgradeable and a same-process reopen never blocks on the lease
+/// its own clones hold.
+pub(crate) struct StoreInner {
     location: StoreLocation,
     /// Opened for reads only (shared locks, no writer lease, no schema
     /// DDL): a hook or CLI that reads beside a running writer.
@@ -115,6 +120,16 @@ impl GraphStore {
                 pool: Mutex::new(Vec::new()),
             }),
         })
+    }
+    /// The shared state, for the store.rs handle registry
+    /// ([`GraphStore::from_shared`]).
+    pub(crate) fn shared(&self) -> Arc<StoreInner> {
+        self.inner.clone()
+    }
+    /// A handle over shared state from the registry: a full clone (the
+    /// pool and the engine slot are shared).
+    pub(crate) fn from_shared(inner: Arc<StoreInner>) -> Self {
+        Self { inner }
     }
     /// Whether the handle only reads (see [`GraphStore::open_read_only`]).
     pub fn is_read_only(&self) -> bool {

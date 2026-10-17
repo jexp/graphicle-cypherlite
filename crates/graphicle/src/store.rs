@@ -295,7 +295,7 @@ pub fn analysis_report(store: &crate::store_graph::GraphStore, repository: &str)
 /// writer lease allows one open per directory, so concurrent operations
 /// share one engine ([`Store::graph`]). A `Weak` entry dies with the last
 /// operation holding it, releasing the lease between operations.
-static GRAPHS: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::GraphStore>>> =
+static GRAPHS: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::StoreInner>>> =
     Mutex::new(BTreeMap::new());
 
 fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
@@ -310,8 +310,8 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     // airtight. `GraphStore::open` only touches its own store (schema DDL),
     // never `graph_in`, so this cannot re-enter.
     let mut registry = GRAPHS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
-        return Ok(graph);
+    if let Some(inner) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(Arc::new(crate::store_graph::GraphStore::from_shared(inner)));
     }
     // Another process (a server, a background sync) may hold the engine's
     // writer lease; retry briefly, as SQLite's busy_timeout did.
@@ -326,7 +326,7 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
             Err(error) => return Err(error),
         }
     };
-    registry.insert(key, Arc::downgrade(&graph));
+    registry.insert(key, Arc::downgrade(&graph.shared()));
     Ok(graph)
 }
 
@@ -334,7 +334,7 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
 /// directory sharing as [`GRAPHS`], for callers that never write (agent
 /// hooks beside a running server). A read-only open takes shared locks and
 /// never the writer lease, so it neither blocks nor is blocked by a writer.
-static GRAPHS_READ_ONLY: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::GraphStore>>> =
+static GRAPHS_READ_ONLY: Mutex<BTreeMap<PathBuf, std::sync::Weak<crate::store_graph::StoreInner>>> =
     Mutex::new(BTreeMap::new());
 
 /// The read-only counterpart of [`graph_in`]: the store must already exist
@@ -345,13 +345,13 @@ fn graph_in_read_only(directory: &Path) -> Result<Arc<crate::store_graph::GraphS
     let mut registry = GRAPHS_READ_ONLY
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(graph) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
-        return Ok(graph);
+    if let Some(inner) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(Arc::new(crate::store_graph::GraphStore::from_shared(inner)));
     }
     let graph = Arc::new(crate::store_graph::GraphStore::open_read_only(
         key.join("reviews.graph"),
     )?);
-    registry.insert(key, Arc::downgrade(&graph));
+    registry.insert(key, Arc::downgrade(&graph.shared()));
     Ok(graph)
 }
 
