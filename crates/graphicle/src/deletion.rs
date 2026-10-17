@@ -2223,7 +2223,28 @@ pub fn state_api(store: &Store, workspace: &str, token: &str, args: &Value) -> R
         let project = repo(db, p, string(args, "repository_id", 100)?)?;
         let identifier = s(&project, "id").to_string();
         let workspace_id = p.workspace.clone();
-        graph_store(store)?.read(|g| state(g, &workspace_id, &identifier))
+        let mut graph_state = graph_store(store)?.read(|g| state(g, &workspace_id, &identifier))?;
+        // The SQL side still holds the domains no migration node owns yet
+        // (observer notes, hints, served/outcomes, backends, …) and any table
+        // an edition adds. Digest those alongside the graph's tables so
+        // residue in either store shows up, and an undeclared table cannot
+        // hide its rows from the comparison.
+        let sql_state = legacy::state(db, &workspace_id, &identifier)?;
+        if let Some(sql_tables) = sql_state["tables"].as_object() {
+            let mut merged = graph_state["tables"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for (name, entry) in sql_tables {
+                if merged.contains_key(name) || entry["rows"].as_u64().unwrap_or(0) == 0 {
+                    continue;
+                }
+                merged.insert(name.clone(), entry.clone());
+            }
+            graph_state["tables"] = json!(merged);
+            graph_state["digest"] = json!(digest(&graph_state["tables"]));
+        }
+        Ok(graph_state)
     })
 }
 
