@@ -27,6 +27,9 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("content", include_str!("migrate/01_content.cypher")),
     ("memory", include_str!("migrate/02_memory.cypher")),
     ("symbols", include_str!("migrate/03_symbols.cypher")),
+    ("commits", include_str!("migrate/04_commits.cypher")),
+    ("timeline", include_str!("migrate/05_timeline.cypher")),
+    ("accounts", include_str!("migrate/06_accounts.cypher")),
 ];
 
 /// One `-- @csv` section of a script: the CSV file it loads, the import
@@ -241,7 +244,27 @@ mod tests {
              CREATE TABLE gf_nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, repository_id TEXT NOT NULL,
                 node_id TEXT NOT NULL, attributes TEXT NOT NULL,
                 valid_from_episode TEXT NOT NULL, valid_to_episode TEXT,
-                created_at TEXT NOT NULL, expired_at TEXT);",
+                created_at TEXT NOT NULL, expired_at TEXT);
+             CREATE TABLE gf_commits (repository_id TEXT NOT NULL, oid TEXT NOT NULL,
+                tree_oid TEXT NOT NULL, episode TEXT NOT NULL, committed_us INTEGER NOT NULL,
+                recorded_us INTEGER NOT NULL, object BLOB NOT NULL, PRIMARY KEY(repository_id, oid));
+             CREATE TABLE gf_commit_parents (repository_id TEXT NOT NULL, commit_oid TEXT NOT NULL,
+                parent_oid TEXT NOT NULL, position INTEGER NOT NULL,
+                PRIMARY KEY(repository_id, commit_oid, position));
+             CREATE TABLE gf_timeline (id INTEGER PRIMARY KEY AUTOINCREMENT, repository_id TEXT NOT NULL,
+                branch TEXT NOT NULL, episode TEXT NOT NULL, valid_us INTEGER NOT NULL,
+                recorded_us INTEGER NOT NULL, origin TEXT NOT NULL,
+                UNIQUE(repository_id, branch, episode, valid_us, recorded_us));
+             CREATE TABLE am_oauth_accounts (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+                provider TEXT NOT NULL, external_id TEXT NOT NULL, email TEXT,
+                display_name TEXT NOT NULL, token_secret TEXT NOT NULL, refresh_secret TEXT,
+                expires_at TEXT, scopes TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE am_provider_identities (workspace_id TEXT NOT NULL, provider TEXT NOT NULL,
+                external_id TEXT NOT NULL, credential_id TEXT NOT NULL, verified_at TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, provider, external_id, credential_id));
+             CREATE TABLE am_provider_emails (workspace_id TEXT NOT NULL, provider TEXT NOT NULL,
+                external_id TEXT NOT NULL, email TEXT NOT NULL, verified_at TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, provider, external_id));",
         )
         .unwrap();
         db.execute_batch(
@@ -264,7 +287,28 @@ mod tests {
                 ('p1','n1','{\"stable_id\":\"s1\",\"kind\":\"function\",\"qualified_name\":\"main\",\"relpath\":\"src/main.rs\"}','e1',NULL,'2026-03-01'),
                 ('p1','n2','{\"stable_id\":\"s2\",\"kind\":\"function\",\"qualified_name\":\"call\",\"relpath\":\"src/lib.rs\"}','e1',NULL,'2026-03-01'),
                 ('p1','n3','{\"stable_id\":\"s3\",\"kind\":\"struct\",\"qualified_name\":\"S\",\"relpath\":\"src/lib.rs\"}','e2',NULL,'2026-03-02'),
-                ('p1','n4','{\"stable_id\":\"s4\",\"kind\":\"function\",\"qualified_name\":\"gone\",\"relpath\":\"src/old.rs\"}','e1','e3','2026-03-01');",
+                ('p1','n4','{\"stable_id\":\"s4\",\"kind\":\"function\",\"qualified_name\":\"gone\",\"relpath\":\"src/old.rs\"}','e1','e3','2026-03-01');
+             INSERT INTO gf_commits VALUES
+                ('p1','c1','t1','e1',1000,2000,x'00ff01'),
+                ('p1','c2','t2','e2',1100,2100,x'0102'),
+                ('p1','c3','t3','e3',1200,2200,x'ff'),
+                ('p2','c4','t4','e4',1300,2300,x'0100');
+             INSERT INTO gf_commit_parents VALUES
+                ('p1','c2','c1',0),
+                ('p1','c3','c1',0),
+                ('p1','c3','c2',1);
+             INSERT INTO gf_timeline (repository_id,branch,episode,valid_us,recorded_us,origin) VALUES
+                ('p1','main','e1',1000,2000,'sync'),
+                ('p1','main','e2',1100,2100,'sync'),
+                ('p2','main','e1',1200,2200,'import');
+             INSERT INTO am_oauth_accounts VALUES
+                ('o1','w1','github','42','a@x.io','Alice','s1','s2','2027-01-01','repo','active','2026-05-01'),
+                ('o2','w1','slack','U9',NULL,'Bob','s3',NULL,NULL,'','active','2026-05-02');
+             INSERT INTO am_provider_identities VALUES
+                ('w1','github','42','cred1','2026-05-01'),
+                ('w1','slack','U9','cred2','2026-05-02');
+             INSERT INTO am_provider_emails VALUES
+                ('w1','github','42','a@x.io','2026-05-01');",
         )
         .unwrap();
         drop(db);
@@ -286,6 +330,13 @@ mod tests {
         assert_eq!(counts["memories.csv"], 2);
         // Three live nodes; the expired one is not exported.
         assert_eq!(counts["symbols.csv"], 3);
+        assert_eq!(counts["commits.csv"], 4);
+        // One PARENT relationship per gf_commit_parents row.
+        assert_eq!(counts["commit_parents.csv"], 3);
+        assert_eq!(counts["timeline.csv"], 3);
+        assert_eq!(counts["oauth_accounts.csv"], 2);
+        assert_eq!(counts["provider_identities.csv"], 2);
+        assert_eq!(counts["provider_emails.csv"], 1);
         // The source store is the backup: byte-identical afterwards.
         assert_eq!(std::fs::read(&source).unwrap(), before);
         // A non-empty target is refused.
@@ -317,6 +368,30 @@ mod tests {
                 )?
                 .unwrap();
                 assert_eq!(live["n"], 3);
+                // Commit history and its parent links.
+                let parents = store_graph::one(
+                    db,
+                    "MATCH (:Commit)-[r:PARENT]->(:Commit) RETURN count(r) AS n",
+                    Params::new(),
+                )?
+                .unwrap();
+                assert_eq!(parents["n"], 3);
+                // gf_commits.object round-trips as base64 (bytes 00 ff 01).
+                let object = store_graph::one(
+                    db,
+                    "MATCH (c:Commit {oid: 'c1'}) RETURN c.object AS object",
+                    Params::new(),
+                )?
+                .unwrap();
+                assert_eq!(object["object"], "AP8B");
+                // Timeline assertions hang off their project.
+                let timeline = store_graph::one(
+                    db,
+                    "MATCH (a:Assertion)-[:ON_TIMELINE]->(:Project) RETURN count(a) AS n",
+                    Params::new(),
+                )?
+                .unwrap();
+                assert_eq!(timeline["n"], 3);
                 Ok(())
             })
             .unwrap();

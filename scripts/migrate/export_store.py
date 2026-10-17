@@ -21,6 +21,7 @@ placeholder) is rejected here rather than migrated corrupt.
 Standard library only; no third-party packages.
 """
 
+import base64
 import csv
 import json
 import sqlite3
@@ -44,9 +45,19 @@ def encode(value):
     return text.replace(ESC, ESC + ESC).replace("\n", ESC + "n").replace("\r", ESC + "r")
 
 
-# (csv name, source table, SELECT ... ORDER BY ...) — one per migrated
-# domain. The column order is the CSV header; the import scripts name
-# these columns. Every SELECT ends in a deterministic ORDER BY.
+def _base64_object(row):
+    """gf_commits.object (a BLOB) as base64 text for the graph store."""
+    raw = row[5]
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    return (*row[:5], base64.b64encode(raw).decode("ascii"))
+
+
+# (csv name, source table, SELECT ... ORDER BY ... [, row transform]) — one
+# per migrated domain. The column order is the CSV header; the import scripts
+# name these columns. Every SELECT ends in a deterministic ORDER BY. A fourth
+# element, when present, rewrites a fetched row before it is escaped/written
+# (used to carry BLOB columns the graph value model has no type for).
 DOMAINS = [
     (
         "workspaces",
@@ -93,6 +104,53 @@ DOMAINS = [
         "attributes AS data, valid_from_episode, created_at "
         "FROM gf_nodes WHERE valid_to_episode IS NULL ORDER BY id",
     ),
+    # Commits and their parent links (history is *not* rebuilt by
+    # re-projection: a commit is a fact about the repository, not a
+    # projection of a source file). `object` is a BLOB; the graph value
+    # model has no byte string, so it is carried base64 (the same
+    # convention the vault uses for ciphertext).
+    (
+        "commits",
+        "gf_commits",
+        "SELECT repository_id, oid, tree_oid, committed_us, recorded_us, object "
+        "FROM gf_commits ORDER BY repository_id, oid",
+        _base64_object,
+    ),
+    (
+        "commit_parents",
+        "gf_commit_parents",
+        "SELECT repository_id, commit_oid, parent_oid, position "
+        "FROM gf_commit_parents ORDER BY repository_id, commit_oid, position",
+    ),
+    # Append-only timeline assertions (valid/recorded time). The SQL rowid
+    # becomes the graph `seq` tiebreak so insertion order is preserved.
+    (
+        "timeline",
+        "gf_timeline",
+        "SELECT id, repository_id, branch, episode, valid_us, recorded_us, origin "
+        "FROM gf_timeline ORDER BY id",
+    ),
+    # Account/identity data. am_secrets (the ciphertext vault) is
+    # intentionally not exported: see docs/migrate-store.md.
+    (
+        "oauth_accounts",
+        "am_oauth_accounts",
+        "SELECT id, workspace_id, provider, external_id, email, display_name, "
+        "token_secret, refresh_secret, expires_at, scopes, state, updated_at "
+        "FROM am_oauth_accounts ORDER BY id",
+    ),
+    (
+        "provider_identities",
+        "am_provider_identities",
+        "SELECT workspace_id, provider, external_id, credential_id, verified_at "
+        "FROM am_provider_identities ORDER BY workspace_id, provider, external_id, credential_id",
+    ),
+    (
+        "provider_emails",
+        "am_provider_emails",
+        "SELECT workspace_id, provider, external_id, email, verified_at "
+        "FROM am_provider_emails ORDER BY workspace_id, provider, external_id",
+    ),
 ]
 
 
@@ -111,7 +169,9 @@ def main() -> None:
         for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     manifest = {}
-    for name, table, query in DOMAINS:
+    for entry in DOMAINS:
+        name, table, query = entry[:3]
+        transform = entry[3] if len(entry) > 3 else None
         path = out_dir / f"{name}.csv"
         if table not in present:
             print(f"export_store: table {table} absent; writing an empty {name}.csv",
@@ -123,7 +183,7 @@ def main() -> None:
         else:
             cursor = db.execute(query)
             columns = [d[0] for d in cursor.description]
-            rows = cursor.fetchall()
+            rows = [transform(row) if transform else row for row in cursor.fetchall()]
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
             writer.writerow(columns)
