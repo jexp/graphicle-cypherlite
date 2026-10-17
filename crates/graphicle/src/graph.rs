@@ -2,10 +2,10 @@
 //! Neo4j is optional infrastructure; its results never bypass the canonical source view.
 use crate::{
     Error, Result, claims, digest, integer, model, now, query,
-    store::{Principal, Store, decode, one, repo, s},
+    store::{Principal, Store, decode, repo, s},
     string,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -540,7 +540,7 @@ pub fn configure_neo4j(store: &Store, workspace: &str, token: &str, args: &Value
     string(&secret, "username", 200)?;
     string(&secret, "password", 1000)?;
     let value = json!({"endpoint":endpoint,"database":database,"credential_ref":reference});
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(old)=one(db,"SELECT config FROM am_backends WHERE repository_id=? AND kind='neo4j'",[s(&repository,"id")])?{let cfg:Value=serde_json::from_str(s(&old,"config"))?;if cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}}db.execute("INSERT OR REPLACE INTO am_backends VALUES(?,?,?)",params![s(&repository,"id"),"neo4j",value.to_string()])?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(cfg)=crate::projection::backend_config(db,s(&repository,"id"),"neo4j")?{if cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}}crate::projection::backend_set(db,s(&repository,"id"),"neo4j",&value)?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
 }
 async fn cypher(
     store: &Store,
@@ -585,13 +585,9 @@ pub async fn neo4j(
 ) -> Result<Value> {
     let (config, graph, revision) = store.authorized(workspace, token, "admin", |db, p| {
         let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-        let mut backend = one(
-            db,
-            "SELECT config FROM am_backends WHERE repository_id=? AND kind='neo4j'",
-            [s(&repository, "id")],
-        )?
-        .ok_or_else(|| Error::bad("Configure a Neo4j database first"))?;
-        decode(&mut backend, "config")?;
+        let config = crate::projection::backend_config(db, s(&repository, "id"), "neo4j")?
+            .ok_or_else(|| Error::bad("Configure a Neo4j database first"))?;
+        let backend = json!({"config": config});
         if publish {
             crate::projection::ready(db, s(&repository, "id"), "neo4j", &backend["config"])?;
         }

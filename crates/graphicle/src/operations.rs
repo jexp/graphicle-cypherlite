@@ -279,15 +279,14 @@ pub fn purge_derived_cache(
             "MATCH (q:QueryCache {repository_id: $repo}) DELETE q",
             crate::store_graph::params(&serde_json::json!({"repo": repository})),
         )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (s:PreparationStep {repository_id: $repo}) DELETE s",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
         Ok(())
     })?;
-    for table in [
-        "am_vectors",
-        "am_document_reads",
-        "am_preparation_steps",
-        "am_reports",
-        "am_communities",
-    ] {
+    for table in ["am_vectors", "am_document_reads", "am_reports", "am_communities"] {
         db.execute(
             &format!("DELETE FROM {table} WHERE repository_id=?"),
             [repository],

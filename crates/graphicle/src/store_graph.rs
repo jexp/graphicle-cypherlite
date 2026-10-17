@@ -452,6 +452,13 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX sym_head_repo IF NOT EXISTS FOR (s:SymbolHead) ON (s.repository_id)",
     "CREATE INDEX sym_head_file IF NOT EXISTS FOR (s:SymbolHead) ON (s.relpath)",
     "CREATE INDEX sym_move_from IF NOT EXISTS FOR (m:SymbolMove) ON (m.from_stable_id)",
+    // Observer notes and projection maintenance (observer.rs, projection.rs).
+    "CREATE INDEX note_repo IF NOT EXISTS FOR (n:ObserverNote) ON (n.repository_id)",
+    "CREATE INDEX note_source IF NOT EXISTS FOR (n:ObserverNote) ON (n.source_id)",
+    "CREATE INDEX reflection_repo IF NOT EXISTS FOR (m:MentalModel) ON (m.repository_id)",
+    "CREATE INDEX backend_repo IF NOT EXISTS FOR (b:Backend) ON (b.repository_id)",
+    "CREATE INDEX cleanup_state IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.state)",
+    "CREATE INDEX cleanup_ws IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.workspace_id)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:
