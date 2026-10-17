@@ -1302,7 +1302,7 @@ pub fn queue(
         crate::observer::KIND => graph.read(|g| {
             crate::store_graph::one(
                 g,
-                "MATCH (n:ObserverNote {repository_id: $repo}) RETURN count(n) AS count, max(n.created_at) AS latest",
+                "MATCH (n:Observation {repository_id: $repo}) RETURN count(n) AS count, max(n.created_at) AS latest",
                 crate::store_graph::params(&json!({"repo": identifier})),
             )
         })?,

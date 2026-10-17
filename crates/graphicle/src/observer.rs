@@ -273,7 +273,7 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
             crate::store::graph_for(db)?.read(|g| {
                 Ok(store_graph::one(
                     g,
-                    "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source, step_key: $key, source_sha256: $sha}) RETURN 1 AS present LIMIT 1",
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source, step_key: $key, source_sha256: $sha}) RETURN 1 AS present LIMIT 1",
                     store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id"),"key":key,"sha":s(doc,"sha256")})),
                 )?
                 .is_some())
@@ -318,17 +318,17 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
                 // (a lost session-date header) must not survive.
                 store_graph::write(
                     g,
-                    "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source}) DETACH DELETE n",
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source}) DETACH DELETE n",
                     store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id")})),
                 )?;
                 store_graph::write(
                     g,
-                    "CREATE (n:ObserverNote {repository_id: $repo, source_id: $source}) SET n += $props",
+                    "CREATE (n:Observation {repository_id: $repo, source_id: $source}) SET n += $props",
                     store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id"),"props":node})),
                 )?;
                 store_graph::write(
                     g,
-                    "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source}), (p:Project {id: $repo}) MERGE (n)-[:OF]->(p)",
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source}), (p:Project {id: $repo}) MERGE (n)-[:OF]->(p)",
                     store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id")})),
                 )?;
                 Ok(())
@@ -369,7 +369,7 @@ pub fn notes_for(db: &Connection, repository: &str, documents: &[Value]) -> Resu
     for mut row in crate::store::graph_for(db)?.read(|g| {
         store_graph::rows(
             g,
-            "MATCH (n:ObserverNote {repository_id: $repo}) \
+            "MATCH (n:Observation {repository_id: $repo}) \
              RETURN n.source_id AS source_id, n.source_sha256 AS source_sha256, \
                     n.source_version AS source_version, n.source_order AS source_order, \
                     n.session_date AS session_date, n.notes AS notes \
@@ -1071,7 +1071,7 @@ pub fn forget_source(
     let removed = graph.transaction(|g| {
         Ok(store_graph::write(
             g,
-            "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source}) DETACH DELETE n",
+            "MATCH (n:Observation {repository_id: $repo, source_id: $source}) DETACH DELETE n",
             store_graph::params(&json!({"repo":repository,"source":source})),
         )?
         .nodes_deleted as usize)
@@ -1132,7 +1132,7 @@ pub fn forget_document(
     for row in graph.read(|g| {
         store_graph::rows(
             g,
-            "MATCH (n:ObserverNote {source_id: $doc}) RETURN DISTINCT n.repository_id AS repository_id",
+            "MATCH (n:Observation {source_id: $doc}) RETURN DISTINCT n.repository_id AS repository_id",
             store_graph::params(&json!({"doc":document})),
         )
     })? {
@@ -1163,7 +1163,7 @@ pub fn status(
         .read(|g| {
             store_graph::rows(
                 g,
-                "MATCH (n:ObserverNote {repository_id: $repo}) \
+                "MATCH (n:Observation {repository_id: $repo}) \
                  RETURN n.source_id AS source_id, n.source_sha256 AS source_sha256, n.notes AS notes",
                 store_graph::params(&json!({"repo":repository})),
             )

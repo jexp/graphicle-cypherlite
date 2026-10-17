@@ -178,7 +178,7 @@ impl Fixture {
             .read(|db| {
                 graphicle_runtime::store_graph::rows(
                     db,
-                    "MATCH (n:ObserverNote {repository_id: $repo}) \
+                    "MATCH (n:Observation {repository_id: $repo}) \
                      RETURN n.source_id AS source_id ORDER BY n.source_id",
                     graphicle_runtime::store_graph::params(&json!({"repo": self.repo.as_str()})),
                 )

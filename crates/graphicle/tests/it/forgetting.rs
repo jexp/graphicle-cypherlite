@@ -541,8 +541,8 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
     // The connector tables moved to the graph store; the SQL state covers
     // the rest.
     for table in [
-        // Observer notes moved to the graph store (ObserverNote nodes).
-        "ObserverNote",
+        // Observer notes moved to the graph store (Observation nodes).
+        "Observation",
         "am_vectors",
         "repo_memories",
         "repo_memory_revisions",

@@ -1105,7 +1105,7 @@ pub fn forget(
     )? {
         if scope.source(s(&row, "source_id")) {
             // The SQL row goes here; `forget_source` erases the graph-side
-            // ObserverNote and the dependency edges.
+            // Observation and the dependency edges.
             notes += db.execute(
                 "DELETE FROM am_observer_notes WHERE repository_id=? AND source_id=?",
                 rusqlite::params![repository, s(&row, "source_id")],

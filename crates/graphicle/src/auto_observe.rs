@@ -224,7 +224,7 @@ fn decide(store: &Store, db: &Connection, connector: &Value, config: &model::Con
         .read(|g| {
             crate::store_graph::rows(
                 g,
-                "MATCH (n:ObserverNote {repository_id: $repo}) RETURN n.source_id AS source_id, n.step_key AS step_key",
+                "MATCH (n:Observation {repository_id: $repo}) RETURN n.source_id AS source_id, n.step_key AS step_key",
                 crate::store_graph::params(&json!({"repo": repository_id})),
             )
         })?

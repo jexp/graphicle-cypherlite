@@ -91,7 +91,7 @@ impl Fixture {
             .read(|db| {
                 graphicle_runtime::store_graph::rows(
                     db,
-                    "MATCH (n:ObserverNote {repository_id: $repo}) \
+                    "MATCH (n:Observation {repository_id: $repo}) \
                      RETURN n.source_id AS source_id, n.notes AS notes ORDER BY n.source_id",
                     graphicle_runtime::store_graph::params(&json!({"repo": self.repo.as_str()})),
                 )
@@ -660,7 +660,7 @@ async fn questions_pin_the_observer_note_state_and_validate_note_options() {
         .transaction(|db| {
             graphicle_runtime::store_graph::write(
                 db,
-                "MATCH (n:ObserverNote {repository_id: $repo}) SET n.notes = $notes",
+                "MATCH (n:Observation {repository_id: $repo}) SET n.notes = $notes",
                 graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
                     "notes": r#"[{"text":"rewritten","evidence":[]}]"#})),
             )?;
@@ -733,7 +733,7 @@ async fn note_keys_reach_a_passage_through_the_notes_that_quote_it() {
         .transaction(|db| {
             graphicle_runtime::store_graph::write(
                 db,
-                "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
+                "MATCH (n:Observation {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
                 graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
                     "source": "file:session-0001.txt", "notes": note.to_string()})),
             )?;
@@ -819,7 +819,7 @@ async fn note_keys_reach_a_passage_through_the_notes_that_quote_it() {
         .transaction(|db| {
             graphicle_runtime::store_graph::write(
                 db,
-                "MATCH (n:ObserverNote {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
+                "MATCH (n:Observation {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
                 graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
                     "source": "file:session-0001.txt", "notes": "[]"})),
             )?;
