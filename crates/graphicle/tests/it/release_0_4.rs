@@ -135,7 +135,14 @@ async fn remote(State(state): State<RemoteState>, request: Request) -> axum::res
                 .store
                 .transaction(|db| {
                     store::invalidate(db, &state.project)?;
-                    db.execute("UPDATE am_projection_cleanup SET state='complete'", [])?;
+                    store::graph_for(db)?.transaction(|g| {
+                        graphicle_runtime::store_graph::write(
+                            g,
+                            "MATCH (c:ProjectionCleanup) SET c.state = 'complete'",
+                            graphicle_runtime::store_graph::Params::new(),
+                        )?;
+                        Ok(())
+                    })?;
                     Ok(())
                 })
                 .unwrap();

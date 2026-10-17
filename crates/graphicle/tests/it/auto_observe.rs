@@ -173,16 +173,19 @@ impl Fixture {
             .collect()
     }
     fn noted_sources(&self) -> Vec<String> {
-        let db = self.store.connect().unwrap();
-        let mut statement = db
-            .prepare(
-                "SELECT source_id FROM am_observer_notes WHERE repository_id=? ORDER BY source_id",
-            )
-            .unwrap();
-        statement
-            .query_map([&self.repo], |r| r.get(0))
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "MATCH (n:ObserverNote {repository_id: $repo}) \
+                     RETURN n.source_id AS source_id ORDER BY n.source_id",
+                    graphicle_runtime::store_graph::params(&json!({"repo": self.repo.as_str()})),
+                )
+            })
             .unwrap()
-            .map(Result::unwrap)
+            .iter()
+            .map(|row| row["source_id"].as_str().unwrap().to_string())
             .collect()
     }
 }
