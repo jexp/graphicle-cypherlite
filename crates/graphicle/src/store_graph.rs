@@ -467,6 +467,19 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX sym_head_repo IF NOT EXISTS FOR (s:SymbolHead) ON (s.repository_id)",
     "CREATE INDEX sym_head_file IF NOT EXISTS FOR (s:SymbolHead) ON (s.relpath)",
     "CREATE INDEX sym_move_from IF NOT EXISTS FOR (m:SymbolMove) ON (m.from_stable_id)",
+    // Bi-temporal symbol versions (graph_projection): every projection step
+    // closes the live versions of the nodes it rewrote and reads the live
+    // versions of the dirty owner groups. Without these the planner anchors
+    // each lookup on the repository's whole Symbol set and expands
+    // `HAS_VERSION` once per symbol — PROFILE on a 5276-symbol store: 5276 db
+    // hits, ~10 ms per lookup. With them the planner starts from the indexed
+    // version node instead: 1 db hit for the closing `UNWIND` row (the query
+    // text is unchanged — the anchor choice is the planner's), 30 for a
+    // dirty owner group. Measured 100-200x on those three shapes; index
+    // maintenance costs ~5% on version writes.
+    "CREATE INDEX live_node IF NOT EXISTS FOR (v:Live) ON (v.node_id)",
+    "CREATE INDEX live_owner IF NOT EXISTS FOR (v:Live) ON (v.owner)",
+    "CREATE INDEX version_node IF NOT EXISTS FOR (v:SymbolVersion) ON (v.node_id)",
     // Observer notes and projection maintenance (observer.rs, projection.rs).
     "CREATE INDEX note_repo IF NOT EXISTS FOR (n:Observation) ON (n.repository_id)",
     "CREATE INDEX note_source IF NOT EXISTS FOR (n:Observation) ON (n.source_id)",
