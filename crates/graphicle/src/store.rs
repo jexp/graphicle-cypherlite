@@ -314,12 +314,15 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
         return Ok(Arc::new(crate::store_graph::GraphStore::from_shared(inner)));
     }
     // Another process (a server, a background sync) may hold the engine's
-    // writer lease; retry briefly, as SQLite's busy_timeout did.
+    // writer lease; retry briefly, as SQLite's busy_timeout did. Each attempt
+    // already waits `LEASE_WAIT` inside `GraphStore::engine`, so the retry
+    // count stays small: multiplying the two budgets is how a contended open
+    // once spun for the better part of an hour before reporting the lease.
     let mut attempts = 0;
     let graph = loop {
         match crate::store_graph::GraphStore::open(key.join("reviews.graph")) {
             Ok(graph) => break Arc::new(graph),
-            Err(error) if error.message.contains("storage locked") && attempts < 100 => {
+            Err(error) if error.message.contains("storage locked") && attempts < 1 => {
                 attempts += 1;
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -328,6 +331,51 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     };
     registry.insert(key, Arc::downgrade(&graph.shared()));
     Ok(graph)
+}
+
+/// Directories whose writer lease a probe found held, with when it did: a
+/// read command beside a running server must not pay the full lease wait
+/// once per graph access (a `context` reads the graph a dozen times). The
+/// hint is short-lived and only ever routes a call to the read-only engine,
+/// whose writes fail where the caller reports them.
+static LEASE_HELD: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new());
+
+/// How long a lease probe's finding stands before the next call probes again.
+const LEASE_HINT: Duration = Duration::from_secs(5);
+
+fn lease_held_recently(key: &Path) -> bool {
+    LEASE_HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .is_some_and(|at| at.elapsed() < LEASE_HINT)
+}
+
+fn note_lease_held(key: &Path) {
+    LEASE_HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.to_path_buf(), Instant::now());
+}
+
+/// The graph handle an operation gets: the writer's, or — when another
+/// process holds the writer lease for the whole retry window — the
+/// read-only follower, so a read beside a running server answers (as it did
+/// against SQLite, whose readers never took the write lock). A write through
+/// the follower fails in the engine, where the caller reports it.
+fn graph_for_operation(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
+    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    if lease_held_recently(&key) {
+        return graph_in_read_only(directory);
+    }
+    match graph_in(directory) {
+        Ok(graph) => Ok(graph),
+        Err(error) if error.message.contains("storage locked") => {
+            note_lease_held(&key);
+            graph_in_read_only(directory)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Read-only handles, by canonical directory: the same one-handle-per-
@@ -372,7 +420,10 @@ pub fn graph_for(db: &Connection) -> Result<Arc<crate::store_graph::GraphStore>>
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::bad("Database path has no parent directory"))?;
-    graph_in(&directory)
+    // As in [`Store::graph`]: a lease another process holds for the whole
+    // retry window must not fail a read — the caller gets the read-only
+    // engine, and a write through it is reported by the engine.
+    graph_for_operation(&directory)
 }
 
 /// The read-only counterpart of [`graph_for`] for callers that never write
@@ -415,7 +466,18 @@ impl Store {
         // fails at open, not at first use; the handle itself is not kept —
         // holding it would hold the engine's writer lease for the store's
         // lifetime and block every other process (see `graph_in`).
-        graph_in(directory)?;
+        //
+        // A lease held by another process is not a misconfiguration: the
+        // engine allows one writer, so a CLI beside a running server (or a
+        // second sync) must still open the store, read through the read-only
+        // handle `Store::graph` falls back to, and fail at the write if it
+        // turns out to write. Only a genuine open failure is fatal here.
+        if let Err(error) = graph_in(directory) {
+            if !error.message.contains("storage locked") {
+                return Err(error);
+            }
+            note_lease_held(&std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf()));
+        }
         let db = store.connect()?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.execute_batch(include_str!("schema.sql"))?;
@@ -489,8 +551,15 @@ impl Store {
     /// beside a server, a background sync) can open the store; its open
     /// busy-retries the lease briefly, as SQLite's busy_timeout did. Bind
     /// the handle once per operation and pass `&GraphStore` down.
+    ///
+    /// When another process holds the writer lease for the whole retry
+    /// window, the handle falls back to the read-only engine: a read command
+    /// beside a running server answers (as it did against SQLite, whose
+    /// readers never took the write lock), and a write through the fallback
+    /// fails in the engine, where the caller reports it.
     pub fn graph(&self) -> Arc<crate::store_graph::GraphStore> {
-        graph_in(&self.directory).expect("graph store opened at Store::open")
+        graph_for_operation(&self.directory)
+            .unwrap_or_else(|error| panic!("graph store opened at Store::open: {}", error.message))
     }
     /// This store's passage-embedding cache for `model_key`
     /// ([`crate::embedding_cache`]); vectors live in the graph store, so no
