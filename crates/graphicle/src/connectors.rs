@@ -517,7 +517,7 @@ impl Store {
                 })?;
                 for doc in &removed {
                     crate::invalidation::document_changed(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc),"connector_document_deleted")?;
-                    crate::observer::forget_document(db,&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;
+                    crate::observer::forget_document(&self.graph(),workspace,&crate::invalidation::connector_document_id(s(&connector,"id"),doc))?;
                 }
             }
             crate::doc_links::after_sync(self,db,s(&repository,"id"),s(&connector,"id"),p)?;
@@ -785,7 +785,6 @@ pub(crate) fn activate(
             "connector_document_updated",
         )?;
         crate::observer::forget_document(
-            db,
             graph,
             &workspace,
             &crate::invalidation::connector_document_id(identifier, doc),
@@ -799,7 +798,6 @@ pub(crate) fn activate(
             "connector_document_removed",
         )?;
         crate::observer::forget_document(
-            db,
             graph,
             &workspace,
             &crate::invalidation::connector_document_id(identifier, doc),

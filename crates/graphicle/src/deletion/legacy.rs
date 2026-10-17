@@ -1097,7 +1097,7 @@ pub fn forget(
     )? {
         if scope.source(s(&row, "source_id")) {
             notes +=
-                crate::observer::forget_source(db, graph, workspace, repository, s(&row, "source_id"))?;
+                crate::observer::forget_source(graph, workspace, repository, s(&row, "source_id"))?;
         }
     }
     let vectors = select_rowids(

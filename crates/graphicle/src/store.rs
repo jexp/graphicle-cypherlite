@@ -1018,7 +1018,7 @@ impl Store {
             // invalidation loops; the event was already written by
             // `store_content::activate` with the head swap.
             let gstore=&graph;
-            for path in changed.iter().chain(&removed) {crate::invalidation::file_changed(gstore,&p.workspace,identifier,path,"repository_commit")?;crate::observer::forget_source(db,gstore,&p.workspace,identifier,&format!("file:{path}"))?;}
+            for path in changed.iter().chain(&removed) {crate::invalidation::file_changed(gstore,&p.workspace,identifier,path,"repository_commit")?;crate::observer::forget_source(gstore,&p.workspace,identifier,&format!("file:{path}"))?;}
             for key in &changed_docs {let lines=chunk_lines.get(key).cloned().unwrap_or_default();crate::invalidation::record_file_chunks(gstore,&p.workspace,identifier,&key.0,&lines)?;}
             // Every commit yields a graph episode labelled with its commit identity.
             let metadata:Value=serde_json::from_str(s(&sync,"metadata")).unwrap_or(Value::Null);

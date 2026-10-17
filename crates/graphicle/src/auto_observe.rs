@@ -24,7 +24,7 @@
 //! or above the threshold queues the next round at once.
 use crate::{
     Error, Result, integer, jobs, memory, model, observer,
-    store::{Principal, Store, authorize_hash, decode, repo, rows, s},
+    store::{Principal, Store, authorize_hash, decode, repo, s},
     string,
 };
 use rusqlite::Connection;
@@ -220,14 +220,17 @@ fn decide(store: &Store, db: &Connection, connector: &Value, config: &model::Con
     let args = observe_args(policy, repository_id, &prefix);
     let (_, profile) = config.profile(args["model"].as_str())?;
     let recipe = observer::Recipe::new(&args, profile)?;
-    let observed: BTreeMap<String, String> = rows(
-        db,
-        "SELECT source_id,step_key FROM am_observer_notes WHERE repository_id=?",
-        [repository_id],
-    )?
-    .iter()
-    .map(|r| (s(r, "source_id").to_string(), s(r, "step_key").to_string()))
-    .collect();
+    let observed: BTreeMap<String, String> = graph
+        .read(|g| {
+            crate::store_graph::rows(
+                g,
+                "MATCH (n:ObserverNote {repository_id: $repo}) RETURN n.source_id AS source_id, n.step_key AS step_key",
+                crate::store_graph::params(&json!({"repo": repository_id})),
+            )
+        })?
+        .iter()
+        .map(|r| (s(r, "source_id").to_string(), s(r, "step_key").to_string()))
+        .collect();
     let unobserved: usize = documents
         .iter()
         .filter(|d| s(d, "id").starts_with(&prefix))
