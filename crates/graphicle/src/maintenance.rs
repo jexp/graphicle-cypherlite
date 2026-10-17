@@ -18,8 +18,16 @@ use std::{collections::BTreeSet, path::Path};
 /// The graph store of this data directory (`<dir>/reviews.graph`), opened
 /// beside the SQLite store while the migration runs (docs/store-api.md:
 /// "beside, not instead of"). Opening applies the schema idempotently.
-pub(crate) fn graph_store(store: &Store) -> Result<GraphStore> {
-    GraphStore::open(store.directory.join("reviews.graph"))
+/// This MUST be the shared registry handle: a second writer open of the
+/// same directory blocks on the engine lease the first handle's pooled
+/// connections hold (a self-deadlock), which a `graph_for(db)` call below
+/// this one would otherwise run into.
+pub(crate) fn graph_store(store: &Store) -> Result<std::sync::Arc<GraphStore>> {
+    // The Arc, not a clone: the registry holds only a Weak, and a bare
+    // clone would let the registered handle drop while this one's pooled
+    // connections still pin the engine lease — a later `graph_for(db)`
+    // would then reopen the directory and block on its own lease forever.
+    Ok(store.graph())
 }
 
 /// Whether this project's per-episode by-products live on the graph store

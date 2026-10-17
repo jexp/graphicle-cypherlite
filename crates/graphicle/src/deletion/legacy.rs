@@ -470,11 +470,16 @@ pub(crate) fn secure_delete(db: &Connection) -> Result<bool> {
 }
 
 pub(crate) fn external(db: &Connection, repository: &str) -> Result<Vec<Value>> {
-    rows(
-        db,
-        "SELECT id,kind,revision,state FROM am_projection_cleanup WHERE scope=? ORDER BY kind,id",
-        [repository],
-    )
+    // Cleanup requests are ProjectionCleanup nodes now (projection.rs).
+    crate::store::graph_for(db)?.read(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (c:ProjectionCleanup {scope: $scope}) \
+             RETURN c.id AS id, c.kind AS kind, c.revision AS revision, c.state AS state \
+             ORDER BY c.kind, c.id",
+            crate::store_graph::params(&json!({"scope": repository})),
+        )
+    })
 }
 
 /// A captured external cleanup is done once its row completed at (or after)
@@ -483,11 +488,14 @@ pub(crate) fn external_now(db: &Connection, captured: &Value) -> Result<(Vec<Val
     let mut pending = false;
     let mut out = Vec::new();
     for cleanup in captured.as_array().into_iter().flatten() {
-        let row = one(
-            db,
-            "SELECT revision,state,error FROM am_projection_cleanup WHERE id=?",
-            [s(cleanup, "id")],
-        )?;
+        let row = crate::store::graph_for(db)?.read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (c:ProjectionCleanup {id: $id}) \
+                 RETURN c.revision AS revision, c.state AS state, c.error AS error",
+                crate::store_graph::params(&json!({"id": s(cleanup, "id")})),
+            )
+        })?;
         let done = row.as_ref().is_some_and(|r| {
             r["state"] == "complete" && r["revision"].as_i64() >= cleanup["revision"].as_i64()
         });
@@ -1096,8 +1104,13 @@ pub fn forget(
         [repository],
     )? {
         if scope.source(s(&row, "source_id")) {
-            notes +=
-                crate::observer::forget_source(graph, workspace, repository, s(&row, "source_id"))?;
+            // The SQL row goes here; `forget_source` erases the graph-side
+            // ObserverNote and the dependency edges.
+            notes += db.execute(
+                "DELETE FROM am_observer_notes WHERE repository_id=? AND source_id=?",
+                rusqlite::params![repository, s(&row, "source_id")],
+            )?;
+            crate::observer::forget_source(graph, workspace, repository, s(&row, "source_id"))?;
         }
     }
     let vectors = select_rowids(
