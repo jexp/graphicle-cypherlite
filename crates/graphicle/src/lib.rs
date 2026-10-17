@@ -39,6 +39,7 @@ pub mod limits;
 pub mod local;
 pub mod local_inference;
 pub mod maintenance;
+pub mod migrate;
 pub mod memory;
 pub mod memory_evidence;
 pub mod model;
