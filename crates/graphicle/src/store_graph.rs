@@ -40,7 +40,12 @@ pub struct GraphStore {
     inner: Arc<StoreInner>,
 }
 
-struct StoreInner {
+/// Shared across clones; the store.rs registry keys on this (not the
+/// `GraphStore` wrapper) so any live clone — which shares the pooled
+/// connections pinning the engine's writer lease — keeps the registry
+/// entry upgradeable and a same-process reopen never blocks on the lease
+/// its own clones hold.
+pub(crate) struct StoreInner {
     location: StoreLocation,
     /// Opened for reads only (shared locks, no writer lease, no schema
     /// DDL): a hook or CLI that reads beside a running writer.
@@ -115,6 +120,16 @@ impl GraphStore {
                 pool: Mutex::new(Vec::new()),
             }),
         })
+    }
+    /// The shared state, for the store.rs handle registry
+    /// ([`GraphStore::from_shared`]).
+    pub(crate) fn shared(&self) -> Arc<StoreInner> {
+        self.inner.clone()
+    }
+    /// A handle over shared state from the registry: a full clone (the
+    /// pool and the engine slot are shared).
+    pub(crate) fn from_shared(inner: Arc<StoreInner>) -> Self {
+        Self { inner }
     }
     /// Whether the handle only reads (see [`GraphStore::open_read_only`]).
     pub fn is_read_only(&self) -> bool {
@@ -452,6 +467,13 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX sym_head_repo IF NOT EXISTS FOR (s:SymbolHead) ON (s.repository_id)",
     "CREATE INDEX sym_head_file IF NOT EXISTS FOR (s:SymbolHead) ON (s.relpath)",
     "CREATE INDEX sym_move_from IF NOT EXISTS FOR (m:SymbolMove) ON (m.from_stable_id)",
+    // Observer notes and projection maintenance (observer.rs, projection.rs).
+    "CREATE INDEX note_repo IF NOT EXISTS FOR (n:Observation) ON (n.repository_id)",
+    "CREATE INDEX note_source IF NOT EXISTS FOR (n:Observation) ON (n.source_id)",
+    "CREATE INDEX reflection_repo IF NOT EXISTS FOR (m:MentalModel) ON (m.repository_id)",
+    "CREATE INDEX backend_repo IF NOT EXISTS FOR (b:Backend) ON (b.repository_id)",
+    "CREATE INDEX cleanup_state IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.state)",
+    "CREATE INDEX cleanup_ws IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.workspace_id)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:

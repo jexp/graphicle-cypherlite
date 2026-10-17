@@ -9,11 +9,10 @@ use crate::{
     Error, Result,
     jobs::{self, Job, Worker},
     model, query,
-    store::{Store, decode, one, repo, s},
+    store::{Store, repo, s},
     store_graph::{self, GraphStore},
     string,
 };
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -371,7 +370,7 @@ pub fn configure(store: &Store, workspace: &str, token: &str, args: &Value) -> R
         return Err(Error::bad("Use an alphanumeric collection name"));
     }
     let config = json!({"endpoint":endpoint,"collection":collection,"credential_ref":reference});
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Ok(old)=self::config(db,s(&repository,"id"))&& old!=config{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"qdrant",&old,"backend_reconfigured")?;}db.execute("INSERT OR REPLACE INTO am_backends VALUES(?,?,?)",params![s(&repository,"id"),"qdrant",config.to_string()])?;Ok(json!({"configured":true,"stored_remotely":"vectors and opaque source identities; no original text"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Ok(old)=self::config(db,s(&repository,"id"))&& old!=config{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"qdrant",&old,"backend_reconfigured")?;}crate::projection::backend_set(db,s(&repository,"id"),"qdrant",&config)?;Ok(json!({"configured":true,"stored_remotely":"vectors and opaque source identities; no original text"}))})
 }
 async fn request(
     store: &Store,
@@ -407,14 +406,8 @@ async fn request(
     model::bounded_json(response).await
 }
 fn config(db: &rusqlite::Connection, repository: &str) -> Result<Value> {
-    let mut row = one(
-        db,
-        "SELECT config FROM am_backends WHERE repository_id=? AND kind='qdrant'",
-        [repository],
-    )?
-    .ok_or_else(|| Error::bad("Configure a Qdrant collection first"))?;
-    decode(&mut row, "config")?;
-    Ok(row["config"].clone())
+    crate::projection::backend_config(db, repository, "qdrant")?
+        .ok_or_else(|| Error::bad("Configure a Qdrant collection first"))
 }
 pub(crate) async fn clear_projection(
     store: &Store,

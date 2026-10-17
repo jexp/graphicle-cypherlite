@@ -401,10 +401,17 @@ fn source_reverification_requires_tombstones_and_checks_historical_rows() {
 #[test]
 fn external_cleanup_keeps_a_receipt_incomplete_until_it_finishes() {
     let f = Fixture::new();
-    f.sql(
-        "INSERT INTO am_backends VALUES(?1,'qdrant','{\"url\":\"http://127.0.0.1:9\",\"collection\":\"memory\"}')",
-        [&f.repo],
-    );
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "CREATE (:Backend {repository_id: $repo, kind: 'qdrant',                  config: '{\"url\":\"http://127.0.0.1:9\",\"collection\":\"memory\"}'})",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str()})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let connector = f.connector(json!([{"id":"plan","title":"Launch plan","content":SECRET}]));
     let receipt = f.delete_connector(&connector)["receipt"].clone();
     assert_eq!(receipt["verified_local"], true, "{receipt:#}");
@@ -413,7 +420,17 @@ fn external_cleanup_keeps_a_receipt_incomplete_until_it_finishes() {
     assert_eq!(receipt["external_cleanup"][0]["kind"], "qdrant");
     assert_eq!(f.verify(&receipt)["external_pending"], true);
     // The projection worker marks the cleanup complete once Qdrant confirms.
-    f.sql("UPDATE am_projection_cleanup SET state='complete'", []);
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "MATCH (c:ProjectionCleanup) SET c.state = 'complete'",
+                graphicle_runtime::store_graph::Params::new(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let checked = f.verify(&receipt);
     assert_eq!(checked["external_pending"], false, "{checked:#}");
     assert_eq!(checked["complete"], true);

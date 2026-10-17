@@ -1299,11 +1299,13 @@ pub fn queue(
             [identifier],
         )?,
         "embed" => Some(json!({"count": crate::vector::graph_vector_count(&graph, identifier)?})),
-        crate::observer::KIND => one(
-            db,
-            "SELECT count(*) AS count,max(created_at) AS latest FROM am_observer_notes WHERE repository_id=?",
-            [identifier],
-        )?,
+        crate::observer::KIND => graph.read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (n:Observation {repository_id: $repo}) RETURN count(n) AS count, max(n.created_at) AS latest",
+                crate::store_graph::params(&json!({"repo": identifier})),
+            )
+        })?,
         "connector" | "permissions" | "connector_probe" => store
             .graph()
             .read(|db| {
