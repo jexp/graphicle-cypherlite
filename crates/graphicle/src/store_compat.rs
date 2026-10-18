@@ -32,7 +32,7 @@ pub const HISTORY_TABLES: &[&str] = &["am_team_audit", "am_login_pending", "am_b
 pub const RETAINED_TABLES: &[&str] = &["am_team_audit"];
 
 /// Whether this store has `table`.
-fn has(db: &Connection, table: &str) -> Result<bool> {
+pub(crate) fn has(db: &Connection, table: &str) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
         [table],

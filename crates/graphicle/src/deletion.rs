@@ -272,8 +272,24 @@ fn retained(db: Graph) -> Result<Vec<&'static str>> {
 /// attempts and browser sessions) and the commercial edition's team history
 /// labels that this store has and no extension named
 /// ([`crate::store_compat`]), then the core's.
-fn history(db: Graph) -> Result<Vec<&'static str>> {
-    let mut labels = crate::extension::installed().history_tables();
+fn history(db: Graph, sql: Option<&rusqlite::Connection>) -> Result<Vec<&'static str>> {
+    // The team access history lives in the SQL store, so its presence is a
+    // SQL question, not a graph one; a graph probe would silently drop it.
+    // It is listed first, in the order the commercial edition declares it,
+    // so one store reports the same lists whichever edition reads it.
+    let mut labels: Vec<&'static str> = match sql {
+        Some(sql) => crate::store_compat::HISTORY_TABLES
+            .iter()
+            .copied()
+            .filter(|table| crate::store_compat::has(sql, table).unwrap_or(false))
+            .collect(),
+        None => Vec::new(),
+    };
+    for label in crate::extension::installed().history_tables() {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
     for label in crate::store_compat::HISTORY_TABLES {
         let label = known_label(label);
         if !labels.contains(&label) && present(db, label)? {
@@ -1986,7 +2002,7 @@ pub fn policy_receipt(
         "tables_scanned":text["tables_scanned"].as_u64().unwrap_or(0)+sql_text["tables_scanned"].as_u64().unwrap_or(0),
         "matches":text_matches});
     let visible = visible_documents(db, identifier, scope)?;
-    let snapshot = state(db, &p.workspace, identifier)?;
+    let snapshot = state(db, &p.workspace, identifier, Some(sql))?;
     // External cleanups are queued in the SQL store (projection.rs).
     let cleanups = legacy::external(sql, identifier)?;
     let clean = remaining.values().chain(tainted.values()).all(|n| *n == 0)
@@ -2088,7 +2104,7 @@ pub fn rows_receipt(
             &retained,
             false,
         )?;
-        let history_labels = history(db)?;
+        let history_labels = history(db, Some(sql))?;
         let (history, other): (Vec<Value>, Vec<Value>) = found["matches"]
             .as_array()
             .cloned()
@@ -2154,9 +2170,14 @@ fn mask(value: &str) -> String {
 /// digests minted per store, clock readings and sync counters are masked. Two
 /// stores digest equally when they hold the same content, whichever edition
 /// created them.
-pub fn state(db: Graph, workspace: &str, repository: &str) -> Result<Value> {
+pub fn state(
+    db: Graph,
+    workspace: &str,
+    repository: &str,
+    sql: Option<&rusqlite::Connection>,
+) -> Result<Value> {
     let mut tables_out = BTreeMap::new();
-    let history = history(db)?;
+    let history = history(db, sql)?;
     // The label catalog is the walk list: history, caches, locations and the
     // receipts label are excluded, as are labels this store does not carry.
     for label in catalog(db)? {
@@ -2255,7 +2276,8 @@ pub fn state_api(store: &Store, workspace: &str, token: &str, args: &Value) -> R
         let project = repo(db, p, string(args, "repository_id", 100)?)?;
         let identifier = s(&project, "id").to_string();
         let workspace_id = p.workspace.clone();
-        let mut graph_state = graph_store(store)?.read(|g| state(g, &workspace_id, &identifier))?;
+        let mut graph_state =
+            graph_store(store)?.read(|g| state(g, &workspace_id, &identifier, Some(db)))?;
         // The SQL side still holds the domains no migration node owns yet
         // (observer notes, hints, served/outcomes, backends, …) and any table
         // an edition adds. Digest those alongside the graph's tables so
