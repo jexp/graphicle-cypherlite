@@ -398,12 +398,18 @@ pub fn source_plan(
     let mut cited = std::collections::BTreeSet::new();
     if policy.skip_cited_by_reviewed {
         let _ = principal; // authorization happened at the Store boundary
-        for memory in rows(
+        // Memories are scoped by their `repository_id` property (only
+        // connectors carry an `-[:OF]->(:Project)` edge), and `data` is a
+        // stringified-JSON property the engine stores as a string: both
+        // have to be right or a cited source looks uncited and the
+        // retention plan forgets a document a reviewed memory cites.
+        for mut memory in rows(
             db,
-            "MATCH (m:Memory)-[:OF]->(:Project {id: $repo}) WHERE m.state = 'reviewed' \
+            "MATCH (m:Memory {repository_id: $repo}) WHERE m.state = 'reviewed' \
              RETURN m.data AS data",
             params(&[("repo", json!(identifier))]),
         )? {
+            crate::store::decode(&mut memory, "data")?;
             for field in ["native_sources", "evidence_links"] {
                 if let Some(sources) = memory["data"][field].as_object() {
                     cited.extend(sources.keys().cloned());
