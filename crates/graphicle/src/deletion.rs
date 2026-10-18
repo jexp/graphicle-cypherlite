@@ -2360,7 +2360,7 @@ pub fn forget_project_references(
     let labels = detach(
         db,
         "EpisodeLabel",
-        "n.workspace = $ws AND n.repo = $repo",
+        "n.workspace = $ws AND n.repository_id = $repo",
         gparams([("ws", json!(workspace)), ("repo", json!(repository))]),
     )?;
     Ok(json!({"dependency_edges":edges,"dependency_nodes":artifacts,"stale_markers":stale,"episode_labels":labels}))
