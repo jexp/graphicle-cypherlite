@@ -239,7 +239,22 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
         attributes.get("unresolved_calls").is_none(),
         "{attributes:#}"
     );
-    let stored = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NULL");
+    // Unresolved calls live on `:UnresolvedCall` nodes (`gf_unresolved_calls`
+    // is the legacy table the projection no longer writes).
+    let open_calls = |closed: bool| {
+        crate::gql_one(
+            &f.store,
+            &format!(
+                "MATCH (u:UnresolvedCall {{repository_id: $repo}}) \
+                 WHERE u.valid_to_episode IS {} NULL RETURN count(u) AS n",
+                if closed { "NOT" } else { "" }
+            ),
+            graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap()
+    };
+    let stored = open_calls(false);
     assert!(stored > 0, "fixture must produce ambiguous receiver calls");
     assert_eq!(attributes["unresolved_calls_count"], stored);
     let graph = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
@@ -256,7 +271,7 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
         &sha(2),
     );
     assert_ne!(e1, e2);
-    let closed = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NOT NULL");
+    let closed = open_calls(true);
     assert_eq!(closed, stored);
     let previous = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     assert_eq!(
