@@ -822,10 +822,32 @@ fn detach_ids(db: Graph, label: &str, ids: &[i64]) -> Result<usize> {
 /// counterpart of `invalidation::forget_dependent` (which migrates with the
 /// invalidation module).
 fn forget_dependent(db: Graph, workspace: &str, kind: &str, id: &str) -> Result<()> {
+    // The entry's own node and the sources it points at, before the edges
+    // go: an artifact left with no `DEPENDS_ON` edge in either direction
+    // carries no dependency information, and the verified deletion scans
+    // for exactly that residue. A source another dependent still points at
+    // keeps its edge, so it survives the sweep.
+    let endpoints: BTreeSet<i64> = rows(
+        db,
+        "MATCH (a:Artifact {workspace: $ws, kind: $kind, id: $id})-[:DEPENDS_ON]->(s:Artifact) \
+         RETURN id(a) AS a, id(s) AS s",
+        gparams([("ws", json!(workspace)), ("kind", json!(kind)), ("id", json!(id))]),
+    )?
+    .iter()
+    .flat_map(|row| [row["a"].as_i64(), row["s"].as_i64()])
+    .flatten()
+    .collect();
     db.query_with_params(
         "MATCH (a:Artifact {workspace: $ws, kind: $kind, id: $id})-[r:DEPENDS_ON]->() DELETE r",
         gparams([("ws", json!(workspace)), ("kind", json!(kind)), ("id", json!(id))]),
     )?;
+    if !endpoints.is_empty() {
+        db.query_with_params(
+            "MATCH (a:Artifact) WHERE id(a) IN $ids AND NOT (a)-[:DEPENDS_ON]-() \
+             DETACH DELETE a",
+            gparams([("ids", json!(endpoints.into_iter().collect::<Vec<_>>()))]),
+        )?;
+    }
     Ok(())
 }
 
@@ -1354,6 +1376,16 @@ pub fn delete_memories(
         revisions += counted(
             db,
             "MATCH (r:MemoryRevision)-[:REVISION_OF]->(:Memory {id: $id}) RETURN count(r) AS n",
+            gparams([("id", json!(identifier))]),
+        )?;
+        // The revisions go with the memory: each carries the memory's
+        // `memory_id` and its raw content, so leaving them behind would
+        // keep the forgotten memory's text in the store — and the receipt,
+        // which counts them under `removed`, would be reporting a removal
+        // that did not happen. Deleted before the memory node, while the
+        // `REVISION_OF` edge still reaches them.
+        db.query_with_params(
+            "MATCH (r:MemoryRevision)-[:REVISION_OF]->(:Memory {id: $id}) DETACH DELETE r",
             gparams([("id", json!(identifier))]),
         )?;
         // The memory's pinned or pending quotes go with it.
