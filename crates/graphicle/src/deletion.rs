@@ -329,6 +329,9 @@ const CACHES: &[&str] = &["ModelCache", "QueryCache"];
 /// content digest equally wherever their folders are. Residue scans still
 /// read them, and they go with their project.
 const LOCATIONS: &[&str] = &["Folder"];
+/// The same list as the state contract spells it: the legacy table name, so
+/// a receipt reads the same whichever backend wrote the store (the label
+/// stays the filter's spelling).
 /// Sync counters: they count imports, not content (label, property).
 const COUNTERS: &[(&str, &str)] = &[
     ("Connector", "generation"),
@@ -2252,7 +2255,9 @@ pub fn state(
     }
     Ok(
         json!({"contract":STATE_CONTRACT,"digest":digest(&json!(tables_out)),"tables":tables_out,
-        "excluded":{"history":history,"caches":CACHES,"locations":LOCATIONS,"empty_tables":true},
+        "excluded":{"history":history,"caches":CACHES,
+            "locations":LOCATIONS.iter().map(|label| table_of(label)).collect::<Vec<_>>(),
+            "empty_tables":true},
         "masked":["identifiers minted per store","capability digests minted per store","clock readings","sync counters"]}),
     )
 }
