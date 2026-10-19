@@ -1239,9 +1239,13 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
             return Err(error);
         }
     }
-    // The content store's graph travels as a sidecar of the backup.
+    // The content store's graph travels as a sidecar of the backup. For a
+    // file backup that sidecar is `<backup>.graph` — the same path the block
+    // above already copied, validated and materialized — so this clone runs
+    // only when nothing has been restored yet (cloning onto an existing
+    // destination is an engine error: `clone destination already exists`).
     let sidecar = crate::store_graph::backup_sidecar(backup);
-    if sidecar.exists() {
+    if sidecar.exists() && !directory.join("reviews.graph").exists() {
         crate::store_graph::clone_store(&sidecar, &directory.join("reviews.graph"))?;
     }
     Ok(
