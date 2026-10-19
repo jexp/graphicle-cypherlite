@@ -954,7 +954,7 @@ fn record_episode(
     // The final transaction records the episode itself: unresolved calls,
     // contradiction markers, the Episode node and its FOLLOWS edge.
     graph_commit(g, |g| {
-        persist_unresolved_calls(g, repository, episode, graph, stamp)?;
+        persist_unresolved_calls(g, repository, episode, sequence, graph, stamp)?;
         if !disappeared.is_empty() {
             // Cardinality-one relations in the new graph: (relation,
             // subject) → the subject's targets with their edge references.
@@ -1451,6 +1451,7 @@ fn persist_unresolved_calls(
     g: &mut GraphConnection,
     repository: &str,
     episode: &str,
+    sequence: i64,
     graph: &Graph,
     stamp: &str,
 ) -> Result<()> {
@@ -1482,10 +1483,11 @@ fn persist_unresolved_calls(
             "UNWIND $rows AS row \
              MERGE (u:UnresolvedCall {repository_id:$r, episode:$e, position: row.position}) \
              SET u.caller = row.caller, u.callee = row.callee, u.call = row.call, \
-                 u.created_at = $stamp",
+                 u.episode_sequence = $seq, u.created_at = $stamp",
             gparams([
                 ("r", gs(repository)),
                 ("e", gs(episode)),
+                ("seq", gi(sequence)),
                 ("rows", gj(&json!(rows))),
                 ("stamp", gs(stamp)),
             ]),
