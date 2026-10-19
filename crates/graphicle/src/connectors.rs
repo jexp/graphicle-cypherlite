@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The `RETURN` projection standing in for `SELECT * FROM am_connectors`:
 /// config and cursor come back as decoded maps, not JSON text.
-const CONNECTOR_COLS: &str = "c.id AS id, c.repository_id AS repository_id, c.name AS name, c.kind AS kind, c.config AS config, c.credential_env AS credential_env, c.state AS state, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error, c.created_at AS created_at";
+const CONNECTOR_COLS: &str = "c.id AS id, c.repository_id AS repository_id, c.name AS name, c.kind AS kind, c.config AS config, c.credential_env AS credential_env, c.state AS state, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error, c.capability_hash AS capability_hash, c.workspace_id AS workspace_id, c.created_at AS created_at";
 
 /// An ACL object as the doc/stage node carries it: a readers flag and a
 /// credential id list (list property; membership predicates read it).
@@ -341,7 +341,7 @@ impl Store {
                 if let Some(reference)=credential.filter(|v|v.starts_with("secret:"))&& graph::one(gdb,"MATCH (s:Secret {workspace_id: $workspace, id: $id}) RETURN s.id AS id",Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(&reference[7..])))]))?.is_none(){return Err(Error::denied());}
                 if let Some(reference)=credential.filter(|v|v.starts_with("oauth:")) {let provider=if ["jira","confluence"].contains(&kind){"atlassian"}else{kind};if graph::one(gdb,"MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, provider: $provider, state: 'active'}) RETURN a.id AS id",Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(&reference[6..]))),("provider".into(),json_to_value(&json!(provider)))]))?.is_none(){return Err(Error::denied());}}
                 let identifier=id();
-                graph::write(gdb,"MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: $kind, config: $config, credential_env: $credential, state: 'active', generation: 0, created_at: $now})-[:OF]->(p)",Params::from([
+                graph::write(gdb,"MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: $kind, config: $config, credential_env: $credential, state: 'active', generation: 0, capability_hash: $capability, workspace_id: $workspace, created_at: $now})-[:OF]->(p)",Params::from([
                     ("id".into(),json_to_value(&json!(identifier))),
                     ("repository".into(),json_to_value(&json!(s(&repository,"id")))),
                     ("workspace".into(),json_to_value(&repository["workspace_id"])),
@@ -351,6 +351,10 @@ impl Store {
                     ("kind".into(),json_to_value(&json!(kind))),
                     ("config".into(),jtext(&config)?),
                     ("credential".into(),credential.map(|c|json_to_value(&json!(c))).unwrap_or(cypherlite::Value::Null)),
+                    // The creator's capability hash: a scheduled sync job
+                    // carries it as its `principal_hash`, and the worker
+                    // refuses to lease a job it cannot authorize.
+                    ("capability".into(),json_to_value(&json!(p.hash))),
                     ("now".into(),json_to_value(&json!(now()))),
                 ]))?;
                 Ok(json!({"id":identifier,"name":name,"kind":kind,"state":"active","sharing":"explicit_workspace_policy","provider_permissions_synced":false}))

@@ -789,7 +789,7 @@ impl Store {
             self.graph().transaction(|db| {
                 crate::store_graph::write(
                     db,
-                    "MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: 'jsonl', config: $config, credential_env: NULL, state: 'active', generation: 0, created_at: $now})-[:OF]->(p)",
+                    "MERGE (p:Project {id: $repository}) SET p.workspace_id=$workspace, p.project_key=$project_key, p.name=$project_name CREATE (c:Connector {id: $id, repository_id: $repository, name: $name, kind: 'jsonl', config: $config, credential_env: NULL, state: 'active', generation: 0, capability_hash: $capability, workspace_id: $workspace, created_at: $now})-[:OF]->(p)",
                     crate::store_graph::Params::from([
                         ("id".into(), crate::store_graph::json_to_value(&json!(created))),
                         ("repository".into(), crate::store_graph::json_to_value(&repository["id"])),
@@ -797,6 +797,7 @@ impl Store {
                         ("project_key".into(), crate::store_graph::json_to_value(&repository["project_key"])),
                         ("project_name".into(), crate::store_graph::json_to_value(&repository["name"])),
                         ("name".into(), crate::store_graph::json_to_value(&json!(CONNECTOR_NAME))),
+                        ("capability".into(), crate::store_graph::json_to_value(&json!(p.hash))),
                         ("config".into(), cypherlite::Value::String(json!({"acl":{"workspace_readers":false,"credentials":[]}}).to_string().into())),
                         ("now".into(), crate::store_graph::json_to_value(&json!(now()))),
                     ]),
