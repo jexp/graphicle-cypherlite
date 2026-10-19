@@ -1332,6 +1332,21 @@ fn forget_memories(
         }
     }
     for identifier in &removed {
+        // The memory's claims go with it: each names the memory by
+        // `memory_id` and quotes the sources it was written from, so a claim
+        // left behind is residue the verified deletion reports — and the
+        // `ABOUT_MEMORY` edge a `DETACH DELETE` removes is not the node.
+        db.query_with_params(
+            "MATCH (c:Claim {repository_id: $repo, memory_id: $id}) DETACH DELETE c",
+            gparams([("repo", json!(repository)), ("id", json!(identifier))]),
+        )?;
+        // Its revisions too, and for the same reason: each holds the
+        // memory's raw content, and `DETACH DELETE` on the memory leaves
+        // them behind (their `REVISION_OF` edge is removed, not the node).
+        db.query_with_params(
+            "MATCH (r:MemoryRevision)-[:REVISION_OF]->(:Memory {id: $id}) DETACH DELETE r",
+            gparams([("id", json!(identifier))]),
+        )?;
         // The node takes its revisions, its embedding and every relationship
         // (claims' ABOUT_MEMORY, symbol PINNED_TO) with it.
         db.query_with_params(
@@ -2235,9 +2250,20 @@ pub fn state(
     for row in rows(
         db,
         "MATCH (a)-[r]->(b) WHERE a.repository_id = $repo \
-         RETURN type(r) AS t, properties(r) AS p, a.id AS from_id, b.id AS to_id",
+         RETURN type(r) AS t, properties(r) AS p, a.id AS from_id, b.id AS to_id, \
+                labels(a) AS from_labels",
         gparams([("repo", json!(repository))]),
     )? {
+        // A history node's edges are history: the label is excluded from the
+        // digest above, and so must be the `OF` edge a job leaves to its
+        // project — otherwise a store that ran one more job than another
+        // digests differently for a reason the contract calls history.
+        if row["from_labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|l| l.as_str().is_some_and(|l| history.contains(&l))))
+        {
+            continue;
+        }
         let entry = mask(
             &json!({"from":row["from_id"],"to":row["to_id"],"properties":row["p"]}).to_string(),
         );

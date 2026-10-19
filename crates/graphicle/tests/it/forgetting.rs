@@ -413,6 +413,33 @@ fn dump(f: &Fixture, table: &str) -> Vec<String> {
         return out;
     }
     let db = f.store.connect().unwrap();
+    // The state digest reports a relationship type beside the labels, so a
+    // name that is no SQL table is one: read its edges from the graph.
+    let is_sql: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if !is_sql {
+        let mut out: Vec<String> = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::rows(
+                    g,
+                    &format!("MATCH ()-[r:`{table}`]->() RETURN r"),
+                    graphicle_runtime::store_graph::params(&json!([])),
+                )
+            })
+            .unwrap()
+            .iter()
+            .map(|r| masked(&graphicle_runtime::store_graph::node(r, "r")).to_string())
+            .collect();
+        out.sort();
+        return out;
+    }
     let mut statement = db.prepare(&format!("SELECT * FROM {table}")).unwrap();
     let names: Vec<String> = statement
         .column_names()
