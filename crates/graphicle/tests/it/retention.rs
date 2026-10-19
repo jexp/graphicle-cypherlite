@@ -356,8 +356,16 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         f.count("SELECT count(*) FROM gf_coverage_inventory WHERE repository_id=?"),
         if pro { 20 } else { 0 }
     );
-    let unresolved_episodes =
-        f.count("SELECT count(DISTINCT episode) FROM gf_unresolved_calls WHERE repository_id=?");
+    // Unresolved calls live on `:UnresolvedCall` nodes; the count is the
+    // distinct episodes whose calls are still open (current + previous).
+    let unresolved_episodes = crate::gql_one(
+        &f.store,
+        "MATCH (u:UnresolvedCall {repository_id: $repo}) \
+         RETURN count(DISTINCT u.episode) AS n",
+        graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+    )
+    .and_then(|row| row["n"].as_i64())
+    .unwrap();
     assert_eq!(unresolved_episodes, 2);
     let db = f.store.connect().unwrap();
     for (index, episode) in episodes.iter().enumerate() {
@@ -369,13 +377,16 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
                 |r| r.get(0),
             )
             .unwrap();
-        let unresolved: i64 = db
-            .query_row(
-                "SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND episode=?",
-                [&f.repo, episode],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let unresolved: i64 = crate::gql_one(
+            &f.store,
+            "MATCH (u:UnresolvedCall {repository_id: $repo, episode: $ep}) RETURN count(u) AS n",
+            graphicle_runtime::store_graph::Params::from([
+                crate::gp("repo", json!(f.repo)),
+                crate::gp("ep", json!(episode)),
+            ]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap();
         assert_eq!(
             coverage > 0,
             pro && n > 5,
@@ -447,7 +458,13 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         if pro { 3 } else { 0 }
     );
     assert_eq!(
-        f.count("SELECT count(DISTINCT episode) FROM gf_unresolved_calls WHERE repository_id=?"),
+        crate::gql_one(
+            &f.store,
+            "MATCH (u:UnresolvedCall {repository_id: $repo}) RETURN count(DISTINCT u.episode) AS n",
+            graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap(),
         1
     );
 
