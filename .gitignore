@@ -2,6 +2,7 @@
 # and crates/graphicle-memory) and the release archives
 # packaging/release_build.py writes.
 target/
+target-agent/
 /dist/
 # Parser sources prepared by crates/graphicle/tools/prepare_parser_sources.py.
 /.tslp-root/
