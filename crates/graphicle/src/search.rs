@@ -191,12 +191,9 @@ fn v3_instructions(notes: bool, period: bool, premise: bool) -> String {
 
 /// Input tokens this job may still reserve.
 pub(crate) fn remaining_input(worker: &Worker, job: &Job) -> Result<usize> {
-    jobs::guarded_read(&worker.store, job, |db, _, _| {
-        let used: i64 = db.query_row(
-            "SELECT coalesce(sum(input_reserved),0) FROM am_call_reservations WHERE job_id=?",
-            [&job.id],
-            |r| r.get(0),
-        )?;
+    jobs::guarded_read(&worker.store, job, |_, _, _| {
+        let totals = crate::jobs::reservation_totals(&worker.store.graph(), &job.id)?;
+        let used = totals["input"].as_i64().unwrap_or(0);
         Ok(
             (job.payload["max_input_tokens"].as_u64().unwrap_or(64000) as usize)
                 .saturating_sub(used.max(0) as usize),
@@ -237,7 +234,7 @@ async fn basic_inner(worker: &Worker, job: &Job) -> Result<Value> {
     let v3 = contract == "grounded-v3";
     let v2 = contract == "grounded-v2" || v3;
     let (mut snap, integration) = jobs::guarded_read(&worker.store, job, |db, p, r| {
-        let snap = query::snapshot(db, r, p)?;
+        let snap = query::snapshot(db, &worker.store.graph(), r, p)?;
         // A `basic` job
         // reads the code graph and reviewed memory by default when the
         // project's code-graph episode holds code symbols, with `context`'s
@@ -336,7 +333,7 @@ async fn basic_inner(worker: &Worker, job: &Job) -> Result<Value> {
     // documents' edges to code when `doc_links` is off.
     let local_switch = json!({"graph_retrieval": graph_switch, "doc_links": links_switch});
     let local = jobs::guarded_read(&worker.store, job, |db, p, r| {
-        crate::graph::for_query(db, r, p, &snap, &local_switch)
+        crate::graph::for_query(db, &worker.store.graph(), r, p, &snap, &local_switch)
     })?;
     let mut rankings = crate::graph::add_rankings(&snap, local.as_ref(), question, rankings)?;
     // `note_keys` requires observer_notes, so `available` holds the pinned

@@ -1,8 +1,8 @@
 use crate::memory;
-use crate::store::{Principal, Store, decode, one, repo, rows, s};
+use crate::store::{Principal, Store, decode, repo, s};
 use crate::{Error, Result, digest, graph_projection, integer, native, string};
 use graphicle::graph::Graph;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -321,13 +321,11 @@ pub struct Snapshot {
 /// episode (`episode_graph`); retained only as the fallback for repositories
 /// without a recorded episode and for the B10 equivalence test.
 pub fn legacy_graph(db: &Connection, repository: &Value, _p: &Principal) -> Result<Value> {
+    let _ = db;
+    let graph_store = crate::store::graph_for(db)?;
     // Past the adapter's file limit (a project larger than earlier builds
     // allowed), file relationships come from the projected episode only.
-    let files: i64 = db.query_row(
-        "SELECT count(*) FROM repo_heads WHERE repository_id=?",
-        [s(repository, "id")],
-        |r| r.get(0),
-    )?;
+    let files = crate::store_content::file_count(&graph_store, s(repository, "id"))?;
     if usize::try_from(files).unwrap_or(usize::MAX) > graphicle_memory::structure::GRAPH_FILE_LIMIT
     {
         return Ok(
@@ -338,11 +336,7 @@ pub fn legacy_graph(db: &Connection, repository: &Value, _p: &Principal) -> Resu
         );
     }
     let mut analyses = BTreeMap::new();
-    for mut row in rows(
-        db,
-        "SELECT p.path,p.data FROM repo_parses p JOIN repo_heads h ON h.repository_id=p.repository_id AND h.path=p.path AND h.sha256=p.sha256 WHERE p.repository_id=? ORDER BY p.path",
-        [s(repository, "id")],
-    )? {
+    for mut row in crate::store_content::head_parses(&graph_store, s(repository, "id"))? {
         decode(&mut row, "data")?;
         analyses.insert(s(&row, "path").to_string(), row["data"].clone());
     }
@@ -467,10 +461,10 @@ pub fn episode_graph(graph: &Graph, episode: &str) -> Value {
 pub fn source_graph(db: &Connection, repository: &Value, p: &Principal) -> Result<Value> {
     let id = s(repository, "id");
     let episode = graph_projection::current_episode(db, id)?;
-    if !graph_projection::is_recorded(db, id, &episode)? {
+    if !graph_projection::is_recorded(&*crate::store::graph_for(db)?, id, &episode)? {
         return legacy_graph(db, repository, p);
     }
-    match graph_projection::resident(db, id, &episode) {
+    match graph_projection::resident(&*crate::store::graph_for(db)?, id, &episode) {
         Ok(handle) => Ok(episode_graph(&handle, &episode)),
         Err(error) => {
             let mut graph = legacy_graph(db, repository, p)?;
@@ -480,13 +474,19 @@ pub fn source_graph(db: &Connection, repository: &Value, p: &Principal) -> Resul
         }
     }
 }
-pub fn snapshot(db: &Connection, repository: &Value, p: &Principal) -> Result<Snapshot> {
+pub fn snapshot(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    repository: &Value,
+    p: &Principal,
+) -> Result<Snapshot> {
     let documents = memory::documents(db, repository, p)?;
     // One read of the sources serves the memory listing too.
-    let memories = memory::list_of(db, repository, &documents, true)?;
+    let memories = memory::list_of(db, graph, repository, &documents, true)?;
+    let reviewed = memory::reviewed_state_for(graph, repository, &memories)?;
     let graph = source_graph(db, repository, p)?;
     let state = digest(
-        &json!({"sources":memory::state(&documents),"memories":memories.iter().map(|m|json!([m["id"],m["revision"],m["state"],m["stale"]])).collect::<Vec<_>>(),"reviewed_state":memory::reviewed_state_for(db,repository,&memories)?}),
+        &json!({"sources":memory::state(&documents),"memories":memories.iter().map(|m|json!([m["id"],m["revision"],m["state"],m["stale"]])).collect::<Vec<_>>(),"reviewed_state":reviewed}),
     );
     Ok(Snapshot {
         repository: repository.clone(),
@@ -1983,30 +1983,35 @@ fn arm_report(
     }
     Value::Object(report)
 }
+/// Rank `rows` (recall candidates with `identity`/`source_sha`) against a
+/// query embedding through the graph store's vector indexes — only a hit
+/// whose stored `source_sha` still matches the candidate's ranks, so a
+/// stale embedding never ranks (the retired path loaded every `am_vectors`
+/// row and computed cosine here).
 pub fn semantic_ranking(
+    graph: &crate::store_graph::GraphStore,
+    repository: &str,
+    model_key: &str,
     rows: &[Value],
-    vectors: &BTreeMap<String, Vec<f64>>,
     query: &[f64],
 ) -> Result<Value> {
-    let valid: BTreeSet<_> = rows.iter().map(|r| s(r, "identity")).collect();
-    let mut pairs = Vec::new();
+    let valid: BTreeMap<&str, &str> = rows
+        .iter()
+        .map(|r| (s(r, "identity"), s(r, "source_sha")))
+        .collect();
     let norm = query.iter().map(|v| v * v).sum::<f64>().sqrt();
     if !norm.is_finite() || norm <= 0.0 {
         return Err(Error::bad("Query embedding is empty"));
     }
-    for (id, v) in vectors {
-        if valid.contains(id.as_str()) && v.len() == query.len() {
-            let divisor = v.iter().map(|x| x * x).sum::<f64>().sqrt() * norm;
-            if divisor > 0.0 {
-                pairs.push((
-                    id,
-                    v.iter().zip(query).map(|(a, b)| a * b).sum::<f64>() / divisor,
-                ));
-            }
-        }
-    }
-    pairs.sort_by(|(a, x), (b, y)| y.total_cmp(x).then(a.cmp(b)));
-    Ok(json!({"semantic":pairs.into_iter().take(200).map(|(id,_)|id).collect::<Vec<_>>()}))
+    let hits =
+        crate::vector::semantic_search(graph, repository, model_key, query, valid.len().max(200))?;
+    let ranked: Vec<&str> = hits
+        .iter()
+        .filter(|(id, sha, _)| valid.get(id.as_str()) == Some(&sha.as_str()))
+        .take(200)
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    Ok(json!({"semantic":ranked}))
 }
 impl Store {
     pub fn project_context(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
@@ -2059,7 +2064,7 @@ impl Store {
                     crate::identifier_route::Routed::Answered(packet) => return Ok(packet),
                     crate::identifier_route::Routed::Retrieval(route) => route,
                 };
-                let mut packet = project_packet(db, p, &repository, args, embedding, reranker)?.1;
+                let mut packet = project_packet(&self.graph(), db, p, &repository, args, embedding, reranker)?.1;
                 let mut route = route;
                 // A question that asks more about the names it gives keeps
                 // them: the identifier arm ranks their files.
@@ -2074,7 +2079,7 @@ impl Store {
             // one project's questions only.
             crate::workspace::Scope::Workspace => {
                 let (on, defaulted) = crate::identifier_route::switch(args)?;
-                let mut packet = crate::workspace::context(db, p, args, embedding, reranker)?;
+                let mut packet = crate::workspace::context(&self.graph(), db, p, args, embedding, reranker)?;
                 let mut route =
                     json!({"path":"retrieval","reason":"workspace","defaulted":defaulted});
                 route[crate::identifier_route::FIELD] = json!(on);
@@ -2095,6 +2100,7 @@ impl Store {
 /// scope through this function, so a workspace read is authorized and
 /// ranked exactly as a single-project read.
 pub fn project_packet(
+    graph_store: &crate::store_graph::GraphStore,
     db: &Connection,
     p: &Principal,
     repository: &Value,
@@ -2102,13 +2108,15 @@ pub fn project_packet(
     embedding: Option<&crate::model::Profile>,
     reranker: Option<&crate::model::Profile>,
 ) -> Result<(Snapshot, Value)> {
-    let mut snap = crate::phase::phase("context_snapshot", || snapshot(db, repository, p))?;
+    let mut snap = crate::phase::phase("context_snapshot", || {
+        snapshot(db, graph_store, repository, p)
+    })?;
     if args["memory_retrieval"] == false {
         snap.memories.clear();
     }
     let filter = Filter::parse(args)?.map(|f| restrict(&mut snap, &f));
     let graph = crate::phase::phase("context_graph", || {
-        crate::graph::for_query(db, repository, p, &snap, args)
+        crate::graph::for_query(db, graph_store, repository, p, &snap, args)
     })?;
     let question = string(args, "question", 16000)?;
     // What the arms read: a code question's content, not its instructions
@@ -2135,22 +2143,13 @@ pub fn project_packet(
             .iter()
             .map(|c| (s(c, "identity"), s(c, "source_sha")))
             .collect::<BTreeMap<_, _>>();
-        let mut vectors = BTreeMap::new();
         let key = crate::model::key(profile);
-        for row in crate::store::rows(
-            db,
-            "SELECT identity,source_sha,vector FROM am_vectors WHERE repository_id=? AND model_key=?",
-            rusqlite::params![s(repository, "id"), key],
-        )? {
-            if valid.get(s(&row, "identity")) == Some(&s(&row, "source_sha")) {
-                vectors.insert(
-                    s(&row, "identity").to_string(),
-                    serde_json::from_str::<Vec<f64>>(s(&row, "vector"))?,
-                );
-            }
-        }
-        dense_report = json!({"status":if vectors.is_empty(){"index_unavailable"}else{"ready"},"model_key":key,"vectors":vectors.len(),"authorized_candidates":candidates.len()});
-        if !vectors.is_empty() {
+        let vectors = crate::vector::graph_vector_index(graph_store, s(repository, "id"), &key)?
+            .into_iter()
+            .filter(|(identity, sha)| valid.get(identity.as_str()) == Some(&sha.as_str()))
+            .count();
+        dense_report = json!({"status":if vectors==0{"index_unavailable"}else{"ready"},"model_key":key,"vectors":vectors,"authorized_candidates":candidates.len()});
+        if vectors > 0 {
             let started = std::time::Instant::now();
             let (query, tokens, _) =
                 crate::local_inference::embed_query(profile, &[query.to_string()])?;
@@ -2162,7 +2161,15 @@ pub fn project_packet(
             dense_calls = 1;
             dense_report["input_tokens"] = json!(tokens);
             dense_report["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
-            if let Some(extra) = semantic_ranking(&candidates, &vectors, &query[0])?.as_object() {
+            if let Some(extra) = semantic_ranking(
+                graph_store,
+                s(repository, "id"),
+                &key,
+                &candidates,
+                &query[0],
+            )?
+            .as_object()
+            {
                 for (k, v) in extra {
                     rankings[k] = v.clone();
                 }
@@ -2199,8 +2206,14 @@ pub fn project_packet(
                 }
                 dense_calls += 1;
                 for ((i, _), vector) in picked.iter().zip(&found) {
-                    rankings[format!("semantic_q{}", i + 1)] =
-                        semantic_ranking(&candidates, &vectors, vector)?["semantic"].clone();
+                    rankings[format!("semantic_q{}", i + 1)] = semantic_ranking(
+                        graph_store,
+                        s(repository, "id"),
+                        &key,
+                        &candidates,
+                        vector,
+                    )?["semantic"]
+                        .clone();
                 }
                 embedded.push(json!({"kind":kind,"texts":texts.len(),"input_tokens":tokens}));
             }
@@ -2220,6 +2233,7 @@ pub fn project_packet(
     } else {
         crate::phase::phase("context_arm", || {
             crate::code_graph_arm::arm_with(
+                graph_store,
                 db,
                 s(repository, "id"),
                 &snap,
@@ -2256,8 +2270,11 @@ pub fn project_packet(
         }
         None => json!({"status":"no_passages"}),
     };
-    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))
-        .with_folder(crate::folders::current_folder(db, s(repository, "id"))?);
+    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))?
+        .with_folder(crate::folders::current_folder(
+            crate::store::graph_for(db)?.as_ref(),
+            s(repository, "id"),
+        )?);
     if crate::observer::KeyMode::parse(args.get("note_keys"))?.is_some() {
         rankings[crate::observer::NOTE_KEYS] = json!(crate::observer::notes_for(
             db,
@@ -2283,7 +2300,7 @@ pub fn project_packet(
     }
     packet["model_calls"] = json!(packet["model_calls"].as_u64().unwrap_or(0) + dense_calls);
     packet["freshness"] = json!(crate::invalidation::repository_freshness(
-        db,
+        graph_store,
         &p.workspace,
         s(repository, "id")
     )?);
@@ -2293,14 +2310,14 @@ pub fn project_packet(
 impl Store {
     pub fn project_status(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace,token,"read",|db,p| {
-            let repository=repo(db,p,string(args,"repository_id",100)?)?;let snap=snapshot(db,&repository,p)?;
-            let observed:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM am_connectors WHERE repository_id=? AND state='active' AND json_type(config,'$.observe')='object')",[s(&repository,"id")],|r|r.get(0))?;
+            let repository=repo(db,p,string(args,"repository_id",100)?)?;let snap=snapshot(db,&self.graph(),&repository,p)?;
+            let observed:bool=self.graph().read(|db|crate::store_graph::rows(db,"MATCH (c:Connector {repository_id: $repository, state: 'active'}) RETURN c.config AS config",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&repository["id"]))])))?.iter().any(|c|serde_json::from_str::<Value>(crate::store_graph::s(c,"config")).map(|c|c["observe"].is_object()).unwrap_or(false));
             Ok(json!({"repository":repository,"files":snap.documents.iter().filter(|d|d["source_kind"]=="repository_file").count(),
                 "evidence_sources":snap.documents.len(),"memories":snap.memories.len(),"stale_memories":snap.memories.iter().filter(|m|m["stale"]==true).count(),
                 "draft_memories":snap.memories.iter().filter(|m|m["state"]=="draft").count(),"source_state":snap.state,"native_runtime":{"enabled":true,"language":"rust","service_version":env!("CARGO_PKG_VERSION"),"core_version":graphicle_memory::VERSION},
                 "structural_revision":graphicle_memory::structure::REVISION,"graph":snap.graph,"automatic_model_calls":observed,
                 "write_lock":crate::store::lock_report(),
-                "freshness":crate::invalidation::repository_freshness(db,&p.workspace,s(&repository,"id"))?}))
+                "freshness":crate::invalidation::repository_freshness(&self.graph(),&p.workspace,s(&repository,"id"))?}))
         })
     }
     pub fn read_project_source(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
@@ -2314,13 +2331,13 @@ impl Store {
                 .ok_or_else(|| Error::bad("Select a source ID or file path"))?;
             if let Some(snapshot)=args["snapshot"].as_str().filter(|v|*v!=s(&repository,"snapshot")) {
                 let path=identifier.strip_prefix("file:").ok_or_else(||Error::bad("Repository snapshots only apply to repository files"))?;
-                let saved=one(db,"SELECT manifest,created_at FROM repo_snapshots WHERE repository_id=? AND sha256=?",params![s(&repository,"id"),snapshot])?.ok_or_else(||Error::bad("Snapshot unavailable"))?;
+                let saved=crate::store_content::snapshot_get(&self.graph(),s(&repository,"id"),snapshot)?.ok_or_else(||Error::bad("Snapshot unavailable"))?;
                 let manifest:Value=serde_json::from_str(s(&saved,"manifest"))?;
                 let sha=manifest[path]["sha256"].as_str().ok_or_else(||Error::bad("File was absent from this snapshot"))?;
-                let original=one(db,"SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",params![s(&repository,"id"),sha])?.ok_or_else(||Error::bad("Historical source was removed"))?;
+                let content=crate::store_content::object_content(&self.graph(),s(&repository,"id"),sha)?.ok_or_else(||Error::bad("Historical source was removed"))?;
                 if args["sha256"].as_str().is_some_and(|expected|expected!=sha) {return Err(Error::conflict("Hash does not match the requested snapshot"));}
-                if graphicle_memory::text::sha256(s(&original,"content").as_bytes())!=sha {return Err(Error::bad("Historical source integrity check failed"));}
-                let doc=json!({"id":identifier,"path":path,"title":path,"sha256":sha,"version":sha,"snapshot":snapshot,"source_kind":"repository_file","content":original["content"],"recorded_at":null,"observed_at":saved["created_at"],"authority":"historical_original_source"});
+                if graphicle_memory::text::sha256(content.as_bytes())!=sha {return Err(Error::bad("Historical source integrity check failed"));}
+                let doc=json!({"id":identifier,"path":path,"title":path,"sha256":sha,"version":sha,"snapshot":snapshot,"source_kind":"repository_file","content":content,"recorded_at":null,"observed_at":saved["created_at"],"authority":"historical_original_source"});
                 return memory::read_source(&doc,args);
             }
             let source = docs
@@ -2708,6 +2725,7 @@ mod tests {
             .collect();
         let snapshot = synthetic(documents, vec![]);
         let db = rusqlite::Connection::open_in_memory().unwrap();
+        let graph_store = crate::store_graph::GraphStore::open_in_memory().unwrap();
         let principal = crate::store::Principal {
             workspace: "w".into(),
             credential: "c".into(),
@@ -2715,10 +2733,16 @@ mod tests {
             role: "owner".into(),
         };
         let args = json!({"question":"note 50000","graph_retrieval":true});
-        let graph =
-            crate::graph::for_query(&db, &snapshot.repository, &principal, &snapshot, &args)
-                .unwrap()
-                .unwrap();
+        let graph = crate::graph::for_query(
+            &db,
+            &graph_store,
+            &snapshot.repository,
+            &principal,
+            &snapshot,
+            &args,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(graph["degraded"]["nodes"], bound + 1, "{graph}");
         let rankings =
             crate::graph::add_rankings(&snapshot, Some(&graph), "note 50000", json!({})).unwrap();
@@ -2870,7 +2894,6 @@ mod tests {
         // `graph_local` reads reviewed claims and entity links: a store's schema.
         let dir = tempfile::TempDir::new().unwrap();
         let store = crate::store::Store::open(dir.path()).unwrap();
-        let db = store.connect().unwrap();
         let principal = crate::store::Principal {
             workspace: "w".into(),
             credential: "c".into(),
@@ -2878,10 +2901,17 @@ mod tests {
             role: "owner".into(),
         };
         let args = json!({"question":"refresh token","graph_retrieval":true});
-        let graph =
-            crate::graph::for_query(&db, &snapshot.repository, &principal, &snapshot, &args)
-                .unwrap()
-                .unwrap();
+        let db = store.connect().unwrap();
+        let graph = crate::graph::for_query(
+            &db,
+            &store.graph(),
+            &snapshot.repository,
+            &principal,
+            &snapshot,
+            &args,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(graph["degraded"]["nodes"], 2, "{graph}");
         assert_eq!(graph["degraded"]["edges"], over);
         let rankings =

@@ -18,6 +18,7 @@ use graphicle_runtime::{
     jobs::{self, Worker},
     model,
     store::{self, Store, s},
+    store_graph::{self, Params, json_to_value},
 };
 use serde_json::{Value, json};
 use std::{
@@ -129,22 +130,65 @@ impl Fixture {
             .as_i64()
             .unwrap()
     }
-    fn rows(&self, repo: &str) -> Vec<Value> {
+    /// Run a read-only Cypher query against the store's graph (the link
+    /// rows live there, not in the SQL store).
+    fn graph(&self, cypher: &str, params: Params) -> Vec<Value> {
         self.store
+            .graph()
+            .read(|db| store_graph::rows(db, cypher, params))
+            .unwrap()
+    }
+    fn gcount(&self, cypher: &str) -> i64 {
+        self.store
+            .graph()
             .read(|db| {
-                let mut found = store::rows(
-                    db,
-                    "SELECT document_id,document_sha256,mention,mark,state,scope,candidates,target_repository_id,\
-                     stable_id,target_relpath,target,rung,producer FROM gf_doc_links WHERE repository_id=? \
-                     ORDER BY document_id,byte_start,id",
-                    [repo],
-                )?;
-                for row in &mut found {
-                    store::decode(row, "target")?;
-                }
-                Ok(found)
+                Ok(store_graph::one(db, cypher, Params::new())?.unwrap()["n"]
+                    .as_i64()
+                    .unwrap())
             })
             .unwrap()
+    }
+    /// A Cypher write transaction on the store's graph.
+    fn graph_write(&self, statements: &[&str]) {
+        self.store
+            .graph()
+            .transaction(|db| {
+                for statement in statements {
+                    store_graph::rows(db, statement, Params::new())?;
+                }
+                Ok(())
+            })
+            .unwrap()
+    }
+    /// One parameterized Cypher write on the store's graph.
+    fn graph_write_params(&self, cypher: &str, params: Params) {
+        self.store
+            .graph()
+            .transaction(|db| {
+                store_graph::rows(db, cypher, params.clone())?;
+                Ok(())
+            })
+            .unwrap()
+    }
+    fn rows(&self, repo: &str) -> Vec<Value> {
+        let mut params = Params::new();
+        params.insert("repo".into(), json_to_value(&json!(repo)));
+        let found = self.graph(
+            &format!(
+                "MATCH (d:ConnectorDoc {{repository_id: $repo}})-[l:LINKS_TO]->() \
+                 RETURN {} ORDER BY d.id, l.byte_start, l.seq",
+                doc_links::LINK_COLUMNS
+            ),
+            params,
+        );
+        found
+            .into_iter()
+            .map(|mut row| {
+                // The facts live in dotted properties; reassemble them.
+                row["target"] = doc_links::target_facts(&row);
+                row
+            })
+            .collect()
     }
     fn reader(&self) -> (String, String) {
         let reader = self
@@ -217,7 +261,7 @@ fn markdown_mentions_link_where_the_engine_resolves_them() {
         .store
         .read(|db| {
             let episode = graph_projection::current_episode(db, &repo)?;
-            let handle = graph_projection::resident(db, &repo, &episode)?;
+            let handle = graph_projection::resident(&crate::gstore(db), &repo, &episode)?;
             let graph: &graphicle::graph::Graph = &handle;
             let text = |i: usize, key: &str| {
                 graph.nodes()[i]
@@ -305,7 +349,7 @@ fn markdown_mentions_link_where_the_engine_resolves_them() {
     assert_eq!(coverage["coverage"]["by_rung"]["mention"], files["linked"]);
     assert_eq!(coverage["coverage"]["pending_documents"], 0);
     // One source row per document read: code files are not documents.
-    assert_eq!(f.count("SELECT count(*) AS n FROM gf_doc_link_sources"), 1);
+    assert_eq!(f.gcount("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 1);
     // A page synced but not yet read by the `link` job is pending; a code
     // file never is.
     f.sync(
@@ -848,7 +892,7 @@ fn conversation_stores_get_no_links_and_unchanged_evidence() {
     );
     f.drain(&repo);
     assert!(f.rows(&repo).is_empty());
-    assert_eq!(f.count("SELECT count(*) AS n FROM gf_doc_link_sources"), 0);
+    assert_eq!(f.gcount("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 0);
     for question in ["what failed again", "when is dinner"] {
         let on = f.context(&repo, json!({"question":question}));
         let off = f.context(&repo, json!({"question":question,"doc_links":false}));
@@ -1203,16 +1247,15 @@ async fn connector_code_marks_link_without_changing_text_or_staling_memories() {
     );
     // The issue's text has no backticks: it is the frozen conversion's.
     let stored = |id: &str| {
-        f.store
-            .read(|db| {
-                Ok(store::one(
-                    db,
-                    "SELECT content,sha256,metadata FROM am_connector_docs WHERE connector_id=? AND id=?",
-                    rusqlite::params![connectors[0], id],
-                )?
-                .unwrap())
-            })
-            .unwrap()
+        crate::gql_one(
+            &f.store,
+            "MATCH (d:ConnectorDoc {connector_id: $connector, id: $id}) RETURN d.content AS content, d.sha256 AS sha256, d.metadata AS metadata",
+            graphicle_runtime::store_graph::Params::from([
+                crate::gp("connector", json!(connectors[0])),
+                crate::gp("id", json!(id)),
+            ]),
+        )
+        .unwrap()
     };
     let issue = stored("GW-1");
     assert!(s(&issue, "content").ends_with(&frozen_adf_text(&code_marked_adf(true))));
@@ -1405,7 +1448,18 @@ fn imports_take_code_spans_and_queue_the_link_job() {
     }
     import(json!([[11, 23]])).unwrap();
     assert_eq!(
-        f.count("SELECT count(*) AS n FROM am_jobs WHERE kind='link' AND state='queued'"),
+        f.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {kind: 'link', state: 'queued'}) RETURN count(j) AS n",
+                    graphicle_runtime::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap(),
         1
     );
     f.drain(&repo);
@@ -1437,26 +1491,32 @@ impl Fixture {
     /// `document_id → updated_at` of every document's source row: a row
     /// rewritten by a `link` job gets a new stamp.
     fn stamps(&self) -> BTreeMap<String, String> {
-        self.store
-            .read(|db| {
-                Ok(store::rows(
-                    db,
-                    "SELECT document_id,updated_at FROM gf_doc_link_sources",
-                    [],
-                )?
-                .into_iter()
-                .map(|r| {
-                    (
-                        s(&r, "document_id").to_string(),
-                        s(&r, "updated_at").to_string(),
-                    )
-                })
-                .collect())
-            })
-            .unwrap()
+        self.graph(
+            "MATCH (d:ConnectorDoc) RETURN d.id AS document_id, d.updated_at AS updated_at",
+            Params::new(),
+        )
+        .into_iter()
+        .map(|r| {
+            (
+                s(&r, "document_id").to_string(),
+                s(&r, "updated_at").to_string(),
+            )
+        })
+        .collect()
     }
     fn queued_links(&self) -> i64 {
-        self.count("SELECT count(*) AS n FROM am_jobs WHERE kind='link' AND state='queued'")
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {kind: 'link', state: 'queued'}) RETURN count(j) AS n",
+                    graphicle_runtime::store_graph::Params::new(),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap_or(0)
     }
     fn jsonl(&self, repo: &str, name: &str) -> String {
         let connector = self
@@ -1579,13 +1639,10 @@ fn an_import_while_the_link_job_runs_queues_another_and_graph_link_relinks() {
         );
     }
     // `graph.link` relinks on request.
-    f.store
-        .transaction(|db| {
-            db.execute("DELETE FROM gf_doc_links", [])?;
-            db.execute("DELETE FROM gf_doc_link_sources", [])?;
-            Ok(())
-        })
-        .unwrap();
+    f.graph_write(&[
+        "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() DELETE l",
+        "MATCH (d:ConnectorDoc) WHERE d.source_kind IS NOT NULL DELETE d",
+    ]);
     let linked = f.store.graph_link(&f.workspace, &f.key).unwrap();
     assert_eq!(linked["documents"]["relinked"], 2, "{linked}");
     assert_eq!(
@@ -1732,7 +1789,7 @@ fn sdk_sessions_are_never_linked_and_queue_no_link_job() {
     assert!(s(&rows[0], "document_id").ends_with(":t-1"));
 }
 
-/// A store whose link tables are new, as after an upgrade,
+/// A store whose link rows are new, as after an upgrade,
 /// queues the workspace's `link` job when it is opened, and the next drain
 /// links its documents; rows of other rules do the same; a current store
 /// queues nothing.
@@ -1741,15 +1798,13 @@ fn an_upgraded_store_links_its_documents_at_the_next_drain() {
     let f = Fixture::new();
     let repo = gateway(&f);
     assert!(!f.rows(&repo).is_empty());
-    f.store
-        .transaction(|db| {
-            db.execute_batch(
-                "DROP TABLE gf_doc_links; DROP TABLE gf_doc_link_sources;
-                 DROP TABLE gf_doc_link_checkpoints; DROP TABLE gf_doc_link_state;",
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    // As a store from before the move looks: no link rows, no state.
+    f.graph_write(&[
+        "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() DELETE l",
+        "MATCH (d:ConnectorDoc) WHERE d.source_kind IS NOT NULL DELETE d",
+        "MATCH (c:DocLinkCheckpoint) DELETE c",
+        "MATCH (t:DocLinkState) DELETE t",
+    ]);
     let reopened = Store::open(f._dir.path()).unwrap();
     assert_eq!(f.queued_links(), 1);
     jobs::drain_projection(&reopened, &repo).unwrap();
@@ -1757,12 +1812,7 @@ fn an_upgraded_store_links_its_documents_at_the_next_drain() {
     let coverage = f.read(&f.key, json!({"repository_id":repo})).unwrap();
     assert_eq!(coverage["coverage"]["pending_documents"], 0, "{coverage}");
     // Rows of other rules.
-    f.store
-        .transaction(|db| {
-            db.execute("UPDATE gf_doc_link_state SET rules='doc-links/0'", [])?;
-            Ok(())
-        })
-        .unwrap();
+    f.graph_write(&["MATCH (t:DocLinkState) SET t.rules = 'doc-links/0'"]);
     Store::open(f._dir.path()).unwrap();
     assert_eq!(f.queued_links(), 1);
     jobs::drain_projection(&reopened, &repo).unwrap();
@@ -1779,22 +1829,43 @@ fn an_upgraded_store_links_its_documents_at_the_next_drain() {
 fn another_producers_rows_stay_and_are_not_read_without_it() {
     let f = Fixture::new();
     let repo = gateway(&f);
-    f.store
-        .transaction(|db| {
-            db.execute(
-                "INSERT INTO gf_doc_links(repository_id,document_id,document_sha256,source_kind,byte_start,byte_end,\
-                 mention,mark,state,scope,candidates,target_repository_id,stable_id,target_relpath,target_sha256,\
-                 target_start,target_end,target,rung,producer,created_at) \
-                 SELECT repository_id,document_id,document_sha256,source_kind,byte_start,byte_end,mention,'lexical',\
-                 state,scope,candidates,target_repository_id,stable_id,target_relpath,target_sha256,target_start,\
-                 target_end,target,'lexical','an-extension',created_at FROM gf_doc_links WHERE repository_id=? AND state='linked'",
-                [&repo],
-            )?;
-            Ok(())
+    // An extension's copy of the linked rows: its own rung and producer.
+    let copies: Vec<Value> = f
+        .rows(&repo)
+        .into_iter()
+        .filter(|r| r["state"] == "linked")
+        .map(|r| {
+            let mut props = r.clone();
+            let props = props.as_object_mut().unwrap();
+            props.remove("repository_id");
+            // The reassembled facts map is not a storable value; its dotted
+            // properties are set below.
+            props.remove("target");
+            props.insert("mark".into(), json!("lexical"));
+            props.insert("rung".into(), json!("lexical"));
+            props.insert("producer".into(), json!("an-extension"));
+            // The facts live in dotted properties (`target.node_id`, …).
+            for (key, value) in r["target"].as_object().cloned().unwrap_or_default() {
+                if !value.is_null() {
+                    props.insert(format!("target.{key}"), value);
+                }
+            }
+            props.retain(|key, value| !value.is_null() && !key.starts_with("target_"));
+            json!({"doc": s(&r, "document_id"), "props": props})
         })
-        .unwrap();
+        .collect();
+    assert_eq!(copies.len(), 1);
+    let mut params = Params::new();
+    params.insert("repo".into(), json_to_value(&json!(repo)));
+    params.insert("rows".into(), json_to_value(&json!(copies)));
+    f.graph_write_params(
+        "UNWIND $rows AS row \
+         MATCH (d:ConnectorDoc {repository_id: $repo, id: row.doc}) \
+         CREATE (d)-[l:LINKS_TO]->(d) SET l += row.props",
+        params,
+    );
     let extension =
-        || f.count("SELECT count(*) AS n FROM gf_doc_links WHERE producer='an-extension'");
+        || f.gcount("MATCH ()-[l:LINKS_TO]->() WHERE l.producer='an-extension' RETURN count(l) AS n");
     assert_eq!(extension(), 1);
     // The page changes: the job rewrites its own rows only.
     let edited = format!("{PROTOCOL}\nSee also the release notes.\n");
@@ -1862,11 +1933,12 @@ fn a_project_whose_episode_cannot_be_read_leaves_the_others_linking() {
         .read(|db| graph_projection::current_episode(db, &broken))
         .unwrap();
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&broken],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(broken))],
+            );
             Ok(())
         })
         .unwrap();
@@ -2001,7 +2073,7 @@ fn outcomes_across_projects_say_nothing_of_projects_a_reader_cannot_read() {
             .store
             .read(|db| {
                 let episode = graph_projection::current_episode(db, &shown)?;
-                let handle = graph_projection::resident(db, &shown, &episode)?;
+                let handle = graph_projection::resident(&crate::gstore(db), &shown, &episode)?;
                 let graph: &graphicle::graph::Graph = &handle;
                 Ok(graph
                     .nodes()
@@ -2219,12 +2291,14 @@ async fn basic_answers_and_mcp_recall_take_the_switch() {
         .store
         .read(|db| graph_projection::current_episode(db, &repo))
         .unwrap();
+    // Corrupt the episode's attributes in the authoritative graph store.
     f.store
-        .transaction(|db| {
-            db.execute(
-                "UPDATE gf_episodes SET attributes='not json' WHERE repository_id=?",
-                [&repo],
-            )?;
+        .read(|db| {
+            crate::gwrite(
+                db,
+                "MATCH (e:Episode {repository_id:$r}) SET e.attributes = 'not json'",
+                &[("r", json!(repo))],
+            );
             Ok(())
         })
         .unwrap();

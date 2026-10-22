@@ -165,14 +165,28 @@ impl Fixture {
     fn principal(&self) -> String {
         graphicle_memory::text::sha256(self.key.as_bytes())
     }
-    /// A job row as an earlier release could have queued it.
+    /// A job row as an earlier release could have queued it (the queue lives
+    /// in the store's graph now).
     fn queued(&self, id: &str, kind: &str, payload: &Value, priority: i64) {
         let stamp = graphicle_runtime::now();
-        self.store.connect().unwrap().execute(
-            "INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,3,?,?,?)",
-            rusqlite::params![id, self.repo, kind, id, payload.to_string(), self.principal(), priority, stamp, stamp, stamp],
-        )
-        .unwrap();
+        let encoded = payload.to_string();
+        self.store
+            .graph()
+            .transaction(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "CREATE (j:Job {id: $id}) SET j += $job",
+                    graphicle_runtime::store_graph::params(&json!({"id": id, "job": {
+                        "id": id, "repository_id": self.repo, "workspace_id": self.workspace,
+                        "kind": kind, "input_hash": id, "payload": encoded,
+                        "payload_bytes": encoded.len(), "principal_hash": self.principal(),
+                        "state": "queued", "priority": priority, "attempt": 0, "max_attempts": 3,
+                        "not_before": stamp, "created_at": stamp, "updated_at": stamp,
+                    }})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
     }
     fn status(&self, id: &str) -> Value {
         self.store
@@ -274,17 +288,24 @@ async fn archived_options_are_refused_where_callers_sent_them_and_inert_values_p
         if entry.surfaces.contains(&Surface::ObservePolicy) {
             // A policy stored before the archive stops automatic observation
             // and says why.
-            f.store
-                .connect()
-                .unwrap()
-                .execute(
-                    "UPDATE am_connectors SET config=json_set(config,'$.observe',json(?)) WHERE id=?",
-                    rusqlite::params![
-                        json!({ entry.option: turned_on(entry) }).to_string(),
-                        f.connector
-                    ],
-                )
-                .unwrap();
+            // Connectors live in the graph store; rewrite the policy there.
+            let current = crate::gql_one(
+                &f.store,
+                "MATCH (c:Connector {id: $id}) RETURN c.config AS config",
+                graphicle_runtime::store_graph::Params::from([crate::gp("id", json!(f.connector))]),
+            )
+            .unwrap();
+            let mut config: Value =
+                serde_json::from_str(current["config"].as_str().unwrap()).unwrap();
+            config["observe"] = json!({ entry.option: turned_on(entry) });
+            crate::gql_write(
+                &f.store,
+                "MATCH (c:Connector {id: $id}) SET c.config=$config",
+                graphicle_runtime::store_graph::Params::from([
+                    crate::gp("id", json!(f.connector)),
+                    crate::gp("config", json!(config.to_string())),
+                ]),
+            );
             let decisions = f.store.auto_observe(&f.config, Some(&f.connector)).unwrap();
             assert!(
                 decisions

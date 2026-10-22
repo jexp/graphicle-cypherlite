@@ -28,7 +28,7 @@ pub mod fresh;
 pub mod git_hooks;
 pub mod graph;
 pub mod graph_command;
-mod graph_delta;
+pub mod graph_delta;
 mod graph_materialize;
 pub mod graph_projection;
 pub mod graph_tools;
@@ -42,6 +42,7 @@ pub mod limits;
 pub mod local;
 pub mod local_inference;
 pub mod maintenance;
+pub mod migrate;
 pub mod memory;
 pub mod memory_evidence;
 pub mod metering;
@@ -68,6 +69,8 @@ pub mod setup;
 pub mod source_age;
 pub mod store;
 pub mod store_compat;
+pub mod store_content;
+pub mod store_graph;
 pub mod structured_memory;
 pub mod symbol_links;
 pub mod symbols;
@@ -128,6 +131,16 @@ impl std::error::Error for Error {}
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Self::bad(format!("Storage operation failed: {e}"))
+    }
+}
+impl From<cypherlite::Error> for Error {
+    fn from(e: cypherlite::Error) -> Self {
+        match e {
+            cypherlite::Error::Conflict => {
+                Self::conflict("Write conflicted with a concurrent write")
+            }
+            other => Self::bad(format!("Graph storage operation failed: {other}")),
+        }
     }
 }
 impl From<serde_json::Error> for Error {

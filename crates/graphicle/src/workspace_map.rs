@@ -84,6 +84,7 @@ fn map(
     offset: usize,
     limit: usize,
 ) -> Result<Value> {
+    let graph_store = crate::store::graph_for(db)?;
     let scratch = graph_projection::pr_scratch_projects(db, &p.workspace)?;
     // The map's projects, each authorized as a direct read of it is.
     let mut listed: Vec<Value> = Vec::new();
@@ -114,7 +115,7 @@ fn map(
     let mut incoming: BTreeMap<String, usize> = BTreeMap::new();
     let mut edges = 0usize;
     for &source in &members {
-        for edge in graph_projection::live_cross_edges(db, p, source, CrossDirection::Outgoing)? {
+        for edge in graph_projection::live_cross_edges(db, graph_store.as_ref(), p, source, CrossDirection::Outgoing)? {
             let target = s(&edge, "target_repository_id");
             if target == source || !members.contains(target) {
                 continue;
@@ -177,7 +178,7 @@ fn map(
 /// The file set the project's symbols were projected from, and whether it is
 /// the project's current one (otherwise its graph waits for a projection).
 fn graph(db: &Connection, id: &str) -> Result<Value> {
-    Ok(match symbols::table_episode(db, id)? {
+    Ok(match symbols::table_episode(crate::store::graph_for(db)?.as_ref(), id)? {
         Some(episode) => {
             let current = episode == graph_projection::current_episode(db, id)?;
             json!({"episode":episode,"current":current})
@@ -190,12 +191,13 @@ fn graph(db: &Connection, id: &str) -> Result<Value> {
 /// module comment); the import counts are added by the caller.
 fn counts(db: &Connection, p: &Principal, repository: &Value) -> Result<Value> {
     let id = s(repository, "id");
+    let graph = crate::store::graph_for(db)?;
     let documents = memory::documents(db, repository, p)?;
     let files = documents
         .iter()
         .filter(|d| d["source_kind"] == "repository_file")
         .count();
-    let memories = memory::list_of(db, repository, &documents, false)?;
+    let memories = memory::list_of(db, graph.as_ref(), repository, &documents, false)?;
     let memory_symbols: u64 = memories
         .iter()
         .map(|m| m["symbol_links"]["links"].as_u64().unwrap_or(0))

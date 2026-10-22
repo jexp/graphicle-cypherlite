@@ -324,7 +324,7 @@ fn code_graph(db: &Connection, repository: &str) -> Option<CodeGraph> {
     let Reading { episode, lag } = code_graph_arm::reading(db, repository, &heads, &current)
         .ok()
         .flatten()?;
-    let handle = graph_projection::resident(db, repository, &episode).ok()?;
+    let handle = graph_projection::resident(crate::store::graph_for(db).ok()?.as_ref(), repository, &episode).ok()?;
     let graph: &Graph = &handle;
     let symbols: Vec<(usize, String, String)> = graph
         .nodes()

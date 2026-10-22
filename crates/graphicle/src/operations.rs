@@ -2,9 +2,9 @@
 use crate::{Error, Result, integer, now, string};
 use crate::{
     memory,
-    store::{self, Store, decode, one, repo, rows, s},
+    store::{self, Store, decode, repo, rows, s},
+    store_graph,
 };
-use rusqlite::params;
 use serde_json::{Value, json};
 
 impl Store {
@@ -101,28 +101,30 @@ impl Store {
                     let files:Vec<_>=matching.iter().skip(offset).take(limit).map(|d|json!({"id":d["id"],"path":d["path"],"title":d["title"],"sha256":d["sha256"],"source_kind":d["source_kind"],"bytes":s(d,"content").len()})).collect();
                     Ok(json!({"files":files,"total":matching.len(),"next_offset":if offset+limit<matching.len(){Some(offset+limit)}else{None},"snapshot":repository["snapshot"]}))
                 },
-                "memories"=>Ok(json!(memory::list(db,&repository,p,args["include_retired"]==true)?)),
+                "memories"=>Ok(json!(memory::list(db,&self.graph(),&repository,p,args["include_retired"]==true)?)),
                 "memory.history"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
+                    let memories=memory::list(db,&self.graph(),&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     let known=args["known_at"].as_str().map(graphicle_memory::temporal::instant).transpose().map_err(Error::bad)?;
                     let mut versions=Vec::new();
                     let docs=memory::documents(db,&repository,p)?;
-                    for mut row in rows(db,"SELECT data,created_at FROM repo_memory_revisions WHERE memory_id=? ORDER BY revision",[memory_id])? {
+                    for row in self.graph().read(|g| store_graph::rows(g,
+                        "MATCH (r:MemoryRevision {memory_id: $id}) RETURN r.data AS data, r.created_at AS created_at ORDER BY r.revision",
+                        store_graph::params(&json!({"id": memory_id}))))? {
                         if known.is_some_and(|at|graphicle_memory::temporal::instant(s(&row,"created_at")).is_ok_and(|t|t>at)){continue;}
-                        decode(&mut row,"data")?;let mut memory=row["data"].clone();decode(&mut memory,"data")?;
+                        let mut memory:Value=serde_json::from_str(s(&row,"data"))?;decode(&mut memory,"data")?;
                         if memory::accessible(&memory["data"],&docs,&memories){versions.push(memory);}
                     }
                     if known.is_some(){Ok(json!({"memory":versions.last(),"historical":true}))}else{Ok(json!({"versions":versions}))}
                 },
-                "memory.export"=>Ok(json!({"format":"graphicle.memories.v1","repository_id":identifier,"memories":memory::list(db,&repository,p,true)?})),
+                "memory.export"=>Ok(json!({"format":"graphicle.memories.v1","repository_id":identifier,"memories":memory::list(db,&self.graph(),&repository,p,true)?})),
                 // Reviewed procedures and decisions with an allow-list of
                 // fields and no client-identifying text.
                 "memory.template"=>{
-                    let docs=memory::documents(db,&repository,p)?;let memories=memory::list_of(db,&repository,&docs,false)?;
+                    let docs=memory::documents(db,&repository,p)?;let memories=memory::list_of(db,&self.graph(),&repository,&docs,false)?;
                     crate::packs::template(db,&p.workspace,&repository,&docs,&memories,args)
                 },
-                "history"=>Ok(json!({"snapshots":rows(db,"SELECT sha256,metadata,created_at FROM repo_snapshots WHERE repository_id=? ORDER BY created_at DESC LIMIT 100",[identifier])?})),
+                "history"=>Ok(json!({"snapshots":crate::store_content::snapshots(&self.graph(),identifier,100)?})),
                 _=>Err(Error::bad("Unsupported project read"))
             }
         })
@@ -145,23 +147,30 @@ impl Store {
         let mut result = self.authorized(workspace,token,permission,|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;let identifier=s(&repository,"id");
             match operation {
-                "sync.abort"=>{db.execute("UPDATE repo_syncs SET state='aborted' WHERE repository_id=? AND id=? AND state IN ('pending','preparing')",params![identifier,string(args,"sync_id",100)?])?;Ok(json!({"aborted":true}))},
-                "learning.refresh.propose"=>memory::propose_refresh(db,&repository,p,args),
+                "sync.abort"=>{crate::store_content::sync_abort(&self.graph(),identifier,string(args,"sync_id",100)?)?;Ok(json!({"aborted":true}))},
+                "learning.refresh.propose"=>memory::propose_refresh(db,&self.graph(),&repository,p,args),
                 "memory.state"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let old=memories.iter().find(|m|m["id"]==args["memory_id"]).ok_or_else(||Error::bad("Memory unavailable"))?;
+                    let memories=memory::list(db,&self.graph(),&repository,p,true)?;let old=memories.iter().find(|m|m["id"]==args["memory_id"]).ok_or_else(||Error::bad("Memory unavailable"))?;
                     if args["state"]!="retired"{return Err(Error::bad("Use draft review to approve a memory"));}
-                    let data=old["data"].clone();let result=memory::save(db,identifier,Some(s(old,"id")),args["expected_revision"].as_i64(),s(old,"kind"),s(old,"title"),s(old,"body"),"retired",&data)?;
-                    db.execute("UPDATE am_claims SET state='retired',updated_at=? WHERE repository_id=? AND memory_id=?",params![now(),identifier,s(old,"id")])?;Ok(result)
+                    let data=old["data"].clone();let result=memory::save(db,&self.graph(),identifier,Some(s(old,"id")),args["expected_revision"].as_i64(),s(old,"kind"),s(old,"title"),s(old,"body"),"retired",&data)?;
+                    self.graph().transaction(|g| {
+                        store_graph::rows(g,
+                            "MATCH (c:Claim {repository_id: $repo, memory_id: $mid}) SET c.state = 'retired', c.updated_at = $at RETURN c.id AS id",
+                            store_graph::params(&json!({"repo":identifier,"mid":s(old,"id"),"at":now()})))?;
+                        Ok(())
+                    })?;Ok(result)
                 },
                 "memory.delete"=>{
-                    let memories=memory::list(db,&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
+                    let memories=memory::list(db,&self.graph(),&repository,p,true)?;let memory_id=string(args,"memory_id",100)?;
                     if !memories.iter().any(|m|s(m,"id")==memory_id){return Err(Error::bad("Memory unavailable"));}
                     // The memory, its dependents and everything naming them go in one transaction, with a hash-chained receipt.
-                    let (deleted,counts)=crate::deletion::delete_memories(db,&p.workspace,identifier,&memories,memory_id)?;
-                    purge_derived_cache(db,identifier)?;
+                    let graph=self.graph();
+                    let (deleted,counts)=graph.transaction(|g| crate::deletion::delete_memories(g,&p.workspace,identifier,&memories,memory_id))?;
+                    crate::vector::clear_embeddings(&graph, identifier)?;
+                    purge_derived_cache(&graph,db,identifier)?;
                     let keys:Vec<String>=deleted.iter().cloned().collect();
-                    let remaining=crate::deletion::memory_rows(db,identifier,&keys)?;
-                    let receipt=crate::deletion::rows_receipt(db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining,true)?;
+                    let remaining=graph.read(|g| crate::deletion::memory_rows(g,identifier,&keys))?;
+                    let receipt=graph.read(|g| crate::deletion::rows_receipt(g,db,p,identifier,"memory.delete","memories",json!({"rule":"memory_with_dependent_notes_and_historical_versions"}),counts,&keys,remaining.clone(),true))?;
                     Ok(json!({"deleted":deleted.len(),"transitive":true,"receipt":receipt}))
                 },
                 // An agent's proposal is always a draft citing exact quotes of
@@ -191,7 +200,18 @@ impl Store {
                     if !named.is_empty() { proposal["symbols"]=json!(named); }
                     let fingerprint=crate::digest(&proposal);
                     // Replays compare the whole proposal; a key names one proposal only.
-                    if let Some(old)=one(db,"SELECT id,state,json_extract(data,'$.proposal.digest') AS digest FROM repo_memories WHERE repository_id=? AND json_extract(data,'$.proposal.idempotency_key')=?",params![identifier,key])?{
+                    if let Some(old)={
+                        // Proposals of one repository are few; find the key in
+                        // the decoded payload rather than pattern-matching JSON.
+                        let mut found=None;
+                        for m in crate::memory::memory_rows(&self.graph(), identifier)? {
+                            if s(&m["data"]["proposal"],"idempotency_key")==key {
+                                found=Some(json!({"id":m["id"],"state":m["state"],"digest":m["data"]["proposal"]["digest"]}));
+                                break;
+                            }
+                        }
+                        found
+                    } {
                         if old["digest"]!=json!(fingerprint){return Err(Error::conflict("Idempotency key already refers to a different proposal"));}
                         return Ok(json!({"memory_id":old["id"],"state":old["state"],"replayed":true}));
                     }
@@ -212,7 +232,7 @@ impl Store {
                     data["authority"]=json!("agent_proposed_draft");data["notes"]=json!({});
                     if let Some(recall)=recall { data["recall"]=recall; }
                     data["proposal"]=json!({"idempotency_key":key,"digest":fingerprint,"reason":reason,"files":files,"proposed_at":now()});
-                    let saved=memory::save(db,identifier,None,None,kind,title,body,"draft",&data)?;
+                    let saved=memory::save(db,&self.graph(),identifier,None,None,kind,title,body,"draft",&data)?;
                     store::event(db,identifier,"memory_proposed",json!({"id":saved["id"],"kind":kind}))?;
                     Ok(json!({"memory_id":saved["id"],"revision":saved["revision"],"state":"draft","approval_required":true,"review":"learning.review"}))
                 },
@@ -228,7 +248,7 @@ impl Store {
                         if data.get("symbols").is_some_and(|v|!v.is_array()) || data.get("symbol_files").is_some_and(|v|!v.is_object()){return Err(Error::bad("Invalid symbol links"));}
                         let report=crate::symbols::reground(db,identifier,&mut data,&docs)?;
                         regrounded+=report["regrounded"].as_u64().unwrap_or(0);unresolved+=report["unresolved"].as_u64().unwrap_or(0);
-                        imported.push(memory::save(db,identifier,None,None,string(value,"kind",100)?,string(value,"title",500)?,string(value,"body",64000)?,"draft",&data)?);
+                        imported.push(memory::save(db,&self.graph(),identifier,None,None,string(value,"kind",100)?,string(value,"title",500)?,string(value,"body",64000)?,"draft",&data)?);
                     }
                     let mut result=json!({"imported":imported,"approval_required":true});
                     // Only an import that carried symbol links reports them.
@@ -240,7 +260,7 @@ impl Store {
                 "memory.import_pack"=>{
                     let values=args["memories"].as_array().ok_or_else(||Error::bad("Expected memories, a list"))?;
                     let docs=memory::documents(db,&repository,p)?;
-                    crate::packs::import(db,identifier,&docs,values)
+                    crate::packs::import(db,&self.graph(),identifier,&docs,values)
                 },
                 _=>Err(Error::bad("Unsupported project mutation"))
             }
@@ -252,22 +272,42 @@ impl Store {
         Ok(result)
     }
 }
-pub fn purge_derived_cache(db: &rusqlite::Connection, repository: &str) -> Result<()> {
-    for table in [
-        "am_model_cache",
-        "am_query_cache",
-        "am_vectors",
-        "am_document_reads",
-        "am_preparation_steps",
-        "am_reports",
-        "am_communities",
-    ] {
+pub fn purge_derived_cache(
+    graph: &crate::store_graph::GraphStore,
+    db: &rusqlite::Connection,
+    repository: &str,
+) -> Result<()> {
+    // Jobs and the model/query caches live in the graph store now; the rest
+    // is still SQL until its own migration node lands.
+    graph.transaction(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (j:Job {repository_id: $repo}) DETACH DELETE j",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (c:ModelCache {repository_id: $repo}) DELETE c",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (q:QueryCache {repository_id: $repo}) DELETE q",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        crate::store_graph::rows(
+            g,
+            "MATCH (s:PreparationStep {repository_id: $repo}) DELETE s",
+            crate::store_graph::params(&serde_json::json!({"repo": repository})),
+        )?;
+        Ok(())
+    })?;
+    for table in ["am_vectors", "am_document_reads", "am_reports", "am_communities"] {
         db.execute(
             &format!("DELETE FROM {table} WHERE repository_id=?"),
             [repository],
         )?;
     }
-    db.execute("DELETE FROM am_jobs WHERE repository_id=?", [repository])?;
     store::invalidate(db, repository)
 }
 pub fn redact(value: &str) -> String {

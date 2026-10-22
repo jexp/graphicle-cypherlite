@@ -1,14 +1,345 @@
 //! Optional Qdrant index. Only identities and vectors are projected; original text stays canonical.
+//!
+//! Passage embeddings themselves live in the graph store: a `Vector`-typed
+//! `embedding` property (with `embedding_model_key` / `embedding_source_sha`)
+//! on the `Memory` or `Chunk` node the passage came from (migration plan
+//! §2.7; `docs/store-api.md`). The helpers below are the memory pipeline's
+//! reads and writes of those properties; `am_vectors` is gone.
 use crate::{
     Error, Result,
     jobs::{self, Job, Worker},
     model, query,
-    store::{Store, decode, one, repo, rows, s},
+    store::{Store, repo, s},
+    store_graph::{self, GraphStore},
     string,
 };
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The `Memory` embedding of `identity` (`memory:<id>`) or the `Chunk`
+/// embedding of a passage identity, as the `am_vectors` row shape the
+/// callers of the SQL table had (`vector` decoded to a number list).
+fn embedding_row(node: &Value, identity: String) -> Value {
+    let vector = node["embedding"].clone();
+    json!({"identity":identity,"source_sha":node["embedding_source_sha"],
+        "model_key":node["embedding_model_key"],
+        "dimensions":vector.as_array().map(|v| v.len() as i64).unwrap_or(0),
+        "vector":vector})
+}
+
+/// Every embedding of one repository and model, as `am_vectors` rows
+/// (`ORDER BY identity`).
+pub fn graph_vectors(graph: &GraphStore, repository: &str, model_key: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    graph.read(|db| {
+        for row in store_graph::rows(
+            db,
+            "MATCH (m:Memory {repository_id: $repo}) \
+             WHERE m.embedding_model_key = $key AND m.embedding IS NOT NULL \
+             RETURN m",
+            store_graph::params(&json!({"repo": repository, "key": model_key})),
+        )? {
+            let node = store_graph::node(&row, "m");
+            out.push(embedding_row(&node, format!("memory:{}", s(&node, "id"))));
+        }
+        for row in store_graph::rows(
+            db,
+            "MATCH (c:Chunk {repository_id: $repo}) \
+             WHERE c.embedding_model_key = $key AND c.embedding IS NOT NULL \
+             RETURN c",
+            store_graph::params(&json!({"repo": repository, "key": model_key})),
+        )? {
+            let node = store_graph::node(&row, "c");
+            let identity = s(&node, "id").to_string();
+            out.push(embedding_row(&node, identity));
+        }
+        Ok(())
+    })?;
+    out.sort_by(|a, b| s(a, "identity").cmp(s(b, "identity")));
+    Ok(out)
+}
+
+/// Every embedding of one repository, any model, as `am_vectors` rows
+/// including `repository_id` (deletion's canonical store digest renders
+/// them). `vector` stays a number list, as the SQL text decoded to.
+pub fn graph_vectors_all(graph: &GraphStore, repository: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    graph.read(|db| {
+        for (label, prefixed) in [("Memory", true), ("Chunk", false)] {
+            for row in store_graph::rows(
+                db,
+                &format!(
+                    "MATCH (n:{label} {{repository_id: $repo}}) \
+                     WHERE n.embedding IS NOT NULL \
+                     RETURN n.id AS id, n.embedding_source_sha AS sha, \
+                     n.embedding_model_key AS model_key, n.embedding AS vector"
+                ),
+                store_graph::params(&json!({"repo": repository})),
+            )? {
+                let id = s(&row, "id");
+                let vector = row["vector"].clone();
+                out.push(json!({"repository_id":repository,
+                    "identity":if prefixed { format!("memory:{id}") } else { id.to_string() },
+                    "source_sha":row["sha"],"model_key":row["model_key"],
+                    "dimensions":vector.as_array().map(|v| v.len() as i64).unwrap_or(0),
+                    "vector":vector}));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The number of embeddings a repository holds (any model) — the `embed`
+/// job's progress counter.
+pub fn graph_vector_count(graph: &GraphStore, repository: &str) -> Result<u64> {
+    let mut total = 0;
+    graph.read(|db| {
+        for label in ["Memory", "Chunk"] {
+            let row = store_graph::one(
+                db,
+                &format!(
+                    "MATCH (n:{label} {{repository_id: $repo}}) \
+                     WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
+                ),
+                store_graph::params(&json!({"repo": repository})),
+            )?;
+            total += row.and_then(|r| r["count"].as_u64()).unwrap_or(0);
+        }
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+/// Store passage embeddings on the nodes they describe, creating the
+/// store's vector indexes for the model's dimension on first use
+/// (`GraphStore::ensure_vector_indexes`). `rows` is `(identity,
+/// source_sha, vector)`; a `memory:<id>` identity lands on that Memory
+/// node, anything else on the passage's Chunk node.
+pub fn store_embeddings(
+    graph: &GraphStore,
+    repository: &str,
+    model_key: &str,
+    rows: &[(String, String, Vec<f64>)],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let dimensions = rows[0].2.len() as u32;
+    if dimensions == 0 || rows.iter().any(|(_, _, v)| v.len() as u32 != dimensions) {
+        return Err(Error::bad("Vector dimensions do not match"));
+    }
+    graph.ensure_vector_indexes(dimensions)?;
+    let memories: Vec<Value> = rows
+        .iter()
+        .filter_map(|(identity, sha, vector)| {
+            identity
+                .strip_prefix("memory:")
+                .map(|id| json!({"id":id,"sha":sha,"vec":vector}))
+        })
+        .collect();
+    let chunks: Vec<Value> = rows
+        .iter()
+        .filter(|(identity, _, _)| !identity.starts_with("memory:"))
+        .map(|(identity, sha, vector)| json!({"id":identity,"sha":sha,"vec":vector}))
+        .collect();
+    graph.transaction(|db| {
+        if !memories.is_empty() {
+            store_graph::rows(
+                db,
+                "UNWIND $rows AS row MERGE (m:Memory {id: row.id}) \
+                 SET m.embedding = vector(row.vec, $dim, FLOAT64), \
+                     m.embedding_model_key = $key, m.embedding_source_sha = row.sha \
+                 RETURN count(m) AS n",
+                store_graph::params(&json!({"rows":memories,"dim":dimensions,"key":model_key})),
+            )?;
+        }
+        if !chunks.is_empty() {
+            store_graph::rows(
+                db,
+                "UNWIND $rows AS row MERGE (c:Chunk {id: row.id}) \
+                 SET c.repository_id = $repo, \
+                     c.embedding = vector(row.vec, $dim, FLOAT64), \
+                     c.embedding_model_key = $key, c.embedding_source_sha = row.sha \
+                 RETURN count(c) AS n",
+                store_graph::params(
+                    &json!({"rows":chunks,"repo":repository,"dim":dimensions,"key":model_key}),
+                ),
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// Drop the embeddings of `identities` (passage ids and `memory:<id>`s);
+/// returns how many nodes carried one. Stub `Chunk` nodes exist only to
+/// carry an embedding, so they go with it.
+pub fn delete_embeddings(
+    graph: &GraphStore,
+    repository: &str,
+    identities: &[String],
+) -> Result<usize> {
+    if identities.is_empty() {
+        return Ok(0);
+    }
+    let memories: Vec<&str> = identities
+        .iter()
+        .filter_map(|i| i.strip_prefix("memory:"))
+        .collect();
+    let chunks: Vec<&str> = identities
+        .iter()
+        .filter(|i| !i.starts_with("memory:"))
+        .map(String::as_str)
+        .collect();
+    graph.transaction(|db| {
+        let mut removed = 0usize;
+        if !memories.is_empty() {
+            let row = store_graph::one(
+                db,
+                "UNWIND $ids AS id MATCH (m:Memory {id: id, repository_id: $repo}) \
+                 WHERE m.embedding IS NOT NULL \
+                 WITH count(m) AS n, collect(m) AS ms UNWIND ms AS m \
+                 REMOVE m.embedding, m.embedding_model_key, m.embedding_source_sha \
+                 RETURN n",
+                store_graph::params(&json!({"ids":memories,"repo":repository})),
+            )?;
+            removed += row
+                .and_then(|r| r["n"].as_u64().map(|n| n as usize))
+                .unwrap_or(0);
+        }
+        if !chunks.is_empty() {
+            let row = store_graph::one(
+                db,
+                "UNWIND $ids AS id MATCH (c:Chunk {id: id, repository_id: $repo}) \
+                 WHERE c.embedding IS NOT NULL \
+                 WITH collect(c) AS cs UNWIND cs AS c DETACH DELETE c \
+                 RETURN size(cs) AS n",
+                store_graph::params(&json!({"ids":chunks,"repo":repository})),
+            )?;
+            removed += row
+                .and_then(|r| r["n"].as_u64().map(|n| n as usize))
+                .unwrap_or(0);
+        }
+        Ok(removed)
+    })
+}
+
+/// The `(identity, source_sha)` pairs of every embedding of one repository
+/// and model, without the vector payloads — the freshness filter of the
+/// dense arm and the embed job's reuse check.
+pub fn graph_vector_index(
+    graph: &GraphStore,
+    repository: &str,
+    model_key: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    graph.read(|db| {
+        for (label, prefixed) in [("Memory", true), ("Chunk", false)] {
+            for row in store_graph::rows(
+                db,
+                &format!(
+                    "MATCH (n:{label} {{repository_id: $repo}}) \
+                     WHERE n.embedding_model_key = $key AND n.embedding IS NOT NULL \
+                     RETURN n.id AS id, n.embedding_source_sha AS sha"
+                ),
+                store_graph::params(&json!({"repo": repository, "key": model_key})),
+            )? {
+                let id = s(&row, "id");
+                out.push((
+                    if prefixed {
+                        format!("memory:{id}")
+                    } else {
+                        id.to_string()
+                    },
+                    s(&row, "sha").to_string(),
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Every embedding identity of one repository, any model (`memory:<id>` for
+/// Memory nodes, the passage id for Chunk stubs).
+pub fn graph_vector_identities(graph: &GraphStore, repository: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    graph.read(|db| {
+        for (label, prefixed) in [("Memory", true), ("Chunk", false)] {
+            for row in store_graph::rows(
+                db,
+                &format!(
+                    "MATCH (n:{label} {{repository_id: $repo}}) \
+                     WHERE n.embedding IS NOT NULL RETURN n.id AS id"
+                ),
+                store_graph::params(&json!({"repo": repository})),
+            )? {
+                let id = s(&row, "id");
+                out.push(if prefixed {
+                    format!("memory:{id}")
+                } else {
+                    id.to_string()
+                });
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Drop every embedding of one repository (the derived-cache purge).
+pub fn clear_embeddings(graph: &GraphStore, repository: &str) -> Result<()> {
+    let identities = graph_vector_identities(graph, repository)?;
+    delete_embeddings(graph, repository, &identities)?;
+    Ok(())
+}
+
+/// The `limit` nearest embeddings of one repository and model to `query`,
+/// as `(identity, source_sha, score)` rows, best first — the vector-index
+/// counterpart of the retired load-all-and-cosine pass over `am_vectors`.
+pub fn semantic_search(
+    graph: &GraphStore,
+    repository: &str,
+    model_key: &str,
+    query: &[f64],
+    limit: usize,
+) -> Result<Vec<(String, String, f64)>> {
+    let mut pairs: Vec<(String, String, f64)> = Vec::new();
+    graph.read(|db| {
+        for (label, index, prefixed) in [
+            ("Chunk", "chunk_embed", false),
+            ("Memory", "mem_embed", true),
+        ] {
+            for row in store_graph::rows(
+                db,
+                &format!(
+                    "MATCH (n:{label}) \
+                     SEARCH n IN (VECTOR INDEX {index} FOR $qv LIMIT $k) SCORE AS score \
+                     WHERE n.repository_id = $repo AND n.embedding_model_key = $key \
+                     RETURN n.id AS id, n.embedding_source_sha AS sha, score"
+                ),
+                store_graph::params(
+                    &json!({"qv":query,"k":limit as i64,"repo":repository,"key":model_key}),
+                ),
+            )? {
+                let id = s(&row, "id");
+                pairs.push((
+                    if prefixed {
+                        format!("memory:{id}")
+                    } else {
+                        id.to_string()
+                    },
+                    s(&row, "sha").to_string(),
+                    row["score"].as_f64().unwrap_or(0.0),
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    pairs.sort_by(|(a, _, x), (b, _, y)| y.total_cmp(x).then(a.cmp(b)));
+    pairs.truncate(limit);
+    Ok(pairs)
+}
 fn point(identity: &str) -> String {
     let h = graphicle_memory::text::sha256(identity.as_bytes());
     format!(
@@ -39,7 +370,7 @@ pub fn configure(store: &Store, workspace: &str, token: &str, args: &Value) -> R
         return Err(Error::bad("Use an alphanumeric collection name"));
     }
     let config = json!({"endpoint":endpoint,"collection":collection,"credential_ref":reference});
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Ok(old)=self::config(db,s(&repository,"id"))&& old!=config{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"qdrant",&old,"backend_reconfigured")?;}db.execute("INSERT OR REPLACE INTO am_backends VALUES(?,?,?)",params![s(&repository,"id"),"qdrant",config.to_string()])?;Ok(json!({"configured":true,"stored_remotely":"vectors and opaque source identities; no original text"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Ok(old)=self::config(db,s(&repository,"id"))&& old!=config{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"qdrant",&old,"backend_reconfigured")?;}crate::projection::backend_set(db,s(&repository,"id"),"qdrant",&config)?;Ok(json!({"configured":true,"stored_remotely":"vectors and opaque source identities; no original text"}))})
 }
 async fn request(
     store: &Store,
@@ -75,14 +406,8 @@ async fn request(
     model::bounded_json(response).await
 }
 fn config(db: &rusqlite::Connection, repository: &str) -> Result<Value> {
-    let mut row = one(
-        db,
-        "SELECT config FROM am_backends WHERE repository_id=? AND kind='qdrant'",
-        [repository],
-    )?
-    .ok_or_else(|| Error::bad("Configure a Qdrant collection first"))?;
-    decode(&mut row, "config")?;
-    Ok(row["config"].clone())
+    crate::projection::backend_config(db, repository, "qdrant")?
+        .ok_or_else(|| Error::bad("Configure a Qdrant collection first"))
 }
 pub(crate) async fn clear_projection(
     store: &Store,
@@ -113,21 +438,15 @@ pub async fn publish(
     let (config, snapshot, vectors, revision) =
         store.authorized(workspace, token, "admin", |db, p| {
             let r = repo(db, p, string(args, "repository_id", 100)?)?;
-            let snapshot = query::snapshot(db, &r, p)?;
+            let snapshot = query::snapshot(db, &store.graph(), &r, p)?;
             let (candidates, _) = query::candidates(&snapshot)?;
             let valid = candidates
                 .iter()
                 .map(|c| (s(c, "identity"), s(c, "source_sha")))
                 .collect::<BTreeMap<_, _>>();
-            let mut vectors = rows(
-                db,
-                "SELECT * FROM am_vectors WHERE repository_id=? AND model_key=? ORDER BY identity",
-                params![s(&r, "id"), string(args, "model_key", 64)?],
-            )?;
+            let mut vectors =
+                graph_vectors(&store.graph(), s(&r, "id"), string(args, "model_key", 64)?)?;
             vectors.retain(|v| valid.get(s(v, "identity")) == Some(&s(v, "source_sha")));
-            for v in &mut vectors {
-                decode(v, "vector")?;
-            }
             let cfg = config(db, s(&r, "id"))?;
             crate::projection::ready(db, s(&r, "id"), "qdrant", &cfg)?;
             let revision = crate::projection::marker(db, s(&r, "id"), "qdrant", &cfg)?;
@@ -177,7 +496,7 @@ pub async fn publish(
     for batch in vectors.chunks(64) {
         store.authorized(workspace, token, "admin", |db, p| {
             let r = repo(db, p, scope)?;
-            if query::snapshot(db, &r, p)?.state != snapshot.state || crate::projection::marker(db, scope, "qdrant", &config)? != revision {
+            if query::snapshot(db, &store.graph(), &r, p)?.state != snapshot.state || crate::projection::marker(db, scope, "qdrant", &config)? != revision {
                 return Err(Error::conflict("Sources changed during vector publication"));
             }
             Ok(())
@@ -197,7 +516,7 @@ pub async fn publish(
     }
     let current = store.authorized(workspace, token, "admin", |db, p| {
         let r = repo(db, p, scope)?;
-        Ok(query::snapshot(db, &r, p)?.state == snapshot.state && crate::projection::marker(db, scope, "qdrant", &config)? == revision)
+        Ok(query::snapshot(db, &store.graph(), &r, p)?.state == snapshot.state && crate::projection::marker(db, scope, "qdrant", &config)? == revision)
     })?;
     if !current {
         return Err(Error::conflict(

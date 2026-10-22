@@ -111,7 +111,14 @@ impl Fixture {
             .unwrap();
         self.drain_jobs();
         let db = self.store.connect().unwrap();
-        graph_projection::resolve_episode(&db, &self.workspace, &self.repo, sha).unwrap()
+        graph_projection::resolve_episode(
+            &db,
+            &crate::gstore(&db),
+            &self.workspace,
+            &self.repo,
+            sha,
+        )
+        .unwrap()
     }
     fn drain_jobs(&self) {
         while let Some(job) = self.store.lease_job().unwrap() {
@@ -232,10 +239,25 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
         attributes.get("unresolved_calls").is_none(),
         "{attributes:#}"
     );
-    let stored = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NULL");
+    // Unresolved calls live on `:UnresolvedCall` nodes (`gf_unresolved_calls`
+    // is the legacy table the projection no longer writes).
+    let open_calls = |closed: bool| {
+        crate::gql_one(
+            &f.store,
+            &format!(
+                "MATCH (u:UnresolvedCall {{repository_id: $repo}}) \
+                 WHERE u.valid_to_episode IS {} NULL RETURN count(u) AS n",
+                if closed { "NOT" } else { "" }
+            ),
+            graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap()
+    };
+    let stored = open_calls(false);
     assert!(stored > 0, "fixture must produce ambiguous receiver calls");
     assert_eq!(attributes["unresolved_calls_count"], stored);
-    let graph = graph_projection::load(&db, &f.repo, &e1).unwrap();
+    let graph = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     let calls = graph.attributes()["unresolved_calls"].as_array().unwrap();
     assert_eq!(calls.len() as i64, stored);
     assert!(calls.iter().all(|c| c["caller"].is_string()), "{calls:#?}");
@@ -249,9 +271,9 @@ fn unresolved_calls_live_in_their_own_table_and_reload() {
         &sha(2),
     );
     assert_ne!(e1, e2);
-    let closed = f.count("SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND valid_to_episode IS NOT NULL");
+    let closed = open_calls(true);
     assert_eq!(closed, stored);
-    let previous = graph_projection::load(&db, &f.repo, &e1).unwrap();
+    let previous = graph_projection::load(&crate::gstore(&db), &f.repo, &e1).unwrap();
     assert_eq!(
         previous.attributes()["unresolved_calls"]
             .as_array()
@@ -334,8 +356,16 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         f.count("SELECT count(*) FROM gf_coverage_inventory WHERE repository_id=?"),
         if pro { 20 } else { 0 }
     );
-    let unresolved_episodes =
-        f.count("SELECT count(DISTINCT episode) FROM gf_unresolved_calls WHERE repository_id=?");
+    // Unresolved calls live on `:UnresolvedCall` nodes; the count is the
+    // distinct episodes whose calls are still open (current + previous).
+    let unresolved_episodes = crate::gql_one(
+        &f.store,
+        "MATCH (u:UnresolvedCall {repository_id: $repo}) \
+         RETURN count(DISTINCT u.episode) AS n",
+        graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+    )
+    .and_then(|row| row["n"].as_i64())
+    .unwrap();
     assert_eq!(unresolved_episodes, 2);
     let db = f.store.connect().unwrap();
     for (index, episode) in episodes.iter().enumerate() {
@@ -347,13 +377,16 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
                 |r| r.get(0),
             )
             .unwrap();
-        let unresolved: i64 = db
-            .query_row(
-                "SELECT count(*) FROM gf_unresolved_calls WHERE repository_id=? AND episode=?",
-                [&f.repo, episode],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let unresolved: i64 = crate::gql_one(
+            &f.store,
+            "MATCH (u:UnresolvedCall {repository_id: $repo, episode: $ep}) RETURN count(u) AS n",
+            graphicle_runtime::store_graph::Params::from([
+                crate::gp("repo", json!(f.repo)),
+                crate::gp("ep", json!(episode)),
+            ]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap();
         assert_eq!(
             coverage > 0,
             pro && n > 5,
@@ -373,7 +406,7 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
             "episode {n} unresolved {unresolved}"
         );
         // Graph history itself is never trimmed.
-        let graph = graph_projection::load(&db, &f.repo, episode).unwrap();
+        let graph = graph_projection::load(&crate::gstore(&db), &f.repo, episode).unwrap();
         assert!(graph.node_count() > 0);
     }
 
@@ -425,7 +458,13 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         if pro { 3 } else { 0 }
     );
     assert_eq!(
-        f.count("SELECT count(DISTINCT episode) FROM gf_unresolved_calls WHERE repository_id=?"),
+        crate::gql_one(
+            &f.store,
+            "MATCH (u:UnresolvedCall {repository_id: $repo}) RETURN count(DISTINCT u.episode) AS n",
+            graphicle_runtime::store_graph::Params::from([crate::gp("repo", json!(f.repo))]),
+        )
+        .and_then(|row| row["n"].as_i64())
+        .unwrap(),
         1
     );
 
@@ -443,7 +482,7 @@ async fn twenty_five_episodes_are_trimmed_to_the_retention_window() {
         assert!(old.get("uncovered_changed").is_none(), "{old:#}");
     }
     // The previous episode lost its unresolved calls: the loaded graph says so.
-    let stale = graph_projection::load(&db, &f.repo, &episodes[23]).unwrap();
+    let stale = graph_projection::load(&crate::gstore(&db), &f.repo, &episodes[23]).unwrap();
     assert_eq!(
         stale.attributes()["unresolved_calls"]
             .as_array()

@@ -86,18 +86,26 @@ impl Fixture {
             .unwrap()
     }
     fn note_rows(&self) -> Vec<(String, usize)> {
-        let db = self.store.connect().unwrap();
-        let mut statement = db
-            .prepare("SELECT source_id,notes FROM am_observer_notes WHERE repository_id=? ORDER BY source_id")
-            .unwrap();
-        statement
-            .query_map([&self.repo], |r| {
-                let notes: String = r.get(1)?;
-                let notes: Value = serde_json::from_str(&notes).unwrap();
-                Ok((r.get::<_, String>(0)?, notes.as_array().unwrap().len()))
+        self.store
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "MATCH (n:Observation {repository_id: $repo}) \
+                     RETURN n.source_id AS source_id, n.notes AS notes ORDER BY n.source_id",
+                    graphicle_runtime::store_graph::params(&json!({"repo": self.repo.as_str()})),
+                )
             })
             .unwrap()
-            .map(Result::unwrap)
+            .iter()
+            .map(|row| {
+                let notes: Value =
+                    serde_json::from_str(row["notes"].as_str().unwrap()).unwrap();
+                (
+                    row["source_id"].as_str().unwrap().to_string(),
+                    notes.as_array().unwrap().len(),
+                )
+            })
             .collect()
     }
 }
@@ -440,19 +448,30 @@ async fn observer_notes_are_deleted_when_their_source_changes_or_is_removed() {
     // not supported, unit `observer-reflection`) goes with them too.
     let reflections = || -> i64 {
         f.store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (m:MentalModel {repository_id: $repo}) RETURN count(m) AS n",
+                    graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str()})),
+                )
+            })
             .unwrap()
-            .query_row(
-                "SELECT count(*) FROM am_observer_reflections WHERE repository_id=?",
-                [&f.repo],
-                |r| r.get(0),
-            )
-            .unwrap()
+            .map(|row| row["n"].as_i64().unwrap())
+            .unwrap_or(0)
     };
-    f.store.connect().unwrap().execute(
-        "INSERT INTO am_observer_reflections(repository_id,step_key,model_key,principal_hash,job_id,items,inputs,sources,dropped,created_at) VALUES(?,'step','model','principal','job','[]','{}',?,0,'2026-01-01T00:00:00Z')",
-        [f.repo.as_str(), r#"["file:session-0001.txt","file:session-0002.txt"]"#],
-    ).unwrap();
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "CREATE (m:MentalModel {repository_id: $repo, step_key: 'step', model_key: 'model',                  principal_hash: 'principal', job_id: 'job', items: '[]', inputs: '{}',                  sources: $sources, dropped: 0, created_at: '2026-01-01T00:00:00Z'})",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
+                    "sources": r#"["file:session-0001.txt","file:session-0002.txt"]"#})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(reflections(), 1);
     let changed = S1.replace("Fitbit Inspire HR", "Garmin Venu");
     f.sync(&[("session-0001.txt", &changed)]);
@@ -461,16 +480,12 @@ async fn observer_notes_are_deleted_when_their_source_changes_or_is_removed() {
         "a changed or removed source must not keep derived notes"
     );
     assert_eq!(reflections(), 0, "nor a reflection built from it");
-    let db = f.store.connect().unwrap();
-    let edges: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_dependencies WHERE dependent_kind='observer_note'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let edges = graphicle_runtime::invalidation::dependencies(&f.store.graph(), &f.workspace)
+        .unwrap()
+        .iter()
+        .filter(|e| e.dependent_kind == "observer_note")
+        .count();
     assert_eq!(edges, 0, "dependency edges are removed with the notes");
-    drop(db);
     let rebuilt = f.run(&m, args).await;
     assert_eq!(rebuilt["result"]["units"]["total"], 1, "{rebuilt}");
     assert_eq!(f.note_rows(), [("file:session-0001.txt".to_string(), 1)]);
@@ -668,12 +683,16 @@ async fn questions_pin_the_observer_note_state_and_validate_note_options() {
         .unwrap();
     // A concurrent observer rewrite lands before the queued question runs.
     f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE am_observer_notes SET notes=? WHERE repository_id=?",
-            [r#"[{"text":"rewritten","evidence":[]}]"#, f.repo.as_str()],
-        )
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "MATCH (n:Observation {repository_id: $repo}) SET n.notes = $notes",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
+                    "notes": r#"[{"text":"rewritten","evidence":[]}]"#})),
+            )?;
+            Ok(())
+        })
         .unwrap();
     let stale = f.work(&m, &queued["id"]).await;
     assert_eq!(stale["state"], "failed", "{stale}");
@@ -737,16 +756,16 @@ async fn note_keys_reach_a_passage_through_the_notes_that_quote_it() {
     let note = json!([{"text":"User owns a wearable fitness tracker.",
         "evidence":[{"byte_start":start,"byte_end":start + line.len(),"quote":line}]}]);
     f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE am_observer_notes SET notes=? WHERE repository_id=? AND source_id=?",
-            [
-                note.to_string().as_str(),
-                f.repo.as_str(),
-                "file:session-0001.txt",
-            ],
-        )
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "MATCH (n:Observation {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
+                    "source": "file:session-0001.txt", "notes": note.to_string()})),
+            )?;
+            Ok(())
+        })
         .unwrap();
     // No word of the question is in either session's text.
     let ask = |extra: Value| {
@@ -823,12 +842,16 @@ async fn note_keys_reach_a_passage_through_the_notes_that_quote_it() {
         .enqueue(&f.workspace, &f.key, &f.args(again), &m.config)
         .unwrap();
     f.store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE am_observer_notes SET notes=? WHERE repository_id=? AND source_id=?",
-            [r#"[]"#, f.repo.as_str(), "file:session-0001.txt"],
-        )
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "MATCH (n:Observation {repository_id: $repo, source_id: $source}) SET n.notes = $notes",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str(),
+                    "source": "file:session-0001.txt", "notes": "[]"})),
+            )?;
+            Ok(())
+        })
         .unwrap();
     let stale = f.work(&m, &queued["id"]).await;
     assert_eq!(stale["state"], "failed", "{stale}");

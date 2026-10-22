@@ -429,7 +429,10 @@ pub fn answer(db: &Connection, p: &Principal, repository: &Value, args: &Value) 
     else {
         return retrieval("no_code_graph", &names);
     };
-    let Ok(handle) = graph_projection::resident(db, id, &episode) else {
+    let Ok(store) = crate::store::graph_for(db) else {
+        return retrieval("no_code_graph", &names);
+    };
+    let Ok(handle) = graph_projection::resident(&store, id, &episode) else {
         return retrieval("no_code_graph", &names);
     };
     let graph: &Graph = &handle;
@@ -657,7 +660,7 @@ pub fn answer(db: &Connection, p: &Principal, repository: &Value, args: &Value) 
             "graph_episode": episode},
         "code_graph": {"status": "identifier_route", "episode": episode,
             "episode_lag": lag.as_ref().map_or(0, |lag| lag.changed)},
-        "freshness": crate::invalidation::repository_freshness(db, &p.workspace, id)?,
+        "freshness": crate::invalidation::repository_freshness(crate::store::graph_for(db)?.as_ref(), &p.workspace, id)?,
         REPORT: route,
     });
     Ok(Routed::Answered(packet))

@@ -130,7 +130,7 @@ fn derive(f: &Fixture, source: &str) {
     let t = graphicle_runtime::now();
     f.store
         .authorized(ws, &f.key, "approve", |db, _| {
-            memory::save(db, repo, None, None, "note", "Migration window", SECRET, "reviewed",
+            memory::save(db, &f.store.graph(), repo, None, None, "note", "Migration window", SECRET, "reviewed",
                 &json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:sha}}))
         })
         .unwrap();
@@ -147,22 +147,32 @@ fn derive(f: &Fixture, source: &str) {
     let attributes = json!({"document_id":source,"excerpt":SECRET}).to_string();
     f.sql("INSERT INTO gf_anchor_edges(repository_id,episode,chunk_id,node_id,rung,confidence,attributes,created_at) VALUES(?1,'e1','chunk-plan',NULL,'lexical',0.5,?2,?3)", rusqlite::params![repo, attributes, t]);
     let passage = format!("{source}:0");
-    f.sql(
-        "INSERT INTO am_vectors VALUES(?1,?2,?3,'embedding-model',3,'[0.1,0.2,0.3]')",
-        rusqlite::params![repo, passage, sha],
-    );
+    graphicle_runtime::vector::store_embeddings(
+        &f.store.graph(),
+        repo,
+        "embedding-model",
+        &[(passage.clone(), sha.clone(), vec![0.1, 0.2, 0.3])],
+    )
+    .unwrap();
     for (kind, dependent) in [
         ("anchor", format!("{repo}:chunk-plan")),
         ("embedding", format!("{repo}:{passage}")),
     ] {
-        f.sql(
-            "INSERT INTO gf_dependencies VALUES(?1,?2,?3,'document',?4,?5)",
-            rusqlite::params![ws, kind, dependent, source, t],
-        );
-        f.sql(
-            "INSERT INTO gf_stale VALUES(?1,?2,?3,'source_changed',?4)",
-            rusqlite::params![ws, kind, dependent, t],
-        );
+        graphicle_runtime::invalidation::record_dependency(
+            &f.store.graph(),
+            ws,
+            (kind, &dependent),
+            ("document", source),
+        )
+        .unwrap();
+        graphicle_runtime::invalidation::mark_stale(
+            &f.store.graph(),
+            ws,
+            kind,
+            &dependent,
+            "source_changed",
+        )
+        .unwrap();
     }
     let answer = json!({"answer":SECRET}).to_string();
     f.sql(
@@ -216,8 +226,19 @@ fn connector_deletion_returns_a_verified_receipt_covering_derived_state() {
     ] {
         assert_eq!(removed[kind], expected, "{kind}: {removed}");
     }
-    assert_eq!(f.count("SELECT count(*) FROM gf_stale", []), 0);
-    assert_eq!(f.count("SELECT count(*) FROM gf_dependencies WHERE dependent_kind IN ('anchor','embedding','memory')", []), 0);
+    assert!(
+        graphicle_runtime::invalidation::stale_markers(&f.store.graph(), &f.workspace)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        graphicle_runtime::invalidation::dependencies(&f.store.graph(), &f.workspace)
+            .unwrap()
+            .iter()
+            .filter(|e| ["anchor", "embedding", "memory"].contains(&e.dependent_kind.as_str()))
+            .count(),
+        0
+    );
     // Computed while the documents were visible, so removed whether or not
     // they name them: the cached answer, served record, outcome and hint.
     let since = &receipt["removed"]["since_visible"];
@@ -343,23 +364,32 @@ fn source_reverification_requires_tombstones_and_checks_historical_rows() {
         .unwrap()["receipt"]
         .clone();
     assert_eq!(f.verify(&receipt)["verified_local"], true);
-    f.sql(
-        "INSERT INTO am_connector_versions VALUES(?1,'plan','old',?2,'{}','2026-01-01')",
-        rusqlite::params![connector, SECRET],
+    // Versions live in the graph store; a retained historical copy fails
+    // verification until it goes.
+    crate::gql_write(
+        &f.store,
+        "CREATE (v:ConnectorVersion {connector_id: $connector, id: 'plan', sha256: 'old', content: $content, metadata: '{}', created_at: '2026-01-01'})",
+        graphicle_runtime::store_graph::Params::from([
+            crate::gp("connector", json!(connector)),
+            crate::gp("content", json!(SECRET)),
+        ]),
     );
     assert_eq!(
         f.verify(&receipt)["verified_local"],
         false,
         "a historical copy still retains the forgotten source"
     );
-    f.sql(
-        "DELETE FROM am_connector_versions WHERE connector_id=?",
-        [&connector],
+    crate::gql_write(
+        &f.store,
+        "MATCH (v:ConnectorVersion {connector_id: $connector}) DELETE v",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
     );
     assert_eq!(f.verify(&receipt)["verified_local"], true);
-    f.sql(
-        "DELETE FROM am_forgotten_sources WHERE connector_id=?",
-        [&connector],
+    // Tombstones live in the graph store beside the connector's data.
+    crate::gql_write(
+        &f.store,
+        "MATCH (f:ForgottenSource {connector_id: $connector}) DELETE f",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
     );
     assert_eq!(
         f.verify(&receipt)["verified_local"],
@@ -371,10 +401,17 @@ fn source_reverification_requires_tombstones_and_checks_historical_rows() {
 #[test]
 fn external_cleanup_keeps_a_receipt_incomplete_until_it_finishes() {
     let f = Fixture::new();
-    f.sql(
-        "INSERT INTO am_backends VALUES(?1,'qdrant','{\"url\":\"http://127.0.0.1:9\",\"collection\":\"memory\"}')",
-        [&f.repo],
-    );
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "CREATE (:Backend {repository_id: $repo, kind: 'qdrant',                  config: '{\"url\":\"http://127.0.0.1:9\",\"collection\":\"memory\"}'})",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo.as_str()})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let connector = f.connector(json!([{"id":"plan","title":"Launch plan","content":SECRET}]));
     let receipt = f.delete_connector(&connector)["receipt"].clone();
     assert_eq!(receipt["verified_local"], true, "{receipt:#}");
@@ -383,7 +420,17 @@ fn external_cleanup_keeps_a_receipt_incomplete_until_it_finishes() {
     assert_eq!(receipt["external_cleanup"][0]["kind"], "qdrant");
     assert_eq!(f.verify(&receipt)["external_pending"], true);
     // The projection worker marks the cleanup complete once Qdrant confirms.
-    f.sql("UPDATE am_projection_cleanup SET state='complete'", []);
+    f.store
+        .graph()
+        .transaction(|db| {
+            graphicle_runtime::store_graph::write(
+                db,
+                "MATCH (c:ProjectionCleanup) SET c.state = 'complete'",
+                graphicle_runtime::store_graph::Params::new(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let checked = f.verify(&receipt);
     assert_eq!(checked["external_pending"], false, "{checked:#}");
     assert_eq!(checked["complete"], true);
@@ -397,14 +444,20 @@ fn project_deletion_receipt_outlives_the_project_and_extends_the_chain() {
     let second = f.connector(json!([{"id":"memo","title":"Memo","content":MEMO}]));
     let memo = format!("connector:{second}:memo");
     let file = format!("{}:README.md", f.repo);
-    f.sql(
-        "INSERT INTO gf_dependencies VALUES(?1,'memory','m1','file',?2,'2026-01-01')",
-        rusqlite::params![f.workspace, file],
-    );
-    f.sql(
-        "INSERT INTO gf_dependencies VALUES(?1,'memory','m2','document',?2,'2026-01-01')",
-        rusqlite::params![f.workspace, memo],
-    );
+    graphicle_runtime::invalidation::record_dependency(
+        &f.store.graph(),
+        &f.workspace,
+        ("memory", "m1"),
+        ("file", &file),
+    )
+    .unwrap();
+    graphicle_runtime::invalidation::record_dependency(
+        &f.store.graph(),
+        &f.workspace,
+        ("memory", "m2"),
+        ("document", &memo),
+    )
+    .unwrap();
     let deleted = f
         .store
         .maintain(
@@ -424,7 +477,11 @@ fn project_deletion_receipt_outlives_the_project_and_extends_the_chain() {
             .unwrap()
             >= 2
     );
-    assert_eq!(f.count("SELECT count(*) FROM gf_dependencies", []), 0);
+    assert!(
+        graphicle_runtime::invalidation::dependencies(&f.store.graph(), &f.workspace)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(receipt["sequence"], 2);
     assert_eq!(receipt["previous"], connector_receipt["digest"]);
     assert_eq!(f.count("SELECT count(*) FROM repo_projects", []), 0);

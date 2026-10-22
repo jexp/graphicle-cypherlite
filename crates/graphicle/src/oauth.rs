@@ -1,14 +1,21 @@
 //! Authorization-code connections with one-use state, PKCE and encrypted tokens.
+//!
+//! Accounts, pending requests and provider identities live in the graph
+//! store: `(:OAuthAccount)-[:USES]->(:Secret)`, `(:OAuthPending)`,
+//! `(:ProviderIdentity)` (see `cypherlite-migration.md` §2.5).
 use crate::{
     Error, Result, digest, id, local, model, now,
-    store::{Store, authorize_hash, one, rows, s},
+    store::{Store, authorize_hash, s},
+    store_graph::{self as graph, Params, json_to_value},
     string,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// The `RETURN` projection standing in for `SELECT * FROM am_oauth_accounts`.
+const ACCOUNT_COLS: &str = "a.id AS id, a.workspace_id AS workspace_id, a.provider AS provider, a.external_id AS external_id, a.email AS email, a.display_name AS display_name, a.token_secret AS token_secret, a.refresh_secret AS refresh_secret, a.expires_at AS expires_at, a.scopes AS scopes, a.state AS state, a.updated_at AS updated_at";
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -84,8 +91,8 @@ pub fn configure(store: &Store, workspace: &str, capability: &str, args: &Value)
     Ok(json!({"configured":name}))
 }
 pub fn status(store: &Store, workspace: &str, capability: &str) -> Result<Value> {
-    store.authorized(workspace,capability,"read",|db,p|{
-        let accounts=if p.permits("admin"){rows(db,"SELECT id,provider,external_id,email,display_name,expires_at,scopes,state FROM am_oauth_accounts WHERE workspace_id=? ORDER BY display_name",[workspace])?}else{vec![]};
+    store.authorized(workspace,capability,"read",|_,p|{
+        let accounts=if p.permits("admin"){store.graph().read(|db|graph::rows(db,"MATCH (a:OAuthAccount {workspace_id: $workspace}) RETURN a.id AS id, a.provider AS provider, a.external_id AS external_id, a.email AS email, a.display_name AS display_name, a.expires_at AS expires_at, a.scopes AS scopes, a.state AS state ORDER BY a.display_name",Params::from([("workspace".into(),json_to_value(&json!(workspace)))])))?}else{vec![]};
         Ok(json!({"providers":providers(store,workspace)?.keys().collect::<Vec<_>>(),"accounts":accounts}))
     })
 }
@@ -117,10 +124,24 @@ pub fn start(
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     store.transaction(|db|{
         authorize_hash(db,workspace,&principal.hash,"admin")?;
-        db.execute("DELETE FROM am_secrets WHERE id IN (SELECT verifier_secret FROM am_oauth_pending WHERE workspace_id=? AND (expires_at<? OR used=1))",params![workspace,now()])?;
-        let count:i64=db.query_row("SELECT count(*) FROM am_oauth_pending WHERE workspace_id=?",[workspace],|r|r.get(0))?;
+        Ok(())
+    })?;
+    store.graph().transaction(|db|{
+        // Expired or used requests go, with the secrets that bind their verifiers
+        // (the SQL store cascaded the row with its secret).
+        graph::write(db,"MATCH (p:OAuthPending {workspace_id: $workspace}) WHERE p.expires_at < $now OR p.used = true WITH p, p.verifier_secret AS secret DETACH DELETE p WITH collect(secret) AS secrets MATCH (s:Secret) WHERE s.id IN secrets DELETE s",Params::from([("workspace".into(),json_to_value(&json!(workspace))),("now".into(),json_to_value(&json!(now())))]))?;
+        let count=graph::one(db,"MATCH (p:OAuthPending {workspace_id: $workspace}) RETURN count(p) AS count",Params::from([("workspace".into(),json_to_value(&json!(workspace)))]))?.and_then(|r|r["count"].as_i64()).unwrap_or(0);
         if count>=20{return Err(Error::bad("Too many pending connection requests; allow them to expire"));}
-        db.execute("INSERT INTO am_oauth_pending VALUES(?,?,?,?,?,?,?,0)",params![state_hash,workspace,principal.hash,name,redirect,secret,expires])?;Ok(())
+        graph::write(db,"CREATE (p:OAuthPending {state_hash: $state_hash, workspace_id: $workspace, principal_hash: $principal, provider: $provider, redirect_uri: $redirect, verifier_secret: $secret, expires_at: $expires, used: false})",Params::from([
+            ("state_hash".into(),json_to_value(&json!(state_hash))),
+            ("workspace".into(),json_to_value(&json!(workspace))),
+            ("principal".into(),json_to_value(&json!(principal.hash))),
+            ("provider".into(),json_to_value(&json!(name))),
+            ("redirect".into(),json_to_value(&json!(redirect))),
+            ("secret".into(),json_to_value(&json!(secret))),
+            ("expires".into(),json_to_value(&json!(expires))),
+        ]))?;
+        Ok(())
     })?;
     let mut url = model::checked_url(&config.authorization_url)?;
     {
@@ -218,10 +239,14 @@ pub async fn callback(
         return Err(Error::bad("Invalid OAuth response"));
     }
     let state_hash = digest(&json!(state));
-    let pending=store.transaction(|db|{
-        let p=one(db,"SELECT * FROM am_oauth_pending WHERE state_hash=? AND provider=? AND used=0 AND expires_at>?",params![state_hash,name,now()])?.ok_or_else(||Error::bad("Connection request expired or was already used"))?;
-        authorize_hash(db,s(&p,"workspace_id"),s(&p,"principal_hash"),"admin")?;
-        db.execute("UPDATE am_oauth_pending SET used=1 WHERE state_hash=?",[&state_hash])?;Ok(p)
+    let pending=store.graph().transaction(|db|{
+        let p=graph::one(db,"MATCH (p:OAuthPending {state_hash: $state_hash, provider: $provider, used: false}) WHERE p.expires_at > $now RETURN p.workspace_id AS workspace_id, p.principal_hash AS principal_hash, p.redirect_uri AS redirect_uri, p.verifier_secret AS verifier_secret",Params::from([("state_hash".into(),json_to_value(&json!(state_hash))),("provider".into(),json_to_value(&json!(name))),("now".into(),json_to_value(&json!(now())))]))?.ok_or_else(||Error::bad("Connection request expired or was already used"))?;
+        graph::write(db,"MATCH (p:OAuthPending {state_hash: $state_hash}) SET p.used = true",Params::from([("state_hash".into(),json_to_value(&json!(state_hash)))]))?;
+        Ok(p)
+    })?;
+    store.transaction(|db|{
+        authorize_hash(db,s(&pending,"workspace_id"),s(&pending,"principal_hash"),"admin")?;
+        Ok(())
     })?;
     let workspace = s(&pending, "workspace_id");
     let all = providers(store, workspace)?;
@@ -315,12 +340,39 @@ pub async fn callback(
                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
         });
     let identifier = id();
-    store.transaction(|db|{
-        let principal=authorize_hash(db,workspace,s(&pending,"principal_hash"),"admin")?;
-        db.execute("INSERT INTO am_oauth_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![identifier,workspace,name,external,email,display,token_secret,refresh_secret,expiry,token_metadata["scope"].as_str().unwrap_or(""),"active",now()])?;
-        db.execute("INSERT OR REPLACE INTO am_provider_identities VALUES(?,?,?,?,?)",params![workspace,name,external,principal.credential,now()])?;
-        db.execute("DELETE FROM am_oauth_pending WHERE state_hash=?",[&state_hash])?;
-        db.execute("DELETE FROM am_secrets WHERE id=?",[s(&pending,"verifier_secret")])?;
+    let principal = store.transaction(|db| {
+        authorize_hash(db, workspace, s(&pending, "principal_hash"), "admin")
+    })?;
+    store.graph().transaction(|db|{
+        graph::write(db,"CREATE (a:OAuthAccount {id: $id, workspace_id: $workspace, provider: $provider, external_id: $external, email: $email, display_name: $display, token_secret: $token_secret, refresh_secret: $refresh_secret, expires_at: $expiry, scopes: $scopes, state: 'active', updated_at: $now})",Params::from([
+            ("id".into(),json_to_value(&json!(identifier))),
+            ("workspace".into(),json_to_value(&json!(workspace))),
+            ("provider".into(),json_to_value(&json!(name))),
+            ("external".into(),json_to_value(&json!(external))),
+            ("email".into(),email.as_ref().map(|e|json_to_value(&json!(e))).unwrap_or(cypherlite::Value::Null)),
+            ("display".into(),json_to_value(&json!(display))),
+            ("token_secret".into(),json_to_value(&json!(token_secret))),
+            ("refresh_secret".into(),refresh_secret.as_ref().map(|r|json_to_value(&json!(r))).unwrap_or(cypherlite::Value::Null)),
+            ("expiry".into(),expiry.as_ref().map(|e|json_to_value(&json!(e))).unwrap_or(cypherlite::Value::Null)),
+            ("scopes".into(),json_to_value(&json!(token_metadata["scope"].as_str().unwrap_or("")))),
+            ("now".into(),json_to_value(&json!(now()))),
+        ]))?;
+        let mut used_secrets = vec![&token_secret];
+        if let Some(refresh) = &refresh_secret {
+            used_secrets.push(refresh);
+        }
+        for secret in used_secrets {
+            graph::write(db,"MATCH (a:OAuthAccount {id: $id}), (s:Secret {id: $secret}) MERGE (a)-[:USES]->(s)",Params::from([("id".into(),json_to_value(&json!(identifier))),("secret".into(),json_to_value(&json!(secret)))]))?;
+        }
+        graph::write(db,"MERGE (i:ProviderIdentity {workspace_id: $workspace, provider: $provider, external_id: $external, credential_id: $credential}) SET i.verified_at = $now",Params::from([
+            ("workspace".into(),json_to_value(&json!(workspace))),
+            ("provider".into(),json_to_value(&json!(name))),
+            ("external".into(),json_to_value(&json!(external))),
+            ("credential".into(),json_to_value(&json!(principal.credential))),
+            ("now".into(),json_to_value(&json!(now()))),
+        ]))?;
+        graph::write(db,"MATCH (p:OAuthPending {state_hash: $state_hash}) DELETE p",Params::from([("state_hash".into(),json_to_value(&json!(state_hash)))]))?;
+        graph::write(db,"MATCH (s:Secret {id: $id}) DELETE s",Params::from([("id".into(),json_to_value(&json!(s(&pending,"verifier_secret"))))]))?;
         Ok(json!({"connected":true,"provider":name,"account_id":identifier,"display_name":display,"credential_ref":format!("oauth:{identifier}")}))
     })
 }
@@ -342,15 +394,20 @@ async fn refresh_as(
     permission: &str,
     identifier: &str,
 ) -> Result<Value> {
-    let account = store.transaction(|db| {
-        authorize_hash(db, workspace, principal, permission)?;
-        one(
-            db,
-            "SELECT * FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND state='active'",
-            params![workspace, identifier],
-        )?
-        .ok_or_else(|| Error::bad("Account unavailable"))
+    store.transaction(|db| {
+        authorize_hash(db, workspace, principal, permission).map(|_| ())
     })?;
+    let account = store.graph().read(|db| {
+        graph::one(
+            db,
+            &format!("MATCH (a:OAuthAccount {{workspace_id: $workspace, id: $id, state: 'active'}}) RETURN {ACCOUNT_COLS}"),
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("id".into(), json_to_value(&json!(identifier))),
+            ]),
+        )
+    })?
+    .ok_or_else(|| Error::bad("Account unavailable"))?;
     let name = s(&account, "provider");
     let all = providers(store, workspace)?;
     let profile = profile_for(&all, name)?;
@@ -386,18 +443,41 @@ async fn refresh_as(
         });
     let result=store.transaction(|db|{
         authorize_hash(db,workspace,principal,permission)?;
-        let changed=db.execute("UPDATE am_oauth_accounts SET token_secret=?,refresh_secret=coalesce(?,refresh_secret),expires_at=?,updated_at=? WHERE workspace_id=? AND id=? AND state='active' AND token_secret=?",params![access,renewed,expires,now(),workspace,identifier,s(&account,"token_secret")])?;
-        if changed!=1{return Err(Error::conflict("Account changed while refreshing"));}
-        db.execute("DELETE FROM am_secrets WHERE id=?",[s(&account,"token_secret")])?;
-        if renewed.is_some(){db.execute("DELETE FROM am_secrets WHERE id=?",[s(&account,"refresh_secret")])?;}
+        Ok(())
+    }).and_then(|_| store.graph().transaction(|db|{
+        let found=graph::one(db,"MATCH (a:OAuthAccount {workspace_id: $workspace, id: $id, state: 'active', token_secret: $old_token}) RETURN a.id AS id",Params::from([
+            ("workspace".into(),json_to_value(&json!(workspace))),
+            ("id".into(),json_to_value(&json!(identifier))),
+            ("old_token".into(),json_to_value(&json!(s(&account,"token_secret")))),
+        ]))?;
+        if found.is_none(){return Err(Error::conflict("Account changed while refreshing"));}
+        graph::write(db,"MATCH (a:OAuthAccount {id: $id}) SET a.token_secret=$access, a.refresh_secret=CASE WHEN $renewed IS NULL THEN a.refresh_secret ELSE $renewed END, a.expires_at=$expires, a.updated_at=$now",Params::from([
+            ("id".into(),json_to_value(&json!(identifier))),
+            ("access".into(),json_to_value(&json!(access))),
+            ("renewed".into(),renewed.as_ref().map(|r|json_to_value(&json!(r))).unwrap_or(cypherlite::Value::Null)),
+            ("expires".into(),expires.as_ref().map(|e|json_to_value(&json!(e))).unwrap_or(cypherlite::Value::Null)),
+            ("now".into(),json_to_value(&json!(now()))),
+        ]))?;
+        let mut replaced = vec![s(&account,"token_secret").to_string()];
+        if renewed.is_some(){replaced.push(s(&account,"refresh_secret").to_string());}
+        for secret in replaced {
+            graph::write(db,"MATCH (s:Secret {id: $id}) DELETE s",Params::from([("id".into(),json_to_value(&json!(secret)))]))?;
+        }
         Ok(json!({"refreshed":true,"expires_at":expires}))
-    });
+    }));
     if result.is_err() {
-        store.transaction(|db| {
-            db.execute(
-                "DELETE FROM am_secrets WHERE id=? OR id=?",
-                params![access, renewed],
-            )?;
+        store.graph().transaction(|db| {
+            let mut stale = vec![access.clone()];
+            if let Some(renewed) = &renewed {
+                stale.push(renewed.clone());
+            }
+            for secret in stale {
+                graph::write(
+                    db,
+                    "MATCH (s:Secret {id: $id}) DELETE s",
+                    Params::from([("id".into(), json_to_value(&json!(secret)))]),
+                )?;
+            }
             Ok(())
         })?;
     }
@@ -416,15 +496,20 @@ pub(crate) async fn for_connector(
     reference: &str,
 ) -> Result<String> {
     if let Some(identifier) = reference.strip_prefix("oauth:") {
-        let account = store.transaction(|db| {
-            authorize_hash(db, &job.workspace, &job.principal_hash, "collect")?;
-            one(
-                db,
-                "SELECT * FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND state='active'",
-                params![job.workspace, identifier],
-            )?
-            .ok_or_else(|| Error::bad("Connected account unavailable"))
+        store.transaction(|db| {
+            authorize_hash(db, &job.workspace, &job.principal_hash, "collect").map(|_| ())
         })?;
+        let account = store.graph().read(|db| {
+            graph::one(
+                db,
+                &format!("MATCH (a:OAuthAccount {{workspace_id: $workspace, id: $id, state: 'active'}}) RETURN {ACCOUNT_COLS}"),
+                Params::from([
+                    ("workspace".into(), json_to_value(&json!(job.workspace))),
+                    ("id".into(), json_to_value(&json!(identifier))),
+                ]),
+            )
+        })?
+        .ok_or_else(|| Error::bad("Connected account unavailable"))?;
         let expiring = account["expires_at"]
             .as_str()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -450,13 +535,21 @@ pub fn disconnect(
     identifier: &str,
 ) -> Result<Value> {
     store.authorized(workspace,capability,"admin",|db,_|{
-        let account=one(db,"SELECT * FROM am_oauth_accounts WHERE workspace_id=? AND id=?",params![workspace,identifier])?.ok_or_else(||Error::bad("Account unavailable"))?;
+        let account=store.graph().read(|db|graph::one(db,&format!("MATCH (a:OAuthAccount {{workspace_id: $workspace, id: $id}}) RETURN {ACCOUNT_COLS}"),Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(identifier)))])))?.ok_or_else(||Error::bad("Account unavailable"))?;
         let reference=format!("oauth:{identifier}");
-        let projects=rows(db,"SELECT repository_id FROM am_connectors WHERE credential_env=? AND repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?)",params![reference,workspace])?;
-        db.execute("UPDATE am_connectors SET state='paused',last_sync=NULL,generation=generation+1 WHERE credential_env=? AND repository_id IN (SELECT id FROM repo_projects WHERE workspace_id=?)",params![reference,workspace])?;
-        db.execute("DELETE FROM am_oauth_accounts WHERE id=?",[identifier])?;
-        db.execute("DELETE FROM am_secrets WHERE id IN (?,?)",params![s(&account,"token_secret"),s(&account,"refresh_secret")])?;
-        for p in projects{db.execute("DELETE FROM am_model_cache WHERE repository_id=?",[s(&p,"repository_id")])?;crate::store::invalidate(db,s(&p,"repository_id"))?;}
+        let project_ids=crate::store::rows(db,"SELECT id FROM repo_projects WHERE workspace_id=?",[workspace])?.iter().map(|r| s(r,"id").to_string()).collect::<Vec<_>>();
+        let projects=store.graph().transaction(|db|{
+            let projects=graph::rows(db,"MATCH (c:Connector) WHERE c.credential_env=$reference AND c.repository_id IN $projects RETURN c.repository_id AS repository_id",Params::from([("reference".into(),json_to_value(&json!(reference))),("projects".into(),json_to_value(&json!(project_ids)))]))?;
+            graph::write(db,"MATCH (c:Connector) WHERE c.credential_env=$reference AND c.repository_id IN $projects SET c.state='paused', c.last_sync=NULL, c.generation=c.generation+1",Params::from([("reference".into(),json_to_value(&json!(reference))),("projects".into(),json_to_value(&json!(project_ids)))]))?;
+            graph::write(db,"MATCH (a:OAuthAccount {id: $id}) DETACH DELETE a",Params::from([("id".into(),json_to_value(&json!(identifier)))]))?;
+            for secret in [s(&account,"token_secret"),s(&account,"refresh_secret")] {
+                if !secret.is_empty() {
+                    graph::write(db,"MATCH (s:Secret {id: $id}) DELETE s",Params::from([("id".into(),json_to_value(&json!(secret)))]))?;
+                }
+            }
+            Ok(projects)
+        })?;
+        for p in projects{crate::jobs::clear_model_cache(&store.graph(),s(&p,"repository_id"))?;crate::store::invalidate(db,s(&p,"repository_id"))?;}
         Ok(json!({"disconnected":true,"provider_token_revoked":false}))
     })
 }
@@ -468,9 +561,10 @@ pub async fn resources(
     args: &Value,
 ) -> Result<Value> {
     let account_id = string(args, "account_id", 100)?;
-    let account=store.authorized(workspace,token,"admin",|db,_|{
-        one(db,"SELECT * FROM am_oauth_accounts WHERE workspace_id=? AND id=? AND provider='atlassian' AND state='active'",params![workspace,account_id])?.ok_or_else(||Error::bad("Choose a connected Atlassian account"))
-    })?;
+    store.authorized(workspace,token,"admin",|_,_|Ok(()))?;
+    let account=store.graph().read(|db|{
+        graph::one(db,&format!("MATCH (a:OAuthAccount {{workspace_id: $workspace, id: $id, provider: 'atlassian', state: 'active'}}) RETURN {ACCOUNT_COLS}"),Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(account_id)))]))
+    })?.ok_or_else(||Error::bad("Choose a connected Atlassian account"))?;
     if account["expires_at"]
         .as_str()
         .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())

@@ -88,17 +88,19 @@ impl Fixture {
     }
     /// The payload the service stored for a queued job.
     fn payload(&self, queued: &Value) -> Value {
-        let payload: String = self
+        let payload = self
             .store
-            .connect()
+            .graph()
+            .read(|db| {
+                graphicle_runtime::store_graph::one(
+                    db,
+                    "MATCH (j:Job {id: $id}) RETURN j.payload AS payload",
+                    graphicle_runtime::store_graph::params(&json!({"id": s(queued, "id")})),
+                )
+            })
             .unwrap()
-            .query_row(
-                "SELECT payload FROM am_jobs WHERE id=?",
-                [s(queued, "id")],
-                |r| r.get(0),
-            )
             .unwrap();
-        serde_json::from_str(&payload).unwrap()
+        serde_json::from_str(s(&payload, "payload")).unwrap()
     }
 }
 

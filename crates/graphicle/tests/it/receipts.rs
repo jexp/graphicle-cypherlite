@@ -63,13 +63,6 @@ impl Fixture {
         )
         .unwrap()
     }
-    fn count(&self, sql: &str) -> i64 {
-        self.store
-            .connect()
-            .unwrap()
-            .query_row(sql, [&self.repo], |r| r.get(0))
-            .unwrap()
-    }
 }
 
 #[test]
@@ -103,7 +96,15 @@ fn memory_delete_signs_a_receipt_without_the_memory_and_verifies() {
         "{deleted}"
     );
     assert_eq!(
-        f.count("SELECT count(*) FROM repo_memories WHERE repository_id=?"),
+        f.store
+            .graph()
+            .read(|g| graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (m:Memory {repository_id: $repo}) RETURN count(m) AS n",
+                graphicle_runtime::store_graph::params(&json!({"repo": f.repo})),
+            ))
+            .unwrap()
+            .unwrap()["n"],
         1
     );
 
@@ -134,7 +135,12 @@ fn storage_prune_signs_a_receipt_for_removed_snapshots_and_objects() {
     )
     .unwrap();
     local::sync(&f.store, &mut session, &root, Some(&f.repo)).unwrap();
-    assert!(f.count("SELECT count(*) FROM repo_snapshots WHERE repository_id=?") >= 2);
+    assert!(
+        graphicle_runtime::store_content::snapshots(&f.store.graph(), &f.repo, 1000)
+            .unwrap()
+            .len()
+            >= 2
+    );
 
     let pruned = f
         .store
@@ -203,16 +209,13 @@ fn source_retention_forgets_exactly_the_previewed_documents() {
         .unwrap();
     // A reviewed memory cites `cited`, so retention keeps it.
     let source = format!("connector:{connector}:cited");
-    let sha = f
-        .store
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT sha256 FROM am_connector_docs WHERE connector_id=? AND id='cited'",
-            [&connector],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap();
+    let sha = crate::gql_one(
+        &f.store,
+        "MATCH (d:ConnectorDoc {connector_id: $connector, id: 'cited'}) RETURN d.sha256 AS sha256",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
+    )
+    .map(|row| row["sha256"].as_str().unwrap().to_string())
+    .unwrap();
     let imported = f.mutate(
         "memory.import",
         json!({"memories":[{"kind":"decision","title":"Password rotation","body":"The staging password rotates monthly.",
@@ -267,16 +270,14 @@ fn source_retention_forgets_exactly_the_previewed_documents() {
     assert!(receipt["policy_digest"].is_string());
     assert_eq!(receipt["verified_local"], true, "{receipt:#}");
     assert_eq!(f.verify(receipt)["complete"], true);
-    let left: Vec<String> = f
-        .store
-        .connect()
-        .unwrap()
-        .prepare("SELECT id FROM am_connector_docs WHERE connector_id=? ORDER BY id")
-        .unwrap()
-        .query_map([&connector], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let left: Vec<String> = crate::gql(
+        &f.store,
+        "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.id AS id ORDER BY d.id",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
+    )
+    .iter()
+    .map(|row| row["id"].as_str().unwrap().to_string())
+    .collect();
     assert_eq!(left, vec!["cited", "fresh", "undated"]);
 
     // The forgotten document is not re-imported by a later sync.
@@ -287,16 +288,13 @@ fn source_retention_forgets_exactly_the_previewed_documents() {
             &f.args(json!({"connector_id":connector,"documents":[{"id":"old","title":"Old","content":"user: again\n","source_timestamp":"2019-05-01T10:00:00Z"}]})),
         )
         .unwrap();
-    let back: i64 = f
-        .store
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM am_connector_docs WHERE connector_id=? AND id='old'",
-            [&connector],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let back: i64 = crate::gql_one(
+        &f.store,
+        "MATCH (d:ConnectorDoc {connector_id: $connector, id: 'old'}) RETURN count(d) AS n",
+        graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(connector))]),
+    )
+    .and_then(|row| row["n"].as_i64())
+    .unwrap();
     assert_eq!(back, 0);
     // A second preview selects nothing, and applying it forgets nothing.
     let empty = f

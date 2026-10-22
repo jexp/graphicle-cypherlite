@@ -2,10 +2,10 @@
 //! Neo4j is optional infrastructure; its results never bypass the canonical source view.
 use crate::{
     Error, Result, claims, digest, integer, model, now, query,
-    store::{Principal, Store, decode, one, repo, rows, s},
+    store::{Principal, Store, decode, repo, s},
     string,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -18,9 +18,14 @@ pub const MAX_EDGES: usize = 200_000;
 /// `context` takes it out before fusion, as it does the observer's note keys.
 pub const LOCAL_STATUS: &str = "graph_local_status";
 
-pub fn snapshot(db: &Connection, repository: &Value, principal: &Principal) -> Result<Value> {
-    let snap = query::snapshot(db, repository, principal)?;
-    from_snapshot(db, repository, principal, &snap)
+pub fn snapshot(
+    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
+    repository: &Value,
+    principal: &Principal,
+) -> Result<Value> {
+    let snap = query::snapshot(db, graph, repository, principal)?;
+    from_snapshot(db, graph, repository, principal, &snap)
 }
 
 /// The property graph, or what exceeded its budget.
@@ -31,11 +36,12 @@ enum Built {
 
 pub fn from_snapshot(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &Value,
     principal: &Principal,
     snap: &query::Snapshot,
 ) -> Result<Value> {
-    match build(db, repository, principal, snap, true)? {
+    match build(db, graph, repository, principal, snap, true)? {
         Built::Graph(graph) => Ok(graph),
         Built::OverBudget(_) => Err(Error::bad(
             "Property graph exceeds its configured node/edge budget",
@@ -48,6 +54,7 @@ pub fn from_snapshot(
 /// out, and the graph says so (`document_edges: "excluded"`).
 fn build(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &Value,
     principal: &Principal,
     snap: &query::Snapshot,
@@ -93,12 +100,16 @@ fn build(
             edge(&mut edges, from, to, "code", e.clone());
         }
     }
-    let facts = claims::current(db, repository, principal)?;
-    let links = rows(
-        db,
-        "SELECT * FROM am_entity_links WHERE repository_id=?",
-        [s(repository, "id")],
-    )?;
+    let facts = claims::current(db, graph, repository, principal)?;
+    let links = graph.read(|g| {
+        crate::store_graph::rows(
+            g,
+            "MATCH (c:Claim {repository_id: $repo})-[:HAS_SUBJECT]->(sub:Entity) \
+             MATCH (c)-[:HAS_OBJECT]->(obj:Entity) \
+             RETURN c.id AS claim_id, sub.id AS subject_id, obj.id AS object_id",
+            crate::store_graph::params(&json!({"repo": s(repository, "id")})),
+        )
+    })?;
     let mut timeline = Vec::new();
     for fact in &facts {
         let id = format!("claim:{}", s(fact, "id"));
@@ -119,12 +130,18 @@ fn build(
             for (field, direction) in [("subject_id", "subject"), ("object_id", "object")] {
                 let entity_id = format!("entity:{}", s(link, field));
                 if !nodes.contains_key(&entity_id)
-                    && let Some(mut e) = one(
-                        db,
-                        "SELECT * FROM am_entities WHERE repository_id=? AND id=?",
-                        params![s(repository, "id"), s(link, field)],
-                    )?
+                    && let Some(e) = graph.read(|g| {
+                        Ok(crate::store_graph::one(
+                            g,
+                            "MATCH (e:Entity {repository_id: $repo, id: $id}) RETURN e",
+                            crate::store_graph::params(
+                                &json!({"repo": s(repository, "id"), "id": s(link, field)}),
+                            ),
+                        )?
+                        .map(|row| crate::store_graph::node(&row, "e")))
+                    })?
                 {
+                    let mut e = e;
                     decode(&mut e, "data")?;
                     nodes.insert(entity_id.clone(),json!({"id":entity_id,"kind":"entity","name":e["name"],"entity_kind":e["kind"],"aliases":e["data"]["aliases"]}));
                 }
@@ -229,6 +246,7 @@ const DOCUMENT_EDGES: &str = "document_edges";
 /// its seed search has an edge from a document to code.
 pub fn for_query(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &Value,
     principal: &Principal,
     snap: &query::Snapshot,
@@ -245,7 +263,7 @@ pub fn for_query(
     }
     let documents = crate::doc_links::Options::parse(args)?.documents();
     Ok(Some(
-        match build(db, repository, principal, snap, documents)? {
+        match build(db, graph, repository, principal, snap, documents)? {
             Built::Graph(graph) => graph,
             Built::OverBudget(report) => json!({"degraded": report}),
         },
@@ -293,8 +311,8 @@ pub fn add_rankings_on(
 pub fn read(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
     store.authorized(workspace,token,"read",|db,p|{
         let repository=repo(db,p,string(args,"repository_id",100)?)?;
-        let snap=query::snapshot(db,&repository,p)?;
-        let graph=match build(db,&repository,p,&snap,true)? {
+        let snap=query::snapshot(db,&store.graph(),&repository,p)?;
+        let graph=match build(db,&store.graph(),&repository,p,&snap,true)? {
             Built::Graph(graph)=>graph,
             // Past the property graph's budget a read answers with no nodes
             // and says why (`degraded`), as `graph_local` does, instead of
@@ -522,7 +540,7 @@ pub fn configure_neo4j(store: &Store, workspace: &str, token: &str, args: &Value
     string(&secret, "username", 200)?;
     string(&secret, "password", 1000)?;
     let value = json!({"endpoint":endpoint,"database":database,"credential_ref":reference});
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(old)=one(db,"SELECT config FROM am_backends WHERE repository_id=? AND kind='neo4j'",[s(&repository,"id")])?{let cfg:Value=serde_json::from_str(s(&old,"config"))?;if cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}}db.execute("INSERT OR REPLACE INTO am_backends VALUES(?,?,?)",params![s(&repository,"id"),"neo4j",value.to_string()])?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(cfg)=crate::projection::backend_config(db,s(&repository,"id"),"neo4j")?{if cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}}crate::projection::backend_set(db,s(&repository,"id"),"neo4j",&value)?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
 }
 async fn cypher(
     store: &Store,
@@ -567,19 +585,15 @@ pub async fn neo4j(
 ) -> Result<Value> {
     let (config, graph, revision) = store.authorized(workspace, token, "admin", |db, p| {
         let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-        let mut backend = one(
-            db,
-            "SELECT config FROM am_backends WHERE repository_id=? AND kind='neo4j'",
-            [s(&repository, "id")],
-        )?
-        .ok_or_else(|| Error::bad("Configure a Neo4j database first"))?;
-        decode(&mut backend, "config")?;
+        let config = crate::projection::backend_config(db, s(&repository, "id"), "neo4j")?
+            .ok_or_else(|| Error::bad("Configure a Neo4j database first"))?;
+        let backend = json!({"config": config});
         if publish {
             crate::projection::ready(db, s(&repository, "id"), "neo4j", &backend["config"])?;
         }
         Ok((
             backend["config"].clone(),
-            snapshot(db, &repository, p)?,
+            snapshot(db, &store.graph(), &repository, p)?,
             crate::projection::marker(db, s(&repository, "id"), "neo4j", &backend["config"])?,
         ))
     })?;
@@ -608,7 +622,7 @@ pub async fn neo4j(
         cypher(store, client, workspace, &config, statements).await?;
         let still_current = store.authorized(workspace, token, "admin", |db, p| {
             let repository = repo(db, p, scope)?;
-            Ok(snapshot(db, &repository, p)?["source_state"] == graph["source_state"] && crate::projection::marker(db, scope, "neo4j", &config)? == revision)
+            Ok(snapshot(db, &store.graph(), &repository, p)?["source_state"] == graph["source_state"] && crate::projection::marker(db, scope, "neo4j", &config)? == revision)
         })?;
         if !still_current {
             cypher(store,client,workspace,&config,json!([{"statement":"MATCH (n:Graphicle {scope:$scope,generation:$generation}) DETACH DELETE n","parameters":{"scope":scope,"generation":generation}}])).await?;
@@ -637,7 +651,7 @@ pub async fn neo4j(
         let results=cypher(store,client,workspace,&config,json!([{"statement":"MATCH (n:Graphicle {scope:$scope}) WHERE toLower(n.name) CONTAINS toLower($query) RETURN n.id AS id LIMIT $limit","parameters":{"scope":scope,"query":args["query"].as_str().unwrap_or(""),"limit":integer(args,"limit",20,200)?}}])).await?;
         // Read a new canonical view after the network request, so revocation wins.
         store.authorized(workspace,token,"admin",|db,p|{
-            let repository=repo(db,p,scope)?;let current=snapshot(db,&repository,p)?;
+            let repository=repo(db,p,scope)?;let current=snapshot(db,&store.graph(),&repository,p)?;
             let ids=results[0]["data"].as_array().into_iter().flatten().filter_map(|v|v["row"][0].as_str()).collect::<BTreeSet<_>>();
             Ok(json!({"nodes":current["nodes"].as_array().unwrap().iter().filter(|n|ids.contains(s(n,"id"))).collect::<Vec<_>>(),"canonical_revalidation":true,"source_state":current["source_state"]}))
         })

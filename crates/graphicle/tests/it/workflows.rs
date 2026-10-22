@@ -818,6 +818,7 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
                     .collect::<Vec<_>>();
                 claims::propose(
                     db,
+                    &f.store.graph(),
                     &repo,
                     p,
                     &json!([value]),
@@ -833,7 +834,12 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
     let targets = f
         .store
         .authorized(&f.workspace, &f.key, "read", |db, p| {
-            claims::current(db, &graphicle_runtime::store::repo(db, p, &f.project)?, p)
+            claims::current(
+                db,
+                &f.store.graph(),
+                &graphicle_runtime::store::repo(db, p, &f.project)?,
+                p,
+            )
         })
         .unwrap();
     let mut corrected = claim(
@@ -869,8 +875,8 @@ fn private_sources_do_not_leak_through_memory_children_or_history() {
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Private","config":{"acl":{"workspace_readers":false,"credentials":[]}}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"secret","title":"Private","content":"Confidential project detail."}]}))).unwrap();
     let source = format!("connector:{}:secret", s(&connector, "id"));
-    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|{let parent=memory::save(db,&f.project,None,None,"note","Private note","Confidential project detail.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential project detail.")},"notes":{}}))?;
-        memory::save(db,&f.project,None,None,"context","Derived note","Also confidential.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{},"notes":{s(&parent,"id"):1}}))?;Ok(())}).unwrap();
+    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|{let parent=memory::save(db,&f.store.graph(),&f.project,None,None,"note","Private note","Confidential project detail.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential project detail.")},"notes":{}}))?;
+        memory::save(db,&f.store.graph(),&f.project,None,None,"context","Derived note","Also confidential.","reviewed",&json!({"dependencies":{},"evidence_links":{},"native_sources":{},"notes":{s(&parent,"id"):1}}))?;Ok(())}).unwrap();
     let reader = f
         .store
         .grant(
@@ -1046,13 +1052,15 @@ async fn basic_answers_use_configured_semantic_search_and_can_disable_it() {
     assert_eq!(remote.state.count.load(Ordering::SeqCst), 3);
     let job=f.store.enqueue(&f.workspace,&f.key,&f.args(json!({"kind":"basic","question":"peaceful place","semantic_retrieval":false,"max_calls":1})),&remote.config).unwrap();
     f.store
-        .transaction(|db| {
-            let payload: String = db.query_row(
-                "SELECT payload FROM am_jobs WHERE id=?",
-                [s(&job, "id")],
-                |r| r.get(0),
+        .graph()
+        .read(|db| {
+            let payload = graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {id: $id}) RETURN j.payload AS payload",
+                graphicle_runtime::store_graph::params(&json!({"id": s(&job, "id")})),
             )?;
-            let payload: Value = serde_json::from_str(&payload)?;
+            let payload: Value =
+                serde_json::from_str(s(&payload.unwrap(), "payload"))?;
             assert!(payload["embedding_key"].is_null());
             Ok(())
         })
@@ -1098,6 +1106,7 @@ async fn reflection_receives_actual_reviewed_memory_text() {
         .authorized(&f.workspace, &f.key, "approve", |db, _| {
             memory::save(
                 db,
+                &f.store.graph(),
                 &f.project,
                 None,
                 None,
@@ -1240,7 +1249,7 @@ fn source_snapshot_pin_backup_restore_and_forgetting_are_real() {
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Private","config":{"acl":{"workspace_readers":false,"credentials":[]}}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"private","title":"Private source","content":"Confidential source."}]}))).unwrap();
     let source = format!("connector:{}:private", s(&connector, "id"));
-    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|memory::save(db,&f.project,None,None,"note","Remember","Confidential source.","reviewed",&json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential source.")}}))).unwrap();
+    f.store.authorized(&f.workspace,&f.key,"approve",|db,_|memory::save(db,&f.store.graph(),&f.project,None,None,"note","Remember","Confidential source.","reviewed",&json!({"dependencies":{},"evidence_links":{},"notes":{},"native_sources":{source:graphicle_memory::text::sha256(b"Confidential source.")}}))).unwrap();
     let removed = f
         .store
         .maintain(
@@ -1265,7 +1274,12 @@ fn expired_connector_snapshot_is_withheld_and_only_one_scan_can_own_a_cursor() {
     let f = Fixture::new();
     let connector=f.store.connector_add(&f.workspace,&f.key,&f.args(json!({"kind":"jsonl","name":"Source","config":{"acl":{"workspace_readers":true,"credentials":[]},"max_age_seconds":60}}))).unwrap();
     f.store.import_documents(&f.workspace,&f.key,&f.args(json!({"connector_id":connector["id"],"documents":[{"id":"old","title":"Remote","content":"Remote source text."}]}))).unwrap();
-    f.store.transaction(|db| {db.execute("UPDATE am_connectors SET kind='github',last_sync='2020-01-01T00:00:00Z' WHERE id=?",[s(&connector,"id")])?;Ok(())}).unwrap();
+    // Connectors live in the graph store; age the fixture's snapshot there.
+    crate::gql_write(
+        &f.store,
+        "MATCH (c:Connector {id: $id}) SET c.kind='github', c.last_sync='2020-01-01T00:00:00Z'",
+        graphicle_runtime::store_graph::Params::from([crate::gp("id", connector["id"].clone())]),
+    );
     assert_eq!(
         f.store
             .project_read(&f.workspace, &f.key, "files", &f.args(json!({})))

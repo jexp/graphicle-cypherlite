@@ -26,26 +26,42 @@
 //! revision means unchanged bytes. The check is a read of indexed rows,
 //! never of the graph: [`Check`].
 //!
-//! **Tables.** `gf_symbol_heads` holds the code symbols of the head set
-//! `gf_symbol_state` names (one row per `stable_id`, with the lines of the
-//! bytes its revision hashes and the file's sha256). A projection of the
-//! current head set keeps it ([`record`], by changed file when it described
-//! the previous episode, else whole), and [`ensure`] rebuilds it from the
-//! resident graph when the head set returns to a recorded episode.
-//! `gf_symbol_moves` holds the exact moves; `gf_symbol_pins` holds quote
-//! occurrences written before their file's symbols were projected, pinned to
-//! their symbols by the next projection of that content ([`pin_pending`]).
-//! Pins go with their memory; the other tables with their project.
+//! **Graph model** (CypherLite; migration plan §2.5). The live-symbol table
+//! is `(:SymbolHead {repository_id, stable_id, revision, relpath,
+//! qualified_name, kind, ordinal, node_id, line_start, line_next, sha256})`,
+//! one node per `stable_id`, holding the lines of the bytes its revision
+//! hashes and the file's sha256. A projection of the current head set keeps
+//! it ([`record`], by changed file when it described the previous episode,
+//! else whole), and [`ensure`] rebuilds it from the resident graph when the
+//! head set returns to a recorded episode. `(:SymbolState {repository_id,
+//! episode, updated_at})` names the episode the heads describe; exact moves
+//! are `(:SymbolMove {repository_id, from_stable_id, to_stable_id, revision,
+//! episode, created_at})` nodes. Pins are
+//! `(:Memory {id})-[:PINNED_TO {relpath, sha256, byte_start, byte_end,
+//! state, covered, symbols, episode, created_at, pinned_at}]->(:SymbolHead)`:
+//! quote occurrences written before their file's symbols were projected,
+//! pinned to their symbols by the next projection of that content
+//! ([`pin_pending`]). Two deliberate deviations from the plan's sketch: the
+//! heads are `:SymbolHead` nodes, not `:Symbol`, so a whole-table replace
+//! (`DETACH DELETE`) can never touch the code graph's `:Symbol` nodes when
+//! that projection migrates; and a pending pin, whose symbol is not known
+//! yet, points at a per-repository anchor (`stable_id: ""`) — the resolved
+//! symbols are the pin's `symbols` property. Pins go with their memory; the
+//! other nodes with their project.
 use crate::{
     Error, Result, graph_projection, now,
-    store::{rows, s},
+    store_graph::{self as sg, GraphStore, Params, json_to_value},
     string,
 };
+use cypherlite::Connection as GraphConnection;
 use graphicle::graph::Graph;
 use graphicle_memory::graph::{identity::LogicalIdentity, span};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// The store::s row helper (SQL rows and graph rows are both JSON objects).
+use crate::store::s;
 
 /// A quote resolved to the symbols that contain it.
 pub const RUNG_QUOTE: &str = "quote";
@@ -112,62 +128,156 @@ fn tail(qualified: &str) -> &str {
     qualified.rsplit('.').next().unwrap_or(qualified)
 }
 
-const COLUMNS: &str =
-    "stable_id,revision,relpath,qualified_name,kind,ordinal,node_id,line_start,line_next,sha256";
+/// The columns of a `:SymbolHead` node as a [`Live`] row.
+const HEAD_RETURN: &str = "s.stable_id AS stable_id, s.revision AS revision, \
+     s.relpath AS relpath, s.qualified_name AS qualified_name, s.kind AS kind, \
+     s.ordinal AS ordinal, s.node_id AS node_id, s.line_start AS line_start, \
+     s.line_next AS line_next, s.sha256 AS sha256";
 
-fn select(db: &Connection, filter: &str, arguments: impl rusqlite::Params) -> Result<Vec<Live>> {
-    let mut statement = db.prepare_cached(&format!(
-        "SELECT {COLUMNS} FROM gf_symbol_heads WHERE {filter}"
-    ))?;
-    let found = statement.query_map(arguments, |row| {
-        Ok(Live {
-            stable_id: row.get(0)?,
-            revision: row.get(1)?,
-            identity: LogicalIdentity {
-                relpath: row.get(2)?,
-                qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                ordinal: row.get::<_, i64>(5)?.max(0) as usize,
-            },
-            node_id: row.get(6)?,
-            line_start: row.get::<_, i64>(7)?.max(1) as usize,
-            line_next: row.get::<_, Option<i64>>(8)?.map(|n| n.max(1) as usize),
-            sha256: row.get(9)?,
-        })
-    })?;
-    Ok(found.collect::<rusqlite::Result<Vec<_>>>()?)
+fn live_row(row: &Value) -> Live {
+    Live {
+        stable_id: s(row, "stable_id").to_string(),
+        revision: s(row, "revision").to_string(),
+        identity: LogicalIdentity {
+            relpath: s(row, "relpath").to_string(),
+            qualified_name: s(row, "qualified_name").to_string(),
+            kind: s(row, "kind").to_string(),
+            ordinal: row["ordinal"].as_u64().unwrap_or(0) as usize,
+        },
+        node_id: s(row, "node_id").to_string(),
+        line_start: (row["line_start"].as_u64().unwrap_or(1) as usize).max(1),
+        line_next: row["line_next"].as_u64().map(|n| (n as usize).max(1)),
+        sha256: s(row, "sha256").to_string(),
+    }
 }
 
-/// The live code symbols with these `stable_id`s.
-pub fn by_ids(db: &Connection, repository: &str, ids: &BTreeSet<String>) -> Result<Vec<Live>> {
+fn repo_params(repository: &str) -> Params {
+    Params::from([("repo".to_string(), json_to_value(&json!(repository)))])
+}
+
+fn heads(g: &mut GraphConnection, filter: &str, params: Params) -> Result<Vec<Live>> {
+    Ok(sg::rows(
+        g,
+        &format!(
+            "MATCH (s:SymbolHead {{repository_id: $repo}}) {filter} RETURN {HEAD_RETURN}"
+        ),
+        params,
+    )?
+    .iter()
+    .map(live_row)
+    .collect())
+}
+
+fn heads_of(g: &mut GraphConnection, repository: &str) -> Result<Vec<Live>> {
+    // The `stable_id: ""` anchor only carries pins; it is not a symbol.
+    heads(g, "WHERE s.stable_id <> ''", repo_params(repository))
+}
+
+fn heads_in(g: &mut GraphConnection, repository: &str, owners: &BTreeSet<String>) -> Result<Vec<Live>> {
+    let mut params = repo_params(repository);
+    params.insert("owners".to_string(), json_to_value(&json!(owners)));
+    heads(g, "WHERE s.relpath IN $owners", params)
+}
+
+fn heads_of_file(g: &mut GraphConnection, repository: &str, path: &str) -> Result<Vec<Live>> {
+    let mut params = repo_params(repository);
+    params.insert("path".to_string(), json_to_value(&json!(path)));
+    heads(
+        g,
+        "WHERE s.relpath = $path",
+        params,
+    )
+}
+
+pub fn by_ids(g: &mut GraphConnection, repository: &str, ids: &BTreeSet<String>) -> Result<Vec<Live>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    select(
-        db,
-        "repository_id=?1 AND stable_id IN (SELECT value FROM json_each(?2))",
-        params![repository, json!(ids).to_string()],
-    )
+    let mut params = repo_params(repository);
+    params.insert("ids".to_string(), json_to_value(&json!(ids)));
+    heads(g, "WHERE s.stable_id IN $ids", params)
 }
 
-/// The live code symbols of one file (`relpath`), by the indexed file column.
-pub fn in_file(db: &Connection, repository: &str, relpath: &str) -> Result<Vec<Live>> {
-    select(
-        db,
-        "repository_id=?1 AND relpath=?2",
-        params![repository, relpath],
-    )
+/// The live code symbols of one file (`relpath`), the head set's file rule.
+pub fn in_file(g: &mut GraphConnection, repository: &str, path: &str) -> Result<Vec<Live>> {
+    heads_of_file(g, repository, path)
 }
 
-/// The head set (episode) `gf_symbol_heads` describes, if any.
-pub fn table_episode(db: &Connection, repository: &str) -> Result<Option<String>> {
-    Ok(rows(
-        db,
-        "SELECT episode FROM gf_symbol_state WHERE repository_id=?",
-        [repository],
+fn by_id(g: &mut GraphConnection, repository: &str, id: &str) -> Result<Option<Live>> {
+    let mut params = repo_params(repository);
+    params.insert("id".to_string(), json_to_value(&json!(id)));
+    Ok(heads(g, "WHERE s.stable_id = $id", params)?.pop())
+}
+
+/// The head set (episode) the live-symbol nodes describe, if any.
+pub fn table_episode(graph: &GraphStore, repository: &str) -> Result<Option<String>> {
+    graph.read(|g| table_episode_in(g, repository))
+}
+
+fn table_episode_in(g: &mut GraphConnection, repository: &str) -> Result<Option<String>> {
+    Ok(sg::one(
+        g,
+        "MATCH (st:SymbolState {repository_id: $repo}) RETURN st.episode AS episode LIMIT 1",
+        repo_params(repository),
     )?
-    .first()
-    .map(|row| s(row, "episode").to_string()))
+    .map(|row| s(&row, "episode").to_string()))
+}
+
+/// Whether the store holds symbol state for `repository` (the guard-hook
+/// fast path of `graph_command`).
+pub fn has_symbol_state(graph: &GraphStore, repository: &str) -> Result<bool> {
+    Ok(table_episode(graph, repository)?.is_some())
+}
+
+/// Whether the store holds live-symbol nodes for `repository`.
+pub fn has_symbol_heads(graph: &GraphStore, repository: &str) -> Result<bool> {
+    graph.read(|g| {
+        Ok(sg::one(
+            g,
+            "MATCH (s:SymbolHead {repository_id: $repo}) WHERE s.stable_id <> '' RETURN s.stable_id AS id LIMIT 1",
+            repo_params(repository),
+        )?
+        .is_some())
+    })
+}
+
+/// Pins of one memory (`Some`), or of the whole repository (`None`) — the
+/// deletion paths' count of `gf_symbol_pins` rows.
+pub fn pin_count(graph: &GraphStore, repository: &str, memory: Option<&str>) -> Result<usize> {
+    let mut params = repo_params(repository);
+    let cypher = match memory {
+        Some(mid) => {
+            params.insert("mid".to_string(), json_to_value(&json!(mid)));
+            "MATCH (m:Memory {id: $mid})-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+             RETURN count(p) AS n"
+        }
+        None => {
+            "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+             RETURN count(p) AS n"
+        }
+    };
+    graph.read(|g| {
+        Ok(sg::one(g, cypher, params)?
+            .and_then(|row| row["n"].as_u64())
+            .unwrap_or(0) as usize)
+    })
+}
+
+/// Remove one memory's pins; returns how many were removed. Replaces the SQL
+/// foreign-key cascade from `repo_memories` to `gf_symbol_pins`.
+pub fn forget_memory_pins(graph: &GraphStore, repository: &str, memory: &str) -> Result<usize> {
+    let mut params = repo_params(repository);
+    params.insert("mid".to_string(), json_to_value(&json!(memory)));
+    graph.transaction(|g| {
+        let found = sg::one(
+            g,
+            "MATCH (m:Memory {id: $mid})-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+             DELETE p \
+             RETURN count(*) AS n",
+            params.clone(),
+        )?;
+        Ok(found.and_then(|row| row["n"].as_u64()).unwrap_or(0) as usize)
+    })
 }
 
 fn attr(attributes: &impl graphicle::record::Properties, key: &str) -> Option<String> {
@@ -260,6 +370,7 @@ fn rows_of(
 /// whole table is rebuilt from `graph`.
 pub(crate) fn record(
     db: &Connection,
+    gstore: &GraphStore,
     repository: &str,
     episode: &str,
     graph: &Graph,
@@ -267,10 +378,11 @@ pub(crate) fn record(
     parent: Option<&str>,
     dirty: &BTreeSet<String>,
 ) -> Result<()> {
-    let incremental = parent.is_some() && table_episode(db, repository)?.as_deref() == parent;
+    let incremental = parent.is_some() && table_episode(gstore, repository)?.as_deref() == parent;
     let owners = incremental.then_some(dirty);
     replace(
         db,
+        gstore,
         repository,
         episode,
         rows_of(graph, heads, owners),
@@ -278,122 +390,157 @@ pub(crate) fn record(
     )
 }
 
-/// Make the table describe `episode`, a recorded episode of the current head
-/// set, when it describes another one: a sync that returned to a recorded
-/// head set, a replayed projection, or a store written before symbol links.
-/// Reads the
-/// resident graph. Runs in a savepoint, so a failure leaves the table as it
-/// was; callers on a sync path ignore the error (the table then lags, and a
-/// changed linked file reads `projection_pending`).
-pub fn ensure(db: &Connection, repository: &str, episode: &str) -> Result<bool> {
-    if table_episode(db, repository)?.as_deref() == Some(episode) {
+/// Make the live-symbol nodes describe `episode`, a recorded episode of the
+/// current head set, when they describe another one: a sync that returned to
+/// a recorded head set, a replayed projection, or a store written before
+/// symbol links. Reads the resident graph. The replacement is one graph
+/// transaction, so a failure leaves the nodes as they were; callers on a
+/// sync path ignore the error (the table then lags, and a changed linked
+/// file reads `projection_pending`).
+pub fn ensure(
+    db: &Connection,
+    gstore: &GraphStore,
+    repository: &str,
+    episode: &str,
+) -> Result<bool> {
+    if table_episode(gstore, repository)?.as_deref() == Some(episode) {
         return Ok(false);
     }
     let heads = crate::store::heads(db, repository)?;
     if graph_projection::episode_of(&heads) != episode
-        || !graph_projection::is_recorded(db, repository, episode)?
+        || !graph_projection::is_recorded(&*crate::store::graph_for(db)?, repository, episode)?
     {
         return Ok(false);
     }
-    savepoint(db, || {
-        let handle = graph_projection::resident(db, repository, episode)?;
-        let graph: &Graph = &handle;
-        replace(db, repository, episode, rows_of(graph, &heads, None), None)
-    })?;
+    let handle = graph_projection::resident(gstore, repository, episode)?;
+    let graph: &Graph = &handle;
+    replace(db, gstore, repository, episode, rows_of(graph, &heads, None), None)?;
     Ok(true)
 }
 
 /// [`ensure`] for the current head set, when it is recorded.
 pub fn ensure_current(db: &Connection, repository: &str) -> Result<bool> {
+    let graph = crate::store::graph_for(db)?;
     let episode = graph_projection::current_episode(db, repository)?;
-    ensure(db, repository, &episode)
+    ensure(db, &graph, repository, &episode)
 }
 
-fn savepoint<T>(db: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
-    db.execute_batch("SAVEPOINT graphicle_symbols")?;
-    match work() {
-        Ok(value) => {
-            db.execute_batch("RELEASE graphicle_symbols")?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = db.execute_batch("ROLLBACK TO graphicle_symbols; RELEASE graphicle_symbols");
-            Err(error)
-        }
+/// A [`Live`] row as a `:SymbolHead` property map (scalars only; `line_next`
+/// is absent when the symbol runs to the end of its file).
+fn live_json(repository: &str, row: &Live) -> Value {
+    let mut out = json!({
+        "repository_id": repository,
+        "stable_id": row.stable_id,
+        "revision": row.revision,
+        "relpath": row.identity.relpath,
+        "qualified_name": row.identity.qualified_name,
+        "kind": row.identity.kind,
+        "ordinal": row.identity.ordinal as u64,
+        "node_id": row.node_id,
+        "line_start": row.line_start as u64,
+        "sha256": row.sha256,
+    });
+    if let Some(next) = row.line_next {
+        out["line_next"] = json!(next as u64);
     }
+    out
 }
 
 /// Replace the rows of `owners` (all rows when `None`) with `new`, record
-/// the exact moves between the old and new rows, and mark the table as
-/// describing `episode`.
+/// the exact moves between the old and new rows, and mark the state as
+/// describing `episode` — one graph transaction.
 fn replace(
     db: &Connection,
+    gstore: &GraphStore,
     repository: &str,
     episode: &str,
     new: Vec<Live>,
     owners: Option<&BTreeSet<String>>,
 ) -> Result<()> {
-    let old = match owners {
-        Some(owners) => {
-            let owners = json!(owners).to_string();
-            let old = select(
-                db,
-                "repository_id=?1 AND relpath IN (SELECT value FROM json_each(?2))",
-                params![repository, owners],
-            )?;
-            db.execute(
-                "DELETE FROM gf_symbol_heads WHERE repository_id=?1 AND relpath IN (SELECT value FROM json_each(?2))",
-                params![repository, owners],
-            )?;
-            old
-        }
-        None => {
-            let old = select(db, "repository_id=?1", params![repository])?;
-            db.execute(
-                "DELETE FROM gf_symbol_heads WHERE repository_id=?",
-                [repository],
-            )?;
-            old
-        }
+    let (old, kept) = {
+        let mut g = gstore.connection()?;
+        let old = match owners {
+            Some(owners) => heads_in(&mut g, repository, owners)?,
+            None => heads_of(&mut g, repository)?,
+        };
+        // Heads still live after the replacement, for the move cleanup:
+        // everything not replaced, plus the new rows.
+        let mut kept: BTreeSet<String> = match owners {
+            Some(owners) => heads_of(&mut g, repository)?
+                .into_iter()
+                .filter(|row| !owners.contains(&row.identity.relpath))
+                .map(|row| row.stable_id)
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        (old, {
+            kept.extend(new.iter().map(|row| row.stable_id.clone()));
+            kept
+        })
     };
-    {
-        let mut insert = db.prepare_cached(
-            "INSERT OR REPLACE INTO gf_symbol_heads(repository_id,stable_id,revision,relpath,qualified_name,kind,ordinal,node_id,line_start,line_next,sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        )?;
-        for row in &new {
-            insert.execute(params![
-                repository,
-                row.stable_id,
-                row.revision,
-                row.identity.relpath,
-                row.identity.qualified_name,
-                row.identity.kind,
-                row.identity.ordinal as i64,
-                row.node_id,
-                row.line_start as i64,
-                row.line_next.map(|n| n as i64),
-                row.sha256
-            ])?;
+    let inserts: Vec<Value> = new.iter().map(|row| live_json(repository, row)).collect();
+    let stamp = now();
+    gstore.transaction(|g| {
+        match owners {
+            // The `stable_id: ""` pin anchor is not a symbol: replacing the
+            // table must never delete it (DETACH DELETE would take the
+            // memories' PINNED_TO relationships with it).
+            Some(owners) => {
+                let mut params = repo_params(repository);
+                params.insert("owners".to_string(), json_to_value(&json!(owners)));
+                sg::rows(
+                    g,
+                    "MATCH (s:SymbolHead {repository_id: $repo})                      WHERE s.relpath IN $owners AND s.stable_id <> ''                      DETACH DELETE s",
+                    params,
+                )?;
+            }
+            None => {
+                sg::rows(
+                    g,
+                    "MATCH (s:SymbolHead {repository_id: $repo}) WHERE s.stable_id <> '' DETACH DELETE s",
+                    repo_params(repository),
+                )?;
+            }
         }
-    }
-    record_moves(db, repository, episode, &old, &new)?;
-    db.execute(
-        "INSERT INTO gf_symbol_state(repository_id,episode,updated_at) VALUES(?,?,?) ON CONFLICT(repository_id) DO UPDATE SET episode=excluded.episode,updated_at=excluded.updated_at",
-        params![repository, episode, now()],
-    )?;
-    pin_pending(db, repository)?;
+        if !inserts.is_empty() {
+            let mut params = repo_params(repository);
+            params.insert("rows".to_string(), json_to_value(&json!(inserts)));
+            sg::rows(
+                g,
+                "UNWIND $rows AS row \
+                 MERGE (s:SymbolHead {repository_id: $repo, stable_id: row.stable_id}) \
+                 SET s += row",
+                params,
+            )?;
+        }
+        record_moves_in(g, repository, episode, &old, &new, &kept, &stamp)?;
+        let mut params = repo_params(repository);
+        params.insert("episode".to_string(), json_to_value(&json!(episode)));
+        params.insert("now".to_string(), json_to_value(&json!(stamp)));
+        sg::rows(
+            g,
+            "MERGE (st:SymbolState {repository_id: $repo}) \
+             SET st.episode = $episode, st.updated_at = $now",
+            params,
+        )?;
+        Ok(())
+    })?;
+    pin_pending(db, gstore, repository)?;
     Ok(())
 }
 
 /// Exact moves: a symbol that left the table and one that entered it
 /// with the same revision, kind and name tail, when exactly one of each
-/// shares that key. A moved-from id that is live again loses its move.
-fn record_moves(
-    db: &Connection,
+/// shares that key. A moved-from id that is live again (`kept`: the head
+/// ids after the replacement) loses its move.
+fn record_moves_in(
+    g: &mut GraphConnection,
     repository: &str,
     episode: &str,
     old: &[Live],
     new: &[Live],
+    kept: &BTreeSet<String>,
+    stamp: &str,
 ) -> Result<()> {
     let old_ids: HashSet<&str> = old.iter().map(|r| r.stable_id.as_str()).collect();
     let new_ids: HashSet<&str> = new.iter().map(|r| r.stable_id.as_str()).collect();
@@ -417,25 +564,40 @@ fn record_moves(
             .or_default()
             .push(row);
     }
-    let stamp = now();
-    let mut insert = db.prepare_cached(
-        "INSERT OR REPLACE INTO gf_symbol_moves(repository_id,from_stable_id,to_stable_id,revision,episode,created_at) VALUES(?,?,?,?,?,?)",
-    )?;
-    for (key, from) in &left {
-        if let (1, Some(to)) = (from.len(), arrived.get(key).filter(|to| to.len() == 1)) {
-            insert.execute(params![
-                repository,
-                from[0].stable_id,
-                to[0].stable_id,
-                from[0].revision,
-                episode,
-                stamp
-            ])?;
-        }
+    let moves: Vec<Value> = left
+        .iter()
+        .filter_map(|(key, from)| {
+            if let (1, Some(to)) = (from.len(), arrived.get(key).filter(|to| to.len() == 1)) {
+                Some(json!({
+                    "repository_id": repository,
+                    "from_stable_id": from[0].stable_id,
+                    "to_stable_id": to[0].stable_id,
+                    "revision": from[0].revision,
+                    "episode": episode,
+                    "created_at": stamp,
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !moves.is_empty() {
+        let mut params = repo_params(repository);
+        params.insert("rows".to_string(), json_to_value(&json!(moves)));
+        sg::rows(
+            g,
+            "UNWIND $rows AS row \
+             MERGE (m:SymbolMove {repository_id: $repo, from_stable_id: row.from_stable_id}) \
+             SET m += row",
+            params,
+        )?;
     }
-    db.execute(
-        "DELETE FROM gf_symbol_moves WHERE repository_id=?1 AND from_stable_id IN (SELECT stable_id FROM gf_symbol_heads WHERE repository_id=?1)",
-        [repository],
+    let mut params = repo_params(repository);
+    params.insert("live".to_string(), json_to_value(&json!(kept)));
+    sg::rows(
+        g,
+        "MATCH (m:SymbolMove {repository_id: $repo}) WHERE m.from_stable_id IN $live DELETE m",
+        params,
     )?;
     Ok(())
 }
@@ -512,9 +674,10 @@ fn is_code_path(path: &str) -> bool {
             == Some(graphicle::detect::FileType::Code)
 }
 
-/// Write-side view of the table for one memory producer.
+/// Write-side view of the live-symbol nodes for one memory producer.
 struct Resolver<'a> {
     db: &'a Connection,
+    graph: std::sync::Arc<GraphStore>,
     repository: &'a str,
     episode: Option<String>,
     manifest: Option<Option<BTreeMap<String, String>>>,
@@ -526,10 +689,13 @@ impl<'a> Resolver<'a> {
         // episode: describe the current head set before resolving. Never
         // fatal; the quotes are then pending.
         let _ = ensure_current(db, repository);
+        let graph = crate::store::graph_for(db)?;
+        let episode = graph.read(|g| table_episode_in(g, repository))?;
         Ok(Self {
             db,
+            graph,
             repository,
-            episode: table_episode(db, repository)?,
+            episode,
             manifest: None,
         })
     }
@@ -538,12 +704,14 @@ impl<'a> Resolver<'a> {
         self.episode.as_deref().unwrap_or("")
     }
 
-    /// The live rows of `path` when the table describes it at `sha`: its
-    /// code symbols (none for a file without any). `None` while the table
-    /// describes other content of the file, or nothing.
+    /// The live rows of `path` when the nodes describe it at `sha`: its
+    /// code symbols (none for a file without any). `None` while the nodes
+    /// describe other content of the file, or nothing.
     fn describe(&mut self, path: &str, sha: &str) -> Result<Option<Vec<Live>>> {
+        let mut g = self.graph.connection()?;
         describe(
             self.db,
+            &mut g,
             self.repository,
             self.episode.as_deref(),
             &mut self.manifest,
@@ -555,17 +723,14 @@ impl<'a> Resolver<'a> {
 
 fn describe(
     db: &Connection,
+    g: &mut GraphConnection,
     repository: &str,
     episode: Option<&str>,
     manifest: &mut Option<Option<BTreeMap<String, String>>>,
     path: &str,
     sha: &str,
 ) -> Result<Option<Vec<Live>>> {
-    let rows = select(
-        db,
-        "repository_id=?1 AND relpath=?2",
-        params![repository, path],
-    )?;
+    let rows = heads_of_file(g, repository, path)?;
     if let Some(first) = rows.first() {
         return Ok((first.sha256 == sha).then_some(rows));
     }
@@ -573,9 +738,13 @@ fn describe(
         return Ok(None);
     };
     let heads = manifest.get_or_insert_with(|| {
-        graph_projection::stored_episode_heads(db, repository, episode)
-            .ok()
-            .flatten()
+        graph_projection::stored_episode_heads(
+            &*crate::store::graph_for(db).ok()?,
+            repository,
+            episode,
+        )
+        .ok()
+        .flatten()
     });
     Ok(heads
         .as_ref()
@@ -774,6 +943,7 @@ pub fn name(
         return Err(Error::bad(format!("Name at most {MAX_NAMED} symbols")));
     }
     let resolver = Resolver::new(db, repository)?;
+    let mut g = resolver.graph.connection()?;
     for item in items {
         if !item.is_object() {
             return Err(Error::bad(
@@ -782,18 +952,19 @@ pub fn name(
         }
         let candidates = if item.get("stable_id").is_some_and(|v| !v.is_null()) {
             let id = string(item, "stable_id", 128)?;
-            select(
-                db,
-                "repository_id=?1 AND stable_id=?2",
-                params![repository, id],
-            )?
+            let mut params = repo_params(repository);
+            params.insert("id".to_string(), json_to_value(&json!(id)));
+            heads(&mut g, "WHERE s.stable_id = $id", params)?
         } else {
             let path = string(item, "path", 1500)?;
             let qualified = string(item, "qualified_name", 4000)?;
-            let mut rows = select(
-                db,
-                "repository_id=?1 AND relpath=?2 AND qualified_name=?3",
-                params![repository, path, qualified],
+            let mut params = repo_params(repository);
+            params.insert("path".to_string(), json_to_value(&json!(path)));
+            params.insert("qualified".to_string(), json_to_value(&json!(qualified)));
+            let mut rows = heads(
+                &mut g,
+                "WHERE s.relpath = $path AND s.qualified_name = $qualified",
+                params,
             )?;
             if let Some(kind) = item["kind"].as_str() {
                 rows.retain(|r| r.identity.kind == kind);
@@ -910,7 +1081,9 @@ pub fn carry_windows(
         .iter()
         .map(|f| s(f, "stable_id").to_string())
         .collect();
-    let live: HashMap<String, Live> = by_ids(db, repository, &ids)?
+    let graph = crate::store::graph_for(db)?;
+    let live: HashMap<String, Live> = graph
+        .read(|g| by_ids(g, repository, &ids))?
         .into_iter()
         .map(|row| (row.stable_id.clone(), row))
         .collect();
@@ -953,99 +1126,147 @@ pub fn carry(data: &mut Value, old: &Value, paths: &BTreeSet<String>) {
     tidy(data);
 }
 
+/// The `covered`/`symbols`/`episode` a pending occurrence is pinned with.
+struct PinResolution {
+    covered: bool,
+    /// The resolved links, as the JSON text the `symbols` property stores
+    /// (a stringified list — the engine has no map-typed properties).
+    symbols: String,
+    episode: Option<String>,
+}
+
+fn pin_match() -> &'static str {
+    "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+     WHERE m.id = row.memory_id"
+}
+
 /// After `memory::save` wrote a revision: queue its pending quote
 /// occurrences for pinning, and pin what can be pinned now.
 pub fn record_pins(db: &Connection, repository: &str, memory: &str, data: &Value) -> Result<()> {
-    let pending: Vec<&Value> = entries(data).filter(|e| e["state"] == "pending").collect();
+    let pending: Vec<Value> = entries(data)
+        .filter(|e| e["state"] == "pending")
+        .map(|entry| {
+            json!({"relpath":s(entry, "relpath"),"sha256":s(entry, "sha256"),
+                "byte_start":entry["byte_start"].as_u64().unwrap_or(0),
+                "byte_end":entry["byte_end"].as_u64().unwrap_or(0)})
+        })
+        .collect();
     if pending.is_empty() {
         return Ok(());
     }
+    let graph = crate::store::graph_for(db)?;
     let stamp = now();
-    for entry in pending {
-        db.execute(
-            "INSERT OR IGNORE INTO gf_symbol_pins(repository_id,memory_id,relpath,sha256,byte_start,byte_end,state,created_at) VALUES(?,?,?,?,?,?,'pending',?)",
-            params![
-                repository,
-                memory,
-                s(entry, "relpath"),
-                s(entry, "sha256"),
-                entry["byte_start"].as_i64(),
-                entry["byte_end"].as_i64(),
-                stamp
-            ],
-        )?;
-    }
-    pin_pending(db, repository)?;
+    graph.transaction(|g| {
+        // A pending pin's symbol is unknown, so the relationship starts at
+        // the repository's anchor node (`stable_id: ""`); the symbols it
+        // pins to are the pin's `symbols` property once resolved.
+        for entry in &pending {
+            let mut params = repo_params(repository);
+            params.insert("mid".to_string(), json_to_value(&json!(memory)));
+            params.insert("path".to_string(), json_to_value(&entry["relpath"]));
+            params.insert("sha".to_string(), json_to_value(&entry["sha256"]));
+            params.insert("start".to_string(), json_to_value(&entry["byte_start"]));
+            params.insert("end".to_string(), json_to_value(&entry["byte_end"]));
+            params.insert("now".to_string(), json_to_value(&json!(stamp)));
+            sg::rows(
+                g,
+                "MERGE (m:Memory {id: $mid}) \
+                 MERGE (a:SymbolHead {repository_id: $repo, stable_id: ''}) \
+                 MERGE (m)-[p:PINNED_TO {relpath: $path, sha256: $sha, \
+                    byte_start: $start, byte_end: $end}]->(a) \
+                 ON CREATE SET p.state = 'pending', p.created_at = $now \
+                 RETURN p.state AS state",
+                params,
+            )?;
+        }
+        pin_pending_in(db, g, repository)
+    })?;
     Ok(())
 }
 
 /// Pin the pending quote occurrences of `repository` that can be pinned:
 /// from another memory's pin of the same bytes, or against the live-symbol
-/// table once it describes the file at the quoted content. Runs after every
-/// change of the table (in the projection's own transaction) and after a
-/// memory with pending quotes is saved.
-pub fn pin_pending(db: &Connection, repository: &str) -> Result<usize> {
-    let pending = rows(
-        db,
-        "SELECT memory_id,relpath,sha256,byte_start,byte_end FROM gf_symbol_pins WHERE repository_id=? AND state='pending'",
-        [repository],
+/// nodes once they describe the file at the quoted content. Runs after every
+/// change of the live-symbol nodes (following the projection's own graph
+/// transaction) and after a memory with pending quotes is saved.
+pub fn pin_pending(db: &Connection, graph: &GraphStore, repository: &str) -> Result<usize> {
+    graph.transaction(|g| pin_pending_in(db, g, repository))
+}
+
+fn pin_pending_in(db: &Connection, g: &mut GraphConnection, repository: &str) -> Result<usize> {
+    let pending = sg::rows(
+        g,
+        "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+         WHERE p.state = 'pending' \
+         RETURN m.id AS memory_id, p.relpath AS relpath, p.sha256 AS sha256, \
+                p.byte_start AS byte_start, p.byte_end AS byte_end",
+        repo_params(repository),
     )?;
     if pending.is_empty() {
         return Ok(0);
     }
-    let episode = table_episode(db, repository)?;
+    let episode = table_episode_in(g, repository)?;
     let mut manifest = None;
     // (path, sha256) → the content there and its live rows, when described.
     type Described = Option<(String, Vec<Live>)>;
     let mut files: HashMap<(String, String), Described> = HashMap::new();
-    let stamp = now();
-    let mut pinned = 0;
-    let update = "UPDATE gf_symbol_pins SET state='pinned',covered=?7,symbols=?8,episode=?9,pinned_at=?10 WHERE repository_id=?1 AND memory_id=?2 AND relpath=?3 AND sha256=?4 AND byte_start=?5 AND byte_end=?6 AND state='pending'";
+    let mut updates: Vec<(String, String, String, u64, u64, PinResolution)> = Vec::new();
     for row in &pending {
         let (memory, path, sha) = (s(row, "memory_id"), s(row, "relpath"), s(row, "sha256"));
         let (start, end) = (
-            row["byte_start"].as_u64().unwrap_or(0) as usize,
-            row["byte_end"].as_u64().unwrap_or(0) as usize,
+            row["byte_start"].as_u64().unwrap_or(0),
+            row["byte_end"].as_u64().unwrap_or(0),
         );
         // The same bytes pinned for another memory (a refresh draft, a
         // later revision applied to another id) need no new resolution.
-        if let Some(other) = rows(
-            db,
-            "SELECT covered,symbols,episode FROM gf_symbol_pins WHERE repository_id=? AND relpath=? AND sha256=? AND byte_start=? AND byte_end=? AND state='pinned' LIMIT 1",
-            params![repository, path, sha, start as i64, end as i64],
+        let mut sibling = repo_params(repository);
+        sibling.insert("path".to_string(), json_to_value(&json!(path)));
+        sibling.insert("sha".to_string(), json_to_value(&json!(sha)));
+        sibling.insert("start".to_string(), json_to_value(&json!(start)));
+        sibling.insert("end".to_string(), json_to_value(&json!(end)));
+        if let Some(other) = sg::rows(
+            g,
+            "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+             WHERE p.relpath = $path AND p.sha256 = $sha AND p.byte_start = $start \
+               AND p.byte_end = $end AND p.state = 'pinned' \
+             RETURN p.covered AS covered, p.symbols AS symbols, p.episode AS episode LIMIT 1",
+            sibling,
         )?
         .pop()
         {
-            pinned += db.execute(
-                update,
-                params![
-                    repository,
-                    memory,
-                    path,
-                    sha,
-                    start as i64,
-                    end as i64,
-                    other["covered"].as_i64(),
-                    other["symbols"].as_str(),
-                    other["episode"].as_str(),
-                    stamp
-                ],
-            )?;
+            updates.push((
+                memory.to_string(),
+                path.to_string(),
+                sha.to_string(),
+                start,
+                end,
+                PinResolution {
+                    covered: other["covered"].as_i64() == Some(1),
+                    symbols: s(&other, "symbols").to_string(),
+                    episode: other["episode"].as_str().map(str::to_string),
+                },
+            ));
             continue;
         }
         let file = match files.entry((path.to_string(), sha.to_string())) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let described =
-                    describe(db, repository, episode.as_deref(), &mut manifest, path, sha)?;
+                    describe(db, g, repository, episode.as_deref(), &mut manifest, path, sha)?;
                 let content = match described {
-                    Some(_) => rows(
-                        db,
-                        "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                        params![repository, sha],
+                    // The object lives in the content store; read it through
+                    // this transaction's own connection (`g`), not a second
+                    // store handle.
+                    Some(_) => sg::one(
+                        g,
+                        "MATCH (o:Object {repository_id: $repo, sha256: $sha}) \
+                         RETURN o.content AS content",
+                        Params::from([
+                            ("repo".to_string(), json_to_value(&json!(repository))),
+                            ("sha".to_string(), json_to_value(&json!(sha))),
+                        ]),
                     )?
-                    .first()
-                    .map(|r| s(r, "content").to_string()),
+                    .map(|row| sg::s(&row, "content").to_string()),
                     None => None,
                 };
                 entry.insert(
@@ -1058,10 +1279,10 @@ pub fn pin_pending(db: &Connection, repository: &str) -> Result<usize> {
         let Some((content, live)) = file else {
             continue;
         };
-        if content.get(start..end).is_none() {
+        if content.get(start as usize..end as usize).is_none() {
             continue;
         }
-        let (covered, hits) = cover(content, live, start, end);
+        let (covered, hits) = cover(content, live, start as usize, end as usize);
         // Judged by its symbol only inside one symbol, as `anchor` judges.
         let covered = occurrence_rule(covered, hits.len()) == RULE_SYMBOLS;
         let symbols: Vec<Value> = hits
@@ -1075,23 +1296,48 @@ pub fn pin_pending(db: &Connection, repository: &str) -> Result<usize> {
                 )
             })
             .collect();
-        pinned += db.execute(
-            update,
-            params![
-                repository,
-                memory,
-                path,
-                sha,
-                start as i64,
-                end as i64,
-                i64::from(covered),
-                json!(symbols).to_string(),
-                episode,
-                stamp
-            ],
-        )?;
+        updates.push((
+            memory.to_string(),
+            path.to_string(),
+            sha.to_string(),
+            start,
+            end,
+            PinResolution {
+                covered,
+                symbols: json!(symbols).to_string(),
+                episode: episode.clone(),
+            },
+        ));
     }
-    Ok(pinned)
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let batch: Vec<Value> = updates
+        .iter()
+        .map(|(memory, path, sha, start, end, resolution)| {
+            json!({"memory_id":memory,"relpath":path,"sha256":sha,"byte_start":start,
+                "byte_end":end,"covered":u64::from(resolution.covered),
+                "symbols":resolution.symbols,"episode":resolution.episode})
+        })
+        .collect();
+    let mut params = repo_params(repository);
+    params.insert("rows".to_string(), json_to_value(&json!(batch)));
+    params.insert("now".to_string(), json_to_value(&json!(now())));
+    let updated = sg::one(
+        g,
+        &format!(
+            "UNWIND $rows AS row {} \
+               AND p.relpath = row.relpath AND p.sha256 = row.sha256 \
+               AND p.byte_start = row.byte_start AND p.byte_end = row.byte_end \
+               AND p.state = 'pending' \
+             SET p.state = 'pinned', p.covered = row.covered, p.symbols = row.symbols, \
+                 p.episode = row.episode, p.pinned_at = $now \
+             RETURN count(*) AS n",
+            pin_match()
+        ),
+        params,
+    )?;
+    Ok(updated.and_then(|row| row["n"].as_u64()).unwrap_or(0) as usize)
 }
 
 /// `memory.import` re-grounds a memory's links in the
@@ -1130,6 +1376,7 @@ pub fn reground(
         return Ok(json!({"regrounded":0,"unresolved":0}));
     };
     let resolver = Resolver::new(db, repository)?;
+    let mut g = resolver.graph.connection()?;
     let current = resolver.episode.as_deref()
         == Some(graph_projection::current_episode(db, repository)?.as_str());
     let scope = graph_projection::identity_scope(db, repository)?;
@@ -1194,12 +1441,7 @@ pub fn reground(
                     continue;
                 };
                 let id = identity.stable_id(&scope);
-                let row = select(
-                    db,
-                    "repository_id=?1 AND stable_id=?2",
-                    params![repository, id],
-                )?
-                .pop();
+                let row = by_id(&mut g, repository, &id)?;
                 match row {
                     Some(row) if row.sha256 != s(doc, "sha256") => {
                         out.push(fail(entry, "projection_pending"))
@@ -1361,17 +1603,25 @@ impl<'a> Lander<'a> {
         anchors: &[Value],
     ) -> Result<Vec<std::result::Result<Landed, &'static str>>> {
         let (db, repository) = (self.db, self.repository);
+        // The symbols live in the graph store; the SQL connection is the
+        // bridge to it (`graph_for`).
+        let graph = crate::store::graph_for(db)?;
         let mut out = Vec::with_capacity(anchors.len());
         for anchor in anchors {
             let Ok(identity) = serde_json::from_value::<LogicalIdentity>(anchor.clone()) else {
                 out.push(Err(LAND_INCOMPLETE));
                 continue;
             };
-            let mut rows = select(
-                db,
-                "repository_id=?1 AND relpath=?2 AND qualified_name=?3",
-                params![repository, identity.relpath, identity.qualified_name],
-            )?;
+            let mut params = repo_params(repository);
+            params.insert("path".to_string(), json_to_value(&json!(identity.relpath)));
+            params.insert("name".to_string(), json_to_value(&json!(identity.qualified_name)));
+            let mut rows = graph.read(|g| {
+                heads(
+                    g,
+                    "WHERE s.relpath = $path AND s.qualified_name = $name",
+                    params.clone(),
+                )
+            })?;
             rows.retain(|r| {
                 r.identity.kind == identity.kind && r.identity.ordinal == identity.ordinal
             });
@@ -1382,7 +1632,7 @@ impl<'a> Lander<'a> {
                 // and only when an anchor is not where the pack had it.
                 if self.by_name.is_none() {
                     let mut all: HashMap<(String, String), Vec<Live>> = HashMap::new();
-                    for row in select(db, "repository_id=?1", params![repository])? {
+                    for row in graph.read(|g| heads_of(g, repository))? {
                         all.entry((
                             row.identity.qualified_name.clone(),
                             row.identity.kind.clone(),
@@ -1579,11 +1829,19 @@ impl Check {
         if wanted.is_empty() && pin_memories.is_empty() {
             return Ok(check);
         }
+        let graph = crate::store::graph_for(db)?;
+        let mut g = graph.connection()?;
         if !pin_memories.is_empty() {
-            for row in rows(
-                db,
-                "SELECT memory_id,relpath,sha256,byte_start,byte_end,state,covered,symbols FROM gf_symbol_pins WHERE repository_id=?1 AND memory_id IN (SELECT value FROM json_each(?2))",
-                params![repository, json!(pin_memories).to_string()],
+            let mut params = repo_params(repository);
+            params.insert("ids".to_string(), json_to_value(&json!(pin_memories)));
+            for row in sg::rows(
+                &mut g,
+                "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead {repository_id: $repo}) \
+                 WHERE m.id IN $ids \
+                 RETURN m.id AS memory_id, p.relpath AS relpath, p.sha256 AS sha256, \
+                        p.byte_start AS byte_start, p.byte_end AS byte_end, \
+                        p.state AS state, p.covered AS covered, p.symbols AS symbols",
+                params,
             )? {
                 let symbols: Vec<Value> =
                     serde_json::from_str(row["symbols"].as_str().unwrap_or("[]"))?;
@@ -1620,9 +1878,9 @@ impl Check {
             }
         }
         check.heads = crate::store::heads(db, repository)?;
-        check.current = table_episode(db, repository)?.as_deref()
+        check.current = table_episode_in(&mut g, repository)?.as_deref()
             == Some(graph_projection::episode_of(&check.heads).as_str());
-        for row in by_ids(db, repository, &wanted)? {
+        for row in by_ids(&mut g, repository, &wanted)? {
             check.rows.insert(row.stable_id.clone(), row);
         }
         // Follow exact moves of ids that left the table.
@@ -1636,10 +1894,13 @@ impl Check {
                 break;
             }
             let mut next = BTreeSet::new();
-            for row in rows(
-                db,
-                "SELECT from_stable_id,to_stable_id FROM gf_symbol_moves WHERE repository_id=?1 AND from_stable_id IN (SELECT value FROM json_each(?2))",
-                params![repository, json!(missing).to_string()],
+            let mut params = repo_params(repository);
+            params.insert("ids".to_string(), json_to_value(&json!(missing)));
+            for row in sg::rows(
+                &mut g,
+                "MATCH (mv:SymbolMove {repository_id: $repo}) WHERE mv.from_stable_id IN $ids \
+                 RETURN mv.from_stable_id AS from_stable_id, mv.to_stable_id AS to_stable_id",
+                params,
             )? {
                 let to = s(&row, "to_stable_id").to_string();
                 check
@@ -1649,7 +1910,7 @@ impl Check {
                     next.insert(to);
                 }
             }
-            for row in by_ids(db, repository, &next)? {
+            for row in by_ids(&mut g, repository, &next)? {
                 next.remove(&row.stable_id);
                 check.rows.insert(row.stable_id.clone(), row);
             }
@@ -1658,24 +1919,31 @@ impl Check {
         // A link whose id now names another symbol while its own bytes live
         // on under the same name (a same-name symbol inserted above shifted
         // the ordinals) reads as missing, not changed.
-        let mut shifted = db.prepare_cached(
-            "SELECT 1 FROM gf_symbol_heads WHERE repository_id=?1 AND relpath=?2 AND qualified_name=?3 AND kind=?4 AND revision=?5 AND stable_id<>?6 LIMIT 1",
-        )?;
         for (stable, revision) in &changed_links {
             let Some(row) = check.rows.get(stable) else {
                 continue;
             };
-            if &row.revision != revision
-                && shifted.exists(params![
-                    repository,
-                    row.identity.relpath,
-                    row.identity.qualified_name,
-                    row.identity.kind,
-                    revision,
-                    stable
-                ])?
-            {
-                check.shifted.insert(stable.clone());
+            if &row.revision != revision {
+                let mut params = repo_params(repository);
+                params.insert("path".to_string(), json_to_value(&json!(row.identity.relpath)));
+                params.insert(
+                    "qualified".to_string(),
+                    json_to_value(&json!(row.identity.qualified_name)),
+                );
+                params.insert("kind".to_string(), json_to_value(&json!(row.identity.kind)));
+                params.insert("revision".to_string(), json_to_value(&json!(revision)));
+                params.insert("stable".to_string(), json_to_value(&json!(stable)));
+                let shifted = sg::one(
+                    &mut g,
+                    "MATCH (s:SymbolHead {repository_id: $repo, relpath: $path, \
+                           qualified_name: $qualified, kind: $kind, revision: $revision}) \
+                     WHERE s.stable_id <> $stable \
+                     RETURN s.stable_id AS id LIMIT 1",
+                    params,
+                )?;
+                if shifted.is_some() {
+                    check.shifted.insert(stable.clone());
+                }
             }
         }
         let docs: HashMap<&str, &Value> = documents.iter().map(|d| (s(d, "id"), d)).collect();
@@ -1870,6 +2138,50 @@ fn merged(mut locations: Vec<(String, std::ops::Range<usize>)>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_pins_round_trip_and_survive_a_table_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let data = json!({"symbols":[{"state":"pending","relpath":"a.py","sha256":"s1","byte_start":5,"byte_end":9,"rung":"quote","source":"file:a.py"}]});
+        store.transaction(|db| record_pins(db, "r1", "m1", &data)).unwrap();
+        let pins = store
+            .graph()
+            .read(|g| {
+                sg::rows(
+                    g,
+                    "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead) RETURN m.id AS mid, p.relpath AS path, p.state AS state",
+                    Params::new(),
+                )
+            })
+            .unwrap();
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        assert_eq!(s(&pins[0], "state"), "pending");
+        // A whole-table heads replacement (a projection) must not take the
+        // pin with it: the anchor node (`stable_id: ""`) is excluded.
+        store
+            .graph()
+            .transaction(|g| {
+                sg::rows(
+                    g,
+                    "MATCH (s:SymbolHead {repository_id: 'r1'}) WHERE s.stable_id <> '' DETACH DELETE s",
+                    Params::new(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let pins = store
+            .graph()
+            .read(|g| {
+                sg::rows(
+                    g,
+                    "MATCH (m:Memory)-[p:PINNED_TO]->(a:SymbolHead) RETURN p.state AS state",
+                    Params::new(),
+                )
+            })
+            .unwrap();
+        assert_eq!(pins.len(), 1, "{pins:?}");
+    }
 
     fn row(id: &str, start: usize, next: Option<usize>) -> Live {
         Live {

@@ -53,6 +53,19 @@ const PROBES: &[&str] = &[
     "Which running shoes do I use?",
 ];
 
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 struct Provider {
     config: model::Config,
     task: tokio::task::JoinHandle<()>,
@@ -208,6 +221,9 @@ impl Fixture {
         if key.exists() {
             std::fs::copy(key, dir.path().join("vault.key")).unwrap();
         }
+        // The connector/account domain lives in the graph store beside the
+        // SQLite file; a fork carries it too.
+        crate::copy_graph(&self.store, dir.path());
         Self {
             store: Store::open(dir.path()).unwrap(),
             _dir: dir,
@@ -350,8 +366,80 @@ fn differing(a: &Value, b: &Value) -> BTreeMap<String, (Value, Value)> {
     out
 }
 
+trait TapMutSorted {
+    fn tap_mut_sorted(self) -> Self;
+}
+impl TapMutSorted for Vec<String> {
+    fn tap_mut_sorted(mut self) -> Self {
+        self.sort();
+        self
+    }
+}
+
 fn dump(f: &Fixture, table: &str) -> Vec<String> {
+    // Migrated domains live in the graph store; dump them from there.
+    let graph_table = match table {
+        "repo_memories" => Some("Memory"),
+        "repo_memory_revisions" => Some("MemoryRevision"),
+        "am_claims" => Some("Claim"),
+        "am_claim_events" => Some("ClaimEvent"),
+        "am_entities" => Some("Entity"),
+        "am_vectors" => {
+            return graphicle_runtime::vector::graph_vectors_all(&f.store.graph(), &f.repo)
+                .unwrap()
+                .iter()
+                .map(|r| masked(r).to_string())
+                .collect::<Vec<_>>()
+                .tap_mut_sorted();
+        }
+        _ => None,
+    };
+    if let Some(label) = graph_table {
+        let mut out: Vec<String> = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::rows(
+                    g,
+                    &format!("MATCH (n:{label}) RETURN n"),
+                    graphicle_runtime::store_graph::params(&json!([])),
+                )
+            })
+            .unwrap()
+            .iter()
+            .map(|r| masked(&graphicle_runtime::store_graph::node(r, "n")).to_string())
+            .collect();
+        out.sort();
+        return out;
+    }
     let db = f.store.connect().unwrap();
+    // The state digest reports a relationship type beside the labels, so a
+    // name that is no SQL table is one: read its edges from the graph.
+    let is_sql: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if !is_sql {
+        let mut out: Vec<String> = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::rows(
+                    g,
+                    &format!("MATCH ()-[r:`{table}`]->() RETURN r"),
+                    graphicle_runtime::store_graph::params(&json!([])),
+                )
+            })
+            .unwrap()
+            .iter()
+            .map(|r| masked(&graphicle_runtime::store_graph::node(r, "r")).to_string())
+            .collect();
+        out.sort();
+        return out;
+    }
     let mut statement = db.prepare(&format!("SELECT * FROM {table}")).unwrap();
     let names: Vec<String> = statement
         .column_names()
@@ -389,6 +477,12 @@ fn assert_same_world(a: &Fixture, b: &Fixture) {
             eprintln!(
                 "{table}: only in forgetting store {only_a:#?}\nonly in never-ingested store {only_b:#?}"
             );
+        }
+    }
+    if sa["digest"] != sb["digest"] {
+        for name in ["repo_memories", "am_claims"] {
+            eprintln!("STATE {name} A: {:?}", dump(a, name));
+            eprintln!("STATE {name} B: {:?}", dump(b, name));
         }
     }
     assert!(
@@ -471,23 +565,43 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
     assert_same_world(&a, &b);
     // The comparison covers the derived state, not an empty shell.
     let covered = a.state();
+    // The connector tables moved to the graph store; the SQL state covers
+    // the rest.
     for table in [
-        "am_connector_docs",
-        "am_connector_versions",
-        "am_observer_notes",
+        // Observer notes moved to the graph store (Observation nodes).
+        "Observation",
         "am_vectors",
         "repo_memories",
         "repo_memory_revisions",
         "am_claims",
         "am_document_reads",
-        "gf_dependencies",
-        "repo_objects",
+        // gf_dependencies and repo_objects moved to the graph store
+        // (invalidation, content store); neither is a SQL table with rows.
     ] {
         assert!(
             covered["tables"][table]["rows"].as_u64().unwrap_or(0) > 0,
             "{table}: {covered:#}"
         );
     }
+    assert!(
+        crate::gql_one(
+            &a.store,
+            "MATCH (d:ConnectorDoc) RETURN count(d) AS n",
+            Default::default()
+        )
+        .and_then(|row| row["n"].as_u64())
+        .unwrap_or(0)
+            > 0,
+        "the graph store holds connector documents"
+    );
+    // The content store lives in the graph (`repo_objects` is no longer a
+    // SQL table the state dump counts).
+    assert!(
+        !graphicle_runtime::store_content::object_list(&a.store.graph(), &a.repo)
+            .unwrap()
+            .is_empty(),
+        "graph content store holds the synced objects"
+    );
     assert_eq!(answers, work(&b, &m, &[&chat]).await);
     assert!(
         !answers

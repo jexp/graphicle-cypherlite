@@ -55,7 +55,7 @@ use graphicle::{
     serve_search::{label, neighbors},
 };
 use graphicle_memory::graph::span;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -240,6 +240,7 @@ impl Reading {
 /// code-graph arm reads it). A project with no episode is refused with the
 /// state of its projection.
 fn reading(
+    graph: &crate::store_graph::GraphStore,
     db: &Connection,
     p: &Principal,
     repository: &str,
@@ -248,10 +249,21 @@ fn reading(
     let heads = crate::store::heads(db, repository)?;
     let current = graph_projection::episode_of(&heads);
     let episode = match as_of {
-        Some(selector) => {
-            graph_projection::resolve_episode(db, &p.workspace, repository, selector)?
+        Some(selector) => graph_projection::resolve_episode(
+            db,
+            &*crate::store::graph_for(db)?,
+            &p.workspace,
+            repository,
+            selector,
+        )?,
+        None if graph_projection::is_recorded(
+            &*crate::store::graph_for(db)?,
+            repository,
+            &current,
+        )? =>
+        {
+            current.clone()
         }
-        None if graph_projection::is_recorded(db, repository, &current)? => current.clone(),
         None => match one(
             db,
             "SELECT episode FROM gf_episodes WHERE repository_id=? ORDER BY sequence DESC LIMIT 1",
@@ -259,14 +271,18 @@ fn reading(
         )? {
             Some(row) => s(&row, "episode").to_string(),
             None => {
-                let state = crate::jobs::projection_state(db, repository, &current)?;
+                let state = crate::jobs::projection_state(graph, repository, &current)?;
                 return Err(Error::bad(format!(
                     "This project's code graph is not built yet (projection: {state}). graphicle mcp builds it when it starts and graphicle sync builds it in the foreground; call again once it is built."
                 )));
             }
         },
     };
-    let recorded = graph_projection::stored_episode_heads(db, repository, &episode)?;
+    let recorded = graph_projection::stored_episode_heads(
+        &*crate::store::graph_for(db)?,
+        repository,
+        &episode,
+    )?;
     Ok(Reading {
         episode,
         current,
@@ -323,7 +339,7 @@ pub fn resident(db: &Connection, repository: &str, episode: &str) -> Result<Arc<
     if let Some(found) = held(repository, episode) {
         return Ok(found);
     }
-    let mut graph = graph_projection::load(db, repository, episode)?;
+    let mut graph = graph_projection::load(&*crate::store::graph_for(db)?, repository, episode)?;
     let communities = graphicle::cluster::cluster(&graph, 1.0, None, "auto")?;
     let labels = graphicle::cluster::label_communities_by_hub(&graph, &communities);
     // The community numbers the engine's export writes (`community`), so the
@@ -405,7 +421,7 @@ pub fn call(store: &Store, workspace: &str, token: &str, args: &Value) -> Result
             None | Some(Value::Null) => None,
             Some(_) => Some(string(args, "as_of", 128)?),
         };
-        let reading = reading(db, p, identifier, as_of)?;
+        let reading = reading(&store.graph(), db, p, identifier, as_of)?;
         let resident = resident(db, identifier, &reading.episode)?;
         let text = graphicle::serve::call_graph_tool(&resident.context, tool, &engine, None)?;
         let named = named_nodes(&resident, tool, &engine, &text);
@@ -634,7 +650,7 @@ pub fn pull_request(
             if !impact {
                 return Ok((identifier, None, None));
             }
-            let reading = reading(db, p, &identifier, None)?;
+            let reading = reading(&store.graph(), db, p, &identifier, None)?;
             let resident = resident(db, &identifier, &reading.episode)?;
             Ok((identifier, Some(reading.episode), Some(resident)))
         })?;
@@ -673,7 +689,7 @@ pub fn read_resource(
     store.authorized_read(workspace, token, "read", |db, p| {
         let repository = repo(db, p, repository)?;
         let identifier = s(&repository, "id");
-        let reading = reading(db, p, identifier, None)?;
+        let reading = reading(&store.graph(), db, p, identifier, None)?;
         let resident = resident(db, identifier, &reading.episode)?;
         let ctx = &resident.context;
         let g = &ctx.graph;
@@ -1164,13 +1180,9 @@ fn citation(
     let content = match contents.get(&path) {
         Some(content) => content.clone(),
         None => {
-            let content = one(
-                db,
-                "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-                params![repository, sha],
-            )?
-            .map(|row| s(&row, "content").to_string())
-            .filter(|content| graphicle_memory::text::sha256(content.as_bytes()) == sha);
+            let graph = crate::store::graph_for(db)?;
+            let content = crate::store_content::object_content(&graph, repository, &sha)?
+                .filter(|content| graphicle_memory::text::sha256(content.as_bytes()) == sha);
             contents.insert(path.clone(), content.clone());
             content
         }

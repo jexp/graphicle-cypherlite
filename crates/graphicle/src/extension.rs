@@ -14,7 +14,9 @@
 //! Where the runtime calls each hook:
 //! - `edition`, `capabilities`: the `build.info` operation, `--version` and
 //!   the update check (`core_capabilities`);
-//! - `migrate`: `Store::open`, after the core schema;
+//! - `migrate`: `GraphStore::open`, after the core graph type and indexes
+//!   (the CypherLite store; the SQL schema is gone — see
+//!   `cypherlite-migration.md`);
 //! - `operations`, `command`, `command_async`: `api::command` and
 //!   `api::command_async`, before the core operations;
 //! - `routes`: `api::router`, inside the request meter and the host, origin
@@ -59,12 +61,20 @@
 //!   core does not define;
 //! - `authorize`: wherever a credential other than the owner capability is
 //!   authorized, at each place [`Access`] lists.
+//!   `deletion.state` and the residue scans of deletion receipts.
+//!
+//! Hooks still taking a rusqlite `&Connection` (`session_credential`,
+//! `credential_allowed`, `credential_revoked`, `request_allowance`,
+//! `usage_details`, `after_projection`) belong to domains whose own migration
+//! nodes switch them to the graph store; `migrate` and `scrub_backup` moved
+//! first because backup/restore is rebuilt on engine primitives.
 use crate::{
     Error, Result,
     api::App,
     connectors::Remote,
     jobs::{Job, Worker},
     store::{Principal, Store},
+    store_graph::GraphStore,
 };
 use axum::{Router, http::StatusCode};
 use rusqlite::Connection;
@@ -497,11 +507,13 @@ pub trait Extension: Send + Sync + 'static {
     /// Adjust the `build.info` capabilities, for example set a feature flag.
     /// The `edition` field is not an extension's to change ([`Self::edition`]).
     fn capabilities(&self, _capabilities: &mut Map<String, Value>) {}
-    /// Create or upgrade this extension's tables. It runs on every store open,
-    /// after the core schema, so it may reference core tables. Statements must
-    /// be idempotent (`CREATE ... IF NOT EXISTS`); stores keep every table, so
-    /// an edition without this extension simply ignores them.
-    fn migrate(&self, _db: &Connection) -> Result<()> {
+    /// Create or upgrade this extension's graph structures (indexes,
+    /// constraints, fixed nodes). It runs on every graph store open, after
+    /// the core graph type and indexes, so it may reference core labels.
+    /// Statements must be idempotent (`CREATE ... IF NOT EXISTS`); stores
+    /// keep every label, so an edition without this extension simply ignores
+    /// them.
+    fn migrate(&self, _store: &GraphStore) -> Result<()> {
         Ok(())
     }
     /// The operations this extension serves through [`Self::command`] and
@@ -666,8 +678,10 @@ pub trait Extension: Send + Sync + 'static {
         &[]
     }
     /// Scrub a portable backup copy (never the live store) after the core
-    /// scrub: remove sessions, secrets or entitlements the copy must not carry.
-    fn scrub_backup(&self, _db: &Connection) -> Result<()> {
+    /// scrub: remove sessions, secrets or entitlements the copy must not
+    /// carry. The copy is open as its own [`GraphStore`]; run the scrub as
+    /// label-scoped Cypher inside one `store.transaction`.
+    fn scrub_backup(&self, _store: &GraphStore) -> Result<()> {
         Ok(())
     }
     /// The key that seals this store's vault (the `am_secrets` rows: provider
@@ -710,8 +724,12 @@ pub trait Extension: Send + Sync + 'static {
     /// error is reported in the projection's result and rolls back only this
     /// hook's writes; it never fails the projection. The default queues
     /// nothing.
+    /// The hook receives the projection's SQL transaction (`db`, for
+    /// un-migrated tables) and the open graph transaction (`graph`) the queue
+    /// lives in; both roll back when the hook errors.
     fn after_projection(
         &self,
+        _graph: &mut cypherlite::Connection,
         _db: &Connection,
         _principal: &Principal,
         _repository: &str,
@@ -1076,10 +1094,10 @@ impl Extensions {
             extension.capabilities(capabilities);
         }
     }
-    pub fn migrate(&self, db: &Connection) -> Result<()> {
+    pub fn migrate(&self, store: &GraphStore) -> Result<()> {
         self.list
             .iter()
-            .try_for_each(|extension| extension.migrate(db))
+            .try_for_each(|extension| extension.migrate(store))
     }
     pub fn routes(&self) -> Router<App> {
         self.list.iter().fold(Router::new(), |router, extension| {
@@ -1202,10 +1220,10 @@ impl Extensions {
             .iter()
             .try_for_each(|extension| extension.served_allowed(db, principal, served))
     }
-    pub fn scrub_backup(&self, db: &Connection) -> Result<()> {
+    pub fn scrub_backup(&self, store: &GraphStore) -> Result<()> {
         self.list
             .iter()
-            .try_for_each(|extension| extension.scrub_backup(db))
+            .try_for_each(|extension| extension.scrub_backup(store))
     }
     /// The vault key of the first extension that holds this store's; `None`
     /// when none does.
@@ -1249,6 +1267,7 @@ impl Extensions {
     /// and the projection still commits.
     pub fn after_projection(
         &self,
+        graph: &crate::store_graph::GraphStore,
         db: &Connection,
         principal: &Principal,
         repository: &str,
@@ -1256,10 +1275,12 @@ impl Extensions {
     ) -> Vec<Value> {
         let mut queued = Vec::new();
         for extension in &self.list {
-            let outcome = db
-                .execute_batch("SAVEPOINT after_projection")
-                .map_err(Error::from)
-                .and_then(|()| extension.after_projection(db, principal, repository, episode));
+            // The hook's SQL writes sit in a savepoint; its graph (queue)
+            // writes in a graph transaction. An error rolls back both.
+            let outcome = graph.transaction(|g| {
+                db.execute_batch("SAVEPOINT after_projection")?;
+                extension.after_projection(g, db, principal, repository, episode)
+            });
             match outcome {
                 Ok(jobs) => {
                     let _ = db.execute_batch("RELEASE after_projection");

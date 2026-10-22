@@ -14,7 +14,8 @@
 //!
 //! The instructions port a research observer that raised the same thinking
 //! reader's accuracy on LongMemEval-S (with a local judge).
-use crate::store::{decode, one, rows, s};
+use crate::store::{decode, s};
+use crate::store_graph::{self};
 use crate::{Error, Result, digest, integer, now, string};
 use crate::{
     invalidation,
@@ -22,7 +23,7 @@ use crate::{
     memory, model, workflows,
 };
 use graphicle_memory::text;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -269,12 +270,14 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
     for doc in &selected {
         let key = recipe.key(doc);
         let current = jobs::guarded_read(&worker.store, &job, |db, _, _| {
-            Ok(one(
-                db,
-                "SELECT 1 AS present FROM am_observer_notes WHERE repository_id=? AND source_id=? AND step_key=? AND source_sha256=?",
-                params![job.repository, s(doc, "id"), key, s(doc, "sha256")],
-            )?
-            .is_some())
+            crate::store::graph_for(db)?.read(|g| {
+                Ok(store_graph::one(
+                    g,
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source, step_key: $key, source_sha256: $sha}) RETURN 1 AS present LIMIT 1",
+                    store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id"),"key":key,"sha":s(doc,"sha256")})),
+                )?
+                .is_some())
+            })
         })?;
         if current {
             reused += 1;
@@ -299,23 +302,48 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
         dropped += lost;
         let data = json!(notes);
         jobs::guarded(&worker.store, &job, |db, p, _| {
-            db.execute(
-                "INSERT OR REPLACE INTO am_observer_notes(repository_id,source_id,source_sha256,source_version,step_key,model_key,principal_hash,job_id,source_order,session_date,notes,dropped,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                params![job.repository, s(doc, "id"), s(doc, "sha256"), s(doc, "version"), key,
-                    model::key(profile), job.principal_hash, job.id,
-                    episode_order(doc).unwrap_or_default(), session_date(doc),
-                    data.to_string(), lost as i64, now()],
-            )?;
+            let mut node = json!({
+                "repository_id":job.repository,"source_id":s(doc,"id"),
+                "source_sha256":s(doc,"sha256"),"source_version":s(doc,"version"),
+                "step_key":key,"model_key":model::key(profile),
+                "principal_hash":job.principal_hash,"job_id":job.id,
+                "source_order":episode_order(doc).unwrap_or_default(),
+                "notes":data.to_string(),"dropped":lost as i64,"created_at":now(),
+            });
+            if let Some(date) = session_date(doc) {
+                node["session_date"] = json!(date);
+            }
+            crate::store::graph_for(db)?.transaction(|g| {
+                // Replace, not merge: a property the new note does not carry
+                // (a lost session-date header) must not survive.
+                store_graph::write(
+                    g,
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source}) DETACH DELETE n",
+                    store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id")})),
+                )?;
+                store_graph::write(
+                    g,
+                    "CREATE (n:Observation {repository_id: $repo, source_id: $source}) SET n += $props",
+                    store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id"),"props":node})),
+                )?;
+                store_graph::write(
+                    g,
+                    "MATCH (n:Observation {repository_id: $repo, source_id: $source}), (p:Project {id: $repo}) MERGE (n)-[:OF]->(p)",
+                    store_graph::params(&json!({"repo":job.repository,"source":s(doc,"id")})),
+                )?;
+                Ok(())
+            })?;
             let artifact = artifact_id(&job.repository, s(doc, "id"));
-            invalidation::forget_dependent(db, &p.workspace, (NOTE, artifact.as_str()))?;
+            let graph = &worker.store.graph();
+            invalidation::forget_dependent(graph, &p.workspace, (NOTE, artifact.as_str()))?;
             invalidation::record_document_dependencies(
-                db,
+                graph,
                 &p.workspace,
                 &job.repository,
                 (NOTE, artifact.as_str()),
                 [s(doc, "id")],
             )?;
-            invalidation::clear_stale(db, &p.workspace, NOTE, &artifact)?;
+            invalidation::clear_stale(graph, &p.workspace, NOTE, &artifact)?;
             Ok(())
         })?;
         processed += 1;
@@ -338,11 +366,17 @@ pub async fn execute(worker: &Worker, original: &Job) -> Result<Value> {
 pub fn notes_for(db: &Connection, repository: &str, documents: &[Value]) -> Result<Vec<Value>> {
     let current: BTreeMap<&str, &Value> = documents.iter().map(|d| (s(d, "id"), d)).collect();
     let mut out = Vec::new();
-    for mut row in rows(
-        db,
-        "SELECT source_id,source_sha256,source_version,source_order,session_date,notes FROM am_observer_notes WHERE repository_id=? ORDER BY source_order,source_id",
-        [repository],
-    )? {
+    for mut row in crate::store::graph_for(db)?.read(|g| {
+        store_graph::rows(
+            g,
+            "MATCH (n:Observation {repository_id: $repo}) \
+             RETURN n.source_id AS source_id, n.source_sha256 AS source_sha256, \
+                    n.source_version AS source_version, n.source_order AS source_order, \
+                    n.session_date AS session_date, n.notes AS notes \
+             ORDER BY n.source_order, n.source_id",
+            store_graph::params(&json!({"repo":repository})),
+        )
+    })? {
         let Some(doc) = current.get(s(&row, "source_id")) else {
             continue;
         };
@@ -481,7 +515,7 @@ pub fn context(
     documents: &[Value],
     args: &Value,
 ) -> Result<Value> {
-    context_with(db, repository, documents, args, None)
+    context_with(db, repository, documents, args, None, None)
 }
 
 /// [`context`] with a local embedding profile: `ranked` then fuses each note's
@@ -492,6 +526,7 @@ pub fn context_with(
     documents: &[Value],
     args: &Value,
     embedding: Option<&crate::model::Profile>,
+    cache: Option<&crate::embedding_cache::Cache>,
 ) -> Result<Value> {
     crate::archived::check(crate::archived::Surface::ObserverContext, args)?;
     let question = string(args, "question", 8000)?;
@@ -540,7 +575,7 @@ pub fn context_with(
         };
         let dense = match embedding {
             Some(profile) if !available.is_empty() => {
-                Some(dense_scores(profile, &available, question)?)
+                Some(dense_scores(profile, &available, question, cache)?)
             }
             _ => None,
         };
@@ -655,15 +690,15 @@ fn keyed_text(note: &Value) -> String {
 
 /// Cosine similarity of each note (with its quotes) to the question under a
 /// local embedding profile. Note vectors are read from and recorded in the
-/// shared embedding cache when `GRAPHICLE_EMBEDDING_CACHE` is set, so notes
+/// store's embedding cache when one is passed, so notes
 /// are embedded once; the question is embedded on every call.
 pub fn dense_scores(
     profile: &crate::model::Profile,
     notes: &[Value],
     question: &str,
+    cache: Option<&crate::embedding_cache::Cache>,
 ) -> Result<Vec<f64>> {
     let texts: Vec<String> = notes.iter().map(keyed_text).collect();
-    let cache = crate::embedding_cache::Cache::from_env(&crate::model::key(profile))?;
     let mut vectors: Vec<Option<Vec<f64>>> = Vec::with_capacity(texts.len());
     for text in &texts {
         vectors.push(match &cache {
@@ -1028,33 +1063,44 @@ pub fn support_windows(notes: &[Value], documents: &[Value]) -> Result<Vec<Value
 
 /// Delete notes derived from one source and their dependency edges.
 pub fn forget_source(
-    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     workspace: &str,
     repository: &str,
     source: &str,
 ) -> Result<usize> {
-    let removed = db.execute(
-        "DELETE FROM am_observer_notes WHERE repository_id=? AND source_id=?",
-        params![repository, source],
-    )?;
+    let removed = graph.transaction(|g| {
+        Ok(store_graph::write(
+            g,
+            "MATCH (n:Observation {repository_id: $repo, source_id: $source}) DETACH DELETE n",
+            store_graph::params(&json!({"repo":repository,"source":source})),
+        )?
+        .nodes_deleted as usize)
+    })?;
     let artifact = artifact_id(repository, source);
-    invalidation::forget_dependent(db, workspace, (NOTE, &artifact))?;
-    invalidation::clear_stale(db, workspace, NOTE, &artifact)?;
-    forget_reflection(db, repository, source)?;
+    invalidation::forget_dependent(graph, workspace, (NOTE, &artifact))?;
+    invalidation::clear_stale(graph, workspace, NOTE, &artifact)?;
+    forget_reflection(graph, repository, source)?;
     Ok(removed)
 }
 
 /// Delete the project's observer reflection when it consumed `source`. The
 /// reflection job is not supported (unit `observer-reflection`), but a
-/// store an earlier release wrote can still hold one in
-/// `am_observer_reflections`, and it must not outlive a source it was built
-/// from. Certified forgetting erases it too (`deletion`).
-fn forget_reflection(db: &Connection, repository: &str, source: &str) -> Result<usize> {
-    let Some(mut row) = one(
-        db,
-        "SELECT sources FROM am_observer_reflections WHERE repository_id=?",
-        [repository],
-    )?
+/// store an earlier release wrote can still hold one as a `MentalModel`
+/// node (the former `am_observer_reflections` row), and it must not outlive
+/// a source it was built from. Certified forgetting erases it too
+/// (`deletion`).
+fn forget_reflection(
+    graph: &crate::store_graph::GraphStore,
+    repository: &str,
+    source: &str,
+) -> Result<usize> {
+    let Some(mut row) = graph.read(|g| {
+        store_graph::one(
+            g,
+            "MATCH (m:MentalModel {repository_id: $repo}) RETURN m.sources AS sources",
+            store_graph::params(&json!({"repo":repository})),
+        )
+    })?
     else {
         return Ok(0);
     };
@@ -1063,27 +1109,43 @@ fn forget_reflection(db: &Connection, repository: &str, source: &str) -> Result<
         .as_array()
         .is_some_and(|v| v.iter().any(|x| x == source))
     {
-        return Ok(db.execute(
-            "DELETE FROM am_observer_reflections WHERE repository_id=?",
-            [repository],
-        )?);
+        return Ok(graph.transaction(|g| {
+            Ok(store_graph::write(
+                g,
+                "MATCH (m:MentalModel {repository_id: $repo}) DETACH DELETE m",
+                store_graph::params(&json!({"repo":repository})),
+            )?
+            .nodes_deleted as usize)
+        })?);
     }
     Ok(0)
 }
 
 /// A connector document changed or was removed: delete its notes wherever
 /// they were written (connector document ids are globally prefixed).
-pub fn forget_document(db: &Connection, workspace: &str, document: &str) -> Result<usize> {
+pub fn forget_document(
+    graph: &crate::store_graph::GraphStore,
+    workspace: &str,
+    document: &str,
+) -> Result<usize> {
     let mut removed = 0;
-    for row in rows(
-        db,
-        "SELECT DISTINCT repository_id FROM am_observer_notes WHERE source_id=?",
-        [document],
-    )? {
-        removed += forget_source(db, workspace, s(&row, "repository_id"), document)?;
+    for row in graph.read(|g| {
+        store_graph::rows(
+            g,
+            "MATCH (n:Observation {source_id: $doc}) RETURN DISTINCT n.repository_id AS repository_id",
+            store_graph::params(&json!({"doc":document})),
+        )
+    })? {
+        removed += forget_source(graph, workspace, s(&row, "repository_id"), document)?;
     }
-    for row in rows(db, "SELECT repository_id FROM am_observer_reflections", [])? {
-        forget_reflection(db, s(&row, "repository_id"), document)?;
+    for row in graph.read(|g| {
+        store_graph::rows(
+            g,
+            "MATCH (m:MentalModel) RETURN m.repository_id AS repository_id",
+            store_graph::Params::new(),
+        )
+    })? {
+        forget_reflection(graph, s(&row, "repository_id"), document)?;
     }
     Ok(removed)
 }
@@ -1096,16 +1158,26 @@ pub fn status(
 ) -> Result<Value> {
     let prefixes = include(args)?;
     let selected = units(documents, &prefixes);
+    // One scan, not a lookup per unit.
+    let written: BTreeMap<String, Value> = crate::store::graph_for(db)?
+        .read(|g| {
+            store_graph::rows(
+                g,
+                "MATCH (n:Observation {repository_id: $repo}) \
+                 RETURN n.source_id AS source_id, n.source_sha256 AS source_sha256, n.notes AS notes",
+                store_graph::params(&json!({"repo":repository})),
+            )
+        })?
+        .into_iter()
+        .map(|row| (s(&row, "source_id").to_string(), row))
+        .collect();
     let mut current = 0;
     let mut stale = 0;
     let mut notes = 0;
     for doc in &selected {
-        match one(
-            db,
-            "SELECT source_sha256,notes FROM am_observer_notes WHERE repository_id=? AND source_id=?",
-            params![repository, s(doc, "id")],
-        )? {
-            Some(mut row) if row["source_sha256"] == doc["sha256"] => {
+        match written.get(s(doc, "id")) {
+            Some(row) if row["source_sha256"] == doc["sha256"] => {
+                let mut row = row.clone();
                 decode(&mut row, "notes")?;
                 current += 1;
                 notes += row["notes"].as_array().map_or(0, Vec::len);

@@ -21,7 +21,6 @@
 //! Interactive operations (`context`, `search`, `impact`, ...) are never
 //! queued; `Store::enqueue` refuses them explicitly.
 use crate::{Error, Result, model};
-use rusqlite::Connection;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -98,25 +97,32 @@ impl Bounds {
     }
 }
 
-/// Payload bytes of jobs waiting to run for one repository.
-pub fn queued_bytes(db: &Connection, repository: &str) -> Result<usize> {
-    let total: i64 = db.query_row(
-        "SELECT coalesce(sum(length(payload)),0) FROM am_jobs WHERE repository_id=? AND state IN ('queued','retry')",
-        [repository],
-        |r| r.get(0),
-    )?;
+/// Payload bytes of jobs waiting to run for one repository (the queue lives
+/// in the graph store; `payload_bytes` is recorded on each `:Job` at enqueue).
+pub fn queued_bytes(graph: &crate::store_graph::GraphStore, repository: &str) -> Result<usize> {
+    let total = graph
+        .read(|db| {
+            crate::store_graph::one(
+                db,
+                "MATCH (j:Job {repository_id: $repo}) WHERE j.state IN ['queued','retry'] \
+                 RETURN coalesce(sum(j.payload_bytes), 0) AS bytes",
+                crate::store_graph::params(&serde_json::json!({"repo": repository})),
+            )
+        })?
+        .and_then(|row| row["bytes"].as_i64())
+        .unwrap_or(0);
     Ok(usize::try_from(total).unwrap_or(usize::MAX))
 }
 
 /// Reject an enqueue whose payload would push the repository's queued bytes
 /// over `bound`. Replays never reach this check.
 pub fn check_queue_bytes(
-    db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &str,
     incoming: usize,
     bound: usize,
 ) -> Result<()> {
-    let queued = queued_bytes(db, repository)?;
+    let queued = queued_bytes(graph, repository)?;
     if queued.saturating_add(incoming) > bound {
         return Err(Error::bad(format!(
             "Repository job queue is full: {queued} bytes queued + {incoming} bytes requested exceed the {bound}-byte bound; wait for queued work to finish or cancel it"

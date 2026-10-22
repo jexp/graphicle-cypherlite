@@ -604,15 +604,37 @@ fn scrub(
     // folder beside it, which the plan never covers and may be a link.
     let mut order = held.ids.clone();
     order.sort_by_key(|id| id == project);
+    // A portable backup is dual (docs/store-api.md): its graph half is the
+    // `<file>.graph` sidecar, which is deleted from beside the SQL file.
+    // An older, SQL-only backup has no sidecar and deletes through the SQL
+    // variant.
+    let sidecar = crate::store_graph::backup_sidecar(&path);
+    let graph = if sidecar.is_dir() {
+        Some(crate::store_graph::GraphStore::open(&sidecar)?)
+    } else {
+        None
+    };
     let mut receipts = Vec::with_capacity(order.len());
     for id in &order {
-        let receipt = crate::maintenance::delete_project(
-            &transaction,
-            p,
-            id,
-            json!({"offboarding": {"backup": relative}}),
-            false,
-        )?;
+        let receipt = match &graph {
+            Some(graph) => {
+                let mut g = graph.connection()?;
+                crate::maintenance::delete_project(
+                    &mut g,
+                    &transaction,
+                    p,
+                    id,
+                    json!({"offboarding": {"backup": relative}}),
+                )?
+            }
+            None => crate::maintenance::delete_project_sql(
+                &transaction,
+                p,
+                id,
+                json!({"offboarding": {"backup": relative}}),
+                false,
+            )?,
+        };
         receipts.push(json!({
             "sequence": receipt["sequence"],
             "digest": receipt["digest"],
@@ -623,6 +645,11 @@ fn scrub(
         "UPDATE am_projection_cleanup SET state='paused',lease_token=NULL,lease_until=NULL WHERE state!='complete'",
         [],
     )?;
+    if let Some(graph) = &graph {
+        // The sidecar's deletions reach its snapshot, so a later restore of
+        // this backup cannot resurrect what the plan removed.
+        graph.checkpoint()?;
+    }
     transaction.commit()?;
     db.execute_batch("VACUUM;")?;
     db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;

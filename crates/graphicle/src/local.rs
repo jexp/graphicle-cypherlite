@@ -473,24 +473,33 @@ fn converted(
     store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
         let project = crate::store::repo(db, p, repository)?;
         let mut found = std::collections::HashMap::new();
-        if !crate::fresh::converted_here(db, &p.workspace, root, s(&project, "snapshot"))? {
+        if !crate::fresh::converted_here(&store.graph(), &p.workspace, root, s(&project, "snapshot"))? {
             return Ok(found);
         }
+        // Binary conversions are SQL (`am_binary_heads`); the heads and
+        // object contents they join against live in the graph content store.
+        let heads = crate::store_content::heads(&store.graph(), s(&project, "id"))?;
         let mut rows = db.prepare(
-            "SELECT b.path,b.original_sha,b.source_sha,b.parser,o.content FROM am_binary_heads b \
-             JOIN repo_heads h ON h.repository_id=b.repository_id AND h.path=b.path AND h.sha256=b.source_sha \
-             JOIN repo_objects o ON o.repository_id=b.repository_id AND o.sha256=b.source_sha \
-             WHERE b.repository_id=?",
+            "SELECT path,original_sha,source_sha,parser FROM am_binary_heads WHERE repository_id=?",
         )?;
         let mut rows = rows.query([s(&project, "id")])?;
         while let Some(row) = rows.next()? {
+            let (path, source_sha): (String, String) = (row.get(0)?, row.get(2)?);
+            if heads.get(&path) != Some(&source_sha) {
+                continue;
+            }
+            let Some(text) =
+                crate::store_content::object_content(&store.graph(), s(&project, "id"), &source_sha)?
+            else {
+                continue;
+            };
             found.insert(
-                row.get::<_, String>(0)?,
+                path,
                 Converted {
                     original: row.get(1)?,
-                    text_sha256: row.get(2)?,
+                    text_sha256: source_sha,
                     parser: row.get(3)?,
-                    text: row.get(4)?,
+                    text,
                 },
             );
         }
@@ -831,15 +840,15 @@ pub fn sync_folder(
                 )?;
             }
             // The folder is this project's from now on.
-            crate::folders::record(db, &p.workspace, &repository, &root)?;
-            crate::fresh::record(db, &p.workspace, &root, &mark, s(&current, "snapshot"))?;
+            crate::folders::record(&store.graph(), &p.workspace, &repository, &root)?;
+            crate::fresh::record(&store.graph(), &p.workspace, &root, &mark, s(&current, "snapshot"))?;
             Ok(())
         },
     )?;
     let (limited, not_analysed) =
         store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
             let current = crate::store::repo(db, p, &repository)?;
-            crate::store::analysis_report(db, s(&current, "id"))
+            crate::store::analysis_report(&store.graph(), s(&current, "id"))
         })?;
     skipped.extend(not_analysed);
     skipped.sort_by(|a, b| s(a, "path").cmp(s(b, "path")));
@@ -909,10 +918,23 @@ fn store_originals(
 ) -> Result<()> {
     store.authorized(&session.workspace,&session.capability,"collect",|db,p|{
         crate::store::repo(db,p,repository)?;
-        for (path,original,parsed) in originals {
-            db.execute("INSERT OR IGNORE INTO am_original_documents VALUES(?,NULL,?,?,?,?,?,?,?)",rusqlite::params![repository,format!("file:{path}"),s(parsed,"original_sha256"),path,s(parsed,"parser"),s(parsed,"text_sha256"),original,now()])?;
-        }
-        let size:i64=db.query_row("SELECT coalesce(sum(length(bytes)),0) FROM am_original_documents WHERE repository_id=?",[repository],|r|r.get(0))?;
+        store.graph().transaction(|db|{
+            for (path,original,parsed) in originals {
+                crate::store_graph::write(db,"MERGE (o:OriginalDocument {repository_id: $repository, source_id: $source, sha256: $sha}) SET o.connector_id=NULL, o.name=$name, o.parser=$parser, o.text_sha256=$text_sha, o.bytes=$bytes, o.bytes_len=$bytes_len, o.created_at=$now",crate::store_graph::Params::from([
+                    ("repository".into(),crate::store_graph::json_to_value(&json!(repository))),
+                    ("source".into(),crate::store_graph::json_to_value(&json!(format!("file:{path}")))),
+                    ("sha".into(),crate::store_graph::json_to_value(&parsed["original_sha256"])),
+                    ("name".into(),crate::store_graph::json_to_value(&json!(path))),
+                    ("parser".into(),crate::store_graph::json_to_value(&parsed["parser"])),
+                    ("text_sha".into(),crate::store_graph::json_to_value(&parsed["text_sha256"])),
+                    ("bytes".into(),crate::store_graph::json_to_value(&json!(crate::store_graph::b64e(original)))),
+                    ("bytes_len".into(),cypherlite::Value::Int(original.len() as i64)),
+                    ("now".into(),crate::store_graph::json_to_value(&json!(now()))),
+                ]))?;
+            }
+            Ok(())
+        })?;
+        let size:i64=store.graph().read(|db|crate::store_graph::one(db,"MATCH (o:OriginalDocument {repository_id: $repository}) RETURN coalesce(sum(o.bytes_len),0) AS used",crate::store_graph::Params::from([("repository".into(),crate::store_graph::json_to_value(&json!(repository)))])))?.and_then(|row|row["used"].as_i64()).unwrap_or(0);
         let cap=store.limits()?.retained_original_bytes;
         if usize::try_from(size).unwrap_or(usize::MAX)>cap{return Err(Error::bad(format!("Retained document originals exceed {}; prune earlier versions with storage.prune, or raise the limit with {}",crate::limits::size(cap),crate::limits::raise("retained_original_bytes"))));}Ok(())
     })
@@ -1093,12 +1115,12 @@ pub fn graph_report(store: &Store, session: &Session, repository: &str) -> Resul
         let id = s(&repository, "id");
         let episode = crate::graph_projection::current_episode(db, id)?;
         Ok(
-            match crate::graph_projection::episode_row(db, id, &episode)? {
+            match crate::graph_projection::episode_row(&*crate::store::graph_for(db)?, id, &episode)? {
                 Some(row) => {
                     json!({"status":"current","episode":episode,"nodes":row["node_count"],"edges":row["edge_count"]})
                 }
                 None => {
-                    json!({"status":crate::jobs::projection_state(db, id, &episode)?,"episode":episode})
+                    json!({"status":crate::jobs::projection_state(&store.graph(), id, &episode)?,"episode":episode})
                 }
             },
         )
@@ -1115,10 +1137,10 @@ pub fn code_symbols(store: &Store, session: &Session, repository: &str) -> Optio
             let row = crate::store::repo(db, p, repository)?;
             let id = s(&row, "id");
             let episode = crate::graph_projection::current_episode(db, id)?;
-            if crate::graph_projection::episode_row(db, id, &episode)?.is_none() {
+            if crate::graph_projection::episode_row(&store.graph(), id, &episode)?.is_none() {
                 return Ok(None);
             }
-            let handle = crate::graph_projection::resident(db, id, &episode)?;
+            let handle = crate::graph_projection::resident(&store.graph(), id, &episode)?;
             let graph: &graphicle::graph::Graph = &handle;
             Ok(Some(
                 graph
@@ -1170,7 +1192,7 @@ pub fn build_graph(
         let files =
             store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
                 let repository = crate::store::repo(db, p, repository)?;
-                Ok(crate::store::heads(db, s(&repository, "id"))?.len())
+                Ok(crate::store_content::heads(&store.graph(), s(&repository, "id"))?.len())
             })?;
         eprintln!("graphicle: building the code graph of {files} files...");
     }
@@ -1291,24 +1313,47 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Restore a portable backup into a fresh data directory. While the store
+/// is dual (docs/store-api.md: "beside, not instead of") a backup is the
+/// scrubbed SQL file at `backup` plus the graph snapshot directory beside
+/// it (`<backup>.graph()`); a `backup` that *is* a directory restores the
+/// graph store alone (the snapshot [`crate::maintenance::backup_graph`]
+/// wrote, already scrubbed).
 pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<Value> {
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    if directory.join("reviews.sqlite3").exists() {
+    if directory.join("reviews.sqlite3").exists() || directory.join("reviews.graph").exists() {
         return Err(Error::bad(
             "Restore into a new --data-dir; an existing store cannot be replaced",
         ));
     }
-    let source =
-        rusqlite::Connection::open_with_flags(backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let integrity: String = source.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let schema: bool = source.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='repo_projects')",
-        [],
-        |r| r.get(0),
-    )?;
-    if integrity != "ok" || !schema {
-        return Err(Error::bad("This is not a valid Graphicle store backup"));
+    if backup.is_dir() {
+        // Validate before anything is written: the backup holds a snapshot,
+        // and the snapshot is a graph.
+        let snapshot = backup.join("graph.json");
+        let valid = std::fs::read(&snapshot)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|document| {
+                document.get("nodes").is_some() && document.get("relationships").is_some()
+            });
+        if !valid {
+            return Err(Error::bad("This is not a valid Graphicle store backup"));
+        }
+    } else {
+        let source = rusqlite::Connection::open_with_flags(
+            backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let integrity: String = source.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let schema: bool = source.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='repo_projects')",
+            [],
+            |r| r.get(0),
+        )?;
+        if integrity != "ok" || !schema {
+            return Err(Error::bad("This is not a valid Graphicle store backup"));
+        }
     }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -1321,15 +1366,64 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     {
         return Err(Error::bad("Store directory must not be a symlink"));
     }
-    let destination = directory.join("reviews.sqlite3");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(&destination)?;
-    if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
-        let _ = std::fs::remove_file(&destination);
-        return Err(error.into());
+    if !backup.is_dir() {
+        let source = rusqlite::Connection::open_with_flags(
+            backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let destination = directory.join("reviews.sqlite3");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&destination)?;
+        if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
+            let _ = std::fs::remove_file(&destination);
+            return Err(error.into());
+        }
+    }
+    let graph_backup = if backup.is_dir() {
+        backup.to_path_buf()
+    } else {
+        std::path::PathBuf::from(format!("{}.graph", backup.display()))
+    };
+    if graph_backup.is_dir() {
+        let destination = directory.join("reviews.graph");
+        let copied = (|| -> Result<()> {
+            std::fs::DirBuilder::new().mode(0o700).create(&destination)?;
+            for file in ["manifest.json", "graph.json"] {
+                let source = graph_backup.join(file);
+                if source.is_file() {
+                    std::fs::copy(&source, destination.join(file))?;
+                }
+            }
+            // The copied snapshot must open and answer; a store that does
+            // not is removed again.
+            let store = crate::store_graph::GraphStore::open(&destination)?;
+            store.read(|db| {
+                crate::store_graph::one(
+                    db,
+                    "MATCH (n) RETURN count(n) AS n",
+                    crate::store_graph::Params::new(),
+                )?;
+                Ok(())
+            })?;
+            store.checkpoint()?;
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            let _ = std::fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+    }
+    // The content store's graph travels as a sidecar of the backup. For a
+    // file backup that sidecar is `<backup>.graph` — the same path the block
+    // above already copied, validated and materialized — so this clone runs
+    // only when nothing has been restored yet (cloning onto an existing
+    // destination is an engine error: `clone destination already exists`).
+    let sidecar = crate::store_graph::backup_sidecar(backup);
+    if sidecar.exists() && !directory.join("reviews.graph").exists() {
+        crate::store_graph::clone_store(&sidecar, &directory.join("reviews.graph"))?;
     }
     Ok(
         json!({"restored":true,"data_dir":directory,"next":"Use graphicle login with your saved workspace access key. Reconnect source accounts and model API keys in Connections; device credentials are excluded from portable backups."}),

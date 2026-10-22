@@ -528,14 +528,12 @@ The benchmark kit's
 OpenAI-compatible endpoint for a rephrased question, keyword queries and a
 short hypothetical answer, and saves them as variants.
 
-Setting `GRAPHICLE_EMBEDDING_CACHE` to a file path lets indexing reuse passage
-vectors across stores and workspaces. Entries are keyed by the embedding model
+Indexing caches passage vectors in the store itself, so re-embedding a
+passage it has embedded before (another project of the same store, a re-run
+job) does not call the model again. Entries are keyed by the embedding model
 key and the SHA-256 of the exact passage text. A local embedder runs each text
 on its own, never in a batch, so a vector does not depend on what was embedded
-beside it. Share a cache only within one trust domain: it holds vectors derived
-from private text, and a hit shows that the same text was embedded before. On
-Unix the database and its sidecar files are restricted to the owner and opened
-without following file symlinks. The cache is off by default.
+beside it.
 
 ### Observer notes
 

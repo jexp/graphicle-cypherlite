@@ -81,9 +81,11 @@ impl Fixture {
     /// digests in a project's state cover every project's rows), and that
     /// project's own rows of those tables.
     fn state(&self, project: &str) -> (Value, Vec<String>) {
+        let sql = self.store.connect().unwrap();
         let mut state = self
             .store
-            .read(|db| deletion::state(db, &self.session.workspace, project))
+            .graph()
+            .read(|g| deletion::state(g, &self.session.workspace, project, Some(&sql)))
             .unwrap();
         let tables = state["tables"].as_object_mut().unwrap();
         for table in WORKSPACE_TABLES {

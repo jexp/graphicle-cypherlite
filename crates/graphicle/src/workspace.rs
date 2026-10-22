@@ -195,6 +195,7 @@ fn project_args(args: &Value, repository: &str) -> Value {
 /// `context` with `scope: "workspace"` for `p` (see the module comment).
 /// `repository_id`, when given, names the project read first.
 pub fn context(
+    graph_store: &crate::store_graph::GraphStore,
     db: &Connection,
     p: &Principal,
     args: &Value,
@@ -218,6 +219,7 @@ pub fn context(
     for (position, repository) in repositories.into_iter().enumerate() {
         let id = s(&repository, "id").to_string();
         match query::project_packet(
+            graph_store,
             db,
             p,
             &repository,
@@ -888,7 +890,8 @@ impl<'a> Graphs<'a> {
         self.loaded
             .entry((repository.to_string(), episode.to_string()))
             .or_insert_with(|| {
-                let handle = graph_projection::resident(self.db, repository, episode).ok()?;
+                let store = crate::store::graph_for(self.db).ok()?;
+                let handle = graph_projection::resident(&store, repository, episode).ok()?;
                 let starts = code_graph_arm::symbol_starts(&handle);
                 Some(Loaded { handle, starts })
             })
@@ -971,10 +974,16 @@ fn cross_step(
             (0, CrossDirection::Outgoing, "target_repository_id"),
             (1, CrossDirection::Incoming, "source_repository_id"),
         ] {
-            pair[slot] = graph_projection::live_cross_edges(db, p, read.id(), direction)?
-                .into_iter()
-                .filter(|edge| index.contains_key(s(edge, other)))
-                .collect();
+            pair[slot] = graph_projection::live_cross_edges(
+                db,
+                &*crate::store::graph_for(db)?,
+                p,
+                read.id(),
+                direction,
+            )?
+            .into_iter()
+            .filter(|edge| index.contains_key(s(edge, other)))
+            .collect();
             read_count += pair[slot].len();
         }
         edges.push(pair);
@@ -1114,13 +1123,17 @@ fn cross_step(
                     continue;
                 };
                 if other_episode != current[j]
-                    && graph_projection::stored_episode_heads(db, reads[j].id(), &other_episode)
-                        .ok()
-                        .flatten()
-                        .is_none_or(|heads| {
-                            heads.get(&target.relpath).map(String::as_str)
-                                != Some(s(document, "sha256"))
-                        })
+                    && graph_projection::stored_episode_heads(
+                        &*crate::store::graph_for(db)?,
+                        reads[j].id(),
+                        &other_episode,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_none_or(|heads| {
+                        heads.get(&target.relpath).map(String::as_str)
+                            != Some(s(document, "sha256"))
+                    })
                 {
                     withheld += 1;
                     continue;

@@ -4,14 +4,13 @@ use crate::{
     Error, Result, digest, id,
     jobs::{self, Job, Worker},
     model,
-    store::{Store, decode, one, repo, s},
+    store::{Store, repo, s},
     string,
 };
 use redis::{
     AsyncCommands,
     streams::{StreamAutoClaimReply, StreamReadReply},
 };
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -79,7 +78,7 @@ pub fn configure(store: &Store, workspace: &str, token: &str, args: &Value) -> R
     let queue: Queue = serde_json::from_value(args["config"].clone())?;
     validate(&queue)?;
     store.resolve_credential(workspace, &queue.credential_ref)?;
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;db.execute("INSERT OR REPLACE INTO am_backends VALUES(?,?,?)",params![s(&repository,"id"),"redis",serde_json::to_string(&queue)?])?;Ok(json!({"configured":true,"dispatch":"explicit per job","source_authority":"coordinator"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;crate::projection::backend_set(db,s(&repository,"id"),"redis",&serde_json::to_value(&queue)?)?;Ok(json!({"configured":true,"dispatch":"explicit per job","source_authority":"coordinator"}))})
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -104,14 +103,9 @@ pub async fn generate(
     output_limit: usize,
 ) -> Result<model::Reply> {
     let queue: Queue = jobs::guarded(&worker.store, job, |db, _, _| {
-        let mut row = one(
-            db,
-            "SELECT config FROM am_backends WHERE repository_id=? AND kind='redis'",
-            [&job.repository],
-        )?
-        .ok_or_else(|| Error::bad("Configure a distributed queue for this project"))?;
-        decode(&mut row, "config")?;
-        Ok(serde_json::from_value(row["config"].clone())?)
+        let config = crate::projection::backend_config(db, &job.repository, "redis")?
+            .ok_or_else(|| Error::bad("Configure a distributed queue for this project"))?;
+        Ok(serde_json::from_value(config)?)
     })?;
     let password = worker
         .store
@@ -167,7 +161,8 @@ pub async fn generate(
         .map_err(queue_error)?;
     let start = Instant::now();
     loop {
-        if let Err(error) = jobs::guarded(&worker.store, job, |db, _, _| jobs::renew(db, job)) {
+        let graph = worker.store.graph().clone();
+        if let Err(error) = jobs::guarded(&worker.store, job, |_, _, _| jobs::renew(&graph, job)) {
             let _: std::result::Result<usize, _> = conn.del(&task_key).await;
             return Err(error);
         }

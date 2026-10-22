@@ -129,13 +129,9 @@ async fn imported_duplicate_text_keeps_each_source_vector_and_accounts_only_subm
     store
         .authorized(ws, key, "read", |db, principal| {
             let repository = store::repo(db, principal, project_id)?;
-            let snapshot = query::snapshot(db, &repository, principal)?;
+            let snapshot = query::snapshot(db, &store.graph(), &repository, principal)?;
             let (candidates, _) = query::candidates(&snapshot)?;
-            let vectors = store::rows(
-                db,
-                "SELECT identity,source_sha,vector FROM am_vectors WHERE repository_id=?",
-                [project_id],
-            )?;
+            let vectors = graphicle_runtime::vector::graph_vectors_all(&store.graph(), project_id)?;
             assert_eq!(vectors.len(), 8);
             for candidate in candidates {
                 let saved = vectors
@@ -143,7 +139,7 @@ async fn imported_duplicate_text_keeps_each_source_vector_and_accounts_only_subm
                     .find(|v| v["identity"] == candidate["identity"])
                     .unwrap();
                 let input = format!("{}\n{}", s(&candidate, "title"), s(&candidate, "text"));
-                let actual: Vec<f64> = serde_json::from_str(s(saved, "vector"))?;
+                let actual: Vec<f64> = serde_json::from_value(saved["vector"].clone())?;
                 assert_eq!(actual, vector(&input));
                 assert_eq!(saved["source_sha"], candidate["source_sha"]);
             }

@@ -26,10 +26,28 @@
 use crate::graph_projection::{PR_SCRATCH, repo_readable};
 use crate::platform::CanonicalExt;
 use crate::store::{Principal, Store, one, repo, s};
+use crate::store_graph::{self as graph, GraphStore, Params, json_to_value};
 use crate::{Error, Result, digest, id, now};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+
+/// Folder aliases live in the graph store as `(:Folder {workspace_id,
+/// folder_key, repository_id, path, freshness, created_at, updated_at})`
+/// nodes; projects stay in SQL until the ownership spine migrates, so a
+/// lookup reads the alias from the graph and checks the project in SQL.
+pub(crate) fn folder_of(graph_store: &GraphStore, workspace: &str, key: &str) -> Result<Option<Value>> {
+    graph_store.read(|db| {
+        graph::one(
+            db,
+            "MATCH (f:Folder {workspace_id: $workspace, folder_key: $key}) RETURN f.repository_id AS repository_id, f.path AS path, f.freshness AS freshness, f.updated_at AS updated_at",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("key".into(), json_to_value(&json!(key))),
+            ]),
+        )
+    })
+}
 
 /// The key of the local project of `folder` (a canonical path), and the key
 /// its aliases are recorded under.
@@ -89,52 +107,65 @@ fn unreadable(folder: &Path) -> Error {
 /// alias first, then a project keyed by the folder; with `synced`, only a
 /// project that holds a snapshot. Returned with whether `p` may read it.
 fn at_folder(
+    graph_store: &GraphStore,
     db: &Connection,
     p: &Principal,
     folder: &Path,
     synced: bool,
 ) -> Result<Option<(Found, bool)>> {
     let key = folder_key(folder);
-    let filter = if synced { " AND r.snapshot<>''" } else { "" };
-    for (sql, via) in [
-        (
-            format!(
-                "SELECT r.id FROM repo_folders f JOIN repo_projects r ON r.id=f.repository_id \
-                 WHERE f.workspace_id=?1 AND f.folder_key=?2{filter}"
-            ),
-            "alias",
-        ),
-        (
-            format!(
-                "SELECT r.id FROM repo_projects r WHERE r.workspace_id=?1 AND r.project_key=?2{filter}"
-            ),
-            "key",
-        ),
-    ] {
-        if let Some(row) = one(db, &sql, params![p.workspace, key])? {
+    // The recorded alias first (graph), then a project keyed by the folder.
+    if let Some(alias) = folder_of(graph_store, &p.workspace, &key)? {
+        let id = s(&alias, "repository_id").to_string();
+        let filter = if synced { " AND r.snapshot<>''" } else { "" };
+        let held = one(
+            db,
+            &format!("SELECT r.id FROM repo_projects r WHERE r.workspace_id=?1 AND r.id=?2{filter}"),
+            params![p.workspace, id],
+        )?;
+        if let Some(row) = held {
             let id = s(&row, "id").to_string();
             let readable = repo_readable(db, p, &id)?;
             return Ok(Some((
                 Found {
                     id,
                     folder: folder.to_path_buf(),
-                    via,
+                    via: "alias",
                 },
                 readable,
             )));
         }
+    }
+    let filter = if synced { " AND r.snapshot<>''" } else { "" };
+    if let Some(row) = one(
+        db,
+        &format!(
+            "SELECT r.id FROM repo_projects r WHERE r.workspace_id=?1 AND r.project_key=?2{filter}"
+        ),
+        params![p.workspace, key],
+    )? {
+        let id = s(&row, "id").to_string();
+        let readable = repo_readable(db, p, &id)?;
+        return Ok(Some((
+            Found {
+                id,
+                folder: folder.to_path_buf(),
+                via: "key",
+            },
+            readable,
+        )));
     }
     Ok(None)
 }
 
 /// The nearest registered ancestor of `path` (itself included) whose project
 /// holds a snapshot, and whether `p` may read that project.
-pub fn lookup(db: &Connection, p: &Principal, path: &Path) -> Result<Lookup> {
+pub fn lookup(graph_store: &GraphStore, db: &Connection, p: &Principal, path: &Path) -> Result<Lookup> {
     let Ok(path) = path.canonical() else {
         return Ok(Lookup::Nothing);
     };
     for folder in path.ancestors() {
-        if let Some((found, readable)) = at_folder(db, p, folder, true)? {
+        if let Some((found, readable)) = at_folder(graph_store, db, p, folder, true)? {
             return Ok(if readable {
                 Lookup::Found(found)
             } else {
@@ -148,8 +179,8 @@ pub fn lookup(db: &Connection, p: &Principal, path: &Path) -> Result<Lookup> {
 /// [`lookup`]'s project when `p` may read it: what the capture hooks and the
 /// `graphicle graph` note use, which pass over a folder whose project the
 /// principal may not read (they never fall through to an ancestor's).
-pub fn project_for_path(db: &Connection, p: &Principal, path: &Path) -> Result<Option<Found>> {
-    Ok(match lookup(db, p, path)? {
+pub fn project_for_path(graph_store: &GraphStore, db: &Connection, p: &Principal, path: &Path) -> Result<Option<Found>> {
+    Ok(match lookup(graph_store, db, p, path)? {
         Lookup::Found(found) => Some(found),
         Lookup::Nothing | Lookup::Unreadable(_) => None,
     })
@@ -159,14 +190,59 @@ pub fn project_for_path(db: &Connection, p: &Principal, path: &Path) -> Result<O
 /// into another project moves its alias there. [`crate::local::sync`] calls
 /// it in the transaction that completes a sync, so a failed sync moves
 /// nothing.
-pub fn record(db: &Connection, workspace: &str, repository: &str, folder: &Path) -> Result<()> {
+/// The folder's `freshness` record (JSON text), or cleared with `None`.
+pub(crate) fn set_freshness(
+    graph_store: &GraphStore,
+    workspace: &str,
+    key: &str,
+    freshness: Option<&str>,
+) -> Result<()> {
+    graph_store.transaction(|db| {
+        graph::write(
+            db,
+            "MATCH (f:Folder {workspace_id: $workspace, folder_key: $key}) SET f.freshness=$freshness",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("key".into(), json_to_value(&json!(key))),
+                (
+                    "freshness".into(),
+                    freshness
+                        .map(|f| json_to_value(&json!(f)))
+                        .unwrap_or(cypherlite::Value::Null),
+                ),
+            ]),
+        )?;
+        Ok(())
+    })
+}
+
+/// The folder aliases of a project (its path and record), latest first.
+pub(crate) fn folders_of(graph_store: &GraphStore, repository: &str) -> Result<Vec<Value>> {
+    graph_store.read(|db| {
+        graph::rows(
+            db,
+            "MATCH (f:Folder {repository_id: $repository}) WHERE f.path IS NOT NULL RETURN f.path AS path, f.updated_at AS updated_at, f.freshness AS freshness ORDER BY f.updated_at DESC, f.path",
+            Params::from([("repository".into(), json_to_value(&json!(repository)))]),
+        )
+    })
+}
+
+pub fn record(graph_store: &GraphStore, workspace: &str, repository: &str, folder: &Path) -> Result<()> {
     let stamp = now();
-    db.execute(
-        "INSERT INTO repo_folders(workspace_id,folder_key,repository_id,path,created_at,updated_at) VALUES(?,?,?,?,?,?) \
-         ON CONFLICT(workspace_id,folder_key) DO UPDATE SET repository_id=excluded.repository_id,path=excluded.path,updated_at=excluded.updated_at",
-        params![workspace, folder_key(folder), repository, folder.to_string_lossy(), stamp, stamp],
-    )?;
-    Ok(())
+    graph_store.transaction(|db| {
+        graph::write(
+            db,
+            "MERGE (f:Folder {workspace_id: $workspace, folder_key: $key}) ON CREATE SET f.created_at=$stamp SET f.repository_id=$repository, f.path=$path, f.updated_at=$stamp",
+            Params::from([
+                ("workspace".into(), json_to_value(&json!(workspace))),
+                ("key".into(), json_to_value(&json!(folder_key(folder)))),
+                ("repository".into(), json_to_value(&json!(repository))),
+                ("path".into(), json_to_value(&json!(folder.to_string_lossy()))),
+                ("stamp".into(), json_to_value(&json!(stamp))),
+            ]),
+        )?;
+        Ok(())
+    })
 }
 
 /// The folder `repository` was last synced from (canonical): its most
@@ -174,12 +250,14 @@ pub fn record(db: &Connection, workspace: &str, repository: &str, folder: &Path)
 /// folder whose content a later `--project` sync of another folder
 /// replaced) still resolve to the project, but only this one describes its
 /// current paths.
-pub fn current_folder(db: &Connection, repository: &str) -> Result<Option<PathBuf>> {
-    Ok(one(
-        db,
-        "SELECT path FROM repo_folders WHERE repository_id=? AND path IS NOT NULL ORDER BY updated_at DESC,path LIMIT 1",
-        [repository],
-    )?
+pub fn current_folder(graph_store: &GraphStore, repository: &str) -> Result<Option<PathBuf>> {
+    Ok(graph_store.read(|db| {
+            graph::one(
+                db,
+                "MATCH (f:Folder {repository_id: $repository}) WHERE f.path IS NOT NULL RETURN f.path AS path ORDER BY f.updated_at DESC, f.path LIMIT 1",
+                Params::from([("repository".into(), json_to_value(&json!(repository)))]),
+            )
+        })?
     .map(|row| PathBuf::from(s(&row, "path"))))
 }
 
@@ -190,6 +268,7 @@ pub fn current_folder(db: &Connection, repository: &str) -> Result<Option<PathBu
 /// folder itself, so a mistyped subfolder never names an ancestor's project,
 /// whose files the sync would replace.
 pub fn requested(
+    graph_store: &GraphStore,
     db: &Connection,
     p: &Principal,
     value: &str,
@@ -199,7 +278,7 @@ pub fn requested(
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
         return Err(Error::bad("Invalid project: use an id, a key or a folder"));
     }
-    if let Some(id) = by_name(db, p, value)? {
+    if let Some(id) = by_name(graph_store, db, p, value)? {
         return Ok(id);
     }
     let path = match cwd {
@@ -213,7 +292,7 @@ pub fn requested(
     }
     if exact {
         let folder = path.canonical()?;
-        return match at_folder(db, p, &folder, false)? {
+        return match at_folder(graph_store, db, p, &folder, false)? {
             Some((found, true)) => Ok(found.id),
             Some((found, false)) => Err(unreadable(&found.folder)),
             None => Err(Error::bad(format!(
@@ -222,7 +301,7 @@ pub fn requested(
             ))),
         };
     }
-    match lookup(db, p, &path)?.readable()? {
+    match lookup(graph_store, db, p, &path)?.readable()? {
         Some(found) => Ok(found.id),
         None => Err(Error::bad(format!(
             "No project is registered for {}; sync it first",
@@ -233,15 +312,18 @@ pub fn requested(
 
 /// The project a project id, a project key or a recorded folder key names,
 /// checked readable by `p`; `None` when none does.
-fn by_name(db: &Connection, p: &Principal, value: &str) -> Result<Option<String>> {
+fn by_name(graph_store: &GraphStore, db: &Connection, p: &Principal, value: &str) -> Result<Option<String>> {
     for sql in [
         "SELECT id FROM repo_projects WHERE workspace_id=? AND id=?",
         "SELECT id FROM repo_projects WHERE workspace_id=? AND project_key=?",
-        "SELECT repository_id AS id FROM repo_folders WHERE workspace_id=? AND folder_key=?",
     ] {
         if let Some(row) = one(db, sql, params![p.workspace, value])? {
             return Ok(Some(s(&repo(db, p, s(&row, "id"))?, "id").to_string()));
         }
+    }
+    if let Some(folder) = folder_of(graph_store, &p.workspace, value)? {
+        let id = s(&folder, "repository_id").to_string();
+        return Ok(Some(s(&repo(db, p, &id)?, "id").to_string()));
     }
     Ok(None)
 }
@@ -252,14 +334,14 @@ fn by_name(db: &Connection, p: &Principal, value: &str) -> Result<Option<String>
 /// resolved as `--project` resolves a path. Over HTTP (`cwd` is `None`) no
 /// path is read: a remote caller never names the server's folders. A project
 /// the caller may not read is refused, whichever way it is named.
-pub fn named(db: &Connection, p: &Principal, value: &str, cwd: Option<&Path>) -> Result<String> {
+pub fn named(graph_store: &GraphStore, db: &Connection, p: &Principal, value: &str, cwd: Option<&Path>) -> Result<String> {
     if cwd.is_some() {
-        return requested(db, p, value, cwd, false);
+        return requested(graph_store, db, p, value, cwd, false);
     }
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
         return Err(Error::bad("Invalid project: use a project id or key"));
     }
-    by_name(db, p, value)?.ok_or_else(|| Error::bad("Unknown project: use a project id or key"))
+    by_name(graph_store, db, p, value)?.ok_or_else(|| Error::bad("Unknown project: use a project id or key"))
 }
 
 /// The project a command acts on, and how it was chosen.
@@ -332,7 +414,7 @@ impl Store {
                     .unwrap_or_default())
             };
             if let Some(value) = requested {
-                let id = self::requested(db, p, value, cwd, false)?;
+                let id = self::requested(&self.graph(), db, p, value, cwd, false)?;
                 return Ok(Some(Resolved {
                     name: name(&id)?,
                     id,
@@ -341,7 +423,7 @@ impl Store {
                 }));
             }
             if let Some(cwd) = cwd
-                && let Some(found) = lookup(db, p, cwd)?.readable()?
+                && let Some(found) = lookup(&self.graph(), db, p, cwd)?.readable()?
             {
                 return Ok(Some(Resolved {
                     name: name(&found.id)?,
@@ -372,13 +454,13 @@ impl Store {
         path: &Path,
     ) -> Result<Option<Found>> {
         self.authorized_read(workspace, token, "read", |db, p| {
-            project_for_path(db, p, path)
+            project_for_path(&self.graph(), db, p, path)
         })
     }
 
     /// [`lookup`] for `path`.
     pub fn lookup_folder(&self, workspace: &str, token: &str, path: &Path) -> Result<Lookup> {
-        self.authorized_read(workspace, token, "read", |db, p| lookup(db, p, path))
+        self.authorized_read(workspace, token, "read", |db, p| lookup(&self.graph(), db, p, path))
     }
 
     /// The project a local sync of `folder` (canonical) goes into, and
@@ -400,8 +482,8 @@ impl Store {
     ) -> Result<(String, bool)> {
         self.authorized(workspace, token, "collect", |db, p| {
             let (project, created) = match requested {
-                Some(value) => (self::requested(db, p, value, cwd, true)?, false),
-                None => match at_folder(db, p, folder, false)? {
+                Some(value) => (self::requested(&self.graph(), db, p, value, cwd, true)?, false),
+                None => match at_folder(&self.graph(), db, p, folder, false)? {
                     Some((found, true)) => (found.id, false),
                     Some((found, false)) => return Err(unreadable(&found.folder)),
                     None => {

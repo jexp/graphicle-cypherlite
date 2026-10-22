@@ -67,8 +67,10 @@ impl Extension for Probe {
         // Ignored: the edition is the declared one.
         capabilities.insert("edition".into(), json!("probe"));
     }
-    fn migrate(&self, db: &Connection) -> Result<()> {
-        db.execute_batch("CREATE TABLE IF NOT EXISTS probe_rows (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE);")?;
+    fn migrate(&self, store: &graphicle_runtime::store_graph::GraphStore) -> Result<()> {
+        store.connection()?.query(
+            "CREATE INDEX probe_rows_id IF NOT EXISTS FOR (n:ProbeRow) ON (n.workspace_id)",
+        )?;
         Ok(())
     }
     fn operations(&self) -> &'static [&'static str] {
@@ -314,9 +316,11 @@ impl Extension for Probe {
     fn metered_operations(&self) -> &'static [&'static str] {
         &["probe.async"]
     }
-    fn scrub_backup(&self, db: &Connection) -> Result<()> {
-        db.execute("DELETE FROM probe_rows", [])?;
-        Ok(())
+    fn scrub_backup(&self, store: &graphicle_runtime::store_graph::GraphStore) -> Result<()> {
+        store.transaction(|db| {
+            db.query("MATCH (n:ProbeRow) DETACH DELETE n")?;
+            Ok(())
+        })
     }
     fn vault_key(&self, store: &Store) -> Option<Result<[u8; 32]>> {
         // Only the stores a test marks keep their vault key in the probe.
@@ -353,6 +357,7 @@ impl Extension for Probe {
     /// fails, which must roll the row back and leave the projection alone.
     fn after_projection(
         &self,
+        graph: &mut cypherlite::Connection,
         db: &Connection,
         principal: &graphicle_runtime::store::Principal,
         repository: &str,
@@ -368,9 +373,23 @@ impl Extension for Probe {
         }
         let stamp = graphicle_runtime::now();
         let id = format!("{FOLLOW}-{episode}");
-        db.execute(
-            "INSERT OR IGNORE INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',-1,3,?,?,?)",
-            rusqlite::params![id, repository, FOLLOW, id, json!({"episode":episode}).to_string(), principal.hash, stamp, stamp, stamp],
+        // INSERT OR IGNORE: MERGE on the idempotence key creates nothing the
+        // second time.
+        let payload = json!({"episode":episode}).to_string();
+        graphicle_runtime::store_graph::rows(
+            graph,
+            "MERGE (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) ON CREATE SET j += $job RETURN j.id AS id",
+            graphicle_runtime::store_graph::params(&json!({
+                "repo": repository, "kind": FOLLOW, "hash": id,
+                "job": {
+                    "id": id, "repository_id": repository, "workspace_id": principal.workspace,
+                    "kind": FOLLOW, "input_hash": id, "payload": payload,
+                    "payload_bytes": payload.len(), "principal_hash": principal.hash,
+                    "state": "queued", "priority": -1, "attempt": 0, "max_attempts": 3,
+                    "not_before": stamp, "created_at": stamp, "updated_at": stamp,
+                    "episode": episode,
+                },
+            })),
         )?;
         if name == "Probe fails" {
             return Err(Error::bad("probe hook failed"));
@@ -600,11 +619,19 @@ async fn an_extension_may_replace_the_product_page() {
 #[test]
 fn deletion_honours_the_extension_history_and_retained_tables() {
     let f = Fixture::new();
-    f.store
-        .connect()
-        .unwrap()
-        .execute("INSERT INTO probe_rows VALUES('kept',?)", [&f.workspace])
+    // Extension tables are graph labels now: the probe's retained history
+    // lives on the graph store.
+    let graph = graphicle_runtime::store_graph::GraphStore::open(
+        f.store.directory.join("reviews.graph"),
+    )
+    .unwrap();
+    graph
+        .transaction(|db| {
+            db.query("CREATE (:ProbeRow {id: 'kept', workspace_id: 'w'})")?;
+            Ok(())
+        })
         .unwrap();
+    drop(graph);
     let args = json!({"repository_id":f.repo});
     let state = api::command(&f.app(), &f.workspace, &f.owner, "deletion.state", &args).unwrap();
     assert_eq!(state["contract"], "graphicle.state.v2");
@@ -636,17 +663,24 @@ fn deletion_honours_the_extension_history_and_retained_tables() {
 #[test]
 fn store_open_runs_extension_migrations_after_the_core_schema() {
     let f = Fixture::new();
-    let tables: i64 = f
-        .store
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('probe_rows','workspaces')",
-            [],
-            |r| r.get(0),
-        )
+    // Extension migrations run on the graph store (`Extension::migrate`
+    // takes the `GraphStore`), after the core graph type and indexes.
+    let graph = graphicle_runtime::store_graph::GraphStore::open(
+        f.store.directory.join("reviews.graph"),
+    )
+    .unwrap();
+    let found = graph
+        .read(|db| {
+            Ok(graphicle_runtime::store_graph::rows(
+                db,
+                "SHOW INDEXES",
+                graphicle_runtime::store_graph::Params::new(),
+            )?
+            .iter()
+            .any(|index| index["name"] == "probe_rows_id"))
+        })
         .unwrap();
-    assert_eq!(tables, 2);
+    assert!(found, "the extension's index is created at store open");
     // Reopening is idempotent.
     Store::open(f.store.directory.as_ref()).unwrap();
 }
@@ -1126,20 +1160,30 @@ async fn metered_calls_are_admitted_and_capped_by_the_extension() {
 
 #[test]
 fn backups_are_scrubbed_by_the_extension_too() {
+    use graphicle_runtime::store_graph::{GraphStore, Params, json_to_value, one};
     let f = Fixture::new();
-    f.store
-        .connect()
-        .unwrap()
-        .execute("INSERT INTO probe_rows VALUES('row',?)", [&f.workspace])
-        .unwrap();
-    let file = f.store.directory.join("backup.sqlite3");
-    f.store.backup(&file).unwrap();
-    let count = |db: &Connection| -> i64 {
-        db.query_row("SELECT count(*) FROM probe_rows", [], |r| r.get(0))
+    let live = GraphStore::open(f.store.directory.join("reviews.graph")).unwrap();
+    let mut params = Params::new();
+    params.insert("ws".into(), json_to_value(&json!(f.workspace)));
+    live.transaction(|db| {
+        db.query_with_params("CREATE (:ProbeRow {id: 'row', workspace_id: $ws})", params.clone())?;
+        Ok(())
+    })
+    .unwrap();
+    drop(live);
+    let dir = f.store.directory.join("backup.graph()");
+    f.store.backup(&dir).unwrap();
+    let count = |store: &GraphStore| -> i64 {
+        store
+            .read(|db| {
+                Ok(one(db, "MATCH (n:ProbeRow) RETURN count(n) AS n", Params::new())?
+                    .and_then(|r| r["n"].as_i64())
+                    .unwrap_or(0))
+            })
             .unwrap()
     };
-    assert_eq!(count(&Connection::open(&file).unwrap()), 0);
-    assert_eq!(count(&f.store.connect().unwrap()), 1);
+    assert_eq!(count(&GraphStore::open(&dir).unwrap()), 0);
+    assert_eq!(count(&GraphStore::open(f.store.directory.join("reviews.graph")).unwrap()), 1);
 }
 
 /// The vault seals with the key of the extension that holds a store's,
@@ -1229,15 +1273,26 @@ async fn declared_job_kinds_are_leased_and_unknown_kinds_wait() {
     let f = Fixture::new();
     let stamp = graphicle_runtime::now();
     let principal = graphicle_memory::text::sha256(f.owner.as_bytes());
-    let db = f.store.connect().unwrap();
     // The unknown kind is first in line.
-    for (id, kind, priority) in [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)] {
-        db.execute(
-            "INSERT INTO am_jobs(id,repository_id,kind,input_hash,payload,principal_hash,state,priority,max_attempts,not_before,created_at,updated_at) VALUES(?,?,?,?,'{}',?,'queued',?,3,?,?,?)",
-            rusqlite::params![id, f.repo, kind, id, principal, priority, stamp, stamp, stamp],
-        )
+    f.store
+        .graph()
+        .transaction(|db| {
+            for (id, kind, priority) in [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)] {
+                graphicle_runtime::store_graph::rows(
+                    db,
+                    "CREATE (j:Job {id: $id}) SET j += $job",
+                    graphicle_runtime::store_graph::params(&json!({"id": id, "job": {
+                        "id": id, "repository_id": f.repo, "workspace_id": f.workspace,
+                        "kind": kind, "input_hash": id, "payload": "{}", "payload_bytes": 2,
+                        "principal_hash": principal, "state": "queued", "priority": priority,
+                        "attempt": 0, "max_attempts": 3, "not_before": stamp,
+                        "created_at": stamp, "updated_at": stamp,
+                    }})),
+                )?;
+            }
+            Ok(())
+        })
         .unwrap();
-    }
     let worker = Worker::new(f.store.clone(), model::Config::default()).unwrap();
     assert!(worker.once().await.unwrap(), "the probe job runs");
     let status = |id: &str| {
@@ -1336,13 +1391,24 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
     let ran = graphicle_runtime::jobs::drain_projection(&f.store, &follows).unwrap();
     assert_eq!(kinds(&ran), ["project", "link", FOLLOW], "{ran:?}");
     assert!(ran.iter().all(|job| job["ok"] == true), "{ran:?}");
-    let (state, result): (String, String) = db
-        .query_row(
-            "SELECT state,result FROM am_jobs WHERE repository_id=? AND kind=?",
-            rusqlite::params![follows, FOLLOW],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+    let (state, result): (String, String) = {
+        let row = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::one(
+                    g,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.state AS state, j.result AS result",
+                    graphicle_runtime::store_graph::params(&json!({"repo": follows, "kind": FOLLOW})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        (
+            row["state"].as_str().unwrap().to_string(),
+            row["result"].as_str().unwrap().to_string(),
         )
-        .unwrap();
+    };
     assert_eq!(state, "complete");
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &follows).unwrap();
     assert_eq!(
@@ -1358,20 +1424,32 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
     let fails = synced("Probe fails");
     let ran = graphicle_runtime::jobs::drain_projection(&f.store, &fails).unwrap();
     assert_eq!(kinds(&ran), ["project", "link"], "{ran:?}");
-    let queued: i64 = db
-        .query_row(
-            "SELECT count(*) FROM am_jobs WHERE repository_id=? AND kind=?",
-            rusqlite::params![fails, FOLLOW],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let queued: i64 = f
+        .store
+        .graph()
+        .read(|g| {
+            graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN count(j) AS count",
+                graphicle_runtime::store_graph::params(&json!({"repo": fails, "kind": FOLLOW})),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["count"].as_i64())
+        .unwrap_or(0);
     assert_eq!(queued, 0, "the failed hook's row was kept");
-    let projected: String = db
-        .query_row(
-            "SELECT result FROM am_jobs WHERE repository_id=? AND kind='project'",
-            [&fails],
-            |r| r.get(0),
-        )
+    let projected: String = f
+        .store
+        .graph()
+        .read(|g| {
+            graphicle_runtime::store_graph::one(
+                g,
+                "MATCH (j:Job {repository_id: $repo, kind: 'project'}) RETURN j.result AS result",
+                graphicle_runtime::store_graph::params(&json!({"repo": fails})),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["result"].as_str().map(str::to_string))
         .unwrap();
     let projected: Value = serde_json::from_str(&projected).unwrap();
     assert_eq!(
@@ -1379,7 +1457,14 @@ fn the_projection_drain_runs_the_work_extensions_queue_after_a_projection() {
         json!([{"extension":"probe","error":"probe hook failed"}])
     );
     let episode = graphicle_runtime::graph_projection::current_episode(&db, &fails).unwrap();
-    assert!(graphicle_runtime::graph_projection::is_recorded(&db, &fails, &episode).unwrap());
+    assert!(
+        graphicle_runtime::graph_projection::is_recorded(
+            &graphicle_runtime::store::graph_for(&db).unwrap(),
+            &fails,
+            &episode
+        )
+        .unwrap()
+    );
 }
 
 #[derive(Clone)]
@@ -1446,17 +1531,22 @@ async fn provider_permissions_of_a_sync_come_from_the_extension() {
         .unwrap();
     assert_eq!(status["state"], "complete", "{status}");
     assert_eq!(seen.0.lock().unwrap().as_slice(), ["issues"]);
-    let metadata: String = f
+    let metadata: Value = f
         .store
-        .connect()
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.metadata AS metadata",
+                graphicle_runtime::store_graph::Params::from([(
+                    "connector".into(),
+                    graphicle_runtime::store_graph::json_to_value(&json!(s(&connector, "id"))),
+                )]),
+            )
+        })
         .unwrap()
-        .query_row(
-            "SELECT metadata FROM am_connector_docs WHERE connector_id=?",
-            [s(&connector, "id")],
-            |r| r.get(0),
-        )
+        .and_then(|row| serde_json::from_str(row["metadata"].as_str().unwrap_or("null")).ok())
         .unwrap();
-    let metadata: Value = serde_json::from_str(&metadata).unwrap();
     let permissions = &metadata["provider_permissions"];
     assert_eq!(
         permissions["probe_doc"], "org/project:issue:1",

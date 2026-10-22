@@ -426,6 +426,7 @@ fn bump(counts: &mut Value, key: &str) {
 /// (see the module documentation). Other states are skipped and counted.
 pub fn import(
     db: &Connection,
+    graph: &crate::store_graph::GraphStore,
     repository: &str,
     documents: &[Value],
     items: &[Value],
@@ -547,7 +548,7 @@ pub fn import(
         }
         data["pack"] = marks;
         imported.push(memory::save(
-            db, repository, None, None, kind, title, body, "draft", &data,
+            db, &graph, repository, None, None, kind, title, body, "draft", &data,
         )?);
     }
     let mut result = json!({"imported":imported,"skipped":skipped,"approval_required":true});

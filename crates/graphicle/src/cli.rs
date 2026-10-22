@@ -519,6 +519,19 @@ enum Command {
     Backup { path: Option<PathBuf> },
     /// Restore a database into a new data directory; existing data is never overwritten.
     Restore { path: PathBuf },
+    /// Migrate a legacy SQLite store (`reviews.sqlite3`) into a CypherLite
+    /// graph store directory: a one-time, forward-only import (SQL export to
+    /// CSV, then `LOAD CSV` upserts; docs/migrate-store.md). The source file
+    /// is left untouched and a non-empty target is never overwritten.
+    MigrateStore {
+        /// The existing reviews.sqlite3 file.
+        source: PathBuf,
+        /// The graph store directory to create (must be empty or absent).
+        target: PathBuf,
+        /// Print the JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or change settings, such as the answer model.
     ///
     /// `graphicle config set model anthropic` (or openai, or ollama) makes
@@ -906,6 +919,15 @@ where
     if let Command::Restore { path } = command {
         return print(&local::restore(&path, &directory)?);
     }
+    if let Command::MigrateStore {
+        source,
+        target,
+        json,
+    } = &command
+    {
+        let report = crate::migrate::migrate_store(source, target)?;
+        return crate::terminal::emit(&report, *json, crate::migrate::report_text);
+    }
     if let Command::Uninstall { purge, yes, json } = command {
         return crate::disconnect::uninstall(&directory, purge, yes, json);
     }
@@ -1154,6 +1176,7 @@ where
         }
         Command::DocumentWorker { .. } => unreachable!(),
         Command::Restore { .. } => unreachable!(),
+        Command::MigrateStore { .. } => unreachable!(),
         Command::RedisWorker { .. } => unreachable!(),
         Command::Init { name } => {
             let session = if store.directory.join("local-session.json").exists() {

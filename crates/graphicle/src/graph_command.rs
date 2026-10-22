@@ -139,7 +139,9 @@ fn project_name(db: &rusqlite::Connection, id: &str) -> Option<String> {
 /// creating, migrating or writing anything.
 pub fn project_of_folder(directory: &Path, folder: &Path) -> Option<(String, String)> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
+    let graph =
+        crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
     let name = project_name(&db, &found.id)?;
     Some((found.id, name))
 }
@@ -161,11 +163,12 @@ pub struct GraphFolder {
 /// latest recorded code graph holds at least one code symbol
 /// ([`crate::code_graph_arm::code_symbol`]): a
 /// conversation or notes folder, whose graph holds no code, is not one. With
-/// `file`, also whether that graph has nodes in it. The live-symbol table
-/// (`gf_symbol_heads`, code symbols only, which a projection of the head set
-/// keeps) answers the first question with one indexed row, so a hook stays
-/// quick on a large project without code; a store whose table was never
-/// built reads the graph's open nodes (`valid_to_episode IS NULL`) instead.
+/// `file`, also whether that graph has nodes in it. The live-symbol nodes
+/// (`:SymbolHead`, code symbols only, which a projection of the head set
+/// keeps) answer the first question with one indexed lookup, so a hook stays
+/// quick on a large project without code; a store whose graph store is
+/// absent or held by a running server reads the open nodes
+/// (`valid_to_episode IS NULL`) instead.
 /// The second reads the open nodes through the index on each node's file
 /// (`owner`).
 pub fn project_with_graph(
@@ -174,39 +177,48 @@ pub fn project_with_graph(
     file: Option<&Path>,
 ) -> Option<GraphFolder> {
     let (db, principal) = read_only(directory)?;
-    let found = crate::folders::project_for_path(&db, &principal, folder).ok()??;
-    let built = db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM gf_symbol_state WHERE repository_id=?)",
-            [&found.id],
-            |row| row.get::<_, bool>(0),
-        )
+    // The folder mapping and the live-symbol nodes live in the graph store;
+    // a hook must not create it for a folder that never had one, and a store
+    // held by a running server refuses the open — a missing graph file
+    // answers "no graph" here, and the callers below read the graph's open
+    // nodes instead.
+    let graph = directory
+        .join("reviews.graph")
+        .exists()
+        .then(|| crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok())
+        .flatten()?;
+    let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
+    let built = crate::symbols::has_symbol_state(&graph, &found.id)
+        .ok()
         .unwrap_or(false);
     let symbol = if built {
-        db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gf_symbol_heads WHERE repository_id=?)",
-            [&found.id],
-            |row| row.get::<_, bool>(0),
-        )
-        .ok()?
+        crate::symbols::has_symbol_heads(&graph, &found.id).ok()?
     } else {
-        let mut select = db
-            .prepare(
-                "SELECT attributes FROM gf_nodes WHERE repository_id=? AND owner<>'' AND valid_to_episode IS NULL",
-            )
-            .ok()?;
-        let mut rows = select.query([&found.id]).ok()?;
-        let mut symbol = false;
-        while let Some(row) = rows.next().ok()? {
-            let text: String = row.get(0).ok()?;
-            if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-                .is_ok_and(|attributes| crate::code_graph_arm::code_symbol(&attributes))
-            {
-                symbol = true;
-                break;
-            }
-        }
-        symbol
+        // Live symbol versions of the projection (graph store).
+        let store = crate::store::graph_for_read_only(&db).ok()?;
+        store
+            .read(|g| {
+                let mut symbol = false;
+                for row in crate::store_graph::rows(
+                    g,
+                    "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
+                     WHERE v.owner <> '' RETURN v.data AS data",
+                    crate::store_graph::Params::from([(
+                        "r".to_string(),
+                        cypherlite::Value::String(found.id.as_str().into()),
+                    )]),
+                )? {
+                    let text = crate::store::s(&row, "data");
+                    if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+                        .is_ok_and(|attributes| crate::code_graph_arm::code_symbol(&attributes))
+                    {
+                        symbol = true;
+                        break;
+                    }
+                }
+                Ok(symbol)
+            })
+            .ok()?
     };
     if !symbol {
         return None;
@@ -215,15 +227,34 @@ pub fn project_with_graph(
         None => true,
         Some(file) => {
             let file = file.canonical().unwrap_or_else(|_| file.to_path_buf());
-            file.strip_prefix(&found.folder).ok().is_some_and(|relative| {
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM gf_nodes WHERE repository_id=? AND owner=? AND valid_to_episode IS NULL)",
-                    [&found.id, &relative],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false)
-            })
+            file.strip_prefix(&found.folder)
+                .ok()
+                .is_some_and(|relative| {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    crate::store::graph_for(&db)
+                        .and_then(|store| {
+                            store.read(|g| {
+                                crate::store_graph::one(
+                                    g,
+                                    "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:Live) \
+                                 WHERE v.owner = $owner RETURN v.data AS data LIMIT 1",
+                                    crate::store_graph::Params::from([
+                                        (
+                                            "r".to_string(),
+                                            cypherlite::Value::String(found.id.as_str().into()),
+                                        ),
+                                        (
+                                            "owner".to_string(),
+                                            cypherlite::Value::String(relative.as_str().into()),
+                                        ),
+                                    ]),
+                                )
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
         }
     };
     Some(GraphFolder {

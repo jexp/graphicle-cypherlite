@@ -1392,7 +1392,10 @@ pub(crate) fn dispatch(
             store.authorized_read(workspace, capability, "read", |db, p| {
                 let repo = crate::store::repo(db, p, crate::string(args, "repository_id", 100)?)?;
                 let documents = crate::memory::documents(db, &repo, p)?;
-                crate::observer::context_with(db, crate::store::s(&repo, "id"), &documents, args, embedding.as_ref())
+                let cache = embedding.as_ref().map(|profile| {
+                    store.embedding_cache(&crate::model::key(profile))
+                });
+                crate::observer::context_with(db, crate::store::s(&repo, "id"), &documents, args, embedding.as_ref(), cache.as_ref())
             })
         }
         "deletion.verify" => crate::deletion::verify(store, workspace, capability, args),
@@ -2533,7 +2536,7 @@ fn mcp_in(
                             workspace,
                             capability,
                             "read",
-                            |db, p| crate::folders::named(db, p, named, app.mcp.cwd.as_deref()),
+                            |db, p| crate::folders::named(&app.worker.store.graph(), db, p, named, app.mcp.cwd.as_deref()),
                         )?;
                         args["repository_id"] = json!(named);
                     }

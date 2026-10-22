@@ -166,6 +166,8 @@ pub fn lift(
     selected_memories: &[Value],
     candidates: &[Value],
 ) -> Result<Lifted> {
+    // The live symbols are graph-resident; the SQL connection bridges to it.
+    let mut graph = crate::store::graph_for(db)?.connection()?;
     let servable: Vec<&Value> = rows.iter().filter(|row| row["kind"] == "memory").collect();
     let links = if mode == Mode::Off {
         HashMap::new()
@@ -215,7 +217,7 @@ pub fn lift(
             let file = match documents.get(id) {
                 Some(document) => Some(File {
                     document,
-                    live: symbols::in_file(db, repository, relpath)?,
+                    live: symbols::in_file(&mut graph, repository, relpath)?,
                     starts: span::line_starts(s(document, "content")),
                 }),
                 None => None,
@@ -289,7 +291,7 @@ pub fn lift(
         .flatten()
         .map(|link| s(link, "stable_id").to_string())
         .collect();
-    let live: BTreeMap<String, Live> = symbols::by_ids(db, repository, &wanted)?
+    let live: BTreeMap<String, Live> = symbols::by_ids(&mut graph, repository, &wanted)?
         .into_iter()
         .map(|row| (row.stable_id.clone(), row))
         .collect();
@@ -374,6 +376,7 @@ pub fn attach(
     repository: &Value,
     nodes: &mut [Value],
 ) -> Result<()> {
+    let mut graph = crate::store::graph_for(db)?.connection()?;
     let project = s(repository, "id");
     let ids: BTreeSet<String> = nodes
         .iter()
@@ -407,7 +410,7 @@ pub fn attach(
     } else {
         let documents = crate::memory::documents(db, repository, p)?;
         naming = naming.knowing(project, &documents);
-        crate::memory::list_of(db, repository, &documents, false)?
+        crate::memory::list_of(db, crate::store::graph_for(db)?.as_ref(), repository, &documents, false)?
             .into_iter()
             .filter(|m| {
                 named.contains(s(m, "id")) && m["state"] == "reviewed" && m["stale"] != true

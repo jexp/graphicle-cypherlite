@@ -137,7 +137,7 @@ impl Fixture {
         self.store
             .read(|db| {
                 let episode = graph_projection::current_episode(db, repository)?;
-                let graph = graph_projection::resident(db, repository, &episode)?;
+                let graph = graph_projection::resident(&crate::gstore(db), repository, &episode)?;
                 Ok(graph
                     .nodes()
                     .iter()
@@ -220,11 +220,12 @@ fn the_nearest_registered_folder_decides_through_aliases_and_keys() {
         assert_eq!(f.at(&f.root.join("link/x")), Some(pa.clone()));
     }
     // A project synced before folders were recorded is found by its key.
-    f.store
-        .connect()
-        .unwrap()
-        .execute("DELETE FROM repo_folders WHERE repository_id=?", [&pb])
-        .unwrap();
+    // Folder aliases live in the graph store.
+    crate::gql_write(
+        &f.store,
+        "MATCH (f:Folder {repository_id: $repository}) DELETE f",
+        graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(pb))]),
+    );
     let found = f
         .store
         .project_for_path(f.ws(), f.key(), &b)
@@ -668,11 +669,12 @@ fn a_nested_project_owns_the_packages_under_its_folder() {
     let reasons: Vec<String> = f
         .store
         .read(|db| {
-            Ok(graphicle_runtime::store::rows(
+            Ok(crate::grows(
                 db,
-                "SELECT reason FROM gf_cross_unresolved WHERE source_repository_id=? AND valid_to_episode IS NULL",
-                [&application],
-            )?
+                "MATCH (u:UnresolvedCross {source_repository_id:$r}) \
+                 WHERE u.valid_to_episode IS NULL RETURN u.reason AS reason",
+                &[("r", json!(application))],
+            )
             .iter()
             .map(|row| s(row, "reason").to_string())
             .collect())
@@ -934,10 +936,17 @@ fn folder_locations_do_not_change_the_deletion_state() {
         assert_eq!(f.sync(&folder, Some(&project)), project);
         f.store
             .read(|db| {
-                let aliases: i64 =
-                    db.query_row("SELECT count(*) FROM repo_folders", [], |r| r.get(0))?;
+                let aliases: i64 = crate::gql_one(
+                    &f.store,
+                    "MATCH (f:Folder) RETURN count(f) AS n",
+                    Default::default(),
+                )
+                .and_then(|row| row["n"].as_i64())
+                .unwrap();
                 Ok((
-                    graphicle_runtime::deletion::state(db, f.ws(), &project)?,
+                    f.store
+                        .graph()
+                        .read(|g| graphicle_runtime::deletion::state(g, f.ws(), &project, Some(db)))?,
                     aliases,
                 ))
             })
@@ -995,16 +1004,13 @@ fn a_registered_project_is_no_folders_project_until_a_sync_fills_it() {
     let captured = import(&f);
     assert_eq!(captured["sessions"], 1, "{captured:#}");
     let connector = s(&captured["captured"][0], "connector_id").to_string();
-    let owner: String = f
-        .store
-        .read(|db| {
-            Ok(db.query_row(
-                "SELECT repository_id FROM am_connectors WHERE id=?",
-                [&connector],
-                |r| r.get(0),
-            )?)
-        })
-        .unwrap();
+    let owner: String = crate::gql_one(
+        &f.store,
+        "MATCH (c:Connector {id: $id}) RETURN c.repository_id AS repository_id",
+        graphicle_runtime::store_graph::Params::from([crate::gp("id", json!(connector))]),
+    )
+    .map(|row| s(&row, "repository_id").to_string())
+    .unwrap();
     assert_eq!(owner, project);
 }
 
@@ -1286,19 +1292,15 @@ fn a_failed_sync_moves_no_alias() {
         failed.message
     );
     assert_eq!(f.at(&a), Some(pa.clone()));
-    let aliases: Vec<String> = f
-        .store
-        .read(|db| {
-            Ok(graphicle_runtime::store::rows(
-                db,
-                "SELECT repository_id FROM repo_folders ORDER BY repository_id",
-                [],
-            )?
-            .iter()
-            .map(|row| s(row, "repository_id").to_string())
-            .collect())
-        })
-        .unwrap();
+    // Folder aliases live in the graph store.
+    let aliases: Vec<String> = crate::gql(
+        &f.store,
+        "MATCH (f:Folder) RETURN f.repository_id AS repository_id ORDER BY f.repository_id",
+        Default::default(),
+    )
+    .iter()
+    .map(|row| s(row, "repository_id").to_string())
+    .collect();
     assert_eq!(aliases, vec![pa]);
 }
 

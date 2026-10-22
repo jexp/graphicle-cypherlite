@@ -2,27 +2,66 @@
 use crate::{Error, Result, digest, id, native, now, string};
 use crate::{
     memory,
-    store::{Principal, Store, decode, one, repo, rows, s},
+    store::{Principal, Store, repo, s},
+    store_graph::{self, GraphStore},
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub fn current(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
-    let memories = memory::list(db, repository, p, true)?;
+/// One claim by id (optionally state-scoped), as a plain record.
+fn claim_row(
+    db: &mut cypherlite::Connection,
+    repository: &str,
+    claim_id: &str,
+    state: Option<&str>,
+) -> Result<Option<Value>> {
+    let row = if let Some(state) = state {
+        store_graph::one(
+            db,
+            "MATCH (c:Claim {repository_id: $repo, id: $id, state: $state}) RETURN c",
+            store_graph::params(&json!({"repo": repository, "id": claim_id, "state": state})),
+        )?
+    } else {
+        store_graph::one(
+            db,
+            "MATCH (c:Claim {repository_id: $repo, id: $id}) RETURN c",
+            store_graph::params(&json!({"repo": repository, "id": claim_id})),
+        )?
+    };
+    match row {
+        Some(row) => {
+            let mut record = store_graph::node(&row, "c");
+            crate::store::decode(&mut record, "data")?;
+            Ok(Some(record))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn current(
+    db: &Connection,
+    graph: &GraphStore,
+    repository: &Value,
+    p: &Principal,
+) -> Result<Vec<Value>> {
+    let memories = memory::list(db, graph, repository, p, true)?;
     let allowed: BTreeMap<&str, &Value> = memories
         .iter()
         .filter(|m| m["state"] == "reviewed" && m["stale"] != true)
         .map(|m| (s(m, "id"), m))
         .collect();
     let mut output = Vec::new();
-    for mut row in rows(
-        db,
-        "SELECT * FROM am_claims WHERE repository_id=? AND state='active' ORDER BY id",
-        [s(repository, "id")],
-    )? {
+    for row in graph.read(|db| {
+        store_graph::rows(
+            db,
+            "MATCH (c:Claim {repository_id: $repo, state: 'active'}) RETURN c ORDER BY c.id",
+            store_graph::params(&json!({"repo": s(repository, "id")})),
+        )
+    })? {
+        let mut row = store_graph::node(&row, "c");
+        crate::store::decode(&mut row, "data")?;
         if let Some(memory) = allowed.get(s(&row, "memory_id")) {
-            decode(&mut row, "data")?;
             row["memory_revision"] = memory["revision"].clone();
             output.push(row);
         }
@@ -31,6 +70,7 @@ pub fn current(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec
 }
 pub fn propose(
     db: &Connection,
+    graph: &GraphStore,
     repository: &Value,
     p: &Principal,
     claims: &Value,
@@ -56,11 +96,7 @@ pub fn propose(
     let mut output = Vec::new();
     for claim in checked["claims"].as_array().unwrap() {
         let claim_id = s(claim, "id");
-        if let Some(prior) = one(
-            db,
-            "SELECT memory_id,state FROM am_claims WHERE repository_id=? AND id=?",
-            params![identifier, claim_id],
-        )? {
+        if let Some(prior) = graph.read(|g| claim_row(g, identifier, claim_id, None))? {
             output.push(json!({"claim_id":claim_id,"memory_id":prior["memory_id"],"state":prior["state"],"replayed":true}));
             continue;
         }
@@ -105,6 +141,7 @@ pub fn propose(
         let title = graphicle_memory::text::prefix(&title, 120, 500);
         let draft = memory::save(
             db,
+            graph,
             identifier,
             None,
             None,
@@ -117,19 +154,20 @@ pub fn propose(
         let mut persisted = claim.clone();
         persisted["knowledge_at"] = json!(now());
         persisted["target_revision"] = data["target_revision"].clone();
-        db.execute(
-            "INSERT INTO am_claims VALUES(?,?,?,?,?,?,?,?)",
-            params![
-                claim_id,
-                identifier,
-                s(&draft, "id"),
-                "draft",
-                persisted.to_string(),
-                source_state,
-                now(),
-                now()
-            ],
-        )?;
+        graph.transaction(|g| {
+            store_graph::rows(
+                g,
+                "CREATE (c:Claim {id: $id, repository_id: $repo, memory_id: $memory_id, \
+                 state: 'draft', data: $data, source_state: $source_state, \
+                 created_at: $at, updated_at: $at}) \
+                 WITH c MATCH (m:Memory {id: $memory_id}) CREATE (c)-[:ABOUT_MEMORY]->(m) \
+                 RETURN c.id AS id",
+                store_graph::params(&json!({"id":claim_id,"repo":identifier,
+                    "memory_id":s(&draft,"id"),"data":persisted.to_string(),"source_state":source_state,
+                    "at":now()})),
+            )?;
+            Ok(())
+        })?;
         output.push(json!({"claim_id":claim_id,"memory_id":draft["id"],"revision":draft["revision"],"state":"draft","action":claim["action"]}));
     }
     Ok(
@@ -138,45 +176,45 @@ pub fn propose(
 }
 pub fn apply_memory_review(
     db: &Connection,
+    graph: &GraphStore,
     repository: &str,
     draft_id: &str,
     result_id: &str,
     decision: &str,
 ) -> Result<()> {
-    let Some(mut claim) = one(
-        db,
-        "SELECT * FROM am_claims WHERE repository_id=? AND memory_id=?",
-        params![repository, draft_id],
-    )?
-    else {
+    let claim = graph.read(|g| {
+        Ok(store_graph::one(
+            g,
+            "MATCH (c:Claim {repository_id: $repo, memory_id: $mid}) RETURN c",
+            store_graph::params(&json!({"repo": repository, "mid": draft_id})),
+        )?
+        .map(|row| store_graph::node(&row, "c")))
+    })?;
+    let Some(mut claim) = claim else {
         return Ok(());
     };
-    decode(&mut claim, "data")?;
+    crate::store::decode(&mut claim, "data")?;
     let mut data = claim["data"].clone();
     if decision != "approve" {
-        db.execute(
-            "UPDATE am_claims SET state='rejected',updated_at=? WHERE id=?",
-            params![now(), s(&claim, "id")],
-        )?;
+        graph.transaction(|g| {
+            store_graph::rows(
+                g,
+                "MATCH (c:Claim {id: $id}) SET c.state = 'rejected', c.updated_at = $at \
+                 RETURN c.id AS id",
+                store_graph::params(&json!({"id": s(&claim, "id"), "at": now()})),
+            )?;
+            Ok(())
+        })?;
         return Ok(());
     }
     let action = s(&data, "action").to_string();
     let stamp = now();
     if let Some(target) = data["target_id"].as_str() {
-        let mut old = one(
-            db,
-            "SELECT * FROM am_claims WHERE repository_id=? AND id=? AND state='active'",
-            params![repository, target],
-        )?
-        .ok_or_else(|| Error::conflict("Claim target is no longer current"))?;
-        decode(&mut old, "data")?;
-        let mut memory = one(
-            db,
-            "SELECT * FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, s(&old, "memory_id")],
-        )?
-        .ok_or_else(|| Error::conflict("Target memory disappeared"))?;
-        decode(&mut memory, "data")?;
+        let mut old = graph
+            .read(|g| claim_row(g, repository, target, Some("active")))?
+            .ok_or_else(|| Error::conflict("Claim target is no longer current"))?;
+        let memory = memory::memory_row(graph, repository, s(&old, "memory_id"))?
+            .ok_or_else(|| Error::conflict("Target memory disappeared"))?;
         if memory["revision"] != data["target_revision"]["revision"] {
             return Err(Error::conflict("Target revision changed before approval"));
         }
@@ -185,6 +223,7 @@ pub fn apply_memory_review(
             old_data["retirement"] = json!({"action":action,"by_claim":claim["id"],"knowledge_at":stamp,"valid_at":data["valid_at"]});
             memory::save(
                 db,
+                graph,
                 repository,
                 Some(s(&memory, "id")),
                 memory["revision"].as_i64(),
@@ -199,44 +238,42 @@ pub fn apply_memory_review(
             if action == "SUPERSEDE" && !data["valid_at"].is_null() {
                 old["data"]["invalid_at"] = data["valid_at"].clone();
             }
-            db.execute(
-                "UPDATE am_claims SET state='retired',data=?,updated_at=? WHERE id=?",
-                params![old["data"].to_string(), stamp, s(&old, "id")],
-            )?;
-            db.execute(
-                "INSERT INTO am_claim_events VALUES(?,?,?,?,?,?)",
-                params![
-                    id(),
-                    repository,
-                    s(&old, "id"),
-                    "RETIRE",
-                    old["data"].to_string(),
-                    stamp
-                ],
-            )?;
+            graph.transaction(|g| {
+                store_graph::rows(
+                    g,
+                    "MATCH (c:Claim {id: $id}) \
+                     SET c.state = 'retired', c.data = $data, c.updated_at = $at \
+                     CREATE (e:ClaimEvent {id: $eid, repository_id: $repo, claim_id: $id, \
+                         action: 'RETIRE', data: $data, created_at: $at})-[:FOR]->(c) \
+                     RETURN c.id AS id",
+                    store_graph::params(&json!({"id":s(&old,"id"),"data":old["data"].to_string(),
+                        "at":stamp,"eid":id(),"repo":repository})),
+                )?;
+                Ok(())
+            })?;
         }
         // Target history remains provenance, without a live freshness dependency
         // on a fact that this revision deliberately superseded.
-        if let Some(mut memory) = one(
-            db,
-            "SELECT * FROM repo_memories WHERE repository_id=? AND id=?",
-            params![repository, result_id],
-        )? {
-            decode(&mut memory, "data")?;
+        if let Some(mut memory) = memory::memory_row(graph, repository, result_id)? {
             if let Some(notes) = memory["data"]["notes"].as_object_mut() {
                 notes.remove(s(&old, "memory_id"));
             }
             memory["data"]["historical_target"] = data["target_revision"].clone();
-            db.execute(
-                "UPDATE repo_memories SET data=? WHERE id=?",
-                params![memory["data"].to_string(), result_id],
-            )?;
             let mut journal = memory.clone();
             journal["data"] = json!(memory["data"].to_string());
-            db.execute(
-                "UPDATE repo_memory_revisions SET data=? WHERE memory_id=? AND revision=?",
-                params![journal.to_string(), result_id, memory["revision"].as_i64()],
-            )?;
+            graph.transaction(|g| {
+                store_graph::rows(
+                    g,
+                    "MATCH (m:Memory {id: $id}) SET m.data = $data \
+                     WITH m MATCH (r:MemoryRevision {memory_id: $id, revision: m.revision}) \
+                     SET r.data = $raw RETURN m.id AS id",
+                    store_graph::params(
+                        &json!({"id": result_id, "data": memory["data"].to_string(),
+                        "raw": journal.to_string()}),
+                    ),
+                )?;
+                Ok(())
+            })?;
         }
     }
     data["approved_at"] = json!(stamp);
@@ -245,23 +282,8 @@ pub fn apply_memory_review(
     } else {
         "active"
     };
-    db.execute(
-        "UPDATE am_claims SET memory_id=?,state=?,data=?,updated_at=? WHERE id=?",
-        params![result_id, state, data.to_string(), stamp, s(&claim, "id")],
-    )?;
-    db.execute(
-        "INSERT INTO am_claim_events VALUES(?,?,?,?,?,?)",
-        params![
-            id(),
-            repository,
-            s(&claim, "id"),
-            action,
-            data.to_string(),
-            stamp
-        ],
-    )?;
+    let mut entities = Vec::new();
     if state == "active" {
-        let mut entities = Vec::new();
         for facet in ["subject", "object"] {
             let name = s(&data, facet);
             let provenance = data["evidence"]
@@ -269,30 +291,64 @@ pub fn apply_memory_review(
                 .unwrap()
                 .first()
                 .map(|v| v["id"].clone());
-            let entity_id = digest(
+            entities.push(digest(
                 &json!({"repository":repository,"name":name,"speaker":data["speaker"],"source":provenance}),
-            );
-            db.execute(
-                "INSERT OR IGNORE INTO am_entities VALUES(?,?,?,?,?,?)",
-                params![
-                    entity_id,
-                    repository,
-                    name,
-                    "source_scoped",
-                    json!({"speaker":data["speaker"],"source":provenance}).to_string(),
-                    stamp
-                ],
-            )?;
-            entities.push(entity_id);
+            ));
         }
-        db.execute(
-            "INSERT OR REPLACE INTO am_entity_links VALUES(?,?,?,?)",
-            params![repository, s(&claim, "id"), entities[0], entities[1]],
-        )?;
     }
+    let claim_id = s(&claim, "id").to_string();
+    graph.transaction(|g| {
+        store_graph::rows(
+            g,
+            "MATCH (c:Claim {id: $id}) \
+             SET c.memory_id = $mid, c.state = $state, c.data = $data, c.updated_at = $at \
+             CREATE (e:ClaimEvent {id: $eid, repository_id: $repo, claim_id: $id, \
+                 action: $action, data: $data, created_at: $at})-[:FOR]->(c) \
+             RETURN c.id AS id",
+            store_graph::params(&json!({"id":claim_id,"mid":result_id,"state":state,
+                "data":data.to_string(),"at":stamp,"eid":id(),"repo":repository,"action":action})),
+        )?;
+        if state == "active" {
+            for (facet, entity_id) in ["subject", "object"].iter().zip(&entities) {
+                let provenance = data["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .first()
+                    .map(|v| v["id"].clone());
+                store_graph::rows(
+                    g,
+                    "MERGE (e:Entity {id: $id}) ON CREATE SET e.repository_id = $repo, \
+                     e.name = $name, e.kind = 'source_scoped', e.data = $data, \
+                     e.created_at = $at RETURN e.id AS id",
+                    store_graph::params(&json!({"id":entity_id,"repo":repository,
+                        "name":s(&data, facet),"at":stamp,
+                        "data":json!({"speaker":data["speaker"],"source":provenance}).to_string()})),
+                )?;
+            }
+            store_graph::rows(
+                g,
+                "MATCH (c:Claim {id: $cid}) \
+                 OPTIONAL MATCH (c)-[rs:HAS_SUBJECT]->() DELETE rs \
+                 WITH c OPTIONAL MATCH (c)-[ro:HAS_OBJECT]->() DELETE ro \
+                 WITH c MATCH (s:Entity {id: $sid}), (o:Entity {id: $oid}) \
+                 CREATE (c)-[:HAS_SUBJECT]->(s) CREATE (c)-[:HAS_OBJECT]->(o) \
+                 RETURN c.id AS id",
+                store_graph::params(
+                    &json!({"cid":claim_id,"sid":entities[0],"oid":entities[1]}),
+                ),
+            )?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
-pub fn prepare(db: &Connection, repository: &Value, p: &Principal, args: &Value) -> Result<Value> {
+pub fn prepare(
+    db: &Connection,
+    graph: &GraphStore,
+    repository: &Value,
+    p: &Principal,
+    args: &Value,
+) -> Result<Value> {
     let docs = memory::documents(db, repository, p)?;
     let limit = crate::integer(args, "limit", 4, 12)?.max(1);
     // Any byte of a document: an indexed file or a converted or connector
@@ -317,7 +373,7 @@ pub fn prepare(db: &Connection, repository: &Value, p: &Principal, args: &Value)
     if sources.is_empty() {
         return Err(Error::bad("No authorized sources to interpret"));
     }
-    let targets = current(db, repository, p)?
+    let targets = current(db, graph, repository, p)?
         .into_iter()
         .filter(|t| {
             t["data"]["evidence"]
@@ -347,7 +403,7 @@ impl Store {
             if propose_draft { "propose" } else { "read" },
             |db, p| {
                 let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-                let prepared = prepare(db, &repository, p, args)?;
+                let prepared = prepare(db, &self.graph(), &repository, p, args)?;
                 if !propose_draft {
                     return Ok(prepared);
                 }
@@ -358,6 +414,7 @@ impl Store {
                 }
                 propose(
                     db,
+                    &self.graph(),
                     &repository,
                     p,
                     &args["claims"],
@@ -372,7 +429,8 @@ impl Store {
     pub fn claim_history(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized(workspace, token, "read", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let memories = memory::list(db, &repository, p, true)?;
+            let graph = self.graph();
+            let memories = memory::list(db, &graph, &repository, p, true)?;
             let mut claims = Vec::new();
             let as_of = args["as_of"]
                 .as_str()
@@ -384,36 +442,78 @@ impl Store {
                 .map(graphicle_memory::temporal::instant)
                 .transpose()
                 .map_err(Error::bad)?;
-            for mut row in rows(
-                db,
-                "SELECT * FROM am_claims WHERE repository_id=? ORDER BY created_at,id",
-                [s(&repository, "id")],
-            )? {
+            for row in graph.read(|g| {
+                store_graph::rows(
+                    g,
+                    "MATCH (c:Claim {repository_id: $repo}) RETURN c ORDER BY c.created_at, c.id",
+                    store_graph::params(&json!({"repo": s(&repository, "id")})),
+                )
+            })? {
+                let mut row = store_graph::node(&row, "c");
+                crate::store::decode(&mut row, "data")?;
                 if !memories.iter().any(|m| m["id"] == row["memory_id"]) {
                     continue;
                 }
-                decode(&mut row, "data")?;
                 // Reconstruct the knowledge view from immutable events. The
                 // current row may contain an invalidation learned much later.
                 if let Some(at) = known_at {
-                    let mut selected=None;
-                    for mut event in rows(db,"SELECT action,data,created_at FROM am_claim_events WHERE repository_id=? AND claim_id=? ORDER BY created_at,rowid",params![s(&repository,"id"),s(&row,"id")])? {
-                        if graphicle_memory::temporal::instant(s(&event,"created_at")).map_err(Error::bad)?<=at {
-                            decode(&mut event,"data")?;selected=Some(event);
+                    let mut selected = None;
+                    for mut event in graph.read(|g| {
+                        store_graph::rows(
+                            g,
+                            "MATCH (e:ClaimEvent {repository_id: $repo, claim_id: $cid}) \
+                             RETURN e.action AS action, e.data AS data, e.created_at AS created_at \
+                             ORDER BY e.created_at, e.id",
+                            store_graph::params(
+                                &json!({"repo":s(&repository,"id"),"cid":s(&row,"id")}),
+                            ),
+                        )
+                    })? {
+                        if graphicle_memory::temporal::instant(s(&event, "created_at"))
+                            .map_err(Error::bad)?
+                            <= at
+                        {
+                            crate::store::decode(&mut event, "data")?;
+                            selected = Some(event);
                         }
                     }
-                    let Some(event)=selected else {continue;};
-                    row["data"]=event["data"].clone();
-                    row["state"]=json!(if event["action"]=="RETIRE" {"retired"} else if ["KEEP","CONFIRM","RETRACT"].contains(&s(&event,"action")) {"event"} else {"active"});
-                    row["updated_at"]=event["created_at"].clone();
+                    let Some(event) = selected else {
+                        continue;
+                    };
+                    row["data"] = event["data"].clone();
+                    row["state"] = json!(if event["action"] == "RETIRE" {
+                        "retired"
+                    } else if ["KEEP", "CONFIRM", "RETRACT"].contains(&s(&event, "action")) {
+                        "event"
+                    } else {
+                        "active"
+                    });
+                    row["updated_at"] = event["created_at"].clone();
                 }
-                let data=&row["data"];
-                if (known_at.is_some() || as_of.is_some()) && data["approved_at"].is_null() {continue;}
-                if (known_at.is_some() || as_of.is_some()) && row["state"]=="retired" && data["retirement_action"]!="SUPERSEDE" {continue;}
-                if let Some(at)=as_of {
-                    let lower=data["valid_at"].as_str().map(graphicle_memory::temporal::instant).transpose().map_err(Error::bad)?;
-                    let upper=data["invalid_at"].as_str().map(graphicle_memory::temporal::instant).transpose().map_err(Error::bad)?;
-                    if lower.is_some_and(|t|t>at) || upper.is_some_and(|t|t<=at) {continue;}
+                let data = &row["data"];
+                if (known_at.is_some() || as_of.is_some()) && data["approved_at"].is_null() {
+                    continue;
+                }
+                if (known_at.is_some() || as_of.is_some())
+                    && row["state"] == "retired"
+                    && data["retirement_action"] != "SUPERSEDE"
+                {
+                    continue;
+                }
+                if let Some(at) = as_of {
+                    let lower = data["valid_at"]
+                        .as_str()
+                        .map(graphicle_memory::temporal::instant)
+                        .transpose()
+                        .map_err(Error::bad)?;
+                    let upper = data["invalid_at"]
+                        .as_str()
+                        .map(graphicle_memory::temporal::instant)
+                        .transpose()
+                        .map_err(Error::bad)?;
+                    if lower.is_some_and(|t| t > at) || upper.is_some_and(|t| t <= at) {
+                        continue;
+                    }
                 }
                 claims.push(row);
             }

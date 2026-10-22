@@ -265,20 +265,38 @@ async fn a_member_job_is_cancelled_at_lease_once_team_sign_in_is_off() {
             &f.args(json!({"sync_id":begin["sync_id"]})),
         )
         .unwrap();
-    let queued = f.count("SELECT count(*) FROM am_jobs WHERE kind='project' AND state='queued'");
+    let queued = f
+        .store
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {kind: 'project', state: 'queued'}) RETURN count(j) AS n",
+                graphicle_runtime::store_graph::Params::new(),
+            )
+        })
+        .unwrap()
+        .and_then(|row| row["n"].as_i64())
+        .unwrap_or(0);
     assert_eq!(queued, 1);
     // The owner turns team sign-in off before any worker runs.
     f.db().execute("UPDATE am_sso SET enabled=0", []).unwrap();
     let worker = Worker::new(f.store.clone(), model::Config::default()).unwrap();
     worker.once().await.unwrap();
-    let (state, error): (String, Option<String>) = f
-        .db()
-        .query_row(
-            "SELECT state,error FROM am_jobs WHERE kind='project'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let row = f
+        .store
+        .graph()
+        .read(|db| {
+            graphicle_runtime::store_graph::one(
+                db,
+                "MATCH (j:Job {kind: 'project'}) RETURN j.state AS state, j.error AS error",
+                graphicle_runtime::store_graph::Params::new(),
+            )
+        })
+        .unwrap()
         .unwrap();
+    let state = row["state"].as_str().unwrap_or("").to_string();
+    let error = row["error"].as_str().map(str::to_string);
     assert_eq!(state, "cancelled");
     assert_eq!(error.as_deref(), Some("Credential unavailable"));
 }

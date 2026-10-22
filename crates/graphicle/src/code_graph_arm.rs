@@ -90,7 +90,7 @@ pub fn reading(
     heads: &BTreeMap<String, String>,
     current: &str,
 ) -> Result<Option<Reading>> {
-    if graph_projection::is_recorded(db, repository, current)? {
+    if graph_projection::is_recorded(&*crate::store::graph_for(db)?, repository, current)? {
         return Ok(Some(Reading {
             episode: current.to_string(),
             lag: None,
@@ -105,7 +105,12 @@ pub fn reading(
         return Ok(None);
     };
     let episode = s(&latest, "episode").to_string();
-    let Some(recorded) = graph_projection::stored_episode_heads(db, repository, &episode)? else {
+    let Some(recorded) = graph_projection::stored_episode_heads(
+        &*crate::store::graph_for(db)?,
+        repository,
+        &episode,
+    )?
+    else {
         return Ok(None);
     };
     let unchanged: BTreeSet<String> = heads
@@ -227,12 +232,13 @@ pub fn node_span(
 /// it. The job is reported by state only. Whoever synced queued it, and job
 /// listings show a job only to its principal and owners.
 pub fn skip_reason(
+    graph_store: &crate::store_graph::GraphStore,
     db: &Connection,
     repository: &str,
     heads: &BTreeMap<String, String>,
     episode: &str,
 ) -> Result<Value> {
-    let projection = crate::jobs::projection_state(db, repository, episode)?;
+    let projection = crate::jobs::projection_state(graph_store, repository, episode)?;
     // The latest recorded episode. Every episode of a project is one of its
     // head sets: `graphicle pr` records commit trees in a separate PR scratch
     // project, so no
@@ -243,14 +249,18 @@ pub fn skip_reason(
         [repository],
     )?;
     let lag = match &latest {
-        Some(row) => graph_projection::stored_episode_heads(db, repository, s(row, "episode"))?
-            .map(|recorded| {
-                let changed = heads
-                    .iter()
-                    .filter(|(path, sha)| recorded.get(*path) != Some(*sha))
-                    .count();
-                changed + recorded.keys().filter(|p| !heads.contains_key(*p)).count()
-            }),
+        Some(row) => graph_projection::stored_episode_heads(
+            &*crate::store::graph_for(db)?,
+            repository,
+            s(row, "episode"),
+        )?
+        .map(|recorded| {
+            let changed = heads
+                .iter()
+                .filter(|(path, sha)| recorded.get(*path) != Some(*sha))
+                .count();
+            changed + recorded.keys().filter(|p| !heads.contains_key(*p)).count()
+        }),
         None => None,
     };
     Ok(
@@ -441,8 +451,14 @@ pub fn symbols_in(
 
 /// Lexical candidates and their one-hop neighbourhood on the episode the arm
 /// reads ([`reading`]), anchored to the caller's authorized source view.
-pub fn arm(db: &Connection, repository: &str, snapshot: &Snapshot, question: &str) -> Result<Arm> {
-    arm_with(db, repository, snapshot, question, true)
+pub fn arm(
+    graph_store: &crate::store_graph::GraphStore,
+    db: &Connection,
+    repository: &str,
+    snapshot: &Snapshot,
+    question: &str,
+) -> Result<Arm> {
+    arm_with(graph_store, db, repository, snapshot, question, true)
 }
 
 /// A document node of an episode: a Markdown or reStructuredText page or
@@ -511,6 +527,7 @@ fn code_candidates(
 /// document nodes take no part: they are not candidates, seeds or cited
 /// neighbours ([`code_candidates`]).
 pub fn arm_with(
+    graph_store: &crate::store_graph::GraphStore,
     db: &Connection,
     repository: &str,
     snapshot: &Snapshot,
@@ -525,7 +542,7 @@ pub fn arm_with(
     let Some(Reading { episode, lag }) = reading(db, repository, &heads, &current)? else {
         return Ok(Arm {
             hits: Vec::new(),
-            diagnostics: skip_reason(db, repository, &heads, &current)?,
+            diagnostics: skip_reason(graph_store, db, repository, &heads, &current)?,
         });
     };
     // Under the lag fallback a node in a changed file may lead the walk, but
@@ -539,13 +556,13 @@ pub fn arm_with(
             diagnostics["episode_lag"] = json!(lag.changed);
             diagnostics["current_episode"] = json!(lag.current);
             diagnostics["projection"] =
-                json!(crate::jobs::projection_state(db, repository, &lag.current)?);
+                json!(crate::jobs::projection_state(graph_store, repository, &lag.current)?);
             diagnostics["withheld_changed"] = json!(withheld);
             diagnostics["withheld_stale_edges"] = json!(stale);
         }
         Ok::<_, crate::Error>(())
     };
-    let handle = graph_projection::resident(db, repository, &episode)?;
+    let handle = graph_projection::resident(&*crate::store::graph_for(db)?, repository, &episode)?;
     let reference = graph_projection::graph_ref(repository, &episode);
     let index = resident_index(&reference, &handle);
     let graph: &Graph = &handle;
@@ -762,7 +779,7 @@ pub fn integration_default(db: &Connection, repository: &str) -> Result<Value> {
     let Some(Reading { episode, .. }) = reading(db, repository, &heads, &current)? else {
         return Ok(json!({"integrated": false, "reason": "no_episode", "episode": null}));
     };
-    let handle = graph_projection::resident(db, repository, &episode)?;
+    let handle = graph_projection::resident(&*crate::store::graph_for(db)?, repository, &episode)?;
     let graph: &Graph = &handle;
     let integrated = graph
         .nodes()
