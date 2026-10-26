@@ -355,45 +355,19 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     Ok(graph)
 }
 
-/// Directories whose writer lease a probe found held, with when it did: a
-/// read command beside a running server must not pay the full lease wait
-/// once per graph access (a `context` reads the graph a dozen times). The
-/// hint is short-lived and only ever routes a call to the read-only engine,
-/// whose writes fail where the caller reports them.
-static LEASE_HELD: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new());
-
-/// How long a lease probe's finding stands before the next call probes again.
-const LEASE_HINT: Duration = Duration::from_secs(5);
-
-fn lease_held_recently(key: &Path) -> bool {
-    LEASE_HELD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(key)
-        .is_some_and(|at| at.elapsed() < LEASE_HINT)
-}
-
-fn note_lease_held(key: &Path) {
-    LEASE_HELD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key.to_path_buf(), Instant::now());
-}
-
 /// The graph handle an operation gets: the writer's, or — when another
 /// process holds the writer lease for the whole retry window — the
 /// read-only follower, so a read beside a running server answers (as it did
 /// against SQLite, whose readers never took the write lock). A write through
 /// the follower fails in the engine, where the caller reports it.
+///
+/// No lease hint: a transient holder (a fork-guard child, a projection
+/// worker between steps) must not route this process's own writes to the
+/// read-only engine — each access probes the lease itself.
 fn graph_for_operation(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
-    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-    if lease_held_recently(&key) {
-        return graph_in_read_only(directory);
-    }
     match graph_in(directory) {
         Ok(graph) => Ok(graph),
         Err(error) if error.message.contains("storage locked") => {
-            note_lease_held(&key);
             graph_in_read_only(directory)
         }
         Err(error) => Err(error),
@@ -498,7 +472,6 @@ impl Store {
             if !error.message.contains("storage locked") {
                 return Err(error);
             }
-            note_lease_held(&std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf()));
         }
         let db = store.connect()?;
         // A store that needs a newer program is refused before anything in

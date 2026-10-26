@@ -29,11 +29,12 @@
 use crate::{
     Error, Result,
     query::Snapshot,
-    store::{Principal, rows, s},
+    store::{Principal, s},
+    store_graph,
     symbols::{self, Live},
 };
 use graphicle_memory::graph::span;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -102,16 +103,24 @@ fn links_of<'m>(
     if out.is_empty() {
         return Ok(out);
     }
-    let ids: BTreeSet<&String> = out.keys().collect();
-    for row in rows(
-        db,
-        "SELECT memory_id,symbols FROM gf_symbol_pins WHERE repository_id=?1 AND state='pinned' \
-         AND memory_id IN (SELECT value FROM json_each(?2)) ORDER BY memory_id,relpath,byte_start",
-        params![repository, json!(ids).to_string()],
-    )? {
-        let pinned: Vec<Value> = serde_json::from_str(s(&row, "symbols")).unwrap_or_default();
-        if let Some(links) = out.get_mut(s(&row, "memory_id")) {
-            links.extend(resolved(&pinned).cloned());
+    let ids: Vec<String> = out.keys().cloned().collect();
+    if !ids.is_empty() {
+        let graph = crate::store::graph_for(db)?;
+        for row in graph.read(|g| {
+            store_graph::rows(
+                g,
+                "MATCH (m:Memory {repository_id: $repo})-[p:PINNED_TO]->() \
+                 WHERE p.state = 'pinned' AND m.id IN $ids \
+                 RETURN m.id AS memory_id, p.symbols AS symbols \
+                 ORDER BY m.id, p.relpath, p.byte_start",
+                store_graph::params(&json!({"repo": repository, "ids": ids})),
+            )
+        })? {
+            let pinned: Vec<Value> =
+                serde_json::from_str(s(&row, "symbols")).unwrap_or_default();
+            if let Some(links) = out.get_mut(s(&row, "memory_id")) {
+                links.extend(resolved(&pinned).cloned());
+            }
         }
     }
     for links in out.values_mut() {
@@ -386,21 +395,56 @@ pub fn attach(
     if ids.is_empty() {
         return Ok(());
     }
-    // Which reviewed memories name these symbols at all: only then is the
-    // reader's view of the project's memories read.
-    let named: BTreeSet<String> = rows(
-        db,
-        "SELECT m.id AS id FROM repo_memories m, json_each(m.data,'$.symbols') j \
-         WHERE m.repository_id=?1 AND m.state='reviewed' \
-         AND json_extract(j.value,'$.stable_id') IN (SELECT value FROM json_each(?2)) \
-         UNION SELECT g.memory_id AS id FROM gf_symbol_pins g, json_each(g.symbols) j \
-         WHERE g.repository_id=?1 AND g.state='pinned' \
-         AND json_extract(j.value,'$.stable_id') IN (SELECT value FROM json_each(?2))",
-        params![project, json!(ids).to_string()],
+    // Which reviewed memories name these symbols at all: their own resolved
+    // links (`data.symbols`) and their landed pins, decoded from the
+    // stringified JSON the graph stores (the SQL read `json_each` over
+    // both). Only then is the reader's view of the project's memories read.
+    // A memory's `data` holds its links under `symbols` (the SQL read
+    // `json_each(m.data,'$.symbols')`); a pin's `symbols` is the list
+    // itself.
+    let names_symbol = |payload: &str| {
+        serde_json::from_str::<Value>(payload)
+            .map(|value| {
+                let links = value
+                    .as_array()
+                    .cloned()
+                    .or_else(|| value["symbols"].as_array().cloned())
+                    .unwrap_or_default();
+                links
+                    .iter()
+                    .any(|symbol| {
+                        symbol["stable_id"]
+                            .as_str()
+                            .is_some_and(|stable| ids.contains(stable))
+                    })
+            })
+            .unwrap_or(false)
+    };
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    let reviewed = store_graph::rows(
+        &mut graph,
+        "MATCH (m:Memory {repository_id: $repo}) WHERE m.state = 'reviewed' \
+         RETURN m.id AS id, m.data AS data",
+        store_graph::params(&json!({"repo": project})),
+    )?;
+    reviewed
+        .iter()
+        .filter(|row| names_symbol(s(row, "data")))
+        .for_each(|row| {
+            named.insert(s(row, "id").to_string());
+        });
+    store_graph::rows(
+        &mut graph,
+        "MATCH (m:Memory {repository_id: $repo})-[p:PINNED_TO]->() \
+         WHERE p.state = 'pinned' \
+         RETURN m.id AS id, p.symbols AS symbols",
+        store_graph::params(&json!({"repo": project})),
     )?
     .iter()
-    .map(|row| s(row, "id").to_string())
-    .collect();
+    .filter(|row| names_symbol(s(row, "symbols")))
+    .for_each(|row| {
+        named.insert(s(row, "id").to_string());
+    });
     // One view of what the reader may read for every node: each project's
     // documents are listed at most once per call (the project's own once,
     // shared with its memory listing).

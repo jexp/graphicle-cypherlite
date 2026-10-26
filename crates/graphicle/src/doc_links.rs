@@ -3435,12 +3435,26 @@ fn naming(
     limit: usize,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::new();
-    for link in rows(
-        readable.db,
-        "SELECT * FROM gf_doc_links WHERE target_repository_id=? AND stable_id=? AND state='linked' \
-         AND producer IN (SELECT value FROM json_each(?)) ORDER BY repository_id,document_id,byte_start,id",
-        params![project, stable, producers],
-    )? {
+    // The producers are one stringified JSON array (the SQL `json_each`
+    // unpacked them); `IN` wants the list itself.
+    let producers: Value = serde_json::from_str(producers)?;
+    let graph = crate::store::graph_for(readable.db)?;
+    for link in graph.read(|g| {
+        store_graph::rows(
+            g,
+            &format!(
+                "MATCH (d:ConnectorDoc)-[l:LINKS_TO]->() \
+                 WHERE l.target_repository_id = $repo AND l.stable_id = $stable \
+                 AND l.state = 'linked' AND l.producer IN $producers \
+                 RETURN {LINK_COLUMNS} ORDER BY d.repository_id, d.id, l.byte_start, l.seq"
+            ),
+            gparams([
+                ("repo", json!(project)),
+                ("stable", json!(stable)),
+                ("producers", producers),
+            ]),
+        )
+    })? {
         let document = s(&link, "document_id");
         if readable
             .document(s(&link, "repository_id"), document)?
