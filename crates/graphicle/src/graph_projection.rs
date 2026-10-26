@@ -236,7 +236,10 @@ pub fn build_graph_with_report(
     let dir = crate::phase::phase("graph_materialize", || {
         // Source objects are CAS nodes in the graph store
         // (store_content owns Object writes via put_objects/activate).
-        let mut graph_db = crate::store::graph_for(db)?.connection()?;
+        // The store handle stays bound for the connection's scope (see
+        // doc_links for why a dropped handle deadlocks the registry).
+        let graph_store = crate::store::graph_for(db)?;
+        let mut graph_db = graph_store.connection()?;
         crate::graph_materialize::prepare(&mut graph_db, repository, &heads, cache.as_deref())
     })?;
     // Canonical root: node identities derive from paths relative to it, and a

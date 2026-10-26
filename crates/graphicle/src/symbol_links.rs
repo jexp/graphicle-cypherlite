@@ -175,8 +175,11 @@ pub fn lift(
     selected_memories: &[Value],
     candidates: &[Value],
 ) -> Result<Lifted> {
-    // The live symbols are graph-resident; the SQL connection bridges to it.
-    let mut graph = crate::store::graph_for(db)?.connection()?;
+    // The live symbols are graph-resident; the SQL connection bridges to
+    // it. The store handle stays bound for the connection's scope (see
+    // doc_links for why a dropped handle deadlocks the registry).
+    let graph_store = crate::store::graph_for(db)?;
+    let mut graph = graph_store.connection()?;
     let servable: Vec<&Value> = rows.iter().filter(|row| row["kind"] == "memory").collect();
     let links = if mode == Mode::Off {
         HashMap::new()
@@ -385,7 +388,8 @@ pub fn attach(
     repository: &Value,
     nodes: &mut [Value],
 ) -> Result<()> {
-    let mut graph = crate::store::graph_for(db)?.connection()?;
+    let graph_store = crate::store::graph_for(db)?;
+    let mut graph = graph_store.connection()?;
     let project = s(repository, "id");
     let ids: BTreeSet<String> = nodes
         .iter()

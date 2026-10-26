@@ -1147,7 +1147,12 @@ fn symbol_versions(
     db: &Connection,
     project: &str,
 ) -> Result<Vec<(Option<String>, String, String, Option<String>)>> {
-    let mut g = crate::store::graph_for(db)?.connection()?;
+    // The store handle stays bound for the connection's scope: a dropped
+    // handle leaves the engine alive through the connection while the
+    // registry entry dies — the next `graph_for` would miss the registry
+    // and fight the connection's own lease for the whole retry window.
+    let graph_store = crate::store::graph_for(db)?;
+    let mut g = graph_store.connection()?;
     let rows = crate::store_graph::rows(
         &mut g,
         "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v:SymbolVersion) \
