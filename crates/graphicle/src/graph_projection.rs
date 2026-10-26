@@ -2317,51 +2317,81 @@ fn export_surface(index: &ExportIndex) -> String {
 /// The live link rows of `repository` as its import report: what its last
 /// link wrote. Only the persisted fields are filled; the persistence of
 /// [`link_workspace`] reads nothing else.
-fn previous_report(db: &Connection, repository: &str, episode: &str) -> Result<xrepo::LinkReport> {
+/// The previous pass's rows for one importer, for a reused link: its live
+/// `CROSS_CALL` edges and `UnresolvedCross` nodes (the SQL mirrors were
+/// never written).
+fn previous_report(
+    store: &GraphStore,
+    repository: &str,
+    episode: &str,
+) -> Result<xrepo::LinkReport> {
     let text = |row: &Value, field: &str| row[field].as_str().map(str::to_string);
     let line = |row: &Value| row["line"].as_u64().map(|line| line as usize);
-    let edges = rows(
-        db,
-        "SELECT * FROM gf_cross_edges WHERE source_repository_id=? AND valid_to_episode IS NULL ORDER BY id",
-        [repository],
-    )?
-    .iter()
-    .map(|row| xrepo::CrossEdge {
-        source: xrepo::EdgeEnd {
-            repo: repository.to_string(),
-            node_id: s(row, "source_node_id").to_string(),
-            stable_id: text(row, "source_stable_id"),
-            ..Default::default()
-        },
-        target: xrepo::EdgeEnd {
-            repo: s(row, "target_repository_id").to_string(),
-            node_id: s(row, "target_node_id").to_string(),
-            stable_id: text(row, "target_stable_id"),
-            ..Default::default()
-        },
-        relation: s(row, "relation").to_string(),
-        confidence: s(row, "confidence").to_string(),
-        derivation: s(row, "derivation").to_string(),
-        module_path: s(row, "module_path").to_string(),
-        symbol: text(row, "symbol"),
-        version_constraint: text(row, "version_constraint"),
-        exporter_version: text(row, "exporter_version"),
-        version_status: s(row, "version_status").to_string(),
-        line: line(row),
-    })
-    .collect();
-    let unresolved = rows(
-        db,
-        "SELECT * FROM gf_cross_unresolved WHERE source_repository_id=? AND valid_to_episode IS NULL ORDER BY id",
-        [repository],
-    )?
-    .iter()
-    .map(|row| {
-        let relpath = text(row, "relpath");
-        xrepo::UnresolvedImport {
-            repo: repository.to_string(),
-            node_id: s(row, "source_node_id").to_string(),
-            stable_id: text(row, "source_stable_id"),
+    let edges = store
+        .read(|g| {
+            store_graph::rows(
+                g,
+                "MATCH ()-[r:CROSS_CALL]->() WHERE r.source_repository_id = $repo \
+                 AND r.valid_to_episode IS NULL \
+                 RETURN r.source_node_id AS source_node_id, r.source_stable_id AS source_stable_id, \
+                        r.target_repository_id AS target_repository_id, \
+                        r.target_node_id AS target_node_id, r.target_stable_id AS target_stable_id, \
+                        r.relation AS relation, r.confidence AS confidence, \
+                        r.derivation AS derivation, r.module_path AS module_path, \
+                        r.symbol AS symbol, r.version_constraint AS version_constraint, \
+                        r.exporter_version AS exporter_version, r.version_status AS version_status, \
+                        r.line AS line \
+                 ORDER BY r.created_at, r.source_node_id",
+                gparams([("repo", gs(repository))]),
+            )
+        })?
+        .iter()
+        .map(|row| xrepo::CrossEdge {
+            source: xrepo::EdgeEnd {
+                repo: repository.to_string(),
+                node_id: s(row, "source_node_id").to_string(),
+                stable_id: text(row, "source_stable_id"),
+                ..Default::default()
+            },
+            target: xrepo::EdgeEnd {
+                repo: s(row, "target_repository_id").to_string(),
+                node_id: s(row, "target_node_id").to_string(),
+                stable_id: text(row, "target_stable_id"),
+                ..Default::default()
+            },
+            relation: s(row, "relation").to_string(),
+            confidence: s(row, "confidence").to_string(),
+            derivation: s(row, "derivation").to_string(),
+            module_path: s(row, "module_path").to_string(),
+            symbol: text(row, "symbol"),
+            version_constraint: text(row, "version_constraint"),
+            exporter_version: text(row, "exporter_version"),
+            version_status: s(row, "version_status").to_string(),
+            line: line(row),
+        })
+        .collect();
+    let unresolved = store
+        .read(|g| {
+            store_graph::rows(
+                g,
+                "MATCH (u:UnresolvedCross {source_repository_id: $repo}) \
+                 WHERE u.valid_to_episode IS NULL \
+                 RETURN u.source_node_id AS source_node_id, u.source_stable_id AS source_stable_id, \
+                        u.relpath AS relpath, u.module_path AS module_path, u.symbol AS symbol, \
+                        u.package AS package, u.reason AS reason, u.candidates AS candidates, \
+                        u.version_constraint AS version_constraint, \
+                        u.exporter_version AS exporter_version, u.line AS line \
+                 ORDER BY u.created_at, u.source_node_id",
+                gparams([("repo", gs(repository))]),
+            )
+        })?
+        .iter()
+        .map(|row| {
+            let relpath = text(row, "relpath");
+            xrepo::UnresolvedImport {
+                repo: repository.to_string(),
+                node_id: s(row, "source_node_id").to_string(),
+                stable_id: text(row, "source_stable_id"),
             // Not stored; the persistence does not read it.
             ecosystem: relpath
                 .as_deref()
@@ -2543,11 +2573,17 @@ fn export_index(
 /// side moved to a new episode the stale rows are closed with
 /// `valid_to_episode` (the new episode of the side that changed) and the pair
 /// is re-linked.
-pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Result<Value> {
-    // The graph store's link pass always rebuilds a project's links from
-    // its recorded episode (there is no cross-link state to reuse), so the
-    // incremental/full distinction of the SQL pass is always "full" here.
-    let incremental = false;
+pub fn link_workspace(
+    db: &Connection,
+    store: &GraphStore,
+    p: &Principal,
+    full: bool,
+) -> Result<Value> {
+    // The pass is incremental unless `full`: `gf_cross_link_state` records
+    // what a project's link read (inputs) and wrote (edges, unresolved
+    // imports — counted from the graph), and [`unchanged_link`] reuses a
+    // project's links when both still hold.
+    let incremental = !full;
     let workspace = p.workspace.as_str();
     let mut g = store.connection()?;
     let mut hidden = 0usize;
@@ -2763,10 +2799,11 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
                 .map(|(_, (repo, surface))| json!([repo.id, surface]))
                 .collect::<Vec<_>>(),
         ]));
-        let reuse = incremental && keep_state && unchanged_link(db, &importer.id, &inputs)?;
+        let reuse =
+            incremental && keep_state && unchanged_link(store, db, &importer.id, &inputs)?;
         let report = if reuse {
             reused.push(importer.id.as_str());
-            previous_report(db, &importer.id, &importer.episode)?
+            previous_report(store, &importer.id, &importer.episode)?
         } else {
             relinked.push(importer.id.as_str());
             let others: Vec<ExportIndex> = repos
@@ -2935,12 +2972,12 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
         }
         // What this link read and wrote, for the next pass to compare. It
         // updates a stored row only, so a workspace without one gains none.
+        // The counts come from the graph.
+        let (edges, unresolved) = link_counts(store, &importer.id)?;
         db.execute(
-            "UPDATE gf_cross_link_state SET inputs=?1,\
-             edges=(SELECT count(*) FROM gf_cross_edges WHERE source_repository_id=?2 AND valid_to_episode IS NULL),\
-             unresolved=(SELECT count(*) FROM gf_cross_unresolved WHERE source_repository_id=?2 AND valid_to_episode IS NULL) \
-             WHERE repository_id=?2",
-            params![inputs, importer.id],
+            "UPDATE gf_cross_link_state SET inputs=?1, edges=?2, unresolved=?3 \
+             WHERE repository_id=?4",
+            params![inputs, edges, unresolved, importer.id],
         )?;
         unresolved_total += report.unresolved.len();
     }
@@ -2970,13 +3007,45 @@ pub fn link_workspace(db: &Connection, store: &GraphStore, p: &Principal) -> Res
 
 /// Whether `repository`'s last link read `inputs` and its live rows are
 /// still the ones that link wrote (as many edges and unresolved imports).
-fn unchanged_link(db: &Connection, repository: &str, inputs: &str) -> Result<bool> {
+/// The live cross-link rows a repository's link wrote: its open `CROSS_CALL`
+/// edges and `UnresolvedCross` nodes, counted from the graph (the SQL
+/// mirrors were never written).
+fn link_counts(store: &GraphStore, repository: &str) -> Result<(i64, i64)> {
+    store.read(|g| {
+        let edges = store_graph::one(
+            g,
+            "MATCH ()-[r:CROSS_CALL]->() WHERE r.source_repository_id = $repo \
+             AND r.valid_to_episode IS NULL RETURN count(r) AS n",
+            store_graph::params(&json!({"repo": repository})),
+        )?
+        .and_then(|row| row["n"].as_i64())
+        .unwrap_or(0);
+        let unresolved = store_graph::one(
+            g,
+            "MATCH (u:UnresolvedCross {source_repository_id: $repo}) \
+             WHERE u.valid_to_episode IS NULL RETURN count(u) AS n",
+            store_graph::params(&json!({"repo": repository})),
+        )?
+        .and_then(|row| row["n"].as_i64())
+        .unwrap_or(0);
+        Ok((edges, unresolved))
+    })
+}
+
+fn unchanged_link(
+    store: &GraphStore,
+    db: &Connection,
+    repository: &str,
+    inputs: &str,
+) -> Result<bool> {
+    // The recorded inputs and counts are SQL (`gf_cross_link_state`); the
+    // live rows they are compared against are the graph's.
+    let (edges, unresolved) = link_counts(store, repository)?;
     Ok(one(
         db,
         "SELECT 1 AS same FROM gf_cross_link_state WHERE repository_id=?1 AND inputs=?2 \
-         AND edges=(SELECT count(*) FROM gf_cross_edges WHERE source_repository_id=?1 AND valid_to_episode IS NULL) \
-         AND unresolved=(SELECT count(*) FROM gf_cross_unresolved WHERE source_repository_id=?1 AND valid_to_episode IS NULL)",
-        params![repository, inputs],
+         AND edges=?3 AND unresolved=?4",
+        params![repository, inputs, edges, unresolved],
     )?
     .is_some())
 }
@@ -3269,17 +3338,16 @@ impl Store {
     /// ([`crate::doc_links::relink`]): its summary, or its error, is the
     /// result's `documents`.
     pub fn graph_link(&self, workspace: &str, token: &str) -> Result<Value> {
-        self.graph_link_with(workspace, token)
+        self.graph_link_with(workspace, token, false)
     }
     /// [`Store::graph_link`] with a full pass: every project's imports are
-    /// linked again, whatever changed. (The graph store's pass is always a
-    /// full pass; the entry point stays for the CLI's `--full`.)
+    /// linked again, whatever changed.
     pub fn graph_link_full(&self, workspace: &str, token: &str) -> Result<Value> {
-        self.graph_link_with(workspace, token)
+        self.graph_link_with(workspace, token, true)
     }
-    fn graph_link_with(&self, workspace: &str, token: &str) -> Result<Value> {
+    fn graph_link_with(&self, workspace: &str, token: &str, full: bool) -> Result<Value> {
         let (mut result, principal) = self.authorized(workspace, token, "read", |db, p| {
-            Ok((link_workspace(db, &self.graph(), p)?, p.hash.clone()))
+            Ok((link_workspace(db, &self.graph(), p, full)?, p.hash.clone()))
         })?;
         result["documents"] =
             match crate::doc_links::relink(self, workspace, &principal, |_| Ok(())) {

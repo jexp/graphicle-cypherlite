@@ -851,7 +851,7 @@ fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
         leased(&store.graph(), job)?;
         let p = authorize_hash(db, &job.workspace, &job.principal_hash, "read")?;
         let summary =
-            crate::graph_projection::link_workspace(db, &*crate::store::graph_for(db)?, &p)?;
+            crate::graph_projection::link_workspace(db, &*crate::store::graph_for(db)?, &p, false)?;
         let mut result = json!({
             "edges": summary["edges"],
             "unresolved": summary["unresolved"],
