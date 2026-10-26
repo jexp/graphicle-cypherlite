@@ -35,7 +35,7 @@ use crate::{
     Error, Result, doc_links, graph_projection,
     graph_projection::CrossDirection,
     integer, memory,
-    store::{Principal, Store, one, repo, rows, s},
+    store::{Principal, Store, repo, rows, s},
     symbols,
 };
 use rusqlite::Connection;
@@ -202,13 +202,16 @@ fn counts(db: &Connection, p: &Principal, repository: &Value) -> Result<Value> {
         .iter()
         .map(|m| m["symbol_links"]["links"].as_u64().unwrap_or(0))
         .sum();
-    let symbols = one(
-        db,
-        "SELECT COUNT(*) AS n FROM gf_symbol_heads WHERE repository_id=?",
-        [id],
-    )?
-    .and_then(|row| row["n"].as_u64())
-    .unwrap_or(0);
+    let symbols: u64 = graph
+        .read(|g| {
+            crate::store_graph::one(
+                g,
+                "MATCH (s:SymbolHead {repository_id: $repo}) RETURN count(s) AS n",
+                crate::store_graph::params(&json!({"repo": id})),
+            )
+        })?
+        .and_then(|row| row["n"].as_u64())
+        .unwrap_or(0);
     let mentions = doc_links::linked_mentions(db, p, id, &documents)?;
     Ok(
         json!({"files":files,"documents":documents.len() - files,"symbols":symbols,

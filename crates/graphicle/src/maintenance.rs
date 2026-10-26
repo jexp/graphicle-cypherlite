@@ -120,7 +120,17 @@ pub(crate) fn delete_project(
     removed["references"] =
         deletion::forget_project_references(db, &p.workspace, identifier, &connectors)?;
     if let Some(cache) = crate::graph_projection::cache_root(sql, identifier) {
-        crate::graph_materialize::purge(&cache)?;
+        // The cache purge never follows a link: a backup's scrub deletes
+        // from the backup file, and the `gf-cache` beside it may be a link
+        // out of the data folder — the plan refuses that folder, and the
+        // deletion must not touch what lies behind it either.
+        let through_link = cache.ancestors().take(2).any(|component| {
+            std::fs::symlink_metadata(component)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+        });
+        if !through_link {
+            crate::graph_materialize::purge(&cache)?;
+        }
     }
     // The SQL store cascaded from repo_projects; on the graph the cascade is
     // explicit: everything scoped to the project, then the project itself.

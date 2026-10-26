@@ -1869,13 +1869,19 @@ fn the_workspace_map_lists_projects_imports_and_counts() {
             .unwrap();
         assert_eq!(counts["files"], files["total"], "{entry}");
         assert_eq!(counts["documents"], 0);
-        let symbols: i64 = watcher
-            .query_row(
-                "SELECT COUNT(*) FROM gf_symbol_heads WHERE repository_id=?",
-                [id],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let symbols: i64 = f
+            .store
+            .graph()
+            .read(|g| {
+                graphicle_runtime::store_graph::one(
+                    g,
+                    "MATCH (s:SymbolHead {repository_id: $repo}) RETURN count(s) AS n",
+                    graphicle_runtime::store_graph::params(&json!({"repo": id})),
+                )
+            })
+            .unwrap()
+            .and_then(|row| row["n"].as_i64())
+            .unwrap_or(0);
         assert!(symbols >= 1);
         assert_eq!(counts["symbols"], symbols);
         let memories = f

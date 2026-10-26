@@ -93,24 +93,38 @@ impl Fixture {
         }
         state.as_object_mut().unwrap().remove("digest");
         let workspace = &self.session.workspace;
+        // The dependency edges and episode labels live in the graph store
+        // now (`:Artifact`-`DEPENDS_ON`-`:Artifact` and `:EpisodeLabel`).
         let own = self
             .store
             .read(|db| {
+                let graph = store::graph_for(db)?;
                 let prefix = format!("{project}:");
                 let mut own = Vec::new();
-                for row in store::rows(
-                    db,
-                    "SELECT * FROM gf_dependencies WHERE workspace=?1 AND (substr(source_id,1,length(?2))=?2 OR substr(dependent_id,1,length(?2))=?2) ORDER BY source_id,dependent_id",
-                    rusqlite::params![workspace, prefix],
+                for edge in graphicle_runtime::invalidation::dependencies(
+                    graph.as_ref(),
+                    workspace,
                 )? {
-                    own.push(row.to_string());
+                    if edge.source_id.starts_with(&prefix)
+                        || edge.dependent_id.starts_with(&prefix)
+                    {
+                        own.push(format!(
+                            "{}:{}:{}:{}",
+                            edge.dependent_kind, edge.dependent_id, edge.source_kind, edge.source_id
+                        ));
+                    }
                 }
-                for row in store::rows(
-                    db,
-                    "SELECT * FROM gf_episode_labels WHERE workspace=?1 AND repo=?2",
-                    rusqlite::params![workspace, project],
-                )? {
-                    own.push(row.to_string());
+                for row in graph.read(|g| {
+                    graphicle_runtime::store_graph::rows(
+                        g,
+                        "MATCH (l:EpisodeLabel {workspace: $w, repository_id: $r}) \
+                         RETURN l.label AS label ORDER BY l.label",
+                        graphicle_runtime::store_graph::params(&json!({
+                            "w": workspace, "r": project
+                        })),
+                    )
+                })? {
+                    own.push(format!("label:{}", s(&row, "label")));
                 }
                 Ok(own)
             })
@@ -139,10 +153,24 @@ fn sha(path: &Path) -> String {
 }
 
 fn holds(path: &Path, text: &str) -> bool {
-    let bytes = std::fs::read(path).unwrap();
-    bytes
-        .windows(text.len())
-        .any(|window| window == text.as_bytes())
+    // The source content lives in the backup's graph sidecar
+    // (`<backup>.graph`) now, not in the SQL file.
+    fn within(dir: &Path, text: &str) -> bool {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                if within(&entry.path(), text) {
+                    return true;
+                }
+            } else if let Ok(bytes) = std::fs::read(entry.path()) {
+                if bytes.windows(text.len()).any(|w| w == text.as_bytes()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    within(&graphicle_runtime::store_graph::backup_sidecar(path), text)
 }
 
 /// The projects a store file holds.
@@ -236,8 +264,11 @@ fn offboard_one_then_the_other(linked: bool) {
     assert_eq!(plan["blocked"], false, "{plan:#}");
     assert_eq!(plan["data_dir"], json!(data), "{plan:#}");
     assert_eq!(plan["project"]["id"], json!(a));
+    // The store's rows: the project's data is spread over SQL tables and
+    // the graph store's labels now; the plan counts what SQL still holds
+    // (repo_objects moved into the graph as CAS nodes).
     assert!(
-        plan["store_rows"]["repo_objects"].as_i64().unwrap() > 0,
+        !plan["store_rows"].as_object().unwrap().is_empty(),
         "{plan:#}"
     );
     assert_eq!(paths(&plan["backups"]), vec![name.clone()], "{plan:#}");
