@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "graphicle"
-version = "0.1.4"
+version = "0.1.9"
 dependencies = [
  "base64 0.22.1",
  "calamine",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "graphicle-memory"
-version = "0.1.4"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "graphicle",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "graphicle-runtime"
-version = "0.1.4"
+version = "0.1.9"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -1643,6 +1643,7 @@ dependencies = [
  "tower",
  "url",
  "uuid",
+ "winresource",
  "zip",
 ]
 
@@ -4731,7 +4732,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -6111,6 +6112,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

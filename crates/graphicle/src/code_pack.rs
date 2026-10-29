@@ -5013,7 +5013,8 @@ impl Store {
             }
             let episode = crate::graph_projection::current_episode(db, id)?;
             let graph = crate::query_file::open(db, id, &episode).and_then(GraphView::of_query_file);
-            let commit = crate::folders::current_folder(db, id)?.and_then(|folder| git_head(&folder));
+            let commit = crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?
+                .and_then(|folder| git_head(&folder));
             let mut statement = db.prepare(
                 "SELECT o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=?1 AND h.path=?2",
             )?;
@@ -5082,7 +5083,15 @@ fn rank(
         .unwrap_or_else(|| question.to_string());
     let mut args = json!({"repository_id":s(repository,"id"),"question":question,"max_tokens":1000,"max_chars":4000,"more_files":0});
     args[crate::query::PACK_RANKING] = json!(true);
-    let (_, packet) = crate::query::project_packet(db, p, repository, &args, None, None)?;
+    let (_, packet) = crate::query::project_packet(
+        &*crate::store::graph_for(db)?,
+        db,
+        p,
+        repository,
+        &args,
+        None,
+        None,
+    )?;
     Ok(packet[crate::query::PACK_RANKING]
         .as_array()
         .into_iter()

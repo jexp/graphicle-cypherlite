@@ -58,11 +58,30 @@ pub(crate) fn memory_row(
 }
 
 pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<Vec<Value>> {
+    let mut output = repository_documents(db, repository, true)?;
+    output.extend(connector_documents(db, repository, p)?);
+    for doc in &output {
+        if graphicle_memory::text::sha256(s(doc, "content").as_bytes()) != s(doc, "sha256") {
+            return Err(Error::bad("Source integrity check failed"));
+        }
+    }
+    Ok(output)
+}
+
+/// The project's files as [`documents`] lists them, in path order; with
+/// `content` false each one's `content` is empty, for a caller that reads
+/// the text of a few files only ([`load_contents`]).
+pub fn repository_documents(
+    db: &Connection,
+    repository: &Value,
+    content: bool,
+) -> Result<Vec<Value>> {
     let identifier = s(repository, "id");
     let mut output = Vec::new();
     // Heads and contents come from the graph content store; the binary-file
     // metadata (`am_binary_heads`, a converters domain table) stays SQL and
-    // joins in memory on (path, source sha).
+    // joins in memory on (path, source sha). With `content` false the
+    // content column stays empty, as the SQL arm of 0.1.5 left it.
     let mut binaries: std::collections::HashMap<(String, String), Value> = std::collections::HashMap::new();
     for row in rows(
         db,
@@ -75,7 +94,7 @@ pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<V
         );
     }
     let graph = crate::store::graph_for(db)?;
-    for row in crate::store_content::head_documents(&graph, identifier)? {
+    for row in crate::store_content::head_documents(&graph, identifier, content)? {
         let path = s(&row, "path");
         let key = (path.to_string(), s(&row, "sha256").to_string());
         let binary = binaries.get(&key);
@@ -84,6 +103,47 @@ pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<V
             "content":row["content"],"recorded_at":null,"observed_at":repository["updated_at"],
             "authority":"original_repository_source","url":null,"metadata":{"original_sha256":binary.map(|b|b["original_sha"].clone()),"parser":binary.map(|b|b["parser"].clone())}}));
     }
+    Ok(output)
+}
+
+/// The text of the project files among `documents` whose ids `wanted`
+/// names, read into their `content` (from [`repository_documents`] without
+/// content) and checked against their SHA-256, as [`documents`] checks it.
+/// The text comes from the graph content store's objects, one read per file.
+pub fn load_contents(
+    db: &Connection,
+    repository: &Value,
+    documents: &mut [Value],
+    wanted: &BTreeSet<String>,
+) -> Result<()> {
+    let graph = crate::store::graph_for(db)?;
+    for document in documents.iter_mut() {
+        if document["source_kind"] != "repository_file" || !wanted.contains(s(document, "id")) {
+            continue;
+        }
+        let content = crate::store_content::object_content(
+            &graph,
+            s(repository, "id"),
+            s(document, "sha256"),
+        )?
+        .ok_or_else(|| Error::bad("Source unavailable"))?;
+        if graphicle_memory::text::sha256(content.as_bytes()) != s(document, "sha256") {
+            return Err(Error::bad("Source integrity check failed"));
+        }
+        document["content"] = json!(content);
+    }
+    Ok(())
+}
+
+/// The connector documents of the project that `p` may read, as
+/// [`documents`] lists them after the project's files.
+pub fn connector_documents(
+    db: &Connection,
+    repository: &Value,
+    p: &Principal,
+) -> Result<Vec<Value>> {
+    let identifier = s(repository, "id");
+    let mut output = Vec::new();
     // The Python host's workspace-source links
     // (`repo_evidence_links` over `sources`) are no longer read; nothing in
     // this program writes them. Their tables stay.
@@ -173,11 +233,6 @@ pub fn documents(db: &Connection, repository: &Value, p: &Principal) -> Result<V
             "path":metadata["title"],"title":metadata["title"],"source_kind":"connector_source",
             "sha256":row["sha256"],"version":digest(&json!({"sha256":row["sha256"],"title":metadata["title"],"source_timestamp":metadata["source_timestamp"],"permissions":metadata["provider_permissions"]["principals"]})),"content":row["content"],"recorded_at":metadata["source_timestamp"],"metadata":metadata["provider_metadata"],
             "observed_at":metadata["observed_at"],"authority":"imported_source","url":metadata["url"],"connector_id":row["connector_id"]}));
-    }
-    for doc in &output {
-        if graphicle_memory::text::sha256(s(doc, "content").as_bytes()) != s(doc, "sha256") {
-            return Err(Error::bad("Source integrity check failed"));
-        }
     }
     Ok(output)
 }

@@ -736,14 +736,23 @@ pub fn head_parses(store: &GraphStore, repository: &str) -> Result<Vec<Value>> {
 }
 
 /// The documents of `repository`'s current heads (`[{path, sha256,
-/// content}]`), in path order — `memory::documents`' file arm.
-pub fn head_documents(store: &GraphStore, repository: &str) -> Result<Vec<Value>> {
+/// content}]`), in path order — `memory::documents`' file arm. With
+/// `content` false the content column is empty (`memory::load_contents`
+/// reads the text of the few files a caller needs).
+pub fn head_documents(
+    store: &GraphStore,
+    repository: &str,
+    content: bool,
+) -> Result<Vec<Value>> {
     store.read(|db| {
         rows(
             db,
-            "MATCH (f:File {repository_id:$repo})-[:HEAD]->(o:Object) \
-             RETURN f.path AS path, o.sha256 AS sha256, o.content AS content \
-             ORDER BY f.path",
+            &format!(
+                "MATCH (f:File {{repository_id:$repo}})-[:HEAD]->(o:Object) \
+                 RETURN f.path AS path, o.sha256 AS sha256, {} AS content \
+                 ORDER BY f.path",
+                if content { "o.content" } else { "''" }
+            ),
             params(vec![("repo", json!(repository))]),
         )
     })

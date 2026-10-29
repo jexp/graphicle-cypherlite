@@ -20,12 +20,12 @@ use graphicle::{
     session::{GraphHandle, registry},
 };
 use graphicle_memory::graph::identity::{self, IdentityOptions};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock, PoisonError},
 };
 
@@ -42,9 +42,57 @@ pub fn graph_ref(repository: &str, episode: &str) -> String {
     format!("{repository}:{episode}")
 }
 
-/// Deterministic digest of the repository head set (`path → sha256`).
+/// Whether the code graph holds the keys the engine extracts from YAML
+/// (Graphify 0.9.95, #2214). Off: the projection leaves out the files the
+/// engine reads with its YAML key extractor, so answers do not use those keys
+/// yet (on a configuration-heavy project such as kubernetes they made answers
+/// slower and no better); `graphicle graph` and its graph.json still have
+/// them. Part of [`graph_format`], so a store follows a change of this choice
+/// at its next sync.
+const YAML_IN_CODE_GRAPH: bool = false;
+
+/// Whether the projection reads `path` (see [`YAML_IN_CODE_GRAPH`]): not a
+/// file the engine reads with its YAML key extractor. The package manifests
+/// `apm.yml` and `apm.yaml` have an extractor of their own (a package node
+/// and its dependencies), as in 0.1.6, and stay. Only a `.yaml` or `.yml`
+/// name is looked up, so no other file is read for its extractor (a header's
+/// is decided by its content).
+fn projected(path: &Path) -> bool {
+    if YAML_IN_CODE_GRAPH {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    !((name.ends_with(".yaml") || name.ends_with(".yml"))
+        && graphicle::extract::get_extractor(path).as_deref() == Some("yaml"))
+}
+
+/// The graph format of the linked engine: the Graphify release its extraction
+/// follows and its AST cache schema, which changes whenever per-file
+/// extraction output does, and the projection's own choice of files
+/// ([`YAML_IN_CODE_GRAPH`]). Part of every episode id ([`episode_of`]).
+pub fn graph_format() -> String {
+    format!(
+        "graphify-{}/ast-{}{}",
+        graphicle::UPSTREAM_VERSION,
+        graphicle::cache::AST_CACHE_SCHEMA,
+        if YAML_IN_CODE_GRAPH { "" } else { "/no-yaml" }
+    )
+}
+
+/// Deterministic digest of the repository head set (`path → sha256`) and the
+/// engine's [`graph_format`]. An episode is the graph one engine format built
+/// from one head set, so after an engine upgrade that changes extraction the
+/// current head set is a new episode: the first sync projects it again, and
+/// the graph, symbol and cross-repository rows follow the new node ids,
+/// instead of the sync finding the head set recorded and keeping the older
+/// engine's graph (Graphify 0.9.95 made each C# overload a node of its own).
+/// Episodes recorded by an older engine stay in the history; they keep their
+/// head sets in their attributes ([`stored_episode_heads`]).
 pub fn episode_of(heads: &BTreeMap<String, String>) -> String {
-    digest(&json!(heads))
+    digest(&json!({"graph": graph_format(), "heads": heads}))
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +208,13 @@ pub fn current_episode(db: &Connection, repository: &str) -> Result<String> {
 /// no directory and build without a cache.
 pub fn cache_root(db: &Connection, repository: &str) -> Option<PathBuf> {
     let database = db.path().filter(|p| !p.is_empty())?;
-    let directory = std::path::Path::new(database).parent()?;
+    cache_root_in(std::path::Path::new(database).parent()?, repository)
+}
+
+/// [`cache_root`] for the data folder itself: the saved graphs
+/// ([`crate::query_graph`]) are read through the graph store, which knows the
+/// folder (its own directory's parent) but holds no SQL connection.
+pub fn cache_root_in(directory: &Path, repository: &str) -> Option<PathBuf> {
     if !repository
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -245,7 +299,14 @@ pub fn build_graph_with_report(
     // Canonical root: node identities derive from paths relative to it, and a
     // root that crosses a symlink would make cached and fresh records diverge.
     let root = dir.path().canonical()?;
-    let files: Vec<PathBuf> = heads.keys().map(|p| root.join(p)).collect();
+    // The project's extension declarations (`.graphiclerc`), which the
+    // extraction below activates as well, decide a file's extractor.
+    graphicle::rcfile::activate_language_overrides(&root);
+    let files: Vec<PathBuf> = heads
+        .keys()
+        .map(|p| root.join(p))
+        .filter(|p| projected(p))
+        .collect();
     // A contended cross-process cache gets an isolated uncached tree.
     let cache = cache.filter(|_| dir.report.cached);
     if let Some(cache) = &cache {
@@ -1396,6 +1457,21 @@ fn load_g(g: &mut GraphConnection, repository: &str, episode: &str) -> Result<Gr
 pub fn resident(store: &GraphStore, repository: &str, episode: &str) -> Result<GraphHandle> {
     let reference = graph_ref(repository, episode);
     if let Ok(handle) = registry().get(&reference) {
+        return Ok(handle);
+    }
+    // The episode's saved graph and index (crate::query_graph), else the
+    // graph read from the store's rows. The graph store sits in the data
+    // folder (its directory's parent), where the cache folder also lives.
+    if let Some((graph, index)) = crate::phase::phase("graph_saved_read", || {
+        store
+            .path()
+            .and_then(Path::parent)
+            .and_then(|data| cache_root_in(data, repository))
+            .and_then(|cache| crate::query_graph::read_at(&cache, repository, episode))
+    }) {
+        let handle = GraphHandle::new(graph);
+        registry().open(handle.clone(), Some(&reference));
+        graphicle_memory::graph::retrieval::install_index(&reference, &handle, index);
         return Ok(handle);
     }
     let handle = GraphHandle::new(load(store, repository, episode)?);

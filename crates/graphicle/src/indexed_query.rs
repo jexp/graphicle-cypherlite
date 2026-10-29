@@ -393,12 +393,15 @@ pub fn packet(
         return Ok(None);
     }
     crate::phase::phase("context_index_missing", || index.add_files(added))?;
+    // The graph store beside the SQL file serves the memory listing, the
+    // episode probes and the arm below (one handle, held for the scope).
+    let graph_store = crate::store::graph_for(db)?;
     docs.load(db, repository, &memory_sources(db, id)?)?;
-    let memories = memory::list_of(db, repository, &docs.list, true)?;
+    let memories = memory::list_of(db, &graph_store, repository, &docs.list, true)?;
     // The file relationships: the saved ones of the current episode
     // (crate::query_graph), else the snapshot's graph as `context` reads it.
     let current = crate::graph_projection::current_episode(db, id)?;
-    let saved_edges = if crate::graph_projection::is_recorded(db, id, &current)? {
+    let saved_edges = if crate::graph_projection::is_recorded(&graph_store, id, &current)? {
         crate::phase::phase("snapshot_file_edges", || {
             crate::query_graph::FileEdges::read(db, id, &current)
         })
@@ -410,7 +413,7 @@ pub fn packet(
         None => crate::phase::phase("snapshot_graph", || query::source_graph(db, repository, p))?,
     };
     let state = digest(
-        &json!({"sources":memory::state(&docs.list),"memories":memories.iter().map(|m|json!([m["id"],m["revision"],m["state"],m["stale"]])).collect::<Vec<_>>(),"reviewed_state":memory::reviewed_state_for(db,repository,&memories)?}),
+        &json!({"sources":memory::state(&docs.list),"memories":memories.iter().map(|m|json!([m["id"],m["revision"],m["state"],m["stale"]])).collect::<Vec<_>>(),"reviewed_state":memory::reviewed_state_for(&graph_store,repository,&memories)?}),
     );
     let mut memories = memories;
     if args["memory_retrieval"] == false {
@@ -428,7 +431,7 @@ pub fn packet(
         None
     } else {
         Some(crate::phase::phase("context_arm", || {
-            code_graph_arm::plan(db, id, query, links.documents() && !code_first.applied)
+            code_graph_arm::plan(&graph_store, db, id, query, links.documents() && !code_first.applied)
         }))
     };
     let arm = match plan {
@@ -446,7 +449,7 @@ pub fn packet(
                 .collect();
             docs.load(db, repository, &wanted)?;
             let by_id: HashMap<&str, &Value> = docs.list.iter().map(|d| (s(d, "id"), d)).collect();
-            plan.anchor(db, id, &by_id).unwrap_or_else(|error| {
+            plan.anchor(&graph_store, id, &by_id).unwrap_or_else(|error| {
                 let mut arm = code_graph_arm::Arm::skipped("error");
                 arm.diagnostics["error"] = json!(error.message);
                 arm
@@ -819,8 +822,8 @@ pub fn packet(
     if !identifiers.defining.is_empty() {
         rankings[crate::code_question::DEFINING] = json!(identifiers.defining);
     }
-    let lookup =
-        crate::doc_links::Lookup::new(db, id).with_folder(crate::folders::current_folder(db, id)?);
+    let lookup = crate::doc_links::Lookup::new(db, id)?
+        .with_folder(crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?);
     let mut packet = crate::phase::phase("context_assemble", || {
         query::context_indexed(
             &snap,
@@ -835,7 +838,7 @@ pub fn packet(
     packet["local_dense"] = json!({"status":"disabled"});
     packet["identifier_arm"] = identifiers.report;
     packet["freshness"] = json!(crate::invalidation::repository_freshness(
-        db,
+        &*crate::store::graph_for(db)?,
         &p.workspace,
         id
     )?);
@@ -1124,7 +1127,7 @@ pub fn graph_only_packet(
         .cloned()
         .collect();
     let state = digest(
-        &json!({"sources":memory::state(&list),"memories":Vec::<Value>::new(),"reviewed_state":memory::reviewed_state_for(db,repository,&[])?}),
+        &json!({"sources":memory::state(&list),"memories":Vec::<Value>::new(),"reviewed_state":memory::reviewed_state_for(&*crate::store::graph_for(db)?,repository,&[])?}),
     );
     let passages = query::passages(&Snapshot {
         repository: repository.clone(),
@@ -1151,8 +1154,8 @@ pub fn graph_only_packet(
     if !identifiers.defining.is_empty() {
         rankings[crate::code_question::DEFINING] = json!(identifiers.defining);
     }
-    let lookup =
-        crate::doc_links::Lookup::new(db, id).with_folder(crate::folders::current_folder(db, id)?);
+    let lookup = crate::doc_links::Lookup::new(db, id)?
+        .with_folder(crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?);
     let mut packet = query::context_on(
         &snap,
         &quick,

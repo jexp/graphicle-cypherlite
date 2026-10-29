@@ -280,12 +280,22 @@ pub fn arm(
         report["status"] = json!("no_names");
         return Ok(skipped(report));
     }
-    let graph = if args["graph_retrieval"] == false {
+    let mut graph = if args["graph_retrieval"] == false {
         None
     } else {
-        code_graph(db, repository)
+        crate::phase::phase("identifiers_graph", || code_graph(db, repository, true))
     };
-    let ranked = rank(&passages.rows, &named, graph.as_ref());
+    let mut ranked = crate::phase::phase("identifiers_rank", || {
+        rank(&passages.rows, &named, graph.as_ref())
+    });
+    if let Some(graph) = &graph {
+        graph.note();
+    }
+    // A query file whose read failed: the resident graph ranks instead.
+    if graph.as_ref().is_some_and(CodeGraph::corrupt) {
+        graph = code_graph(db, repository, false);
+        ranked = rank(&passages.rows, &named, graph.as_ref());
+    }
     report["status"] = json!(if ranked.ranking.is_empty() {
         "no_match"
     } else {
@@ -309,24 +319,66 @@ pub fn arm(
 /// the project has no recorded episode or it cannot be opened (the arm then
 /// matches text alone).
 struct CodeGraph {
-    handle: GraphHandle,
-    /// Code symbols: (node index, dotted name, file).
-    symbols: Vec<(usize, String, String)>,
-    /// Symbols by the last segment of their dotted name.
-    by_last: HashMap<String, Vec<usize>>,
+    symbols: Symbols,
     /// Files the lag fallback may cite (`None`: all).
     unchanged: Option<BTreeSet<String>>,
 }
 
-fn code_graph(db: &Connection, repository: &str) -> Option<CodeGraph> {
+/// The episode's code symbols: from its query file ([`crate::query_file`])
+/// when this build wrote one, else from its resident graph.
+enum Symbols {
+    Resident {
+        handle: GraphHandle,
+        /// Code symbols: (node index, dotted name, file).
+        list: Vec<(usize, String, String)>,
+        /// Symbols by the last segment of their dotted name.
+        by_last: HashMap<String, Vec<usize>>,
+    },
+    Saved(std::sync::Arc<crate::query_file::QueryFile>),
+}
+
+/// The code symbols of `graph` with a dotted name and a file, in node
+/// order: (node index, dotted name, file, start line).
+pub(crate) fn symbols_of(graph: &Graph) -> Vec<(usize, String, String, Option<usize>)> {
+    graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| code_graph_arm::code_symbol(&node.attributes))
+        .filter_map(|(index, node)| {
+            Some((
+                index,
+                crate::identifier_route::symbol_name(&node.attributes)?,
+                code_graph_arm::relpath(&node.attributes)?,
+                graphicle_memory::graph::span::start_line(&node.attributes),
+            ))
+        })
+        .collect()
+}
+
+/// The code graph of `repository`'s episode: its query file when this
+/// build wrote one and `saved` allows it, else its resident graph.
+fn code_graph(db: &Connection, repository: &str, saved: bool) -> Option<CodeGraph> {
     let heads = crate::store::heads(db, repository).ok()?;
     let current = graph_projection::episode_of(&heads);
     let Reading { episode, lag } = code_graph_arm::reading(db, repository, &heads, &current)
         .ok()
         .flatten()?;
-    let handle = graph_projection::resident(crate::store::graph_for(db).ok()?.as_ref(), repository, &episode).ok()?;
+    let unchanged = lag.map(|lag| lag.unchanged);
+    if let Some(file) = saved
+        .then(|| crate::query_file::open(db, repository, &episode))
+        .flatten()
+    {
+        return Some(CodeGraph {
+            symbols: Symbols::Saved(file),
+            unchanged,
+        });
+    }
+    let handle =
+        graph_projection::resident(crate::store::graph_for(db).ok()?.as_ref(), repository, &episode)
+            .ok()?;
     let graph: &Graph = &handle;
-    let symbols: Vec<(usize, String, String)> = graph
+    let list: Vec<(usize, String, String)> = graph
         .nodes()
         .iter()
         .enumerate()
@@ -340,22 +392,59 @@ fn code_graph(db: &Connection, repository: &str) -> Option<CodeGraph> {
         })
         .collect();
     let mut by_last: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, (_, name, _)) in symbols.iter().enumerate() {
+    for (i, (_, name, _)) in list.iter().enumerate() {
         let last = name.rsplit('.').next().unwrap_or(name);
         by_last.entry(last.to_string()).or_default().push(i);
     }
     Some(CodeGraph {
-        handle,
-        symbols,
-        by_last,
-        unchanged: lag.map(|lag| lag.unchanged),
+        symbols: Symbols::Resident {
+            handle,
+            list,
+            by_last,
+        },
+        unchanged,
     })
 }
 
 impl CodeGraph {
+    /// Whether a read of the query file failed: the arm then ranks again
+    /// with the resident graph.
+    fn corrupt(&self) -> bool {
+        matches!(&self.symbols, Symbols::Saved(file) if file.corrupt())
+    }
+
+    /// With `GRAPHICLE_PHASE_TIMINGS`, logs what the arm read of the query
+    /// file ([`crate::query_file::QueryFile::note`]).
+    fn note(&self) {
+        if let Symbols::Saved(file) = &self.symbols {
+            file.note("identifiers_query_file_read");
+        }
+    }
+
+    /// Symbol `i`: its dotted name and file.
+    fn symbol(&self, i: usize) -> (&str, &str) {
+        match &self.symbols {
+            Symbols::Resident { list, .. } => (list[i].1.as_str(), list[i].2.as_str()),
+            Symbols::Saved(file) => file
+                .symbol(i)
+                .map(|(_, name, relpath, _)| (name, relpath))
+                .unwrap_or(("", "")),
+        }
+    }
+
+    /// The start line of symbol `i`'s node.
+    fn start_line(&self, i: usize) -> Option<usize> {
+        match &self.symbols {
+            Symbols::Resident { handle, list, .. } => {
+                graphicle_memory::graph::span::start_line(&handle.nodes()[list[i].0].attributes)
+            }
+            Symbols::Saved(file) => file.symbol(i).ok().and_then(|(.., start)| start),
+        }
+    }
+
     /// The symbols `name` defines, as the identifier route finds them
     /// (`crate::identifier_route`'s longest matching suffix), by index into
-    /// `symbols`.
+    /// the symbols.
     fn definitions(&self, name: &str) -> Vec<usize> {
         let dotted = name
             .replace("::", ".")
@@ -368,9 +457,16 @@ impl CodeGraph {
         let Some(last) = segments.last() else {
             return Vec::new();
         };
-        let Some(bucket) = self.by_last.get(*last) else {
-            return Vec::new();
+        let bucket: Vec<usize> = match &self.symbols {
+            Symbols::Resident { by_last, .. } => match by_last.get(*last) {
+                Some(bucket) => bucket.clone(),
+                None => return Vec::new(),
+            },
+            Symbols::Saved(file) => file.symbols_ending(last).unwrap_or_default(),
         };
+        if bucket.is_empty() {
+            return Vec::new();
+        }
         let ends_with = |qualified: &str, path: &str| {
             qualified == path
                 || qualified
@@ -384,7 +480,7 @@ impl CodeGraph {
                 .iter()
                 .copied()
                 .filter(|&i| {
-                    let (_, qualified, relpath) = &self.symbols[i];
+                    let (qualified, relpath) = self.symbol(i);
                     ends_with(qualified, &suffix)
                         && (!last_only
                             || relpath
@@ -483,7 +579,7 @@ fn rank(rows: &[Value], named: &Named, graph: Option<&CodeGraph>) -> Ranked {
                 continue;
             }
             for i in found {
-                let (index, _, relpath) = &graph.symbols[i];
+                let (_, relpath) = graph.symbol(i);
                 if graph
                     .unchanged
                     .as_ref()
@@ -495,9 +591,7 @@ fn rank(rows: &[Value], named: &Named, graph: Option<&CodeGraph>) -> Ranked {
                 let Some((&file, _)) = by_file.get_key_value(origin.as_str()) else {
                     continue;
                 };
-                let line = graphicle_memory::graph::span::start_line(
-                    &graph.handle.nodes()[*index].attributes,
-                );
+                let line = graph.start_line(i);
                 defined[n].push((file.to_string(), line.unwrap_or(0)));
                 holders[n].insert(file);
             }
@@ -619,6 +713,342 @@ fn rank(rows: &[Value], named: &Named, graph: Option<&CodeGraph>) -> Ranked {
         files: scored.len(),
         defining,
     }
+}
+
+/// The text of the passages of some files of a passage index, by (file,
+/// passage): what [`arm_indexed`] matches names with separators in.
+pub type PassageTexts<'a> =
+    dyn FnMut(&BTreeSet<usize>) -> Result<HashMap<(usize, u32), String>> + 'a;
+
+/// [`arm`] over a project's passage index ([`crate::passage_index`])
+/// instead of its chunked passages: the same ranking, from the index's
+/// counts of each name. A name with a separator (`Store::open`, `a.b`) is
+/// counted by matching the text of the passages that hold its words, with
+/// every name, as [`rank`] matches it; `text` gives those passages' text
+/// (file, passage), by index.
+pub fn arm_indexed(
+    db: &Connection,
+    repository: &str,
+    index: &crate::passage_index::Index,
+    text: &mut PassageTexts<'_>,
+    args: &Value,
+    question: &str,
+    query: &str,
+) -> Result<Identifiers> {
+    let (mode, defaulted) = match args.get("identifier_arm") {
+        None | Some(Value::Null) => (None, true),
+        Some(Value::Bool(on)) => (Some(*on), false),
+        Some(Value::String(mode)) if mode == "auto" => (None, false),
+        Some(_) => {
+            return Err(crate::Error::bad(
+                "identifier_arm must be true, false or auto",
+            ));
+        }
+    };
+    let setting = mode.map_or(json!("auto"), |on| json!(on));
+    let mut report = json!({"identifier_arm": setting, "defaulted": defaulted});
+    let on = mode.unwrap_or_else(|| crate::code_question::is_code_question(question));
+    let skipped = |report: Value| Identifiers {
+        ranking: None,
+        defining: Vec::new(),
+        report,
+    };
+    if !on {
+        report["status"] = json!("off");
+        return Ok(skipped(report));
+    }
+    let named = named(query);
+    if named.names.is_empty() && named.paths.is_empty() {
+        report["status"] = json!("no_names");
+        return Ok(skipped(report));
+    }
+    let mut graph = if args["graph_retrieval"] == false {
+        None
+    } else {
+        crate::phase::phase("identifiers_graph", || code_graph(db, repository, true))
+    };
+    let mut ranked = crate::phase::phase("identifiers_rank", || {
+        rank_indexed(db, index, text, &named, graph.as_ref())
+    })?;
+    if let Some(graph) = &graph {
+        graph.note();
+    }
+    // A query file whose read failed: the resident graph ranks instead.
+    if graph.as_ref().is_some_and(CodeGraph::corrupt) {
+        graph = code_graph(db, repository, false);
+        ranked = rank_indexed(db, index, text, &named, graph.as_ref())?;
+    }
+    report["status"] = json!(if ranked.ranking.is_empty() {
+        "no_match"
+    } else {
+        "fused"
+    });
+    report["names"] = json!(ranked.names);
+    report["paths"] = json!(ranked.paths);
+    report["defined"] = json!(ranked.defined);
+    report["files"] = json!(ranked.files);
+    report["candidates"] = json!(ranked.ranking.len());
+    report["code_graph"] = json!(graph.is_some());
+    report["defining_files_outside_source"] = json!(ranked.defining.len());
+    Ok(Identifiers {
+        ranking: (!ranked.ranking.is_empty()).then_some(ranked.ranking),
+        defining: ranked.defining,
+        report,
+    })
+}
+
+/// Whether `name` is one ASCII identifier, which the index counts whole.
+fn simple_name(name: &str) -> bool {
+    (3..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// [`rank`] over the passage index: the files in path order (the order the
+/// passages of a project's files come in), each name's counts per passage.
+fn rank_indexed(
+    db: &Connection,
+    index: &crate::passage_index::Index,
+    text: &mut PassageTexts<'_>,
+    named: &Named,
+    graph: Option<&CodeGraph>,
+) -> Result<Ranked> {
+    // Files with passages, as `rank` reads them from the rows.
+    let files: Vec<usize> = (0..index.files.len())
+        .filter(|&f| !index.files[f].passages.is_empty())
+        .collect();
+    let origin = |f: usize| format!("file:{}", index.files[f].path);
+    let total = files.len().max(1) as f64;
+    // (file, passage) → [(name, count)] by name, as `rank` counts them.
+    let mut counts: BTreeMap<(usize, u32), BTreeMap<usize, u32>> = BTreeMap::new();
+    let mut candidates: Vec<&String> = named.names.iter().collect();
+    candidates.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    if !candidates.is_empty() {
+        let pattern = candidates
+            .iter()
+            .map(|name| regex::escape(name))
+            .collect::<Vec<_>>()
+            .join("|");
+        if let Ok(matcher) = regex::Regex::new(&format!(r"(?-u:\b)(?:{pattern})(?-u:\b)")) {
+            let mut verify: BTreeSet<(usize, u32)> = BTreeSet::new();
+            let mut stemmer = graphicle_memory::stem::Stemmer::default();
+            for (n, name) in named.names.iter().enumerate() {
+                if simple_name(name) {
+                    let term = format!("{}{name}", crate::passage_index::IDENT);
+                    for (file, passage, count) in index.postings(db, &term)? {
+                        counts.entry((file, passage)).or_default().insert(n, count);
+                    }
+                    continue;
+                }
+                // A name with separators: the passages that hold all its
+                // words, matched below.
+                let words = graphicle_memory::text::words(name);
+                let mut holding: Option<BTreeSet<(usize, u32)>> = None;
+                for word in words {
+                    let found: BTreeSet<(usize, u32)> = index
+                        .postings(db, &stemmer.stem(&word))?
+                        .into_iter()
+                        .map(|(file, passage, _)| (file, passage))
+                        .collect();
+                    holding = Some(match holding {
+                        None => found,
+                        Some(before) => before.intersection(&found).copied().collect(),
+                    });
+                }
+                verify.extend(holding.unwrap_or_default());
+            }
+            if !verify.is_empty() {
+                let wanted: BTreeSet<usize> = verify.iter().map(|(file, _)| *file).collect();
+                let texts = text(&wanted)?;
+                let position: HashMap<&str, usize> = named
+                    .names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.as_str(), i))
+                    .collect();
+                for key in verify {
+                    let Some(passage_text) = texts.get(&key) else {
+                        continue;
+                    };
+                    let mut found: BTreeMap<usize, u32> = BTreeMap::new();
+                    for hit in matcher.find_iter(passage_text) {
+                        if let Some(&name) = position.get(hit.as_str()) {
+                            *found.entry(name).or_default() += 1;
+                        }
+                    }
+                    if found.is_empty() {
+                        counts.remove(&key);
+                    } else {
+                        counts.insert(key, found);
+                    }
+                }
+            }
+        }
+    }
+    // Files holding each name, by text and by definition.
+    let mut holders: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); named.names.len()];
+    for ((file, _), found) in &counts {
+        for &name in found.keys() {
+            holders[name].insert(*file);
+        }
+    }
+    let mut defined: Vec<Vec<(usize, usize)>> = vec![Vec::new(); named.names.len()];
+    if let Some(graph) = graph {
+        for (n, name) in named.names.iter().enumerate() {
+            let found = graph.definitions(name);
+            if found.is_empty() || found.len() > MAX_DEFINITIONS {
+                continue;
+            }
+            for i in found {
+                let (_, relpath) = graph.symbol(i);
+                if graph
+                    .unchanged
+                    .as_ref()
+                    .is_some_and(|unchanged| !unchanged.contains(relpath))
+                {
+                    continue;
+                }
+                let Some(file) = index
+                    .file(relpath)
+                    .filter(|&f| !index.files[f].passages.is_empty())
+                else {
+                    continue;
+                };
+                let line = graph.start_line(i);
+                defined[n].push((file, line.unwrap_or(0)));
+                holders[n].insert(file);
+            }
+        }
+    }
+    let mut kept: Vec<usize> = (0..named.names.len())
+        .filter(|&n| !holders[n].is_empty())
+        .collect();
+    kept.sort_by_key(|&n| (holders[n].len(), n));
+    kept.truncate(MAX_NAMES);
+    let weights: Vec<(usize, f64)> = kept
+        .iter()
+        .map(|&n| (n, (1.0 + total / holders[n].len() as f64).ln()))
+        .collect();
+    let path_weight = 2.0 * (1.0 + total).ln();
+    let mut path_bonus: HashMap<usize, f64> = HashMap::new();
+    let mut paths_found = Vec::new();
+    for path in &named.paths {
+        let path = path.replace('\\', "/");
+        let matching: Vec<usize> = files
+            .iter()
+            .copied()
+            .filter(|&f| {
+                let file = index.files[f].path.as_str();
+                file == path
+                    || file.ends_with(&format!("/{path}"))
+                    || path.ends_with(&format!("/{file}"))
+            })
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        paths_found.push(path.clone());
+        for &file in &matching {
+            *path_bonus.entry(file).or_default() += path_weight / matching.len() as f64;
+        }
+    }
+    let defines = |n: usize, file: usize| defined[n].iter().any(|(f, _)| *f == file);
+    let passage_defines = |n: usize, file: usize, passage: &crate::passage_index::Passage| {
+        let (start, end) = (passage.line, passage.end_line);
+        defined[n]
+            .iter()
+            .any(|(f, line)| *f == file && *line >= start.max(1) && (end == 0 || *line <= end))
+    };
+    // Per file, each name's count over its passages.
+    let mut in_file: BTreeMap<usize, BTreeMap<usize, u32>> = BTreeMap::new();
+    for ((file, _), found) in &counts {
+        let entry = in_file.entry(*file).or_default();
+        for (&name, &count) in found {
+            *entry.entry(name).or_default() += count;
+        }
+    }
+    let mut considered: BTreeSet<usize> = in_file.keys().copied().collect();
+    considered.extend(path_bonus.keys().copied());
+    for list in &defined {
+        considered.extend(list.iter().map(|(file, _)| *file));
+    }
+    let mut scored: Vec<(f64, u32, usize)> = Vec::new();
+    for &file in &considered {
+        let mut score = path_bonus.get(&file).copied().unwrap_or(0.0);
+        let mut hits = 0u32;
+        for &(n, w) in &weights {
+            let in_text = in_file
+                .get(&file)
+                .and_then(|names| names.get(&n))
+                .copied()
+                .unwrap_or(0);
+            let here = defines(n, file);
+            if in_text > 0 || here {
+                score += if here { 2.0 * w } else { w };
+                hits += in_text;
+            }
+        }
+        if score > 0.0 {
+            scored.push((score, hits, file));
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then(origin(a.2).cmp(&origin(b.2)))
+    });
+    let mut ranking = Vec::new();
+    for (_, _, file) in &scored {
+        let entry = &index.files[*file];
+        let mut passages: Vec<(f64, usize)> = entry
+            .passages
+            .iter()
+            .enumerate()
+            .map(|(p, passage)| {
+                let found = counts.get(&(*file, p as u32));
+                let mut score = 0.0;
+                for &(n, w) in &weights {
+                    let in_text = found.is_some_and(|names| names.contains_key(&n));
+                    let here = passage_defines(n, *file, passage);
+                    if in_text || here {
+                        score += if here { 2.0 * w } else { w };
+                    }
+                }
+                (score, p)
+            })
+            .collect();
+        passages.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let best = passages.first().map_or(0.0, |p| p.0);
+        for (score, p) in passages.into_iter().take(PER_FILE) {
+            if score <= 0.0 && best > 0.0 {
+                break;
+            }
+            ranking.push(format!("file:{}:{}", entry.path, entry.passages[p].start));
+            if best <= 0.0 {
+                break;
+            }
+        }
+        if ranking.len() >= RANKED {
+            break;
+        }
+    }
+    ranking.truncate(RANKED);
+    let mut names: Vec<String> = kept.iter().map(|&n| named.names[n].clone()).collect();
+    names.sort();
+    let defined_paths: Vec<Vec<(String, usize)>> = defined
+        .iter()
+        .map(|list| list.iter().map(|(f, line)| (origin(*f), *line)).collect())
+        .collect();
+    let defining = defining_outside_source(&named.names, &kept, &defined_paths);
+    Ok(Ranked {
+        ranking,
+        names,
+        paths: paths_found,
+        defined: kept.iter().filter(|&&n| !defined[n].is_empty()).count(),
+        files: scored.len(),
+        defining,
+    })
 }
 
 /// The files that define one of the `kept` names written as code
@@ -759,5 +1189,57 @@ mod tests {
             ["file:docs/example.md", "file:tests/conftest.py"]
         );
         assert!(defining_outside_source(&names, &[0, 3, 4], &defined).is_empty());
+    }
+
+    /// The query file's symbols find the definitions the resident graph's
+    /// do, with the same files and start lines.
+    #[test]
+    fn the_query_file_finds_the_resident_definitions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph = crate::query_file::tests::sample();
+        let file = std::sync::Arc::new(crate::query_file::tests::written(&graph, dir.path()));
+        let handle = GraphHandle::new(graph);
+        let symbols = symbols_of(&handle);
+        let list: Vec<(usize, String, String)> = symbols
+            .iter()
+            .map(|(index, name, relpath, _)| (*index, name.clone(), relpath.clone()))
+            .collect();
+        let mut by_last: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, (_, name, _)) in list.iter().enumerate() {
+            let last = name.rsplit('.').next().unwrap_or(name);
+            by_last.entry(last.to_string()).or_default().push(i);
+        }
+        let resident = CodeGraph {
+            symbols: Symbols::Resident {
+                handle,
+                list,
+                by_last,
+            },
+            unchanged: None,
+        };
+        let saved = CodeGraph {
+            symbols: Symbols::Saved(file),
+            unchanged: None,
+        };
+        for name in [
+            "Store.open",
+            "store.Store.close",
+            "Store::open",
+            "self.open",
+            "run_query",
+            "query.run_query",
+            "helper_3",
+            "plan",
+            "Store",
+            "missing",
+            "",
+        ] {
+            let found = resident.definitions(name);
+            assert_eq!(found, saved.definitions(name), "{name}");
+            for i in found {
+                assert_eq!(resident.symbol(i), saved.symbol(i), "{name}");
+                assert_eq!(resident.start_line(i), saved.start_line(i), "{name}");
+            }
+        }
     }
 }

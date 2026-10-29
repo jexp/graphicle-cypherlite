@@ -141,6 +141,11 @@ pub(crate) fn file_of(
     Some(folder(db, repository)?.join(format!("{}.{extension}", episode_name(episode)?)))
 }
 
+/// [`file_of`] against the project's cache folder directly ([`read_at`]).
+fn file_in(cache: &Path, episode: &str, extension: &str) -> Option<PathBuf> {
+    Some(cache.join("query").join(format!("{}.{extension}", episode_name(episode)?)))
+}
+
 fn graph_file(db: &Connection, repository: &str, episode: &str) -> Option<PathBuf> {
     file_of(db, repository, episode, "graph")
 }
@@ -174,10 +179,17 @@ fn graph_key(head: &[u8], key: &[u8]) -> bool {
 /// hold (truncated or damaged) is removed, so that the next sync writes it
 /// again, and the graph is read from the store.
 pub fn read(db: &Connection, repository: &str, episode: &str) -> Option<(Graph, SearchIndex)> {
+    read_at(&graph_projection::cache_root(db, repository)?, repository, episode)
+}
+
+/// [`read`] against the project's cache folder directly: the graph store
+/// resolves the folder from its own location (its directory's parent) and
+/// holds no SQL connection to read it from the database path.
+pub fn read_at(cache: &Path, repository: &str, episode: &str) -> Option<(Graph, SearchIndex)> {
     if !enabled() {
         return None;
     }
-    let path = graph_file(db, repository, episode)?;
+    let path = file_in(cache, episode, "graph")?;
     let file = std::fs::File::open(&path).ok()?;
     let read = identity(&file.metadata().ok()?);
     let mut bytes = Vec::new();
@@ -247,7 +259,7 @@ fn write_atomic_parts(path: &Path, parts: &[&[u8]]) -> std::io::Result<()> {
 pub fn read_episode(db: &Connection, repository: &str) -> Result<Option<String>> {
     let heads = crate::store::heads(db, repository)?;
     let current = graph_projection::episode_of(&heads);
-    if graph_projection::is_recorded(db, repository, &current)? {
+    if graph_projection::is_recorded(&*crate::store::graph_for(db)?, repository, &current)? {
         return Ok(Some(current));
     }
     Ok(crate::store::one(
@@ -481,7 +493,7 @@ pub fn ensure(db: &Connection, repository: &str, retry: bool) -> Result<Value> {
         Some(parts) => parts,
         None => {
             // The graph as every other process reads it from the store.
-            let graph = graph_projection::load(db, repository, &episode)?;
+            let graph = graph_projection::load(&*crate::store::graph_for(db)?, repository, &episode)?;
             let index = SearchIndex::new(&graph);
             let saved = graphicle::snapshot::to_bytes(&graph_key, &graph, &index);
             let edges = FileEdges::of(&graph).encode(&graph_key);
