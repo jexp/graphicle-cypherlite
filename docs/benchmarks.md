@@ -9,11 +9,14 @@ endorsement is implied.
 
 | Area | Status | Result |
 |---|---|---|
-| Code-graph engine: parity | Graphify 0.9.91: run on Linux, 15 October 2026, and again on the 0.1.2 source, 18 October 2026; the full run on macOS is pending. Graphify 0.9.88: done, 13 October 2026; widened 14 October 2026 | Against Graphify 0.9.91, the comparison checks pass on Linux, apart from those that stop on that host, as they did against 0.9.88 (IPv4 loopback, a speech recording and ffmpeg, and one layout tolerance). Against Graphify 0.9.88, every check passes, with reviewed upstream fixes applied to nine of the reference's modules; widened on 14 October, they run most of its test files against the engine, and every file they run passes apart from the recorded known differences. The limits are [below](#parity-with-graphify) |
+| Code-graph engine: parity | Graphify 0.9.95: done on Linux, 24 October 2026. Graphify 0.9.91: run on Linux, 15 October 2026, and again on the 0.1.2 source, 18 October 2026. Graphify 0.9.88: done, 13 October 2026; widened 14 October 2026 | Against Graphify 0.9.95, every comparison check passes on Linux (97 of 97) and every application module has a passing receipt. Against Graphify 0.9.91, the comparison checks pass on Linux, apart from those that stop on that host, as they did against 0.9.88 (IPv4 loopback, a speech recording and ffmpeg, and one layout tolerance). Against Graphify 0.9.88, every check passes, with reviewed upstream fixes applied to nine of the reference's modules; widened on 14 October, they run most of its test files against the engine, and every file they run passes apart from the recorded known differences. The limits are [below](#parity-with-graphify) |
 | Code-graph engine: speed | Done, on a pre-release build that followed Graphify 0.9.77. The 0.1.0 engine: an exploratory survey, 14 October 2026; its registered quiet-host repeat is pending. Updates after commits: Graphicle 0.1.0 against Graphify 0.9.91, registered before the first update, 15 October 2026. 13 codebases against Graphify 0.9.91: Graphicle's 0.1.1 memory engine (a pre-release build), one session per program, 15 October 2026 | Django (pre-release build): code-only extract 7.5 s against 72.8 s for Graphify 0.9.77. Kubernetes v1.37.1 (the 0.1.0 engine, which follows Graphify 0.9.88; exploratory, one run each on one Linux host, the same 16 CPUs, 8 workers, with four recorded deviations): code-only extract 198.4 s against 1,597.9 s for Graphify 0.9.88, the same graph. [Details](#speed-on-kubernetes). Updates after each of 30 commits on prometheus, tokio and poetry (one Linux node, 4 CPUs per run): 6 to 8 times less time than Graphify 0.9.91, with the same differences from a fresh build in both. [Details](#updates-after-commits). 13 codebases, 3 operations each (Graphicle's 0.1.1 memory engine, a pre-release build, against Graphify 0.9.91; the same machine, 3 CPUs and 8 workers each): 3.0 to 22.7 times less time in all 39 measurements; the graphs differ slightly, with node counts within 4.7% and edge counts within 2.0%. [Details](#speed-on-13-codebases-against-graphify-0991) |
 | Code-graph engine: peak memory | A pre-release build with 0.1.1's changes to how the engine holds its data, against Graphify 0.9.91, 15 October 2026; five measurements rechecked on a build of the merged 0.1.1 source | Less peak memory than Graphify 0.9.91 in all 39 measurements (13 repositories; extract, priming update and update with no change), from 0.29 to 0.97 times Graphify's figure; Kubernetes extract 2,091.5 against 2,767 MiB. One Linux node (its 8 H100 GPUs not used), 8 workers; Graphicle's peak RSS against Graphify's peak PSS. [Details](#peak-memory-against-graphify-0991) |
 | Coding agents: Claude Code with Graphicle, Graphify or neither | Four task sets, each test registered before any answer was scored; Claude Code with Opus 5.5, and one set repeated with Haiku 5.5 | Graphicle tied plain Claude Code on finding files and facts in every test, and no token saving is claimed against it. Against Graphify 0.9.91, Graphicle found more facts on Graphify's showcase corpus and used fewer tokens in all four task sets (on SWE-bench Verified, a secondary comparison); in two of them, Graphicle's arm included a prototype that does not ship. [Details](#coding-agents-with-graphicle-graphify-or-neither) |
-| Retrieval: finding the files a fix changes | Graphicle 0.1.3 and the 0.1.2 release, offline, 21 October 2026, on 100 SWE-bench Verified issues never used for tuning and 80 issues used for tuning | On the held-out issues, a file the fix changed was among the first 5 files of 0.1.3's context packet for 75, against 61 for BM25 (SWE-bench style; McNemar exact p = 0.013) and 54 for grep on the issue's names; for the first file and the first 10 files the differences from BM25 are not significant. Ranking only: the agent test of 0.1.3 is pending ([retrieval benchmark](benchmarks/retrieval.md)) |
+| Retrieval: finding the files a fix changes | Graphicle 0.1.8, offline, 25 October 2026, on 100 SWE-bench Verified issues never used for tuning; Graphicle 0.1.3 and the 0.1.2 release, 21 October 2026, on those and 80 issues used for tuning | On the held-out issues, a file the fix changed was among the first 5 files of 0.1.8's context packet for 75, against 61 for BM25 (SWE-bench style; McNemar exact p = 0.013) and 54 for grep on the issue's names; for the first file and the first 10 files the differences from BM25 are not significant. 0.1.3 had the same counts, apart from 82 in the first 10 files against 0.1.8's 81. Ranking only: no agent test of this ranking has been run yet ([retrieval benchmark](benchmarks/retrieval.md)) |
+| Retrieval: time per question, our run | Graphicle 0.1.8 against 0.1.7 on our Linux server, 25 October 2026 | kubernetes, the 22 questions of issue #8, each call a new process: `graphicle context` took a median of 1.34 s with 0.1.8 against 2.99 s with 0.1.7 on 16 cores, and 1.38 s against 3.89 s on 4; the peak memory of a call was 0.6 GB against 3.5 GB, with the same packet for every question. [Details](#our-own-run-on-kubernetes-017-and-018) |
+| Retrieval: time per question, measured independently | Run and published by @selimaytac, who reported issue #8, on Graphicle 0.1.3 and 0.1.5, 23 October 2026 | kubernetes, 22 questions, an Apple M3 Pro, no answer model: `graphicle context` took a median of 153.5 s per question on 0.1.3 and 9.5 s on 0.1.5, and the prompt hook returned a packet for 18 of 22. [Details](#independent-measurements) |
+| Whole-repository packs: the files a fix changes, in repositories past 1M tokens | Questions, arms and scorer fixed; the model runs are not made yet. Context recall without a model, on 3 held-out and 2 development repositories, with the pack built before Meta's hackathon (2a46edb) | Held out (pytorch, vscode and elasticsearch, 90 questions): a mean 55.8% of the files a fix changed had text inside a 64K-token pack (whole, or as excerpts or outlines of their symbols) and 76.8% inside 1M tokens, against 1.1% and 2.2% for the repository cut to the same budget, which holds whole files only. [The benchmark's page](benchmarks/whole-repo.md) |
 | Agent memory: comparison with seven memory systems | Done, on development sets, with a proxy evaluator | Every system's scores and the 21 registered comparisons are [below](#agent-memory-comparison-with-seven-memory-systems). None of them is a headline claim |
 | Agent memory: retrieval defaults | Chosen | Model-free retrieval runs on development data, plus held-out checks; their records are not published yet, so no numbers are given |
 
@@ -27,15 +30,33 @@ conditions, and the sections below have the full tables.
 ### Parity with Graphify
 
 The engine is a Rust port of Graphify. It follows Graphify
-0.9.91 (tag commit `10130e79`): the port was made from 0.9.77 (`5c7b8479`),
-the eleven releases 0.9.78 to 0.9.88 were ported for 0.1.0, and the three
-releases 0.9.89 to 0.9.91 for 0.1.1. Against Graphify 0.9.88 it passed every
-comparison check, and every application module had a passing receipt.
-Against Graphify 0.9.91 the checks have run on Linux, where the only checks
-that do not pass stop for reasons of that host (below); the full run on
-macOS, which records every module's receipt, is still to be made for 0.9.91.
+0.9.95 (tag commit `92741d16`): the port was made from 0.9.77 (`5c7b8479`),
+the eleven releases 0.9.78 to 0.9.88 were ported for 0.1.0, the three
+releases 0.9.89 to 0.9.91 for 0.1.1, and the four releases 0.9.92 to 0.9.95
+for 0.1.7. Against Graphify 0.9.95 it passes every comparison check on
+Linux, and every application module has a passing receipt. Against Graphify
+0.9.88 it passed every comparison check, and every application module had a
+passing receipt. Against Graphify 0.9.91 the checks ran on Linux, where the
+only checks that did not pass stopped for reasons of that host (below).
 That is the parity claim, with these limits:
 
+- **Graphify 0.9.95 (24 October 2026).** A qualified build of the source that
+  follows 0.9.95 (binary SHA-256 `92c162c3…`) ran `tools/qualify_all.py`
+  against the pinned archive of Graphify 0.9.95 (`92741d16`, archive SHA-256
+  `b4bc34d3…`, with `graphifyy` 0.9.95 from PyPI) on Linux (x86_64). Every one
+  of the 97 checks passes, and the file ledger (`migration/FILES.json`) marks
+  all 96 application modules verified. On that host the loopback checks ran
+  with their test servers on the host's own address, `check_transcribe` had
+  ffmpeg and the speech recording (`jfk.wav`), and the force-directed layout
+  is compared with NetworkX at an absolute tolerance of 1e-8 instead of 2e-9:
+  one coordinate of 22 differs there by 2.2e-9, with the same values against
+  0.9.91 as against 0.9.95. Of the test files that 0.9.92 to 0.9.95 add or
+  change, the checks run all but these: the files that test Graphify's skill
+  text, the scan-root test, which reads a Python module variable,
+  `test_cache_long_paths.py`, which runs only on Windows,
+  `test_serve_http.py`, which needs packages the reference environment does
+  not install, and single tests that patch the reference's private Python
+  functions or read its source; each is recorded in its check's receipt.
 - **Graphify 0.9.91 (15 October 2026).** A qualified build of the 0.1.1
   source (binary SHA-256 `f212d846…`) ran `tools/qualify_all.py` against the
   pinned archive of Graphify 0.9.91 (`10130e79`, archive SHA-256
@@ -154,8 +175,12 @@ That is the parity claim, with these limits:
   upstream fixes that were reviewed and the known limitations.
 
 The opt-in additions (`--precise`, `extract --docs`, `extract --routes`,
-`retrieve`, `serve --watch`) go beyond Graphify 0.9.91, so the parity claim
-does not cover them. Each one is off unless you ask for it.
+`retrieve`, `serve --watch`) go beyond Graphify 0.9.95, so the parity claim
+does not cover them. Each one is off unless you ask for it. Two defaults also
+go beyond it: every reader of a saved graph.json repairs parallel links
+stored under `multigraph: false` (upstream repairs them only in its MCP
+server), and the engine reads a graph.json over the 512 MiB cap that it
+wrote itself (upstream refuses it).
 
 ### Speed against Graphify 0.9.77
 
@@ -1106,6 +1131,59 @@ decision rule.
   them ended at their output limit. It made no embedding calls to the model
   servers, because it embeds in its own process.
 
+## Agent memory with GPT models: early pre-release runs
+
+Before the comparison above, in early pre-release evaluations on 8 October 2026, a pre-release build of Graphicle answered LoCoMo (1,540 questions) and LongMemEval-S (500 questions) through three published protocols, on Azure OpenAI models, as memory vendors publish their results:
+
+- **mem0:** Mem0's published prompts, with GPT-5 (2025-08-07) as reader and judge.
+- **gpt54-common:** the Omni prompts, with GPT-5.4 (2026-03-05, medium reasoning) as reader and GPT-4o (2024-11-20) as judge. This is not an exact replication of Zep's setup.
+- **omni-adapted:** the published Omni prompts, with GPT-4.1-mini (2025-04-14) as reader and GPT-4o (2024-11-20) as judge, in place of the unavailable GPT-4o-mini.
+
+Labels for every number in this section:
+
+- **The build.** A pre-release build of Graphicle, whose memory notes were written by GPT-4.1-mini. `graphicle` is its retrieval alone, `graphicle_observer` adds the notes, and `plain` is a baseline without Graphicle.
+- **The other rows are not fresh runs.** `hindsight_replay` and `amb_hybrid_replay` are fresh answers from the published, unchanged retrieval contexts of Hindsight's and the Agent Memory Benchmark's runs. The Mem0 figures are Mem0's own published result files: merged outputs, not a fresh run of the managed service.
+- **Missing notes.** When the answers were scored, notes were missing for 142 of the 500 LongMemEval histories and for 1 of the 10 LoCoMo conversations. Every question stayed in the denominator, and a failure scored 0.
+- **Intervals and gold labels.** LoCoMo intervals resample its ten conversations. About 6.4% of LoCoMo's gold answers are wrong (an independent audit), which caps a fully correct system near 93.6%.
+
+| Dataset | Protocol | Memory or context | Correct | Accuracy [95% interval] | Reader or judge errors | Context tokens, mean |
+| --- | --- | --- | ---: | --- | ---: | ---: |
+| LoCoMo | gpt54-common | graphicle_observer | 1,392 / 1,540 | 90.39% [88.9, 91.8] | 0 | 13,232 |
+| LoCoMo | gpt54-common | hindsight_replay | 1,395 / 1,540 | 90.58% [88.3, 92.6] | 2 | 35,604 |
+| LoCoMo | mem0 | graphicle | 1,413 / 1,540 | 91.75% [89.8, 93.8] | 9 | 6,208 |
+| LoCoMo | mem0 | graphicle_observer | 1,440 / 1,540 | 93.51% [92.0, 94.8] | 11 | 12,661 |
+| LoCoMo | mem0 | plain | 1,382 / 1,540 | 89.74% [87.9, 91.7] | 7 | 6,233 |
+| LoCoMo | omni-adapted | amb_hybrid_replay | 1,201 / 1,540 | 77.99% [75.2, 80.6] | 0 | 21,727 |
+| LoCoMo | omni-adapted | graphicle | 1,330 / 1,540 | 86.36% [85.0, 87.8] | 0 | 6,408 |
+| LoCoMo | omni-adapted | graphicle_observer | 1,330 / 1,540 | 86.36% [83.4, 89.2] | 0 | 13,232 |
+| LoCoMo | omni-adapted | hindsight_replay | 1,347 / 1,540 | 87.47% [85.8, 89.0] | 0 | 35,604 |
+| LoCoMo | omni-adapted | plain | 1,284 / 1,540 | 83.38% [82.1, 84.6] | 0 | 6,429 |
+| LongMemEval-S | gpt54-common | graphicle_observer | 473 / 500 | 94.60% [92.3, 96.3] | 0 | 25,242 |
+| LongMemEval-S | gpt54-common | hindsight_replay | 467 / 500 | 93.40% [90.9, 95.3] | 1 | 43,125 |
+| LongMemEval-S | mem0 | graphicle | 411 / 500 | 82.20% [78.6, 85.3] | 1 | 5,771 |
+| LongMemEval-S | mem0 | graphicle_observer | 463 / 500 | 92.60% [90.0, 94.6] | 1 | 24,176 |
+| LongMemEval-S | mem0 | plain | 385 / 500 | 77.00% [73.1, 80.5] | 0 | 5,806 |
+| LongMemEval-S | omni-adapted | amb_hybrid_replay | 385 / 500 | 77.00% [73.1, 80.5] | 0 | 22,907 |
+| LongMemEval-S | omni-adapted | graphicle | 386 / 500 | 77.20% [73.3, 80.7] | 0 | 5,997 |
+| LongMemEval-S | omni-adapted | graphicle_observer | 429 / 500 | 85.80% [82.5, 88.6] | 0 | 25,242 |
+| LongMemEval-S | omni-adapted | hindsight_replay | 446 / 500 | 89.20% [86.2, 91.6] | 0 | 43,125 |
+| LongMemEval-S | omni-adapted | plain | 380 / 500 | 76.00% [72.1, 79.5] | 0 | 6,035 |
+
+Paired differences, candidate minus control:
+
+| Dataset | Protocol | Comparison | Difference | Paired 95% interval |
+| --- | --- | --- | ---: | --- |
+| LongMemEval-S | omni-adapted | graphicle_observer vs hindsight_replay | -3.40 points | [-6.60, -0.20] |
+| LongMemEval-S | gpt54-common | graphicle_observer vs hindsight_replay | +1.20 points | [-0.80, +3.20] |
+| LoCoMo | omni-adapted | graphicle_observer vs hindsight_replay | -1.10 points | [-3.80, +1.79] |
+| LoCoMo | gpt54-common | graphicle_observer vs hindsight_replay | -0.19 points | [-1.28, +0.83] |
+| LoCoMo | mem0 | graphicle_observer vs Mem0's published files | +1.95 points | [+0.55, +3.55] |
+| LoCoMo | mem0 | graphicle vs Mem0's published files | +0.19 points | [-1.27, +1.88] |
+
+Mem0's published files score 1,410 of 1,540 (91.56%) on LoCoMo and 467 of 500 (93.4%) on LongMemEval-S under the mem0 protocol. These differ from the headlines in Mem0's README. No paired interval was computed for LongMemEval-S.
+
+A citation audit checked the notes' quoted byte spans against the source files: 3,894 spans on LoCoMo and 507,874 on LongMemEval, with 0 integrity errors. It checks that each quote is exact, not that each note is complete or correct.
+
 ## Agent memory: how the retrieval defaults were chosen
 
 Model-free retrieval runs chose the defaults. They ask whether the evidence
@@ -1132,6 +1210,85 @@ numbers.
 - **`note_keys: "merge"`**, which keys passages by the notes that quote them,
   raised evidence recall in the held-out check. It is kept, but off until its
   effect on answers is measured.
+
+## Independent measurements
+
+People outside the project who measured Graphicle with their own scripts,
+on their own machines, and published the results. The numbers below are
+theirs, apart from our own run of the same questions, which says so.
+
+### `graphicle context` on kubernetes, 0.1.3 and 0.1.5
+
+[@selimaytac](https://github.com/selimaytac), who reported
+[issue #8](https://github.com/Graphicle-AI/graphicle/issues/8), ran their 22
+questions about kubernetes on Graphicle 0.1.3 and again on 0.1.5, and
+published the script, the questions and the rows of both runs:
+[selimaytac/benchmarks, graphicle-context](https://github.com/selimaytac/benchmarks/tree/main/graphicle-context).
+Thank you for the report, the questions and the rerun.
+
+**Label:** kubernetes at `ca8a2a9e4`, a shallow clone with the history since
+1 June 2026; the 22 questions of issue #8; an Apple M3 Pro; no answer model
+configured, so no model calls; published 23 October 2026.
+
+| | 0.1.3 | 0.1.5 |
+|---|---|---|
+| `graphicle context`, median time per question | 153.5 s | 9.5 s |
+| The prompt hook returned a packet (one pass) | not run | 18 of 22 |
+
+- **A fixed cost per call.** On that machine each call of 0.1.5 takes
+  about 9 seconds whatever the question, just under the prompt hook's
+  default budget of 10 seconds. `GRAPHICLE_PROMPT_CONTEXT_SECONDS`, or
+  `graphicle config set prompt_context.seconds N` (1 to 25 seconds), raises
+  the budget.
+- **The hook's 4 misses.** 2 of the 22 questions name no code, and the hook
+  does not read them as code questions; the other 2 ran past the budget in
+  that pass.
+- **Rough ratio.** The 0.1.3 column is one round per question, measured
+  while the machine had other work for part of the run; the 0.1.5 column
+  is three rounds per question.
+- **Our own run.** On 16 cores of a Linux server, the same 22 questions took
+  a median of 3.1 seconds with 0.1.5 (the 0.1.5 entry of the
+  [CHANGELOG](../CHANGELOG.md)). Our run of 0.1.8 against 0.1.7 is
+  [below](#our-own-run-on-kubernetes-017-and-018).
+
+### Our own run on kubernetes, 0.1.7 and 0.1.8
+
+0.1.8 reads the code graph's query file in place, instead of decoding the
+whole saved graph at each call as 0.1.7 does. We ran the same 22 questions on
+both releases.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/speed-kubernetes-dark.svg">
+    <img src="../assets/speed-kubernetes-light.svg" alt="Questions on kubernetes: Graphicle 0.1.8 against 0.1.7. Time per question, the median seconds of a graphicle context call: 22 questions on 16 cores, 0.1.7 2.99 s, 0.1.8 1.34 s; 22 questions on 4 cores, 3.89 s and 1.38 s; 22 questions on 4 cores with the file cache dropped before each call, 4.55 s and 1.90 s; 8 lookups on 16 cores, 2.52 s and 0.96 s. Peak memory of a call, the median over the 22 questions on 16 cores: 3.5 GB and 0.6 GB. On the same store, both releases gave the same packet for every question, byte for byte." width="860">
+  </picture>
+</p>
+
+**Label:** one Linux server (Intel Xeon Platinum 8480C), 16 of its cores, or
+4 for a laptop-like run; kubernetes at `ca8a2a9e4`, a shallow clone (30,315
+files); the 22 questions of issue #8, and 8 lookups such as "Where is X
+defined?"; each call a new process, as the prompt hook runs it; both releases
+on the same cores, interleaved; medians; 25 October 2026.
+
+| Release | `graphicle context`, 22 questions, 16 cores | 22 questions, 4 cores | 8 lookups, 16 cores | 22 questions, 4 cores, file cache dropped before each call | Peak memory of a call, 22 questions, 16 cores |
+|---|---|---|---|---|---|
+| 0.1.7 | 2.99 s | 3.89 s | 2.52 s | 4.55 s | 3.5 GB |
+| 0.1.8 | 1.34 s | 1.38 s | 0.96 s | 1.90 s | 0.6 GB |
+
+- **Rounds.** The times are medians over 3 rounds of every question on 16
+  cores and 2 rounds on 4 cores, after one round that is not counted; with
+  the data folder and the program dropped from the file cache before each
+  call, over 1 round. The peak memory is the median of each call's peak
+  resident memory.
+- **Same packets.** On the same store, both releases gave the same packet
+  for every question, byte for byte.
+- **After upgrading.** Until the first `graphicle sync` after upgrading,
+  0.1.8 reads the code graph from the store instead (a median of 22.5 s per
+  question over the 22 questions, 16 cores); the
+  [CHANGELOG](../CHANGELOG.md) has the details.
+- **The chart.** [`benchmarks/kubernetes_chart.py`](benchmarks/kubernetes_chart.py)
+  draws it from the table above: `assets/speed-kubernetes-light.svg` and
+  `-dark.svg`, with a PNG of each at twice the size.
 
 ## Reproducing
 

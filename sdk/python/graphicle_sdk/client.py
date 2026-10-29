@@ -48,7 +48,8 @@ including those this module does not wrap (``graph.query``, ``memory.export``, `
 drop arguments whose value is ``None``; ``command`` sends exactly what it is given.
 
 Errors: an HTTP error response raises :class:`GraphicleError` with ``status``, ``message`` (the
-service's ``error`` text) and ``body``. HTTP 403 raises :class:`GraphiclePermissionError`, which is
+service's ``error`` text), ``body`` and, when the response sent ``Retry-After``, ``retry_after``
+in seconds. HTTP 403 raises :class:`GraphiclePermissionError`, which is
 also a built-in :class:`PermissionError`. A failed or cancelled job raises :class:`GraphicleError`
 with ``status=None`` and the job record in ``job``; an unreachable service raises it with
 ``status=None`` too. :meth:`Project.wait` raises :class:`TimeoutError`.
@@ -60,6 +61,8 @@ forwarded), and ``repr()`` omits it. Only the Python standard library is used.
 """
 from __future__ import annotations
 
+import email.utils
+import ipaddress
 import json
 import math
 import os
@@ -68,7 +71,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 
@@ -84,7 +87,28 @@ __all__ = [
 #: Job states that are still in progress.
 PENDING_STATES = frozenset({"queued", "retry", "running"})
 
-_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+
+def _is_loopback(hostname: str) -> bool:
+    """True for localhost and every loopback address, not only three spellings.
+
+    127.0.0.2 and IPv4-mapped ::ffff:127.0.0.1 are loopback. Sending the workspace
+    capability to them in cleartext is the same as sending it to 127.0.0.1, and
+    refusing them makes a local service on any other 127/8 address unusable.
+    """
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    # An IPv4-mapped address is judged by its IPv4 address: the is_loopback of some
+    # Python releases (3.12.3, for one) is False for ::ffff:127.0.0.1.
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback
+
+
 # Service limits: connector.import takes at most 5,000 documents per call and a request body is
 # capped at 24 MiB; source.forget takes at most 1,000 document ids.
 _IMPORT_DOCUMENTS = 5000
@@ -98,18 +122,24 @@ class GraphicleError(Exception):
     ``status`` is the HTTP status code, or ``None`` when there was no HTTP error response (the
     service was unreachable, or a job failed or was cancelled). ``message`` is the service's error
     text, ``body`` the parsed response body and ``job`` the job record for workflow failures.
+    ``retry_after`` is seconds from a ``Retry-After`` header (a delay, or an HTTP-date counted
+    from now), or ``None`` when the response did not send one.
     """
 
     def __init__(self, status: Optional[int], message: str, *, body: Any = None,
-                 job: Optional[Dict[str, Any]] = None) -> None:
+                 job: Optional[Dict[str, Any]] = None, retry_after: Optional[int] = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
         self.body = body
         self.job = job
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
-        return self.message if self.status is None else f"{self.message} (HTTP {self.status})"
+        text = self.message if self.status is None else f"{self.message} (HTTP {self.status})"
+        if self.retry_after is None:
+            return text
+        return f"{text}; retry after {self.retry_after} s"
 
 
 class GraphiclePermissionError(GraphicleError, PermissionError):
@@ -122,7 +152,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _error(status: int, raw: bytes) -> GraphicleError:
+def _retry_after(headers: Any) -> Optional[int]:
+    raw = headers.get("Retry-After") if headers is not None and hasattr(headers, "get") else None
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    # ASCII digits only: str.isdigit is also true for digits such as a superscript two,
+    # which int() refuses.
+    if text.isascii() and text.isdigit():
+        return int(text)
+    # A value that is neither a delay nor an HTTP-date leaves the error without a delay:
+    # parsedate_to_datetime raises ValueError for one (Python 3.10 and later).
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delay = (parsed - datetime.now(timezone.utc)).total_seconds()
+    return 0 if delay <= 0 else math.ceil(delay)
+
+
+def _error(status: int, raw: bytes, headers: Any = None) -> GraphicleError:
     text = raw.decode("utf-8", "replace").strip()
     try:
         body: Any = json.loads(text) if text else None
@@ -133,7 +184,7 @@ def _error(status: int, raw: bytes) -> GraphicleError:
     else:
         message = text[:2000] or f"HTTP {status}"
     kind = GraphiclePermissionError if status == 403 else GraphicleError
-    return kind(status, message, body=body)
+    return kind(status, message, body=body, retry_after=_retry_after(headers))
 
 
 def default_data_dir() -> Path:
@@ -179,7 +230,7 @@ class Client:
             raise ValueError("url must be an http(s) origin, for example http://127.0.0.1:8854")
         # Accessing port validates non-numeric and out-of-range port strings.
         _ = parts.port
-        if parts.scheme == "http" and parts.hostname not in _LOOPBACK and not insecure_http:
+        if parts.scheme == "http" and not _is_loopback(parts.hostname) and not insecure_http:
             # The capability is a bearer secret; plain HTTP would expose it on the network.
             raise ValueError("Plain http is only for loopback addresses; use https, or pass "
                              "insecure_http=True for a network you trust")
@@ -191,7 +242,7 @@ class Client:
         self._capability = capability
         self._base = f"/api/workspaces/{urllib.parse.quote(workspace, safe='')}"
         handlers: List[urllib.request.BaseHandler] = [_NoRedirect()]
-        if parts.hostname in _LOOPBACK:
+        if _is_loopback(parts.hostname):
             handlers.append(urllib.request.ProxyHandler({}))
         self._opener = urllib.request.build_opener(*handlers)
 
@@ -228,7 +279,7 @@ class Client:
                 raw = b""
             finally:
                 error.close()
-            raise _error(error.code, raw) from None
+            raise _error(error.code, raw, error.headers) from None
         except (urllib.error.URLError, OSError) as error:
             reason = getattr(error, "reason", error)
             if isinstance(reason, TimeoutError):

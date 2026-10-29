@@ -68,6 +68,13 @@ impl Variant {
     }
 }
 
+/// The hash of the engine source this build was made from, which every
+/// snapshot it writes carries: a host that stores data derived from the
+/// engine's graphs can key it the same way.
+pub fn build_code() -> &'static str {
+    CODE
+}
+
 pub fn enabled() -> bool {
     !std::env::var("GRAPHICLE_QUERY_SNAPSHOT").is_ok_and(|v| {
         matches!(
@@ -221,6 +228,31 @@ pub(crate) fn encode(key: &[u8], graph: &Graph, index: &SearchIndex) -> Vec<u8> 
         out.extend_from_slice(chunk);
     }
     out
+}
+
+/// A snapshot of `graph` and `index` that its caller keys and stores itself
+/// (a host's projected graphs): [`from_bytes`] reads it back with the same
+/// `key`, in this build only.
+pub fn to_bytes(key: &[u8], graph: &Graph, index: &SearchIndex) -> Vec<u8> {
+    encode(&caller_key(key), graph, index)
+}
+
+/// The graph and index of a [`to_bytes`] snapshot written with `key` by this
+/// build; `None` when it carries another key or was written by another build.
+pub fn from_bytes(bytes: &[u8], key: &[u8]) -> Option<Result<(Graph, SearchIndex)>> {
+    let key = caller_key(key);
+    let body = bytes
+        .strip_prefix(MAGIC.as_slice())?
+        .strip_prefix(key.as_slice())?;
+    Some(decode(body))
+}
+
+fn caller_key(key: &[u8]) -> Vec<u8> {
+    let mut w = Vec::with_capacity(key.len() + 80);
+    put_bytes(&mut w, CODE.as_bytes());
+    put_bytes(&mut w, b"caller");
+    put_bytes(&mut w, key);
+    w
 }
 
 /// Graph and index from a snapshot body (the bytes after the key).

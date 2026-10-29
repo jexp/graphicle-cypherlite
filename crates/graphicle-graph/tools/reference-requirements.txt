@@ -1,6 +1,9 @@
 # Reference interpreter for the comparison suite (development only): packages of
 # crates/graphicle-graph/.reference-venv, recorded from the environment that produced
-# the qualification receipts (2026-10-15, Graphify 0.9.91).
+# the qualification receipts (2026-10-15, Graphify 0.9.91), rebuilt for
+# Graphify 0.9.95 on 2026-10-24 with only the graphifyy pin changed (0.9.95
+# adds pyyaml>=6.0, already pinned, and caps tree-sitter-dm <0.26, pinned
+# 0.25.1).
 #
 # - CPython 3.12.13 created by uv 0.11.6, include-system-site-packages = false.
 #   Always run `.reference-venv/bin/python tools/...`: console-script shebangs
@@ -9,7 +12,7 @@
 #   holds the absolute path of crates/graphicle/.comparison-venv/lib/python3.12/
 #   site-packages (comparison-requirements.txt; pytest, networkx and most
 #   tree-sitter grammars). Packages listed here shadow those.
-# - `import graphify` is the pinned Graphify 0.9.91 checkout (commit 10130e79,
+# - `import graphify` is the pinned Graphify 0.9.95 checkout (commit 92741d16,
 #   migration/FILES.json source_root), which tools/parity.py puts first on
 #   sys.path. The installed graphifyy wheel (the same release, installed from
 #   its PyPI wheel with --require-hashes) is shadowed and never imported.
@@ -18,6 +21,7 @@
 #          uv pip install --python .reference-venv/bin/python -r tools/reference-requirements.txt
 #          then write the .pth file naming the comparison venv's site-packages.
 # pillow is 13.0.0 (security advisories) instead of the recorded 12.3.0.
+# pypdf is 6.21.2 (security advisories) instead of the recorded 6.19.0.
 annotated-types==0.8.0
 anthropic==1.8.0
 anyio==4.15.1
@@ -27,7 +31,7 @@ charset-normalizer==3.5.1
 docstring_parser==0.18.0
 et_xmlfile==2.0.0
 FalkorDB==1.7.1
-graphifyy==0.9.91
+graphifyy==0.9.95
 graspologic-native==1.2.5
 h11==0.16.0
 httpcore2==2.13.1
@@ -45,7 +49,7 @@ psycopg==3.3.6
 psycopg-binary==3.3.6
 pydantic==2.13.5
 pydantic_core==2.46.5
-pypdf==6.19.0
+pypdf==6.21.2
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
 pytz==2026.3.post1
