@@ -1833,7 +1833,7 @@ pub fn repair_entry(store: &Store, check: &EntryCheck) -> Result<Value> {
             },
             crate::agent_setup::Policy {
                 refresh_ours: true,
-                drop_guards: false,
+                ..Default::default()
             },
         );
     }
@@ -1862,7 +1862,7 @@ pub fn repair_entry(store: &Store, check: &EntryCheck) -> Result<Value> {
             },
             crate::agent_setup::Policy {
                 refresh_ours: true,
-                drop_guards: false,
+                ..Default::default()
             },
         );
     }
@@ -2228,8 +2228,18 @@ pub const ANTHROPIC_MODEL: &str = "claude-opus-5-5";
 pub const OPENAI_MODEL: &str = "gpt-5-mini";
 /// The Ollama model `config set model ollama` chooses when none is pulled.
 pub const OLLAMA_MODEL: &str = "qwen3:4b";
+/// The Muse Spark model `config set model meta` chooses (Meta Model API).
+/// Never a `-contributor` model: that tier lets Meta train on the data.
+pub const META_MODEL: &str = "muse-spark-1.3";
+/// The Meta Model API's OpenAI-compatible address.
+pub const META_BASE_URL: &str = "https://api.meta.ai/v1";
+/// Muse Spark's context window holds the input and the output together.
+pub const META_WINDOW: usize = 1_048_576;
+/// The output limit of the `meta` profile: Muse Spark always reasons, and
+/// its reasoning counts in the output.
+pub const META_OUTPUT_LIMIT: usize = 32_000;
 /// The providers `config set model` knows.
-pub const PROVIDERS: &[&str] = &["anthropic", "openai", "ollama"];
+pub const PROVIDERS: &[&str] = &["anthropic", "openai", "ollama", "meta", "compatible"];
 
 /// An answer model `setup` can offer: what is configured in this
 /// environment, best first.
@@ -2427,9 +2437,11 @@ pub fn ollama_url(value: &str) -> Option<String> {
     }
     let (scheme, rest, default_port) = match value.split_once("://") {
         None => ("http", value, 11434),
-        Some(("http", rest)) => ("http", rest, 80),
-        Some(("https", rest)) => ("https", rest, 443),
-        Some(_) => return None,
+        Some((raw, rest)) => match raw.to_ascii_lowercase().as_str() {
+            "http" => ("http", rest, 80),
+            "https" => ("https", rest, 443),
+            _ => return None,
+        },
     };
     let hostport = rest.split('/').next().unwrap_or_default();
     let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
@@ -2512,9 +2524,40 @@ pub fn model_profile_at(
             }
             profile
         }
+        // Muse Spark or Muse Wonder through the Meta Model API: the Responses
+        // API (where a prompt cache retention of 24 hours can be asked for),
+        // the key in MODEL_API_KEY, reasoning effort medium ("none" is
+        // refused).
+        "meta" => {
+            if model.is_some_and(|m| m.ends_with("-contributor")) {
+                return Err(Error::bad(
+                    "A -contributor model lets Meta train on what you send; set it in the configuration file yourself if you mean to",
+                ));
+            }
+            json!({"protocol":"responses","base_url":url.unwrap_or(META_BASE_URL),
+            "model":model.unwrap_or(META_MODEL),"key_env":key_env.unwrap_or("MODEL_API_KEY"),
+            "input_limit":META_WINDOW - META_OUTPUT_LIMIT,"output_limit":META_OUTPUT_LIMIT,
+            "reasoning_effort":"medium"})
+        }
+        // Any OpenAI-compatible chat server: Muse Spark Open on vLLM or
+        // SGLang, or a hosted endpoint.
+        "compatible" => {
+            let url = url.ok_or_else(|| {
+                Error::bad("compatible needs --url, the server's OpenAI-compatible address (for example http://127.0.0.1:8000/v1)")
+            })?;
+            let model = model.ok_or_else(|| {
+                Error::bad("compatible needs the served model's name: compatible:MODEL")
+            })?;
+            let mut profile = json!({"protocol":"chat","base_url":url,"model":model,
+                "input_limit":128000,"output_limit":16000});
+            if let Some(key) = key_env {
+                profile["key_env"] = json!(key);
+            }
+            profile
+        }
         _ => {
             return Err(Error::bad(format!(
-                "Unknown model provider {provider:?}: choose anthropic, openai or ollama, optionally with a model (anthropic:MODEL, ollama:llama3.2)"
+                "Unknown model provider {provider:?}: choose anthropic, openai, ollama, meta or compatible, optionally with a model (anthropic:MODEL, ollama:llama3.2)"
             )));
         }
     })
@@ -2647,7 +2690,7 @@ pub fn set_answer_model(
         .map_or((spec, None), |(provider, model)| (provider, Some(model)));
     if !PROVIDERS.contains(&provider) {
         return Err(Error::bad(format!(
-            "Unknown model provider {provider:?}: choose anthropic, openai or ollama, optionally with a model (ollama:llama3.2), or none"
+            "Unknown model provider {provider:?}: choose anthropic, openai, ollama, meta or compatible, optionally with a model (ollama:llama3.2), or none"
         )));
     }
     let profile = model_profile(provider, model.or(named), key_env, url)?;
@@ -2924,7 +2967,7 @@ pub fn config_show_text(value: &Value, style: Style) -> String {
         );
     }
     out.push_str(
-        "\nChange the answer model:  graphicle config set model anthropic|openai|ollama[:MODEL]\n",
+        "\nChange the answer model:  graphicle config set model anthropic|openai|ollama|meta[:MODEL]\n",
     );
     out.push_str("Change a setting:         graphicle config set KEY VALUE (graphicle config example lists them)");
     out
@@ -2945,8 +2988,10 @@ pub enum ConfigAction {
     /// such as `models.anthropic.model`.
     Get { key: String },
     /// Change one setting. `model VALUE` sets the answer model: anthropic,
-    /// openai or ollama, optionally with a model (`ollama:llama3.2`), or
-    /// none. Other keys are dotted paths in the file; VALUE is JSON or text.
+    /// openai, ollama, meta (Muse Spark; meta:muse-wonder-1.0 for Muse
+    /// Wonder) or compatible (with --url),
+    /// optionally with a model (`ollama:llama3.2`), or none. Other keys are
+    /// dotted paths in the file; VALUE is JSON or text.
     Set {
         key: String,
         value: String,
@@ -2984,6 +3029,9 @@ pub fn config_command(
             // GRAPHICLE_SYNC_TRACKED_IGNORED overrides the file.
             shown["sync"] =
                 json!({"tracked_ignored": crate::local::tracked_ignored_setting(Some(&config))});
+            // GRAPHICLE_PROMPT_CONTEXT_SECONDS overrides the file.
+            shown["prompt_context"] =
+                json!({"seconds": crate::prompt_hook::budget(Some(&config)).as_secs()});
             shown["limits"] = crate::limits::Limits::from_environment(&config.limits)?.view();
             emit(&shown, json, config_show_text)
         }
@@ -2997,6 +3045,9 @@ pub fn config_command(
             } else if key == "sync.tracked_ignored" {
                 // GRAPHICLE_SYNC_TRACKED_IGNORED overrides the file.
                 Some(json!(crate::local::tracked_ignored_setting(Some(&load()?))))
+            } else if key == "prompt_context.seconds" {
+                // GRAPHICLE_PROMPT_CONTEXT_SECONDS overrides the file.
+                Some(json!(crate::prompt_hook::budget(Some(&load()?)).as_secs()))
             } else if key == crate::update_notice::SETTING {
                 // GRAPHICLE_NO_UPDATE_NOTIFIER overrides the file.
                 Some(json!(crate::update_notice::on(&path)))
@@ -3176,7 +3227,9 @@ pub fn context_text(packet: &Value, style: Style) -> String {
         // agent which tool reads on, and the budget, which the line above
         // gives.
         for line in s(packet, "markdown").lines().skip(1).filter(|line| {
-            *line != crate::identifier_route::READ_ON && !line.starts_with("Budget: ")
+            *line != crate::identifier_route::READ_ON
+                && *line != crate::identifier_route::READ_ON_FILES
+                && !line.starts_with("Budget: ")
         }) {
             let _ = writeln!(out, "{line}");
         }
@@ -3568,7 +3621,7 @@ pub fn job_failure(job: &Value, model: Option<&ModelState>) -> String {
         format!(
             "The evidence for this question does not fit the model's input limit ({} tokens). Raise it with `graphicle config set models.{profile}.input_limit {}`, or ask a narrower question.",
             count(limit as u64),
-            (limit * 2).min(128_000)
+            (limit * 2).min(crate::model::MAX_INPUT_LIMIT)
         )
     } else if error.contains("max_output_tokens") {
         let (limit, profile) = model.map_or((2048, "NAME".to_string()), |m| {
@@ -4386,11 +4439,11 @@ fn apply_fixes(options: &Doctor<'_>) -> Vec<Value> {
                 local::sync(&store, &mut session, &folder, Some(&resolved.id))
             })
             .and_then(|synced| {
-                let graph = local::build_graph(&store, &session, &resolved.id, true)?;
+                let graph = local::sync_graph(&store, &session, &resolved.id, true)?;
                 Ok(json!({"fix":"sync","project":resolved.name,"folder":folder,
                         "changed":synced["replayed"]!=true,"graph":graph["status"]}))
             }),
-            None => local::build_graph(&store, &session, &resolved.id, true).map(
+            None => local::sync_graph(&store, &session, &resolved.id, true).map(
                 |graph| json!({"fix":"graph","project":resolved.name,"graph":graph["status"]}),
             ),
         };
@@ -4805,6 +4858,30 @@ fn checks(options: &Doctor<'_>) -> Vec<Check> {
                         Err(error) => Check::new("graph", State::Fail, "Code graph", error.message)
                             .with_fix("graphicle sync"),
                     });
+                    // How fast questions are: the passage index and the saved
+                    // code graph (crate::indexed_query::readiness).
+                    if let Ok(check) = store.authorized_read(
+                        &session.workspace,
+                        &session.capability,
+                        "read",
+                        |db, _| crate::indexed_query::readiness(db, &resolved.id),
+                    ) {
+                        let state = match check["state"].as_str() {
+                            Some("ready") => State::Ok,
+                            Some("small") => State::Info,
+                            _ => State::Warn,
+                        };
+                        let mut line = Check::new(
+                            "context",
+                            state,
+                            "Questions",
+                            s(&check, "detail").to_string(),
+                        );
+                        if state == State::Warn {
+                            line = line.with_fix(s(&check, "fix").to_string());
+                        }
+                        checks.push(line);
+                    }
                     // Freshness (ux-fresh): the folder against its last
                     // sync, read only.
                     if let Ok(fresh) = crate::fresh::check(&store, &session, &resolved.id) {
@@ -5684,8 +5761,40 @@ args = ["-y", "thing"]
         assert_eq!(ollama["protocol"], "ollama");
         assert!(ollama.get("key_env").is_none());
         assert!(model_profile("gemini", None, None, None).is_err());
+        // Muse Spark through the Meta Model API, never a -contributor model.
+        let meta = model_profile("meta", None, None, None).unwrap();
+        assert_eq!(meta["protocol"], "responses");
+        assert_eq!(meta["base_url"], "https://api.meta.ai/v1");
+        assert_eq!(meta["model"], META_MODEL);
+        assert_eq!(meta["key_env"], "MODEL_API_KEY");
+        assert_eq!(meta["input_limit"], META_WINDOW - META_OUTPUT_LIMIT);
+        assert_eq!(meta["reasoning_effort"], "medium");
+        assert!(meta.get("extra_body").is_none());
+        assert!(meta.get("price").is_none());
+        assert!(model_profile("meta", Some("muse-spark-1.2-contributor"), None, None).is_err());
+        assert!(model_profile("meta", Some("muse-spark-1.3-contributor"), None, None).is_err());
+        assert_eq!(
+            model_profile("meta", Some("muse-spark-1.2"), None, None).unwrap()["model"],
+            "muse-spark-1.2"
+        );
+        assert_eq!(
+            model_profile("meta", Some("muse-wonder-1.0"), None, None).unwrap()["model"],
+            "muse-wonder-1.0"
+        );
+        // Any OpenAI-compatible server, by its address and model.
+        assert!(model_profile("compatible", Some("m"), None, None).is_err());
+        assert!(model_profile("compatible", None, None, Some("http://127.0.0.1:8000/v1")).is_err());
+        let compatible = model_profile(
+            "compatible",
+            Some("muse-spark-open"),
+            None,
+            Some("http://127.0.0.1:8000/v1"),
+        )
+        .unwrap();
+        assert_eq!(compatible["protocol"], "chat");
+        assert!(compatible.get("key_env").is_none());
         // Each profile is valid as Graphicle reads it.
-        for profile in [anthropic, openai, ollama] {
+        for profile in [anthropic, openai, ollama, meta, compatible] {
             let config: model::Config =
                 serde_json::from_value(json!({"default_model":"m","models":{"m":profile}}))
                     .unwrap();
@@ -5925,6 +6034,18 @@ args = ["-y", "thing"]
         }
         for value in ["", "  ", "ftp://host", "host:port", "[::1"] {
             assert_eq!(ollama_url(value), None, "{value}");
+        }
+        // A scheme is case-insensitive. Rejecting HTTP:// makes config set
+        // ignore OLLAMA_HOST and save http://127.0.0.1:11434.
+        for (value, url) in [
+            ("HTTP://gpu.lan:11434", "http://gpu.lan:11434"),
+            (
+                "Https://ollama.example.com",
+                "https://ollama.example.com:443",
+            ),
+            ("HTTP://[::1]:11434", "http://[::1]:11434"),
+        ] {
+            assert_eq!(ollama_url(value).as_deref(), Some(url), "{value}");
         }
         let profile = model_profile_at("ollama", None, None, None, "http://[::1]:11500").unwrap();
         assert_eq!(profile["base_url"], "http://[::1]:11500");
