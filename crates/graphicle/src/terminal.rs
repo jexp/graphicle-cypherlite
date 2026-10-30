@@ -5586,16 +5586,16 @@ fn count_of(row: &Value, key: &str) -> String {
 
 /// The closing line: the exit status and why it is that.
 fn analyze_exit_line(report: &Value, exit: i64, style: Style) -> String {
-    let gate = match report["min_severity"].as_str() {
-        Some(min) => format!("at or above {min}"),
-        None => "no --min-severity given".to_string(),
-    };
     let found = report["violations"].as_array().is_some_and(|v| !v.is_empty());
-    match exit {
-        2 => style.bad("Exit 2: rule errors (see above)."),
-        1 => style.bad(&format!("Exit 1: violations {gate}.")),
-        _ if found => style.good(&format!("Exit 0: violations reported, none {gate}.")),
-        _ => style.good("Exit 0: no violations."),
+    match (exit, report["min_severity"].as_str()) {
+        (2, _) => style.bad("Exit 2: rule errors (see above)."),
+        (1, Some(min)) => style.bad(&format!("Exit 1: violations at or above {min}.")),
+        (_, Some(min)) if found => {
+            style.good(&format!("Exit 0: violations reported, none at or above {min}."))
+        }
+        (_, Some(min)) => style.good(&format!("Exit 0: no violations at or above {min}.")),
+        (_, None) if found => style.good("Exit 0: violations reported (no --min-severity, so nothing gates)."),
+        (_, None) => style.good("Exit 0: no violations."),
     }
 }
 

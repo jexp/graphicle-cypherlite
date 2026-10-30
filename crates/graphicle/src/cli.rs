@@ -310,7 +310,7 @@ enum Command {
         /// Gate on violations at or above this severity: INFO, MINOR, MAJOR,
         /// CRITICAL or BLOCKER. Without it every violation is reported and
         /// the exit status is 0.
-        #[arg(long, value_name = "SEVERITY")]
+        #[arg(long, value_name = "SEVERITY", value_parser = ["INFO", "MINOR", "MAJOR", "CRITICAL", "BLOCKER"])]
         min_severity: Option<String>,
         /// The output: table, markdown, or json. Without it, a table in a
         /// terminal and JSON otherwise.
@@ -1936,16 +1936,10 @@ where
         } => {
             let session = local::session(&store, false)?;
             let resolved = local::resolve(&store, &session, project.as_deref())?;
+            // clap has validated the spelling (a usage error exits 2).
             let min = min_severity
                 .as_deref()
-                .map(|text| {
-                    crate::arch_rules::Severity::parse(&text.to_ascii_uppercase()).ok_or_else(|| {
-                        Error::bad(format!(
-                            "--min-severity {text} is not a severity: INFO, MINOR, MAJOR, CRITICAL or BLOCKER"
-                        ))
-                    })
-                })
-                .transpose()?;
+                .and_then(crate::arch_rules::Severity::parse);
             let report = crate::arch_rules::analyze::run(
                 &store,
                 &session,
