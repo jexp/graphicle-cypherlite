@@ -417,6 +417,15 @@ fn a_head_set_recorded_by_an_older_engine_is_projected_again() {
     )
     .unwrap();
     drop(db);
+    // The graph store is the projection's authority (the SQL mirror above
+    // only keeps the un-migrated readers working), so the older engine's id
+    // is written there too: the relabel must reach the :Episode node the
+    // recorded check reads.
+    crate::grows(
+        &f.db(),
+        "MATCH (e:Episode {repository_id:$r}) SET e.episode = $legacy",
+        &[("r", json!(f.repo)), ("legacy", json!(legacy))],
+    );
     let again = f.project();
     assert_eq!(again["replayed"], false);
     assert_eq!(again["episode"], first["episode"]);
@@ -446,34 +455,43 @@ fn yaml_keys_stay_out_of_the_code_graph_and_apm_manifests_stay_in() {
         ("lib/apm.yaml", "name: lib\nversion: 0.1.0\n"),
     ]);
     f.project();
-    let db = f.db();
-    let yaml_keys: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_nodes WHERE repository_id=? AND \
-             json_extract(attributes,'$.source_file') LIKE '%deploy/%'",
-            [&f.repo],
-            |r| r.get(0),
-        )
-        .unwrap();
+    // The graph store is the projection's authority (the SQL gf_nodes table
+    // went with it): each version's extractor attributes are the stringified
+    // `data` of its :SymbolVersion, and the extractor's `depends_on` is the
+    // relationship type itself.
+    let rows: Vec<Value> = crate::grows(
+        &f.db(),
+        "MATCH (s:Symbol {repository_id:$r})-[:HAS_VERSION]->(v) RETURN v.data AS data",
+        &[("r", json!(f.repo))],
+    );
+    let attributes: Vec<Value> = rows
+        .iter()
+        .map(|row| serde_json::from_str(row["data"].as_str().unwrap_or("null")).unwrap())
+        .collect();
+    let yaml_keys = attributes
+        .iter()
+        .filter(|a| {
+            a["source_file"]
+                .as_str()
+                .is_some_and(|path| path.contains("deploy/"))
+        })
+        .count() as i64;
     assert_eq!(yaml_keys, 0);
-    let mut statement = db
-        .prepare(
-            "SELECT json_extract(attributes,'$.label') FROM gf_nodes WHERE repository_id=? AND \
-             json_extract(attributes,'$.ecosystem')='apm' ORDER BY 1",
-        )
-        .unwrap();
-    let packages: Vec<String> = statement
-        .query_map([&f.repo], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let mut packages: Vec<&str> = attributes
+        .iter()
+        .filter(|a| a["ecosystem"] == "apm")
+        .filter_map(|a| a["label"].as_str())
+        .collect();
+    packages.sort_unstable();
     assert_eq!(packages, ["app", "lib"]);
-    let dependencies: i64 = db
-        .query_row(
-            "SELECT count(*) FROM gf_edges WHERE repository_id=? AND relation='depends_on'",
-            [&f.repo],
-            |r| r.get(0),
-        )
+    let dependencies: i64 = crate::grows(
+        &f.db(),
+        "MATCH (a:Symbol {repository_id:$r})-[rel]->(b:Symbol) \
+         WHERE type(rel) = 'DEPENDS_ON' AND rel.valid_from_episode IS NOT NULL \
+         RETURN count(rel) AS n",
+        &[("r", json!(f.repo))],
+    )[0]["n"]
+        .as_i64()
         .unwrap();
     assert_eq!(dependencies, 1);
     assert!(f.count("gf_nodes") > packages.len() as i64);
