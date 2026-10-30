@@ -1,0 +1,57 @@
+{
+  "state": "complete",
+  "detail": null,
+  "episode": "ep-1",
+  "rule_set": "rs",
+  "group": "arch:default",
+  "min_severity": "MAJOR",
+  "concepts": [
+    {
+      "rule": "arch:Layer/Core",
+      "group": "arch:default",
+      "labels": 2,
+      "relationships": 0,
+      "properties": 1,
+      "nodes": 1
+    }
+  ],
+  "constraints": [
+    {
+      "rule": "arch:NoCycle",
+      "status": "violations",
+      "severity": "MAJOR",
+      "violations": 2
+    },
+    {
+      "rule": "arch:NoBlocker",
+      "status": "violations",
+      "severity": "BLOCKER",
+      "violations": 1
+    }
+  ],
+  "skipped": [],
+  "violations": [
+    {
+      "rule": "arch:NoCycle",
+      "severity": "MAJOR",
+      "path": "src/a.rs",
+      "line": 4,
+      "evidence": "src/a.rs:4"
+    }
+  ],
+  "counts": {
+    "concepts": 1,
+    "failed": 0,
+    "skipped": 0,
+    "violations": 1,
+    "by_severity": {
+      "BLOCKER": 0,
+      "CRITICAL": 0,
+      "MAJOR": 1,
+      "MINOR": 0,
+      "INFO": 0
+    }
+  },
+  "errors": [],
+  "exit": 1
+}
