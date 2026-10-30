@@ -173,9 +173,8 @@ and a changed head set is a new episode with its own run.
 - **Order**: concepts run in the order their `requires` DAG resolves to;
   every declared group runs, in group-id order, with its severity overrides
   applied (a project that declared no group runs every rule). Constraints
-  are resolved with them — their effective severities travel in the job's
-  result for the evaluator that reads the enriched graph — but their queries
-  are not run by the enrich job.
+  are resolved with them and never run by the concept pass; they are
+  evaluated afterwards (see Constraints below).
 - **Failure**: one graph transaction per rule. A rule whose query fails
   leaves nothing behind, is reported under `failed`, and everything that
   requires it (directly or through another rule) is skipped.
@@ -189,6 +188,39 @@ and a changed head set is a new episode with its own run.
   back removes exactly those labels, relationships and properties (nodes it
   created go too, once its removals leave them empty). A rule that *deletes*
   graph content cannot be rolled back: only additive writes are recorded.
+
+### Constraints
+
+A constraint is a query over the **enriched** graph whose result rows are
+violations. The enrich job runs it right after the concepts have applied to
+the episode, in the same job, with the same parameters (`$repo`, `$episode`,
+`$rule`).
+
+- **Each row is a violation**: one `(:Violation)` node per returned row,
+  linked to the project with `(:Violation)-[:IN_PROJECT]->(:Project)`. It
+  carries `repository_id`, `episode`, `rule` (the constraint id), `rule_sha`
+  and `severity`.
+- **Severity** is the effective severity the resolution gives the constraint,
+  after its group overrides (for example `overrides: [arch:X=BLOCKER]`).
+- **Evidence**: each returned column is kept as a property of the violation.
+  Scalars are stored as they are; nodes, lists and maps are stored as JSON
+  text. A column named `repository_id`, `episode`, `rule`, `rule_sha` or
+  `severity` is stored as `evidence_<column>`. `path` and `line` are set when
+  the row provides them: from a `path` or `line` column, or from a node
+  column's `relpath`/`path` and `line`/`start_line`.
+- **Replacement**: evaluating a constraint replaces its rows for the episode.
+  Re-running an unchanged rule set on the same episode leaves one set of
+  rows; another episode keeps its own.
+- **Passing**: a query that returns no rows writes no violations and is
+  reported as `passing`.
+- **Errors**: a query that fails is rolled back whole, reported as `error`,
+  and leaves no rows for that episode. A constraint that requires a concept
+  which failed is reported as `skipped`.
+
+The enrich job's result carries the outcome under `constraints`: the counts
+`violations`, `passing`, `errors` and `skipped`, and one entry per constraint.
+Verification modes beyond "rows are violations" (such as `rowCount` ratchets)
+are not part of this version.
 
 ## AsciiDoc (jQAssistant convention)
 

@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod adoc;
+pub mod constraints;
 pub mod executor;
 pub mod markdown;
 pub mod model;
