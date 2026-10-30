@@ -3,7 +3,7 @@
 //! its rule nodes after one sync, a project without one writes none, and a
 //! changed document is parsed again at the next sync.
 use graphicle_runtime::{
-    arch_rules, local,
+    local,
     store::{Store, s},
     store_graph::{self, GraphStore, Params, rows},
 };
