@@ -9,7 +9,7 @@
 //! thread on first use — check one out per worker thread and keep it, never
 //! one per request.
 use crate::{Error, Result};
-use cypherlite::{Connection, Database, Value};
+use cypherlite::{Connection, Database, PropertyMap, Value};
 use serde_json::{Map, Value as Json};
 use std::{
     collections::BTreeMap,
@@ -554,7 +554,7 @@ pub fn value_to_json(value: &Value) -> Json {
                 .collect::<Map<_, _>>(),
         ),
         Value::Node(node) => {
-            let mut map = properties_to_json(&node.properties);
+            let mut map = properties_to_json(node.properties.as_ref());
             map.insert("_id".into(), Json::from(node.id));
             map.insert(
                 "_labels".into(),
@@ -568,7 +568,7 @@ pub fn value_to_json(value: &Value) -> Json {
             Json::Object(map)
         }
         Value::Relationship(rel) => {
-            let mut map = properties_to_json(&rel.properties);
+            let mut map = properties_to_json(rel.properties.as_ref());
             map.insert("_id".into(), Json::from(rel.id));
             map.insert("_type".into(), Json::String(rel.rel_type.clone()));
             map.insert("_start".into(), Json::from(rel.start));
@@ -581,7 +581,7 @@ pub fn value_to_json(value: &Value) -> Json {
     }
 }
 
-fn properties_to_json(properties: &BTreeMap<String, Value>) -> Map<String, Json> {
+fn properties_to_json(properties: &PropertyMap) -> Map<String, Json> {
     properties
         .iter()
         .map(|(k, v)| (k.clone(), value_to_json(v)))
@@ -613,6 +613,7 @@ pub fn rows(db: &mut Connection, cypher: &str, params: Params) -> Result<Vec<Jso
         .map(|row| {
             Json::Object(
                 result
+                    .header
                     .columns
                     .iter()
                     .cloned()
