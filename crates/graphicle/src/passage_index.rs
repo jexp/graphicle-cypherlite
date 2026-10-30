@@ -533,19 +533,18 @@ fn analyse_batch(
     let mut analysed = Vec::with_capacity(files.len());
     // Read and count in groups, so a large project's text is never all held.
     for group in files.chunks(2_000) {
-        let contents = store.read(|db| {
-            let mut load = db.prepare_cached(
-                "SELECT content FROM repo_objects WHERE repository_id=? AND sha256=?",
-            )?;
-            let mut contents = Vec::with_capacity(group.len());
-            for (path, sha) in group {
-                let content: Option<String> = load
-                    .query_row(params![repository, sha], |r| r.get(0))
-                    .optional()?;
-                contents.push((path.as_str(), sha.as_str(), content.unwrap_or_default()));
-            }
-            Ok(contents)
+        // The text lives on the graph content store now (one batch read for
+        // the group); this module's own tables stay SQL for now.
+        let shas: Vec<String> = group.iter().map(|(_, sha)| sha.clone()).collect();
+        let found = store.read(|db| {
+            let graph = crate::store::graph_for(db)?;
+            crate::store_content::object_contents(&graph, repository, &shas)
         })?;
+        let contents: Vec<(&str, &str, String)> = group
+            .iter()
+            .zip(found)
+            .map(|((path, sha), content)| (path.as_str(), sha.as_str(), content.unwrap_or_default()))
+            .collect();
         let done = cache::par_map(
             &contents,
             Stemmer::default,
