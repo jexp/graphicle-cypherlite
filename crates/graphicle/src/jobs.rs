@@ -972,9 +972,19 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
             "reason": "a newer episode was recorded before enrichment", "episode": episode,
             "current_episode": current}));
     }
-    crate::arch_rules::executor::enrich(&graph, &identifier, &episode, &|| {
+    let mut report = crate::arch_rules::executor::enrich(&graph, &identifier, &episode, &|| {
         leased(&graph, job)
-    })
+    })?;
+    // The constraints read the graph the concepts just enriched, in the same job.
+    let constraints = crate::arch_rules::constraints::evaluate(
+        &graph,
+        &identifier,
+        &episode,
+        &report,
+        &|| leased(&graph, job),
+    )?;
+    report["constraints"] = constraints;
+    Ok(report)
 }
 
 /// Run `repository`'s waiting graph work in this

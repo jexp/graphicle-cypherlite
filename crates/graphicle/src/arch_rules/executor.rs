@@ -401,7 +401,7 @@ fn with_default_group(document: &RuleDocument) -> RuleDocument {
 /// `:RuleGroup` in `(source, line)` order — the order the rule documents
 /// declared them in, which the resolver's tie-breaking keeps. `None` when
 /// the project holds no rule nodes.
-fn rule_document(graph: &GraphStore, repository_id: &str) -> Result<Option<RuleDocument>> {
+pub(super) fn rule_document(graph: &GraphStore, repository_id: &str) -> Result<Option<RuleDocument>> {
     let rules = |label: &str| -> Result<Vec<(String, usize, Rule)>> {
         let rows = graph.read(|db| {
             store_graph::rows(

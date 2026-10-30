@@ -175,6 +175,15 @@ fn a_projection_of_a_project_with_rules_queues_and_runs_the_enrich_job() {
         "{result:#}"
     );
     assert!(f.count("MATCH (s:Symbol:ArchTest) RETURN count(s) AS n") > 0);
+
+    // The constraint runs after the concept over the enriched graph: every
+    // symbol carries the label, so it returns no rows and is passing.
+    assert_eq!(result["constraints"]["passing"], json!(1), "{result:#}");
+    assert_eq!(result["constraints"]["violations"], json!(0), "{result:#}");
+    assert_eq!(
+        f.count("MATCH (v:Violation {repository_id: $repo}) RETURN count(v) AS n"),
+        0
+    );
     assert_eq!(
         f.count("MATCH (a:RuleApplication {rule: 'arch:Test/Label'}) RETURN count(a) AS n"),
         1
