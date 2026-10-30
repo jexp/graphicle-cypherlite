@@ -36,7 +36,7 @@
 //! the concatenation of its chunks' text, in order, and the same inputs give
 //! the same bytes.
 
-use crate::store::{Store, repo, rows, s};
+use crate::store::{Store, repo, s};
 use crate::{Error, Result};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -5003,25 +5003,24 @@ impl Store {
             };
             let ranking: Vec<(String, usize, usize)> =
                 pinned.iter().cloned().chain(ranked).collect();
+            // The heads' file map and the file text live on the graph content
+            // store now; one handle serves the bytes listing, the folder and
+            // the per-path fetch.
+            let content_store = crate::store::graph_for(db)?;
             let mut files = BTreeMap::new();
-            for row in rows(
-                db,
-                "SELECT h.path,o.bytes FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=? ORDER BY h.path",
-                [id],
-            )? {
-                files.insert(s(&row, "path").to_string(), row["bytes"].as_u64().unwrap_or(0) as usize);
+            for (path, bytes) in crate::store_content::head_bytes(&content_store, id)? {
+                files.insert(path, bytes as usize);
             }
             let episode = crate::graph_projection::current_episode(db, id)?;
             let graph = crate::query_file::open(db, id, &episode).and_then(GraphView::of_query_file);
-            let commit = crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?
+            let commit = crate::folders::current_folder(&content_store, id)?
                 .and_then(|folder| git_head(&folder));
-            let mut statement = db.prepare(
-                "SELECT o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=?1 AND h.path=?2",
-            )?;
+            let repo_id = id.to_string();
+            let fetcher = content_store.clone();
             let fetch = move |path: &str| {
-                statement
-                    .query_row(rusqlite::params![id, path], |row| row.get::<_, String>(0))
+                crate::store_content::head_content(&fetcher, &repo_id, path)
                     .ok()
+                    .flatten()
             };
             let name = s(&repository, "name").to_string();
             let key = format!("{id}:{episode}");

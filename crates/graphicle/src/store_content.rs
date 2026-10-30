@@ -777,6 +777,40 @@ pub fn head_sha(store: &GraphStore, repository: &str, path: &str) -> Result<Opti
     })
 }
 
+/// The byte sizes of `repository`'s current heads, by path (`pack`'s file
+/// map). The bytes sit on the `Object` the head names.
+pub fn head_bytes(store: &GraphStore, repository: &str) -> Result<BTreeMap<String, i64>> {
+    store.read(|db| {
+        Ok(rows(
+            db,
+            "MATCH (f:File {repository_id:$repo})-[:HEAD]->(o:Object) \
+             RETURN f.path AS path, o.bytes AS bytes",
+            params(vec![("repo", json!(repository))]),
+        )?
+        .into_iter()
+        .map(|row| (s(&row, "path").to_string(), row["bytes"].as_i64().unwrap_or(0)))
+        .collect())
+    })
+}
+
+/// The content of one headed file — the text of the object its head names,
+/// if the file is headed. One statement, no sha round trip.
+pub fn head_content(
+    store: &GraphStore,
+    repository: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    store.read(|db| {
+        Ok(one(
+            db,
+            "MATCH (f:File {repository_id:$repo, path:$path})-[:HEAD]->(o:Object) \
+             RETURN o.content AS content",
+            params(vec![("repo", json!(repository)), ("path", json!(path))]),
+        )?
+        .and_then(|row| row["content"].as_str().map(str::to_string)))
+    })
+}
+
 /// One object's content, if present.
 pub fn object_content(store: &GraphStore, repository: &str, sha256: &str) -> Result<Option<String>> {
     store.read(|db| {

@@ -902,11 +902,9 @@ pub enum HookRoute {
 /// memory in full ([`HookRoute::Memory`]), and a larger one in full when it
 /// is [`ready`], else for the quick packet.
 pub fn hook_route(db: &Connection, repository: &str) -> Result<HookRoute> {
-    let files: i64 = db.query_row(
-        "SELECT count(*) FROM repo_heads WHERE repository_id=?",
-        [repository],
-        |r| r.get(0),
-    )?;
+    // The heads live in the graph content store; the count comes from there.
+    let graph = crate::store::graph_for(db)?;
+    let files: i64 = crate::store_content::file_count(&graph, repository)?;
     if (files as usize) < SMALL_PROJECT_FILES {
         return Ok(HookRoute::Full);
     }

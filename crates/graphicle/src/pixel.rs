@@ -1586,35 +1586,30 @@ pub fn search(run: &Run<'_>, query: &Query, top: usize) -> Result<Found> {
     run.store.authorized_read(workspace, token, "read", |db, p| {
         crate::store::repo(db, p, id)?;
         let mut paths = HashSet::new();
-        let mut statement = db.prepare(
-            "SELECT h.path,o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=?1",
-        )?;
-        let mut rows = statement.query([id])?;
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            if let Ok(text) = row.get::<_, String>(1) {
-                lookup.scan(&path, &text);
+        // The heads' file text lives on the graph content store now: the
+        // documents are read once and walked twice (the scan, then the key
+        // uses), and the per-path fetch reads a head object from there too.
+        let content_store = crate::store::graph_for(db)?;
+        let documents = crate::store_content::head_documents(&content_store, id, true)?;
+        for row in &documents {
+            let path = row["path"].as_str().unwrap_or_default();
+            if let Some(text) = row["content"].as_str() {
+                lookup.scan(path, text);
             }
-            paths.insert(path);
+            paths.insert(path.to_string());
         }
-        let mut one = db.prepare(
-            "SELECT o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=?1 AND h.path=?2",
-        )?;
         let mut fetch = |path: &str| {
-            one.query_row(rusqlite::params![id, path], |row| row.get::<_, String>(0))
+            crate::store_content::head_content(&content_store, id, path)
                 .ok()
+                .flatten()
         };
         lookup.follow_keys(&mut fetch);
         let keys = lookup.locale_keys(&mut fetch);
         if !keys.is_empty() {
-            let mut again = db.prepare(
-                "SELECT h.path,o.content FROM repo_heads h JOIN repo_objects o ON o.repository_id=h.repository_id AND o.sha256=h.sha256 WHERE h.repository_id=?1",
-            )?;
-            let mut rows = again.query([id])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                if let Ok(text) = row.get::<_, String>(1) {
-                    lookup.key_uses(&path, &text, &keys);
+            for row in &documents {
+                let path = row["path"].as_str().unwrap_or_default();
+                if let Some(text) = row["content"].as_str() {
+                    lookup.key_uses(path, text, &keys);
                 }
             }
         }
