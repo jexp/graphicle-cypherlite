@@ -220,6 +220,7 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     ("Reservation", "am_call_reservations", Scoped::Repository),
     ("Review", "reviews", Scoped::WorkspaceId),
     ("RuleGroup", "RuleGroup", Scoped::Repository),
+    ("RuleSource", "RuleSource", Scoped::Repository),
     ("Run", "repo_runs", Scoped::Repository),
     ("Secret", "am_secrets", Scoped::WorkspaceId),
     ("Served", "gf_served", Scoped::Repository),

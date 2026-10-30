@@ -924,6 +924,10 @@ fn sync_folder_with(
     let passage_index = crate::phase::phase("sync_passage_index", || {
         crate::passage_index::update(store, &repository, index_full)
     });
+    // The rule documents (architecture-concepts.md §1.5) are read from the
+    // folder beside the files the commit took; a failure is reported, never a
+    // failed sync.
+    let rules = crate::arch_rules::ingest(&store.graph(), &repository, &root, limits.file_bytes);
     let (limited, not_analysed) =
         store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
             let current = crate::store::repo(db, p, &repository)?;
@@ -955,6 +959,11 @@ fn sync_folder_with(
         Ok(updated) => updated.report(),
         Err(error) => json!({"error": error.message}),
     };
+    match rules {
+        Ok(Some(rules)) => result["rules"] = rules,
+        Ok(None) => {}
+        Err(error) => result["rules"] = json!({"error": error.message}),
+    }
     Ok(result)
 }
 
