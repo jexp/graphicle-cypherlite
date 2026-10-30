@@ -22,10 +22,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod adoc;
+pub mod analyze;
 pub mod constraints;
 pub mod executor;
 pub mod markdown;
 pub mod model;
+pub mod report;
 pub mod store;
 
 pub use executor::{enrich, has_rules, rollback};
@@ -132,6 +134,22 @@ fn read_text(path: &Path, limit: usize) -> std::result::Result<String, String> {
     }
     let bytes = std::fs::read(path).map_err(|error| format!("Could not read: {error}"))?;
     String::from_utf8(bytes).map_err(|_| "Not UTF-8 text".to_string())
+}
+
+/// The errors of the rule documents in `root` that sync skips: each one that
+/// cannot be read or does not parse, as `path: reason` (the same reasons
+/// [`ingest`] reports under `skipped`). Empty when every document parses.
+pub fn document_errors(root: &Path, limit: usize) -> Vec<String> {
+    documents_in(root)
+        .into_iter()
+        .filter_map(|(source, path)| {
+            let reason = match read_text(&path, limit) {
+                Ok(text) => parse_text(&path, &text).err()?.to_string(),
+                Err(reason) => reason,
+            };
+            Some(format!("{source}: {reason}"))
+        })
+        .collect()
 }
 
 /// The sync's rule document pass, run after the sync's commit. A document whose

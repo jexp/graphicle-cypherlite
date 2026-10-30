@@ -285,6 +285,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         "Data",
         &["sync", "sessions", "backup", "restore", "offboard"],
     ),
+    ("Architecture", &["analyze"]),
     ("Server", &["serve", "init", "login"]),
 ];
 
@@ -320,6 +321,10 @@ const SUMMARIES: &[(&str, &str)] = &[
         "Show this project's sync, code graph, agents and model",
     ),
     ("doctor", "Check the installation and fix common problems"),
+    (
+        "analyze",
+        "Check the architecture rules: a table of violations, exit 1 at --min-severity",
+    ),
     (
         "connect",
         "Connect a coding agent to this project's MCP tools",
@@ -5426,6 +5431,172 @@ pub fn doctor_text(report: &Value, style: Style) -> String {
         ),
     });
     out
+}
+
+// ---------------------------------------------------------------- analyze
+
+/// A plain-text table: a header row and the rows, each column padded to its
+/// widest cell (by characters), the header in bold. Shared by the commands
+/// that print a list of records.
+pub fn table(headers: &[&str], rows: &[Vec<String>], style: Style) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: &[String], paint: fn(Style, &str) -> String| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect();
+        paint(style, padded.join("  ").trim_end())
+    };
+    let header: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+    let mut out = format!("{}\n", line(&header, Style::bold));
+    for row in rows {
+        out.push_str(&line(row, |_, text| text.to_string()));
+        out.push('\n');
+    }
+    out
+}
+
+/// The `analyze` report as readable text: the state, the concept counts, the
+/// violations as a table of severity, rule and evidence, and the exit status
+/// with its reason.
+pub fn analyze_text(report: &Value, style: Style) -> String {
+    let mut out = String::new();
+    let state = s(report, "state");
+    let _ = writeln!(out, "{}", style.bold(&format!("Architecture rules: {}", analyze_title(report))));
+    if let Some(detail) = report["detail"].as_str() {
+        let _ = writeln!(out, "{}", style.dim(detail));
+    }
+    if state == "no_rules" {
+        let _ = writeln!(out, "This project declares no architecture rules.");
+    }
+    let concepts = report["concepts"].as_array().map_or(&[][..], Vec::as_slice);
+    if !concepts.is_empty() {
+        out.push('\n');
+        let rows: Vec<Vec<String>> = concepts
+            .iter()
+            .map(|c| {
+                vec![
+                    s(c, "rule").to_string(),
+                    s(c, "group").to_string(),
+                    count_of(c, "nodes"),
+                    count_of(c, "labels"),
+                    count_of(c, "relationships"),
+                    count_of(c, "properties"),
+                ]
+            })
+            .collect();
+        out.push_str(&table(
+            &["CONCEPT", "GROUP", "NODES", "LABELS", "EDGES", "PROPERTIES"],
+            &rows,
+            style,
+        ));
+    }
+    let violations = report["violations"].as_array().map_or(&[][..], Vec::as_slice);
+    if !violations.is_empty() {
+        out.push('\n');
+        let rows: Vec<Vec<String>> = violations
+            .iter()
+            .map(|v| {
+                vec![
+                    s(v, "severity").to_string(),
+                    s(v, "rule").to_string(),
+                    s(v, "evidence").to_string(),
+                ]
+            })
+            .collect();
+        out.push_str(&table(&["SEVERITY", "RULE", "EVIDENCE"], &rows, style));
+    }
+    if !state.is_empty() && state == "complete" && violations.is_empty() {
+        out.push_str("\nNo violations.\n");
+    }
+    for error in report["errors"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "{} {}", style.bad("error:"), error.as_str().unwrap_or_default());
+    }
+    let exit = report["exit"].as_i64().unwrap_or(2);
+    let _ = writeln!(out, "\n{}", analyze_exit_line(report, exit, style));
+    out
+}
+
+/// The `analyze` report as Markdown: the same content as [`analyze_text`],
+/// for a report artifact or a pull request comment.
+pub fn analyze_markdown(report: &Value) -> String {
+    let mut out = format!("## Architecture rules: {}\n\n", analyze_title(report));
+    if let Some(detail) = report["detail"].as_str() {
+        let _ = writeln!(out, "{detail}\n");
+    }
+    if s(report, "state") == "no_rules" {
+        out.push_str("This project declares no architecture rules.\n");
+    }
+    let concepts = report["concepts"].as_array().map_or(&[][..], Vec::as_slice);
+    if !concepts.is_empty() {
+        out.push_str("| Concept | Group | Nodes | Labels | Edges | Properties |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|\n");
+        for c in concepts {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} |",
+                s(c, "rule"),
+                s(c, "group"),
+                count_of(c, "nodes"),
+                count_of(c, "labels"),
+                count_of(c, "relationships"),
+                count_of(c, "properties"),
+            );
+        }
+        out.push('\n');
+    }
+    let violations = report["violations"].as_array().map_or(&[][..], Vec::as_slice);
+    if !violations.is_empty() {
+        out.push_str("| Severity | Rule | Evidence |\n|---|---|---|\n");
+        for v in violations {
+            let _ = writeln!(out, "| {} | {} | {} |", s(v, "severity"), s(v, "rule"), s(v, "evidence"));
+        }
+        out.push('\n');
+    }
+    for error in report["errors"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "- error: {}", error.as_str().unwrap_or_default());
+    }
+    let exit = report["exit"].as_i64().unwrap_or(2);
+    let _ = writeln!(out, "\n{}", analyze_exit_line(report, exit, Style::plain()));
+    out
+}
+
+/// The heading word of an analysis: its state, in words.
+fn analyze_title(report: &Value) -> &'static str {
+    match s(report, "state") {
+        "complete" => "complete",
+        "waiting" => "waiting",
+        "no_rules" => "no rules",
+        "invalid" => "invalid rule documents",
+        "failed" => "failed",
+        _ => "unknown",
+    }
+}
+
+/// One count of a report row as text (`0` when absent).
+fn count_of(row: &Value, key: &str) -> String {
+    row[key].as_u64().unwrap_or(0).to_string()
+}
+
+/// The closing line: the exit status and why it is that.
+fn analyze_exit_line(report: &Value, exit: i64, style: Style) -> String {
+    let gate = match report["min_severity"].as_str() {
+        Some(min) => format!("at or above {min}"),
+        None => "no --min-severity given".to_string(),
+    };
+    let found = report["violations"].as_array().is_some_and(|v| !v.is_empty());
+    match exit {
+        2 => style.bad("Exit 2: rule errors (see above)."),
+        1 => style.bad(&format!("Exit 1: violations {gate}.")),
+        _ if found => style.good(&format!("Exit 0: violations reported, none {gate}.")),
+        _ => style.good("Exit 0: no violations."),
+    }
 }
 
 #[cfg(test)]
