@@ -115,6 +115,7 @@ mod observer;
 mod offboard;
 mod one_server;
 mod passage_index;
+mod rule_documents;
 mod permissions_refresh;
 mod pixel;
 mod product_workspace;
