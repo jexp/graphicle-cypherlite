@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-catalog"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-model",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-core"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -786,14 +786,14 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-error"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-parser",
 ]
 
 [[package]]
 name = "cypherlite-executor"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "cypherlite-catalog",
@@ -807,8 +807,9 @@ dependencies = [
  "cypherlite-planner",
  "dashmap",
  "indexmap",
- "rand 0.8.8",
+ "rand 0.9.5",
  "regex",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "unicode-normalization",
@@ -817,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-front"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-error",
@@ -828,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-ir"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
@@ -836,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-model"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -846,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-ontology"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
@@ -860,14 +861,14 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-parser"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-model",
 ]
 
 [[package]]
 name = "cypherlite-planner"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -878,11 +879,11 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-splitter"
-version = "0.12.4"
+version = "0.13.0"
 
 [[package]]
 name = "cypherlite-storage"
-version = "0.12.4"
+version = "0.13.0"
 dependencies = [
  "crc32fast",
  "cypherlite-catalog",
@@ -891,6 +892,7 @@ dependencies = [
  "cypherlite-model",
  "fs4",
  "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "libc",
  "serde",
  "serde_json",
@@ -1445,9 +1447,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
