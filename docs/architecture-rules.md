@@ -1,10 +1,15 @@
 # Architecture rule documents
 
-An architecture rule document is an ordinary Markdown file in the repository.
-It holds the team's prose description of the architecture together with the
-rules that enrich and check the graph. Graphicle reads the rule blocks; GitHub
-renders the rest of the file as documentation. The design is in
-`architecture-concepts.md` (§1.5 and §2).
+An architecture rule document is an ordinary file in the repository: Markdown
+(`.md`) or AsciiDoc (`.adoc`, in jQAssistant's convention). It holds the team's
+prose description of the architecture together with the rules that enrich and
+check the graph. Graphicle reads the rule blocks; the rest of the file is
+documentation. The design is in `architecture-concepts.md` (§1.5 and §2).
+
+Both formats read into the same rule structs (`crates/graphicle/src/arch_rules/model.rs`):
+the frontend only finds the blocks and their metadata, and every rule check
+lives in the shared model. `arch_rules::parse_file` chooses the frontend by
+extension; `parse_markdown` and `parse_adoc` name it directly.
 
 ## Layout
 
@@ -154,3 +159,89 @@ Rule documents are regular repository files. The layout does not fix a
 directory; `docs/architecture/` or `.graphicle/` are the expected homes. A
 project's rules are stored as `:ConceptRule`, `:ConstraintRule` and
 `:RuleGroup` nodes scoped to that project.
+
+## AsciiDoc (jQAssistant convention)
+
+A `.adoc` rule document follows the layout jQAssistant's own rule files use
+(jqa-dashboard's `dashboard.adoc`). A rule is a `----` listing whose block
+attributes name its kind; the id is the block's anchor; the description is its
+`.Title`:
+
+```asciidoc
+[[arch:Layer/Persistence]]
+[source,cypher,role=concept,severity=MINOR,requiresConcept=arch:Module/*]
+.Persistence modules are those named *.persistence or *.db.
+----
+MATCH (m:Module) WHERE m.name =~ '.*\\.(persistence|db)'
+MERGE (l:Layer {name: 'Persistence'})
+----
+
+[[arch:NoCycles]]
+[source,cypher,role=constraint,severity="BLOCKER"]
+.Modules must not depend on each other in a cycle.
+----
+MATCH p = (m1:Module)-[:DEPENDS_ON*2..6]->(m1) RETURN p
+----
+
+[[arch:default]]
+[role=group, includesConcepts="arch:*", overrides="arch:NoCycles=MAJOR"]
+== Default pack
+
+The group has no listing; its section ends the block.
+```
+
+- `include::queries/churn.adoc[]` splices the file in, relative to the
+  document's folder; includes nest up to eight levels deep.
+- A rule block that is malformed is reported with its file, kind, id and line,
+  as in Markdown: `constraint block 'arch:NoSeverity' of queries/x.adoc at line 3: missing required key 'severity'`.
+- Severity and requires may be written either way jQAssistant does: a bare
+  attribute (`severity=MINOR`), a quoted one (`severity="MINOR"`), a single
+  reference (`requiresConcept=`) or a list (`requiresConcepts="a, b"`).
+
+The AsciiDoc example above is a `asciidoc` fence, which the Markdown parser
+skips, so it is not read as a rule in this file. Its tests read it directly.
+
+### Construct compatibility
+
+Checked against the jQAssistant rule files that the Git plugin and the
+dashboard publish (`research/jqa-git-queries.md`), and against fixtures written
+in the same dialect under `crates/graphicle/tests/fixtures/arch_rules/jqa-git/`.
+No GPL-licensed text is copied: every fixture is written for this repository.
+
+| Construct | Where seen | Status | How / why |
+|---|---|---|---|
+| `[[id]]` anchor on a rule | dashboard.adoc, git.adoc | supported | The anchor is the rule id. An `id=` attribute must agree with it. |
+| `[source,cypher,role=concept]` listing | dashboard.adoc | supported | The rule body. |
+| `[source, cypher]` (space after comma) | git.adoc sample | supported | Items are trimmed. |
+| `role="concept"` / `role=concept` | dashboard.adoc | supported | Quotes are removed. |
+| `role=constraint` | jQA rule convention | supported | Violation rule. |
+| `role=group` on a section, no listing | dashboard.adoc `[role=group]` | supported | The section ends the block. |
+| `.Title` line | dashboard.adoc | adapted | Becomes `description`. |
+| `description=` attribute | (ours) | supported | Wins over `.Title` when both are given. |
+| `severity=MINOR` / `severity="MAJOR"` | jQA convention for `[role=concept,severity=...]` | supported | Both spellings. A concept with no severity is INFO. |
+| `requiresConcept=x` (single) | dashboard.adoc `requiresConcepts="..."` | supported | Feeds the same list as `requiresConcepts`. |
+| `requiresConcepts="a, b"` | dashboard.adoc | supported | Comma-separated list, trimmed. |
+| `includesConcepts="p:*"` on a group | dashboard.adoc | adapted | Becomes `include`; the wildcard keeps its meaning (trailing `*` only). |
+| `includesConstraints=` on a group | jQA convention | adapted | Becomes `include`, same as `includesConcepts`. |
+| `overrides="id=SEV"` on a group | (ours) | supported | Severity overrides; jQA has no equivalent. |
+| `verify="aggregation"` | dashboard.adoc `verify=` | adapted | Read and ignored. jQA's verification mode is not implemented; the body runs as written. |
+| `[[id,reftext]]` anchor with reftext | jQA docs | adapted | The reftext is dropped; only the id is kept. |
+| `include::file[]` | jQA rule files split by concern | adapted | Resolved relative to the including file, recursively to 8 levels. A missing file is an error. Include attributes (`leveloffset=`, `tags=`) are not applied. |
+| Prose, sections, paragraphs | every rule file | supported | Skipped. Text between rules is documentation. |
+| `////` comment block and `//` line comment | git.adoc | supported | Skipped, including any rule-looking block inside. |
+| `[source,cypher]` with no role | dashboard.adoc examples | supported | Not a rule; skipped. |
+| Tables (`[options="header"]`, `|===`) | git.adoc configuration | supported | Skipped as prose. |
+| Other `[source,lang]` listings with a role | (none seen) | unsupported | A rule body must be `cypher`; any other language is an error, not a silent skip. |
+| Attribute references `{name}` in a rule | jQA docs (document attributes) | unsupported | No attribute context is evaluated. A rule that uses one is refused, naming the line. |
+| `ifdef::` / `ifndef::` / `ifeval::` / `endif::` | jQA docs | unsupported | Conditionals need an attribute context. Refused, so a rule behind a conditional is never silently included or dropped. |
+| `include::` target with `{attr}` | jQA docs | unsupported | Same reason as attribute references. |
+| `[source,cypher]` without `role` but an anchor | git.adoc sample | supported | Skipped: without a `role` it is not a rule. |
+| Single-valued attribute given twice (`id`, `description`, `severity`, `overrides`, `source`) | (ours) | unsupported (rejected) | Error: a repeated attribute has no single meaning. `role` and the `requires`/`include` lists are not checked for repeats: a repeated list merges, and `role` takes its first kind. |
+| Unknown attribute on a rule block | jQA: any key | unsupported (rejected) | Error, naming the key: a typo such as `severty=` must not become silent INFO. Known keys are listed in `adoc.rs`. |
+| Anchor-less rule (no `[[id]]` and no `id=`) | (ours) | unsupported | Error: a rule needs an id. |
+| Git sample query with `GitBranch`/`HEAD` | git.adoc sample | unsupported | Pre-migration model names. The query is ordinary Cypher once the labels are updated, which is out of scope for the frontend. |
+
+The jQA Git rules in `research/jqa-git-queries.md` use their own model
+(`:Git:Commit`, `:Git:Author`, `:Git:File`). Their Cypher is carried as
+written; the frontend does not rewrite labels. A rule that targets the
+Graphicle git schema must name those labels itself.
