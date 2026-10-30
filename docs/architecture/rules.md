@@ -228,3 +228,15 @@ id: arch:default
 include: [arch:*]
 description: Every rule of this repository's pack, for graphicle analyze and CI
 ````
+
+## Reproducing these numbers
+
+The measurements in this document were taken on the repository's own code —
+the three crates, the docs and the root markdown, without
+`crates/graphicle-graph/vendor` (the tree-sitter grammar C sources). A sync
+of the full repository including that tree does not merely risk the batch
+cap: it fails outright today — the 64 MiB `put_objects` batch equals
+CypherLite's WAL payload cap, so `sync_commit` ends in "WAL payload exceeds
+64 MiB limit". Sync the trimmed scope, or raise/split the WAL-bound batch
+first. The rules are unaffected either way: no rule matches anything under
+`vendor/`.
