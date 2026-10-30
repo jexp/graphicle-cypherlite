@@ -34,7 +34,9 @@ impl Severity {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    /// A severity as [`Severity::as_str`] writes it: `INFO`…`BLOCKER`, the
+    /// spelling the frontends read and the rule store keeps.
+    pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
             "INFO" => Severity::Info,
             "MINOR" => Severity::Minor,

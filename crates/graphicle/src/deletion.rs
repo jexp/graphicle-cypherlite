@@ -106,6 +106,7 @@ const HISTORY: &[&str] = &[
     "ToolEvent",
     "IdentityAudit",
     "ProjectionCleanup",
+    "RuleApplication",
     TOMBSTONES,
     "OAuthPending",
 ];
@@ -219,6 +220,7 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     ("RepoAccess", "gf_repo_access", Scoped::WorkspaceProp),
     ("Reservation", "am_call_reservations", Scoped::Repository),
     ("Review", "reviews", Scoped::WorkspaceId),
+    ("RuleApplication", "RuleApplication", Scoped::Repository),
     ("RuleGroup", "RuleGroup", Scoped::Repository),
     ("RuleSource", "RuleSource", Scoped::Repository),
     ("Run", "repo_runs", Scoped::Repository),

@@ -74,6 +74,7 @@ mod fork_guard;
 mod child_env;
 
 mod archived;
+mod arch_enrich;
 mod ask;
 mod async_requests;
 mod auto_observe;

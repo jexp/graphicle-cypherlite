@@ -175,6 +175,13 @@ pub async fn execute(worker: &Worker, job: &Job) -> Result<Value> {
                 .await
                 .map_err(|_| Error::bad("Cross-repository linking interrupted"))?
         }
+        "enrich" => {
+            let store = worker.store.clone();
+            let job = job.clone();
+            tokio::task::spawn_blocking(move || jobs::run_enrich(&store, &job))
+                .await
+                .map_err(|_| Error::bad("Rule-set enrichment interrupted"))?
+        }
         _ => match crate::extension::installed().job(worker, job) {
             Some(run) => run.await,
             // Known by name, run only by an extension (never leased without one).

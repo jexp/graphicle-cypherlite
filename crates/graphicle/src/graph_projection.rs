@@ -1893,7 +1893,13 @@ pub fn project_store(
                     resident(&gstore, identifier, &episode)?;
                     clear_stale_when_current(db, &gstore, identifier)?;
                 }
-                info(&gstore, identifier, &episode, !recorded)
+                let projected = info(&gstore, identifier, &episode, !recorded);
+                // The rule-set enrichment follows the recorded episode as
+                // its own job (architecture-concepts.md §1.5), as it does
+                // behind the projection job; a failure to queue it must not
+                // fail the projection itself.
+                let _ = crate::jobs::enqueue_enrich(store, db, identifier, &p, &episode);
+                projected
             }
             Some(_) => Err(Error::conflict("Repository changed while projecting")),
             None => {

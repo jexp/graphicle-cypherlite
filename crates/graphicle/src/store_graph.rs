@@ -433,6 +433,9 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
                       rule_sha IS STRING NOT NULL, source IS STRING}),
     (rs:RuleSource => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL,
                        doc_sha IS STRING NOT NULL}),
+    (ra:RuleApplication => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
+                            episode IS STRING NOT NULL, provenance IS STRING,
+                            applied_at IS STRING}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -445,6 +448,7 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (xr:ConstraintRule) REQUIRE (xr.repository_id, xr.id) IS KEY,
     CONSTRAINT FOR (rg:RuleGroup) REQUIRE (rg.repository_id, rg.id) IS KEY,
     CONSTRAINT FOR (rs:RuleSource) REQUIRE (rs.repository_id, rs.source) IS KEY,
+    CONSTRAINT FOR (ra:RuleApplication) REQUIRE (ra.repository_id, ra.rule, ra.episode) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)

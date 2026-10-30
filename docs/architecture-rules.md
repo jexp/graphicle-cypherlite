@@ -160,6 +160,36 @@ directory; `docs/architecture/` or `.graphicle/` are the expected homes. A
 project's rules are stored as `:ConceptRule`, `:ConstraintRule` and
 `:RuleGroup` nodes scoped to that project.
 
+## Execution
+
+When a projection records an episode for a project that has rules, the rule
+set's concepts are applied to that episode's graph as one `enrich` job,
+keyed by (rule set, episode) — re-projecting the same content replays it,
+and a changed head set is a new episode with its own run.
+
+- **Parameters**: a concept's Cypher runs as written, with `$repo` (the
+  repository id), `$episode` (the episode being enriched) and `$rule` (the
+  rule's own id) as parameters.
+- **Order**: concepts run in the order their `requires` DAG resolves to;
+  every declared group runs, in group-id order, with its severity overrides
+  applied (a project that declared no group runs every rule). Constraints
+  are resolved with them — their effective severities travel in the job's
+  result for the evaluator that reads the enriched graph — but their queries
+  are not run by the enrich job.
+- **Failure**: one graph transaction per rule. A rule whose query fails
+  leaves nothing behind, is reported under `failed`, and everything that
+  requires it (directly or through another rule) is skipped.
+- **Idempotence**: write concepts with `MERGE` and `SET`; a re-run against
+  the same episode then changes nothing.
+- **Provenance and rollback**: what a rule wrote is recorded per episode as
+  `(:RuleApplication {repository_id, rule, episode})` — `:LABELED {label}`
+  edges for the labels it set, a `concept`/`episode` stamp on the
+  relationships it created, and a `provenance` map naming created nodes,
+  created relationships and set properties. Rolling a rule's application
+  back removes exactly those labels, relationships and properties (nodes it
+  created go too, once its removals leave them empty). A rule that *deletes*
+  graph content cannot be rolled back: only additive writes are recorded.
+
 ## AsciiDoc (jQAssistant convention)
 
 A `.adoc` rule document follows the layout jQAssistant's own rule files use
