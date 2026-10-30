@@ -1,0 +1,30 @@
+[[fixture-git:ChurnPerFile]]
+[source,cypher,role="concept",verify="aggregation"]
+.Count the commits that change each file.
+----
+MATCH (f:File)<-[:MODIFIES]-(:Change)<-[:CONTAINS_CHANGE]-(c:Commit)
+WITH f, count(DISTINCT c) AS changes
+SET f.churn = changes
+----
+
+[[fixture-git:CommitsPerMonth]]
+[source,cypher,role=concept,severity=MINOR]
+.Count commits per month.
+----
+MATCH (c:Commit)
+RETURN date(c.author_date).year AS year, date(c.author_date).month AS month,
+       count(c) AS commits
+ORDER BY year, month
+----
+
+[[fixture-git:BusFactorRisk]]
+[source,cypher,role=constraint,severity="MAJOR",requiresConcept=fixture-git:ChurnPerFile]
+.A file with a churn above 50 and a single author.
+----
+MATCH (f:File)
+WHERE f.churn > 50
+MATCH (f)<-[:MODIFIES]-(:Change)<-[:CONTAINS_CHANGE]-(:Commit)<-[:AUTHORED]-(p:Person)
+WITH f, count(DISTINCT p) AS authors
+WHERE authors = 1
+RETURN f.path AS file, authors
+----
