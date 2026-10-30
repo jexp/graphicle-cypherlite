@@ -5,6 +5,7 @@ pub mod agent_setup;
 pub mod answer_review;
 pub mod api;
 pub mod arch_rules;
+pub mod arch_rules_dag;
 pub mod archived;
 pub mod atlassian;
 pub mod auto_observe;
