@@ -26,6 +26,11 @@
 //!   created and the properties it set. [`rollback`] removes exactly those
 //!   writes. Two whole-store reads per rule is the price of provenance over
 //!   arbitrary Cypher; §9's performance ceiling question measures it.
+//!   The snapshot is unscoped by repository: in a shared multi-project
+//!   store the per-rule cost carries the other projects' nodes too. The
+//!   per-repo-database topology (git-to-graph-plan.md §5) makes this
+//!   correct by construction; until then the ceiling question carries the
+//!   multiplier.
 //! - **Idempotence**: a rule whose query is MERGE-based writes nothing the
 //!   second time, so re-applying a rule set to the same episode — a
 //!   replayed job, a retry — records nothing new. The application record
