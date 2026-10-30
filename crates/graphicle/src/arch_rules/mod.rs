@@ -13,6 +13,8 @@
 //! [`model`] holds the rule structs and every rule check, so the frontends
 //! cannot disagree about what a rule means. [`store`] writes the parsed rules
 //! as `(:ConceptRule)`, `(:ConstraintRule)` and `(:RuleGroup)` nodes.
+//! [`executor`] applies the stored concept rules to a recorded episode, as
+//! the `enrich` job (architecture-concepts.md §1 and §5).
 use crate::Result as GraphResult;
 use crate::store_graph::GraphStore;
 use serde_json::{Value, json};
@@ -20,10 +22,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod adoc;
+pub mod executor;
 pub mod markdown;
 pub mod model;
 pub mod store;
 
+pub use executor::{enrich, has_rules, rollback};
 pub use model::{Group, Reason, Rule, RuleDocument, RuleError, Severity};
 pub use store::{rule_set_hash, store};
 

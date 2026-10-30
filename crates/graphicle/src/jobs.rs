@@ -177,7 +177,7 @@ fn insert_job(
 /// computes the same revision.
 pub fn runtime_revision() -> &'static str {
     static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    REVISION.get_or_init(||digest(&json!({"version":env!("CARGO_PKG_VERSION"),"workflows":include_str!("workflows.rs"),"observer":include_str!("observer.rs"),"search":include_str!("search.rs"),"query":include_str!("query.rs"),"workflow_retrieval":include_str!("workflow_retrieval.rs"),"evidence":include_str!("evidence.rs"),"memory_evidence":include_str!("memory_evidence.rs"),"memory":include_str!("memory.rs"),"graph":include_str!("graph.rs"),"models":include_str!("model.rs"),"claims":include_str!("claims.rs"),"answer_review":include_str!("answer_review.rs"),"connectors":include_str!("connectors.rs"),"atlassian":include_str!("atlassian.rs"),"projection":include_str!("projection.rs"),"permissions":include_str!("permissions.rs"),"semantic_contract":include_str!("../../graphicle-memory/src/semantic.rs"),"retrieval":include_str!("../../graphicle-memory/src/retrieval.rs"),"packing":include_str!("../../graphicle-memory/src/packing.rs"),"ingest":include_str!("../../graphicle-memory/src/ingest.rs"),"text":include_str!("../../graphicle-memory/src/text.rs"),"core":graphicle_memory::structure::REVISION})))
+    REVISION.get_or_init(||digest(&json!({"version":env!("CARGO_PKG_VERSION"),"workflows":include_str!("workflows.rs"),"observer":include_str!("observer.rs"),"search":include_str!("search.rs"),"query":include_str!("query.rs"),"workflow_retrieval":include_str!("workflow_retrieval.rs"),"evidence":include_str!("evidence.rs"),"memory_evidence":include_str!("memory_evidence.rs"),"memory":include_str!("memory.rs"),"graph":include_str!("graph.rs"),"models":include_str!("model.rs"),"claims":include_str!("claims.rs"),"answer_review":include_str!("answer_review.rs"),"connectors":include_str!("connectors.rs"),"atlassian":include_str!("atlassian.rs"),"projection":include_str!("projection.rs"),"permissions":include_str!("permissions.rs"),"arch_rules_executor":include_str!("arch_rules/executor.rs"),"semantic_contract":include_str!("../../graphicle-memory/src/semantic.rs"),"retrieval":include_str!("../../graphicle-memory/src/retrieval.rs"),"packing":include_str!("../../graphicle-memory/src/packing.rs"),"ingest":include_str!("../../graphicle-memory/src/ingest.rs"),"text":include_str!("../../graphicle-memory/src/text.rs"),"core":graphicle_memory::structure::REVISION})))
 }
 
 #[derive(Clone)]
@@ -264,6 +264,7 @@ const KINDS: &[(&str, &str)] = &[
     ("refresh", "propose"),
     ("project", "read"),
     ("link", "read"),
+    ("enrich", "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -648,6 +649,13 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
             Ok(queued) => queued,
             Err(error) => json!({"error": error.message}),
         };
+        // The rule-set enrichment follows the recorded episode as its own
+        // job (architecture-concepts.md §1.5); a failure to queue it must
+        // not fail the projection itself.
+        out["enrich"] = match enqueue_enrich(store, db, identifier, &p, &info.episode) {
+            Ok(queued) => queued,
+            Err(error) => json!({"error": error.message}),
+        };
         // Work extensions queue after a projection, which the projection
         // drain runs next. Listed only when an
         // extension queued something, so Core's result is unchanged.
@@ -871,10 +879,110 @@ fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
     })
 }
 
+/// The `input_hash` of the one `enrich` job per (rule set, episode)
+/// (architecture-concepts.md §5): the cache key that makes a replayed
+/// projection's enrichment the same job.
+pub fn enrich_input_hash(rule_set: &str, episode: &str) -> String {
+    digest(&json!({"kind": "enrich", "rule_set": rule_set, "episode": episode}))
+}
+
+/// Queue the rule-set enrichment of `episode` after its projection recorded
+/// it: one job per (rule set, episode), so a repeated completion replays it
+/// and a failed or cancelled one starts again with a fresh budget. A project
+/// without rule nodes queues nothing. The rule set is read as it stands at
+/// queue time; the job applies whatever it finds when it runs and reports
+/// that rule set's hash in its result.
+pub fn enqueue_enrich(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    episode: &str,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    if !crate::arch_rules::has_rules(&graph, repository)? {
+        return Ok(json!({"kind": "enrich", "episode": episode, "queued": false}));
+    }
+    let rule_set = crate::arch_rules::rule_set_hash(&graph, repository)?;
+    let input_hash = enrich_input_hash(&rule_set, episode);
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: 'enrich', input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({"repo": repository, "hash": input_hash})),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            graph.transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
+                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
+                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
+                )?;
+                Ok(())
+            })?;
+            return Ok(json!({"id": existing["id"], "state": "queued", "kind": "enrich",
+                "episode": episode, "replayed": true, "queued": true}));
+        }
+        return Ok(json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
+            "episode": episode, "replayed": true, "queued": true}));
+    }
+    let payload = json!({"kind": "enrich", "episode": episode, "rule_set": rule_set,
+        "runtime_revision": runtime_revision()});
+    let job_id = graph.transaction(|db| {
+        insert_job(db, repository, &p.workspace, "enrich", &input_hash, &payload, &p.hash, -1, 3)
+    })?;
+    store::event(
+        db,
+        repository,
+        "workflow_queued",
+        json!({"id": job_id, "kind": "enrich", "episode": episode}),
+    )?;
+    Ok(json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
+        "replayed": false, "queued": true}))
+}
+
+/// Execute an `enrich` job: apply the project's concept rules to the
+/// episode's recorded graph (`arch_rules::executor`). The episode is skipped
+/// when a newer one was recorded before the job ran — that episode's
+/// projection queued its own enrichment, the same way a moved-on head set
+/// skips a projection. A rule that fails is reported in the result with its
+/// dependents skipped; only a store or lease failure fails the job. The
+/// job's lease is renewed while it runs.
+pub fn run_enrich(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || enrich_job(store, job))
+}
+
+fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let episode = s(&job.payload, "episode").to_string();
+    let (current, identifier) = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(db, &job.workspace, &job.principal_hash, permission("enrich")?)?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok((
+            crate::graph_projection::current_episode(db, s(&repository, "id"))?,
+            s(&repository, "id").to_string(),
+        ))
+    })?;
+    if current != episode {
+        return Ok(json!({"skipped": true,
+            "reason": "a newer episode was recorded before enrichment", "episode": episode,
+            "current_episode": current}));
+    }
+    crate::arch_rules::executor::enrich(&graph, &identifier, &episode, &|| {
+        leased(&graph, job)
+    })
+}
+
 /// Run `repository`'s waiting graph work in this
 /// process, as a worker would. First every ready `project` job, then the
 /// `link` jobs they queued (a workspace keeps one waiting `link` job, which
-/// may belong to another of its projects), then the jobs of the kinds
+/// may belong to another of its projects), then this repository's `enrich`
+/// jobs (the rule-set enrichment a completed projection queued), then the
+/// jobs of the kinds
 /// extensions declare to follow projections
 /// ([`crate::extension::JobKind::after_projection`]). `graphicle sync`, `mcp`,
 /// `ask`, `run --wait` and `pr` call it; a query never does.
@@ -946,6 +1054,22 @@ pub fn drain_projection_until(
             });
             store.finish_job(&job, result)?;
         }
+    }
+    // The rule-set enrichment each completed projection queued
+    // (architecture-concepts.md §1.5): one job per (rule set, episode), so
+    // the drain leaves the episode fully post-processed. A failing rule is
+    // part of the job's result; the job itself only fails on store errors.
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, "enrich")? else {
+            break;
+        };
+        let result = crate::phase::phase("job_enrich", || run_enrich(store, &job));
+        results.push(match &result {
+            Ok(value) => json!({"job": job.id, "kind": "enrich", "ok": true,
+                "applied": value["applied"], "failed": value["failed"], "skipped": value["skipped"]}),
+            Err(error) => json!({"job": job.id, "kind": "enrich", "ok": false, "error": error.message}),
+        });
+        store.finish_job(&job, result)?;
     }
     let kinds = crate::extension::installed().post_projection_kinds();
     if !kinds.is_empty() && !stopped() {
