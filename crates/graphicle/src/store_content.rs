@@ -102,11 +102,17 @@ pub fn put_objects(store: &GraphStore, repository: &Value, rows_json: &Value) ->
         // gets its HAS_OBJECT relationship in the same CREATE (no MERGE —
         // MERGE and relationship existence checks are superlinear here).
         let existing = existing_object_shas(db, &repo, rows_json)?;
+        // Two files of one batch can carry the same bytes (a copied file):
+        // the store is content-addressed, so one Object holds them for every
+        // path — the batch is deduplicated on the sha before the CREATE,
+        // which the key would otherwise reject as a duplicate.
+        let mut batch: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let missing: Vec<Value> = rows_json
             .as_array()
             .into_iter()
             .flatten()
             .filter(|row| !existing.contains(s(row, "sha256")))
+            .filter(|row| batch.insert(s(row, "sha256").to_string()))
             .cloned()
             .collect();
         if !missing.is_empty() {
