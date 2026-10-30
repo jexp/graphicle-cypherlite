@@ -75,6 +75,7 @@ mod child_env;
 
 mod archived;
 mod arch_enrich;
+mod arch_rules;
 mod ask;
 mod async_requests;
 mod auto_observe;
