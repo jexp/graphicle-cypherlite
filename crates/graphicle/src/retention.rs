@@ -184,14 +184,17 @@ fn count_where(
 /// always stay.
 const COVERAGE: &str =
     "MATCH ()-[c:COVERS]->() WHERE c.repository_id = $repo AND c.episode_sequence <= $cutoff";
-const COVERAGE_UPLOADS: &str = "MATCH (u:CoverageUpload {repository_id: $repo}) WHERE u.episode_sequence <= $cutoff";
-const COVERAGE_INVENTORY: &str = "MATCH (i:CoverageInventory {repository_id: $repo}) WHERE i.episode_sequence <= $cutoff";
+const COVERAGE_UPLOADS: &str =
+    "MATCH (u:CoverageUpload {repository_id: $repo}) WHERE u.episode_sequence <= $cutoff";
+const COVERAGE_INVENTORY: &str =
+    "MATCH (i:CoverageInventory {repository_id: $repo}) WHERE i.episode_sequence <= $cutoff";
 const CROSS_EDGES: &str = "MATCH ()-[r:CROSS_CALL]->() WHERE r.valid_to_episode IS NOT NULL AND (\
      (r.source_repository_id = $repo AND r.source_episode_sequence <= $cutoff) OR \
      (r.target_repository_id = $repo AND r.target_episode_sequence <= $cutoff))";
 const CROSS_UNRESOLVED: &str = "MATCH (u:UnresolvedCross) WHERE u.valid_to_episode IS NOT NULL \
      AND u.source_repository_id = $repo AND u.source_episode_sequence <= $cutoff";
-const UNRESOLVED_CALLS: &str = "MATCH (u:UnresolvedCall {repository_id: $repo}) WHERE u.episode_sequence <= $cutoff";
+const UNRESOLVED_CALLS: &str =
+    "MATCH (u:UnresolvedCall {repository_id: $repo}) WHERE u.episode_sequence <= $cutoff";
 
 /// Apply `retention` to one repository: label-scoped deletes of the
 /// per-episode by-products outside each window. Returns per-kind deleted
@@ -207,10 +210,24 @@ pub fn apply(
     let unresolved_cutoff = latest - retention.unresolved_episodes as i64;
     let coverage = drop_where(db, COVERAGE, "c", false, repository, coverage_cutoff)?;
     let uploads = drop_where(db, COVERAGE_UPLOADS, "u", true, repository, coverage_cutoff)?;
-    let inventories = drop_where(db, COVERAGE_INVENTORY, "i", true, repository, coverage_cutoff)?;
+    let inventories = drop_where(
+        db,
+        COVERAGE_INVENTORY,
+        "i",
+        true,
+        repository,
+        coverage_cutoff,
+    )?;
     let cross_edges = drop_where(db, CROSS_EDGES, "r", false, repository, cross_cutoff)?;
     let cross_unresolved = drop_where(db, CROSS_UNRESOLVED, "u", true, repository, cross_cutoff)?;
-    let unresolved = drop_where(db, UNRESOLVED_CALLS, "u", true, repository, unresolved_cutoff)?;
+    let unresolved = drop_where(
+        db,
+        UNRESOLVED_CALLS,
+        "u",
+        true,
+        repository,
+        unresolved_cutoff,
+    )?;
     Ok(json!({
         "retention": retention,
         "deleted": {
@@ -777,21 +794,15 @@ mod tests {
             })
             .unwrap();
         let retention = Retention::default();
-        let before = store
-            .read(|db| remaining(db, "r", &retention))
-            .unwrap();
+        let before = store.read(|db| remaining(db, "r", &retention)).unwrap();
         assert_eq!(before["unresolved_calls"], json!(23), "{before:#}");
         assert_eq!(before["coverage_uploads"], json!(5), "{before:#}");
         assert_eq!(before["cross_edges"], json!(1), "{before:#}");
-        let applied = store
-            .transaction(|db| apply(db, "r", &retention))
-            .unwrap();
+        let applied = store.transaction(|db| apply(db, "r", &retention)).unwrap();
         assert_eq!(applied["deleted"]["unresolved_calls"], json!(23));
         assert_eq!(applied["deleted"]["coverage_uploads"], json!(5));
         assert_eq!(applied["deleted"]["cross_edges"], json!(1));
-        let after = store
-            .read(|db| remaining(db, "r", &retention))
-            .unwrap();
+        let after = store.read(|db| remaining(db, "r", &retention)).unwrap();
         assert_eq!(
             after,
             json!({"coverage":0,"coverage_uploads":0,"coverage_inventory":0,

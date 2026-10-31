@@ -182,7 +182,11 @@ description: Default pack
         assert_eq!(concept.severity, Severity::Minor);
         assert_eq!(concept.description, "Persistence modules");
         assert!(concept.cypher.starts_with("MATCH (m:Module)"));
-        assert!(concept.cypher.ends_with("MERGE (l:Layer {name: 'Persistence'})"));
+        assert!(
+            concept
+                .cypher
+                .ends_with("MERGE (l:Layer {name: 'Persistence'})")
+        );
         assert_eq!(concept.line, 11);
 
         let constraint = &document.constraints[0];
@@ -191,15 +195,17 @@ description: Default pack
 
         let group = &document.groups[0];
         assert_eq!(group.include, vec!["arch:*"]);
-        assert_eq!(group.overrides, vec![("arch:NoCycles".to_string(), Severity::Major)]);
+        assert_eq!(
+            group.overrides,
+            vec![("arch:NoCycles".to_string(), Severity::Major)]
+        );
     }
 
     #[test]
     fn concept_severity_defaults_to_info() {
-        let document = parse(
-            "````concept\nid: arch:Plain\n```cypher\nMATCH (n) RETURN n\n```\n````\n",
-        )
-        .unwrap();
+        let document =
+            parse("````concept\nid: arch:Plain\n```cypher\nMATCH (n) RETURN n\n```\n````\n")
+                .unwrap();
         assert_eq!(document.concepts[0].severity, Severity::Info);
     }
 
@@ -212,13 +218,19 @@ description: Default pack
 
         // Moving a block down the document keeps its content digest.
         let shifted = parse(&format!("\n\n{DOC}")).unwrap();
-        assert_eq!(first.constraints[0].rule_sha, shifted.constraints[0].rule_sha);
+        assert_eq!(
+            first.constraints[0].rule_sha,
+            shifted.constraints[0].rule_sha
+        );
         assert_ne!(first.constraints[0].line, shifted.constraints[0].line);
 
         let edited = parse(&DOC.replace("MAJOR", "MINOR")).unwrap();
         assert_ne!(first.groups[0].rule_sha, edited.groups[0].rule_sha);
         let reworded = parse(&DOC.replace("MATCH p", "MATCH q")).unwrap();
-        assert_ne!(first.constraints[0].rule_sha, reworded.constraints[0].rule_sha);
+        assert_ne!(
+            first.constraints[0].rule_sha,
+            reworded.constraints[0].rule_sha
+        );
     }
 
     #[test]
@@ -240,7 +252,11 @@ description: Default pack
             "````concept\nid: arch:Typo\nseverty: INFO\n```cypher\nMATCH (n) RETURN n\n```\n````\n",
         );
         assert_eq!(unknown.line, 1);
-        assert!(unknown.to_string().contains("concept block 'arch:Typo' at line 1"));
+        assert!(
+            unknown
+                .to_string()
+                .contains("concept block 'arch:Typo' at line 1")
+        );
         assert!(unknown.to_string().contains("unknown key 'severty'"));
 
         let severity = error(
@@ -252,7 +268,9 @@ description: Default pack
 
     #[test]
     fn structural_faults_are_typed() {
-        let duplicate = error(&format!("{DOC}\n````concept\nid: arch:NoCycles\n```cypher\nRETURN 1\n```\n````\n"));
+        let duplicate = error(&format!(
+            "{DOC}\n````concept\nid: arch:NoCycles\n```cypher\nRETURN 1\n```\n````\n"
+        ));
         assert_eq!(duplicate.reason, Reason::DuplicateId);
         assert_eq!(duplicate.id.as_deref(), Some("arch:NoCycles"));
 
@@ -264,7 +282,11 @@ description: Default pack
         assert_eq!(unclosed.reason, Reason::Unclosed);
 
         let wildcard = error("````group\nid: arch:Bad\ninclude: [arch:*Foo]\n````\n");
-        assert!(wildcard.to_string().contains("'*' is allowed only as the last character"));
+        assert!(
+            wildcard
+                .to_string()
+                .contains("'*' is allowed only as the last character")
+        );
 
         let empty_group = error("````group\nid: arch:Empty\ninclude: []\n````\n");
         assert!(empty_group.to_string().contains("at least one rule"));
@@ -275,7 +297,8 @@ description: Default pack
         // The example in docs/architecture-rules.md is the documented layout;
         // it must parse, and the outer fence must hide it from the document.
         let doc = include_str!("../../../../docs/architecture-rules.md");
-        let start = doc.find("`````markdown\n# Architecture rules").unwrap() + "`````markdown\n".len();
+        let start =
+            doc.find("`````markdown\n# Architecture rules").unwrap() + "`````markdown\n".len();
         let end = start + doc[start..].find("\n`````\n").unwrap();
         let example = parse(&doc[start..end]).unwrap();
         assert_eq!(example.concepts.len(), 2);

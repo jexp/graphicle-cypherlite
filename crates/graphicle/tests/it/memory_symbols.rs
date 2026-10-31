@@ -1063,7 +1063,8 @@ fn deleting_or_forgetting_a_memory_takes_its_symbol_pins() {
     ]);
     let alone = f.note(&[("file:a.py", "    return 2")]);
     assert_eq!(
-        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state").len(),
+        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state")
+            .len(),
         2
     );
 
@@ -1082,7 +1083,8 @@ fn deleting_or_forgetting_a_memory_takes_its_symbol_pins() {
         "{receipt:#}"
     );
     assert_eq!(
-        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state").len(),
+        f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p.state AS state")
+            .len(),
         1
     );
 
@@ -1193,10 +1195,7 @@ fn a_conversation_project_keeps_its_memories_as_before() {
             ]
         );
         assert!(f.gsql("MATCH (s:SymbolHead) RETURN s").is_empty());
-        assert!(
-            f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p")
-                .is_empty()
-        );
+        assert!(f.gsql("MATCH ()-[p:PINNED_TO]->() RETURN p").is_empty());
         f.sync(&[
             (
                 "session-1.txt",

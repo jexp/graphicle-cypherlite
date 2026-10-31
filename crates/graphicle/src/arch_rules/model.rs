@@ -380,14 +380,20 @@ fn fields(block: &RawBlock) -> Result<Fields<'_>, RuleError> {
             return Err(fail(
                 block,
                 id,
-                Reason::Invalid(format!("unknown key '{}' on line {}", field.key, field.line)),
+                Reason::Invalid(format!(
+                    "unknown key '{}' on line {}",
+                    field.key, field.line
+                )),
             ));
         }
         if fields.insert(field.key.as_str(), field).is_some() {
             return Err(fail(
                 block,
                 id,
-                Reason::Invalid(format!("key '{}' repeated on line {}", field.key, field.line)),
+                Reason::Invalid(format!(
+                    "key '{}' repeated on line {}",
+                    field.key, field.line
+                )),
             ));
         }
     }
@@ -399,9 +405,8 @@ fn required_id(block: &RawBlock, fields: &Fields) -> Result<String, RuleError> {
         return Err(missing(block, None, "id"));
     };
     let id = &field.value;
-    let invalid = id.is_empty()
-        || id.contains(char::is_whitespace)
-        || id.contains(['*', ',', '[', ']', '=']);
+    let invalid =
+        id.is_empty() || id.contains(char::is_whitespace) || id.contains(['*', ',', '[', ']', '=']);
     if invalid {
         return Err(fail(
             block,
@@ -477,7 +482,9 @@ fn pattern(item: &str) -> Result<(), String> {
     }
     let stars = item.matches('*').count();
     if stars > 1 || (stars == 1 && !item.ends_with('*')) {
-        return Err(format!("'{item}': '*' is allowed only as the last character"));
+        return Err(format!(
+            "'{item}': '*' is allowed only as the last character"
+        ));
     }
     Ok(())
 }

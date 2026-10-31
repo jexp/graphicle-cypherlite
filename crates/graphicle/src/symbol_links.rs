@@ -116,8 +116,7 @@ fn links_of<'m>(
                 store_graph::params(&json!({"repo": repository, "ids": ids})),
             )
         })? {
-            let pinned: Vec<Value> =
-                serde_json::from_str(s(&row, "symbols")).unwrap_or_default();
+            let pinned: Vec<Value> = serde_json::from_str(s(&row, "symbols")).unwrap_or_default();
             if let Some(links) = out.get_mut(s(&row, "memory_id")) {
                 links.extend(resolved(&pinned).cloned());
             }
@@ -414,13 +413,11 @@ pub fn attach(
                     .cloned()
                     .or_else(|| value["symbols"].as_array().cloned())
                     .unwrap_or_default();
-                links
-                    .iter()
-                    .any(|symbol| {
-                        symbol["stable_id"]
-                            .as_str()
-                            .is_some_and(|stable| ids.contains(stable))
-                    })
+                links.iter().any(|symbol| {
+                    symbol["stable_id"]
+                        .as_str()
+                        .is_some_and(|stable| ids.contains(stable))
+                })
             })
             .unwrap_or(false)
     };
@@ -458,12 +455,16 @@ pub fn attach(
     } else {
         let documents = crate::memory::documents(db, repository, p)?;
         naming = naming.knowing(project, &documents);
-        crate::memory::list_of(db, crate::store::graph_for(db)?.as_ref(), repository, &documents, false)?
-            .into_iter()
-            .filter(|m| {
-                named.contains(s(m, "id")) && m["state"] == "reviewed" && m["stale"] != true
-            })
-            .collect()
+        crate::memory::list_of(
+            db,
+            crate::store::graph_for(db)?.as_ref(),
+            repository,
+            &documents,
+            false,
+        )?
+        .into_iter()
+        .filter(|m| named.contains(s(m, "id")) && m["state"] == "reviewed" && m["stale"] != true)
+        .collect()
     };
     let links = links_of(db, project, memories.iter())?;
     for node in nodes.iter_mut() {

@@ -687,7 +687,8 @@ fn repo_names_only_readable_projects_and_never_a_github_slug() {
     let folder = TempDir::new().unwrap();
     let folder_path = folder.path().canonical().unwrap();
     {
-        graphicle_runtime::folders::record(&f.store.graph(), &f.workspace, &other, &folder_path).unwrap();
+        graphicle_runtime::folders::record(&f.store.graph(), &f.workspace, &other, &folder_path)
+            .unwrap();
     }
     let mut app = f.app();
     let read = |app: &App, token: &str, repo: &str| -> Result<Value, String> {
@@ -1655,8 +1656,8 @@ fn the_guard_finds_code_with_and_without_the_live_symbol_table() {
     };
     nudged("with the live-symbol table");
     // The live-symbol table lives in the graph store now.
-    let graph = graphicle_runtime::store_graph::GraphStore::open(data.join("reviews.graph"))
-        .unwrap();
+    let graph =
+        graphicle_runtime::store_graph::GraphStore::open(data.join("reviews.graph")).unwrap();
     let symbols = graph
         .read(|db| {
             graphicle_runtime::store_graph::one(

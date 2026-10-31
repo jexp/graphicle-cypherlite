@@ -12,15 +12,15 @@ use crate::{
     store::{self, Principal, Store, authorize_hash, decode, one, repo, s},
     store_graph::{self as graph, GraphStore},
 };
+/// A graph-store connection (cypherlite), as handed out by
+/// [`GraphStore::connection`].
+use cypherlite::Connection as GConnection;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
-/// A graph-store connection (cypherlite), as handed out by
-/// [`GraphStore::connection`].
-use cypherlite::Connection as GConnection;
 
 // All work is serialized by repository unless both jobs explicitly opt into
 // independent observer sources. Prefix intersection is conservative: even a
@@ -160,9 +160,18 @@ fn insert_job(
         node["parallel_sources"] = json!(flag);
     }
     if let Some(include) = payload["include"].as_array() {
-        node["include"] = json!(include.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>());
+        node["include"] = json!(
+            include
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+        );
     }
-    graph::rows(db, "CREATE (j:Job {id: $id}) SET j += $job", graph::params(&json!({"id": job_id, "job": node})))?;
+    graph::rows(
+        db,
+        "CREATE (j:Job {id: $id}) SET j += $job",
+        graph::params(&json!({"id": job_id, "job": node})),
+    )?;
     graph::rows(
         db,
         "MATCH (j:Job {id: $id}), (p:Project {id: $repo}) CREATE (j)-[:OF]->(p)",
@@ -515,7 +524,17 @@ pub fn enqueue_projection(
     )?;
     // Background derivation: never ahead of work a caller is waiting on.
     let job_id = graph.transaction(|db| {
-        insert_job(db, repository, &p.workspace, "project", &input_hash, &payload, &p.hash, -1, 3)
+        insert_job(
+            db,
+            repository,
+            &p.workspace,
+            "project",
+            &input_hash,
+            &payload,
+            &p.hash,
+            -1,
+            3,
+        )
     })?;
     store::event(
         db,
@@ -628,7 +647,8 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         if current != expected {
             return Ok(skipped(&current));
         }
-        let info = crate::graph_projection::project_prebuilt(db, &store.graph(), identifier, &p, built)?;
+        let info =
+            crate::graph_projection::project_prebuilt(db, &store.graph(), identifier, &p, built)?;
         for label in &labels {
             crate::graph_projection::label_episode(
                 db,
@@ -659,8 +679,13 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         // Work extensions queue after a projection, which the projection
         // drain runs next. Listed only when an
         // extension queued something, so Core's result is unchanged.
-        let followed =
-            crate::extension::installed().after_projection(&store.graph(), db, &p, identifier, &info.episode);
+        let followed = crate::extension::installed().after_projection(
+            &store.graph(),
+            db,
+            &p,
+            identifier,
+            &info.episode,
+        );
         if !followed.is_empty() {
             out["after_projection"] = json!(followed);
         }
@@ -679,7 +704,8 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
                     .as_object()
                     .is_some_and(|counts| counts.values().any(|n| n.as_u64().unwrap_or(0) > 0));
                 let signed = if any {
-                    let remaining = crate::retention::legacy::remaining(db, identifier, &retention)?;
+                    let remaining =
+                        crate::retention::legacy::remaining(db, identifier, &retention)?;
                     Some(crate::deletion::legacy::rows_receipt(
                         db,
                         &p,
@@ -807,7 +833,17 @@ pub fn enqueue_link(
         payload["after"] = json!(running);
     }
     let job_id = graph.transaction(|db| {
-        insert_job(db, repository, &p.workspace, "link", &input_hash, &payload, &p.hash, -1, 3)
+        insert_job(
+            db,
+            repository,
+            &p.workspace,
+            "link",
+            &input_hash,
+            &payload,
+            &p.hash,
+            -1,
+            3,
+        )
     })?;
     store::event(
         db,
@@ -923,16 +959,30 @@ pub fn enqueue_enrich(
                 )?;
                 Ok(())
             })?;
-            return Ok(json!({"id": existing["id"], "state": "queued", "kind": "enrich",
-                "episode": episode, "replayed": true, "queued": true}));
+            return Ok(
+                json!({"id": existing["id"], "state": "queued", "kind": "enrich",
+                "episode": episode, "replayed": true, "queued": true}),
+            );
         }
-        return Ok(json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
-            "episode": episode, "replayed": true, "queued": true}));
+        return Ok(
+            json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
+            "episode": episode, "replayed": true, "queued": true}),
+        );
     }
     let payload = json!({"kind": "enrich", "episode": episode, "rule_set": rule_set,
         "runtime_revision": runtime_revision()});
     let job_id = graph.transaction(|db| {
-        insert_job(db, repository, &p.workspace, "enrich", &input_hash, &payload, &p.hash, -1, 3)
+        insert_job(
+            db,
+            repository,
+            &p.workspace,
+            "enrich",
+            &input_hash,
+            &payload,
+            &p.hash,
+            -1,
+            3,
+        )
     })?;
     store::event(
         db,
@@ -940,8 +990,10 @@ pub fn enqueue_enrich(
         "workflow_queued",
         json!({"id": job_id, "kind": "enrich", "episode": episode}),
     )?;
-    Ok(json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
-        "replayed": false, "queued": true}))
+    Ok(
+        json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
+        "replayed": false, "queued": true}),
+    )
 }
 
 /// Execute an `enrich` job: apply the project's concept rules to the
@@ -960,7 +1012,12 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
     let episode = s(&job.payload, "episode").to_string();
     let (current, identifier) = store.read(|db| {
         leased(&graph, job)?;
-        let p = authorize_hash(db, &job.workspace, &job.principal_hash, permission("enrich")?)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission("enrich")?,
+        )?;
         let repository = repo(db, &p, &job.repository)?;
         Ok((
             crate::graph_projection::current_episode(db, s(&repository, "id"))?,
@@ -976,13 +1033,10 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
         leased(&graph, job)
     })?;
     // The constraints read the graph the concepts just enriched, in the same job.
-    let constraints = crate::arch_rules::constraints::evaluate(
-        &graph,
-        &identifier,
-        &episode,
-        &report,
-        &|| leased(&graph, job),
-    )?;
+    let constraints =
+        crate::arch_rules::constraints::evaluate(&graph, &identifier, &episode, &report, &|| {
+            leased(&graph, job)
+        })?;
     report.constraints = Some(constraints);
     Ok(report.to_value())
 }
@@ -1163,7 +1217,7 @@ pub fn guarded_read<T>(
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
 fn still_valid(store: &Store, db: &Connection, job: &Job) -> Result<(Principal, Value)> {
-        check_lease(&store.graph(), &job.id, &job.lease)?;
+    check_lease(&store.graph(), &job.id, &job.lease)?;
     let p = authorize_hash(
         db,
         &job.workspace,
@@ -1604,9 +1658,7 @@ impl Store {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
             let old = self
                 .graph()
-                .read(|gdb| {
-                    job_row(gdb, string(args, "job_id", 100)?)
-                })?
+                .read(|gdb| job_row(gdb, string(args, "job_id", 100)?))?
                 .filter(|old| s(old, "repository_id") == s(&repository, "id"))
                 .ok_or_else(|| Error::bad("Job unavailable"))?;
             if p.role != "owner" && s(&old, "principal_hash") != p.hash {
@@ -1768,8 +1820,13 @@ impl Store {
             }
             let authorized = self
                 .read(|db| {
-                    authorize_hash(db, s(&row, "workspace_id"), s(&row, "principal_hash"), permission)
-                        .map(|_| ())
+                    authorize_hash(
+                        db,
+                        s(&row, "workspace_id"),
+                        s(&row, "principal_hash"),
+                        permission,
+                    )
+                    .map(|_| ())
                 })
                 .is_ok();
             if !authorized {
@@ -1793,7 +1850,9 @@ impl Store {
                 graph::one(
                     db,
                     &LEASE_CAS,
-                    graph::params(&json!({"id": s(&row, "id"), "now": stamp, "lease": lease, "until": until})),
+                    graph::params(
+                        &json!({"id": s(&row, "id"), "now": stamp, "lease": lease, "until": until}),
+                    ),
                 )
             })?;
             if taken.is_some() {
@@ -1862,7 +1921,12 @@ impl Store {
             return Ok(());
         };
         self.transaction(|db| {
-            store::event(db, &job.repository, "workflow_finished", json!({"id": job.id, "state": state}))
+            store::event(
+                db,
+                &job.repository,
+                "workflow_finished",
+                json!({"id": job.id, "state": state}),
+            )
         })
     }
 }

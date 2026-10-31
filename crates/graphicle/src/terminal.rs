@@ -4823,7 +4823,9 @@ fn checks(options: &Doctor<'_>) -> Vec<Check> {
                                 &session.workspace,
                                 &session.capability,
                                 "read",
-                                |_db, _| crate::folders::current_folder(&store.graph(), &resolved.id),
+                                |_db, _| {
+                                    crate::folders::current_folder(&store.graph(), &resolved.id)
+                                },
                             )
                             .ok()
                             .flatten()
@@ -5468,7 +5470,11 @@ pub fn table(headers: &[&str], rows: &[Vec<String>], style: Style) -> String {
 pub fn analyze_text(report: &Value, style: Style) -> String {
     let mut out = String::new();
     let state = s(report, "state");
-    let _ = writeln!(out, "{}", style.bold(&format!("Architecture rules: {}", analyze_title(report))));
+    let _ = writeln!(
+        out,
+        "{}",
+        style.bold(&format!("Architecture rules: {}", analyze_title(report)))
+    );
     if let Some(detail) = report["detail"].as_str() {
         let _ = writeln!(out, "{}", style.dim(detail));
     }
@@ -5497,7 +5503,9 @@ pub fn analyze_text(report: &Value, style: Style) -> String {
             style,
         ));
     }
-    let violations = report["violations"].as_array().map_or(&[][..], Vec::as_slice);
+    let violations = report["violations"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     if !violations.is_empty() {
         out.push('\n');
         let rows: Vec<Vec<String>> = violations
@@ -5516,7 +5524,12 @@ pub fn analyze_text(report: &Value, style: Style) -> String {
         out.push_str("\nNo violations.\n");
     }
     for error in report["errors"].as_array().into_iter().flatten() {
-        let _ = writeln!(out, "{} {}", style.bad("error:"), error.as_str().unwrap_or_default());
+        let _ = writeln!(
+            out,
+            "{} {}",
+            style.bad("error:"),
+            error.as_str().unwrap_or_default()
+        );
     }
     let exit = report["exit"].as_i64().unwrap_or(2);
     let _ = writeln!(out, "\n{}", analyze_exit_line(report, exit, style));
@@ -5551,11 +5564,19 @@ pub fn analyze_markdown(report: &Value) -> String {
         }
         out.push('\n');
     }
-    let violations = report["violations"].as_array().map_or(&[][..], Vec::as_slice);
+    let violations = report["violations"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     if !violations.is_empty() {
         out.push_str("| Severity | Rule | Evidence |\n|---|---|---|\n");
         for v in violations {
-            let _ = writeln!(out, "| {} | {} | {} |", s(v, "severity"), s(v, "rule"), s(v, "evidence"));
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
+                s(v, "severity"),
+                s(v, "rule"),
+                s(v, "evidence")
+            );
         }
         out.push('\n');
     }
@@ -5586,15 +5607,19 @@ fn count_of(row: &Value, key: &str) -> String {
 
 /// The closing line: the exit status and why it is that.
 fn analyze_exit_line(report: &Value, exit: i64, style: Style) -> String {
-    let found = report["violations"].as_array().is_some_and(|v| !v.is_empty());
+    let found = report["violations"]
+        .as_array()
+        .is_some_and(|v| !v.is_empty());
     match (exit, report["min_severity"].as_str()) {
         (2, _) => style.bad("Exit 2: rule errors (see above)."),
         (1, Some(min)) => style.bad(&format!("Exit 1: violations at or above {min}.")),
-        (_, Some(min)) if found => {
-            style.good(&format!("Exit 0: violations reported, none at or above {min}."))
-        }
+        (_, Some(min)) if found => style.good(&format!(
+            "Exit 0: violations reported, none at or above {min}."
+        )),
         (_, Some(min)) => style.good(&format!("Exit 0: no violations at or above {min}.")),
-        (_, None) if found => style.good("Exit 0: violations reported (no --min-severity, so nothing gates)."),
+        (_, None) if found => {
+            style.good("Exit 0: violations reported (no --min-severity, so nothing gates).")
+        }
         (_, None) => style.good("Exit 0: no violations."),
     }
 }

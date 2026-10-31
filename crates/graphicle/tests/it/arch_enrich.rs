@@ -30,8 +30,7 @@ impl Fixture {
         )
         .into_iter()
         .map(|mut job| {
-            job["result"] =
-                serde_json::from_str::<Value>(s(&job, "result")).unwrap_or(Value::Null);
+            job["result"] = serde_json::from_str::<Value>(s(&job, "result")).unwrap_or(Value::Null);
             job
         })
         .collect()
@@ -212,8 +211,7 @@ fn a_new_episode_re_runs_the_rule_set_with_its_own_applications() {
 
     // Both episodes' symbols carry the concept's label now.
     assert!(
-        f.count(
-            "MATCH (s:Symbol {relpath: 'src/more.rs'}) WHERE s:ArchTest RETURN count(s) AS n"
-        ) > 0
+        f.count("MATCH (s:Symbol {relpath: 'src/more.rs'}) WHERE s:ArchTest RETURN count(s) AS n")
+            > 0
     );
 }

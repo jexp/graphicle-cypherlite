@@ -2009,7 +2009,10 @@ fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
 /// the resolved symbol, and edges back to the document for the rest.
 fn write(db: &mut cypherlite::Connection, computed: &Computed) -> Result<usize> {
     let document = &computed.document;
-    let key = [("repo", json!(document.project)), ("doc", json!(document.id))];
+    let key = [
+        ("repo", json!(document.project)),
+        ("doc", json!(document.id)),
+    ];
     store_graph::rows(
         db,
         "MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc})-[l:LINKS_TO]->() \
@@ -2153,11 +2156,9 @@ pub fn after_sync(
             })?
             .iter()
             .any(|row| {
-                serde_json::from_str::<Value>(s(row, "metadata"))
-                    .is_ok_and(|metadata| {
-                        metadata["provider_metadata"]["schema"].as_str()
-                            != Some(SDK_SESSION_SCHEMA)
-                    })
+                serde_json::from_str::<Value>(s(row, "metadata")).is_ok_and(|metadata| {
+                    metadata["provider_metadata"]["schema"].as_str() != Some(SDK_SESSION_SCHEMA)
+                })
             });
     // Link rows of this connector's documents that remain to be removed:
     // their own nodes carry the row state (`source_kind`) and the connector
@@ -4068,7 +4069,10 @@ mod tests {
             ("docs/a.md", page),
         ]);
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 1);
+        assert_eq!(
+            unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"),
+            1
+        );
         unit.sync(&[
             ("wire.py", "def parse_header(line):\n    return line\n"),
             ("docs/a.md", page),
@@ -4117,9 +4121,7 @@ mod tests {
         assert_eq!(summary["requeued"], true, "{summary}");
         assert_eq!(summary["relinked"], 0);
         assert_eq!(
-            unit.graph_count(
-                "MATCH (d:ConnectorDoc {id: 'file:docs/b.md'}) RETURN count(d) AS n"
-            ),
+            unit.graph_count("MATCH (d:ConnectorDoc {id: 'file:docs/b.md'}) RETURN count(d) AS n"),
             0
         );
         assert_eq!(
@@ -4137,7 +4139,10 @@ mod tests {
         );
         // That job reads the new episode: both pages link to the edited code.
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 2);
+        assert_eq!(
+            unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"),
+            2
+        );
         let sha = graphicle_memory::text::sha256(edited.as_bytes());
         assert_eq!(
             unit.graph_count(&format!(

@@ -31,7 +31,12 @@ rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 # The CypherLite engine (neo4j-labs, tag v0.12.2, not on crates.io) — the
 # graph store core (src/store_graph.rs). default-features = false drops the
 # arrow/parquet snapshot codec (JSON snapshots instead); spike-verified.
-cypherlite = { path = "/Users/flm2dxqwm5/d/llm/graphicle/third_party/cypherlite/cypherlite/cypherlite", default-features = false }
+# The CypherLite engine (neo4j-labs, not on crates.io — beware the unrelated
+# crates.io cypherlite-* 2.0.1). Pinned to the exact commit the local
+# third_party/cypherlite checkout holds (v0.13.0 + 51, 221329d5): the checkout
+# stays as the readable reference; builds fetch this rev once and cache it.
+# default-features = false drops the arrow/parquet snapshot codec.
+cypherlite = { git = "https://github.com/neo4j-labs/cypherlite", rev = "221329d5269f8e5dcc17a092ca39d2c4716d51e1", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

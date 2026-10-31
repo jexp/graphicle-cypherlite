@@ -57,8 +57,14 @@ impl Fixture {
                      MATCH (f)-[:PARSED_AS]->(p:Parse) WHERE p.sha256=o.sha256 \
                      RETURN p.revision AS revision, p.data AS data",
                     graphicle_runtime::store_graph::Params::from([
-                        ("repo".to_string(), graphicle_runtime::store_graph::json_to_value(&json!(repository))),
-                        ("path".to_string(), graphicle_runtime::store_graph::json_to_value(&json!(path))),
+                        (
+                            "repo".to_string(),
+                            graphicle_runtime::store_graph::json_to_value(&json!(repository)),
+                        ),
+                        (
+                            "path".to_string(),
+                            graphicle_runtime::store_graph::json_to_value(&json!(path)),
+                        ),
                     ]),
                 )
             })
@@ -328,9 +334,8 @@ fn a_manifest_in_parts_commits_nothing_until_the_commit_and_retries_are_idempote
         let (path, content) = file(i);
         json!({"path":path,"sha256":graphicle_memory::text::sha256(content.as_bytes()),"bytes":content.len()})
     };
-    let heads = || {
-        graphicle_runtime::store_content::file_count(&f.store.graph(), &repository).unwrap()
-    };
+    let heads =
+        || graphicle_runtime::store_content::file_count(&f.store.graph(), &repository).unwrap();
     let call = |operation: &str, mut args: Value| {
         args["repository_id"] = json!(repository);
         match operation {

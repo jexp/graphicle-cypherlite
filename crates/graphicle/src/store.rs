@@ -309,7 +309,10 @@ fn transient_failure(message: &str) -> bool {
 /// path order. Complete analyses carry `structure::REVISION`, so only the
 /// others are read. The parses live in the graph store: see
 /// [`store_content::analysis_report`].
-pub fn analysis_report(store: &crate::store_graph::GraphStore, repository: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+pub fn analysis_report(
+    store: &crate::store_graph::GraphStore,
+    repository: &str,
+) -> Result<(Vec<Value>, Vec<Value>)> {
     store_content::analysis_report(store, repository)
 }
 
@@ -367,9 +370,7 @@ fn graph_in(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
 fn graph_for_operation(directory: &Path) -> Result<Arc<crate::store_graph::GraphStore>> {
     match graph_in(directory) {
         Ok(graph) => Ok(graph),
-        Err(error) if error.message.contains("storage locked") => {
-            graph_in_read_only(directory)
-        }
+        Err(error) if error.message.contains("storage locked") => graph_in_read_only(directory),
         Err(error) => Err(error),
     }
 }
@@ -783,67 +784,147 @@ impl Store {
         // all graph. The row is read under a short read snapshot so the SQL
         // write lock is never held across a graph transaction (a held lock
         // starved concurrent syncs past the busy timeout).
-        let repository=self.authorized_read(workspace,token,"collect",|db,p| {
-            repo(db,p,string(args,"repository_id",100)?)
+        let repository = self.authorized_read(workspace, token, "collect", |db, p| {
+            repo(db, p, string(args, "repository_id", 100)?)
         })?;
         {
-            let identifier=s(&repository,"id");
+            let identifier = s(&repository, "id");
             // Earlier parts' entries, the snapshot the sync started from, and its metadata.
-            let (mut files,expected,metadata)=match continued {
-                Some(sync_id)=>{
-                    let sync=store_content::sync_get(&graph,identifier,sync_id)?.ok_or_else(||Error::bad("Sync not found"))?;
-                    if s(&sync,"state")!="preparing" {return Err(Error::conflict("Sync is not waiting for more of its manifest"));}
-                    (serde_json::from_str::<BTreeMap<String,Value>>(s(&sync,"manifest"))?,s(&sync,"expected_snapshot").to_string(),s(&sync,"metadata").to_string())
+            let (mut files, expected, metadata) = match continued {
+                Some(sync_id) => {
+                    let sync = store_content::sync_get(&graph, identifier, sync_id)?
+                        .ok_or_else(|| Error::bad("Sync not found"))?;
+                    if s(&sync, "state") != "preparing" {
+                        return Err(Error::conflict(
+                            "Sync is not waiting for more of its manifest",
+                        ));
+                    }
+                    (
+                        serde_json::from_str::<BTreeMap<String, Value>>(s(&sync, "manifest"))?,
+                        s(&sync, "expected_snapshot").to_string(),
+                        s(&sync, "metadata").to_string(),
+                    )
                 }
-                None=>{
-                    if repository["snapshot"]!=args["expected_snapshot"] {return Err(Error::conflict("Repository changed during scanning"));}
-                    (BTreeMap::new(),s(&repository,"snapshot").to_string(),metadata.to_string())
+                None => {
+                    if repository["snapshot"] != args["expected_snapshot"] {
+                        return Err(Error::conflict("Repository changed during scanning"));
+                    }
+                    (
+                        BTreeMap::new(),
+                        s(&repository, "snapshot").to_string(),
+                        metadata.to_string(),
+                    )
                 }
             };
-            for (name,item) in part {
-                if files.insert(name,item).is_some() {return Err(Error::bad("Duplicate source path"));}
+            for (name, item) in part {
+                if files.insert(name, item).is_some() {
+                    return Err(Error::bad("Duplicate source path"));
+                }
             }
-            let bytes:usize=files.values().map(|item|item["bytes"].as_u64().unwrap_or(0) as usize).sum();
-            if files.len()>limits.project_files || bytes>limits.project_bytes {
-                return Err(crate::limits::project_refusal(files.len(),bytes,false,&limits));
+            let bytes: usize = files
+                .values()
+                .map(|item| item["bytes"].as_u64().unwrap_or(0) as usize)
+                .sum();
+            if files.len() > limits.project_files || bytes > limits.project_bytes {
+                return Err(crate::limits::project_refusal(
+                    files.len(),
+                    bytes,
+                    false,
+                    &limits,
+                ));
             }
-            let unfinished=||->Result<()>{
-                if store_content::syncs_unfinished(&graph,identifier)?>=20{return Err(Error::conflict("Abort an unfinished sync before adding another"));}
+            let unfinished = || -> Result<()> {
+                if store_content::syncs_unfinished(&graph, identifier)? >= 20 {
+                    return Err(Error::conflict(
+                        "Abort an unfinished sync before adding another",
+                    ));
+                }
                 Ok(())
             };
             if !complete {
-                let manifest=graphicle_memory::text::canonical(&json!(files));
-                let sync_id=match continued {
-                    Some(sync_id)=>{store_content::sync_update(&graph,sync_id,&json!({"manifest":manifest}))?;sync_id.to_string()}
-                    None=>{unfinished()?;let sync_id=id();store_content::sync_create(&graph,&repository,&sync_id,&json!({"expected_snapshot":expected,"snapshot":"","manifest":manifest,"metadata":metadata,"state":"preparing"}))?;sync_id}
+                let manifest = graphicle_memory::text::canonical(&json!(files));
+                let sync_id = match continued {
+                    Some(sync_id) => {
+                        store_content::sync_update(&graph, sync_id, &json!({"manifest":manifest}))?;
+                        sync_id.to_string()
+                    }
+                    None => {
+                        unfinished()?;
+                        let sync_id = id();
+                        store_content::sync_create(
+                            &graph,
+                            &repository,
+                            &sync_id,
+                            &json!({"expected_snapshot":expected,"snapshot":"","manifest":manifest,"metadata":metadata,"state":"preparing"}),
+                        )?;
+                        sync_id
+                    }
                 };
-                return Ok(json!({"sync_id":sync_id,"manifest_complete":false,"files":files.len()}));
+                return Ok(
+                    json!({"sync_id":sync_id,"manifest_complete":false,"files":files.len()}),
+                );
             }
-            if s(&repository,"snapshot")!=expected {return Err(Error::conflict("Repository changed during scanning"));}
-            let files=json!(files);
-            let snapshot=digest(&files);
-            let outdated=store_content::outdated_heads(&graph,identifier,[graphicle_memory::structure::REVISION,&limited])?;
-            if s(&repository,"snapshot")==snapshot && outdated==0 {
-                if let Some(sync_id)=continued {store_content::sync_delete(&graph,sync_id)?;}
+            if s(&repository, "snapshot") != expected {
+                return Err(Error::conflict("Repository changed during scanning"));
+            }
+            let files = json!(files);
+            let snapshot = digest(&files);
+            let outdated = store_content::outdated_heads(
+                &graph,
+                identifier,
+                [graphicle_memory::structure::REVISION, &limited],
+            )?;
+            if s(&repository, "snapshot") == snapshot && outdated == 0 {
+                if let Some(sync_id) = continued {
+                    store_content::sync_delete(&graph, sync_id)?;
+                }
                 // Identical tree, possibly a new commit identity: the existing
                 // episode still gains the sha from this sync's metadata. The
                 // enqueue is SQL; re-read the project row under the write
                 // lock and re-verify the snapshot there.
-                let metadata:Value=serde_json::from_str(&metadata)?;
-                let projection=self.authorized(workspace,token,"collect",|db,p| {
-                    let repository=repo(db,p,string(args,"repository_id",100)?)?;
-                    if s(&repository,"snapshot")!=snapshot {return Err(Error::conflict("Repository changed during scanning"));}
-                    crate::jobs::enqueue_projection(self,db,s(&repository,"id"),p,&snapshot,&metadata)
+                let metadata: Value = serde_json::from_str(&metadata)?;
+                let projection = self.authorized(workspace, token, "collect", |db, p| {
+                    let repository = repo(db, p, string(args, "repository_id", 100)?)?;
+                    if s(&repository, "snapshot") != snapshot {
+                        return Err(Error::conflict("Repository changed during scanning"));
+                    }
+                    crate::jobs::enqueue_projection(
+                        self,
+                        db,
+                        s(&repository, "id"),
+                        p,
+                        &snapshot,
+                        &metadata,
+                    )
                 })?;
-                return Ok(json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}));
+                return Ok(
+                    json!({"snapshot":snapshot,"sync_id":null,"missing":[],"replayed":true,"projection_job":projection}),
+                );
             }
             // One UNWIND round trip, replacing the per-file SELECT EXISTS loop.
             let entries:Vec<Value>=files.as_object().unwrap().iter().map(|(name,item)|json!({"path":name,"sha256":item["sha256"],"bytes":item["bytes"]})).collect();
-            let missing=store_content::missing_objects(&graph,identifier,&json!(entries))?;
-            let manifest=graphicle_memory::text::canonical(&files);
-            let sync_id=match continued {
-                Some(sync_id)=>{store_content::sync_update(&graph,sync_id,&json!({"snapshot":snapshot,"manifest":manifest,"state":"pending"}))?;sync_id.to_string()}
-                None=>{unfinished()?;let sync_id=id();store_content::sync_create(&graph,&repository,&sync_id,&json!({"expected_snapshot":expected,"snapshot":snapshot,"manifest":manifest,"metadata":metadata,"state":"pending"}))?;sync_id}
+            let missing = store_content::missing_objects(&graph, identifier, &json!(entries))?;
+            let manifest = graphicle_memory::text::canonical(&files);
+            let sync_id = match continued {
+                Some(sync_id) => {
+                    store_content::sync_update(
+                        &graph,
+                        sync_id,
+                        &json!({"snapshot":snapshot,"manifest":manifest,"state":"pending"}),
+                    )?;
+                    sync_id.to_string()
+                }
+                None => {
+                    unfinished()?;
+                    let sync_id = id();
+                    store_content::sync_create(
+                        &graph,
+                        &repository,
+                        &sync_id,
+                        &json!({"expected_snapshot":expected,"snapshot":snapshot,"manifest":manifest,"metadata":metadata,"state":"pending"}),
+                    )?;
+                    sync_id
+                }
             };
             Ok(json!({"snapshot":snapshot,"sync_id":sync_id,"missing":missing,"replayed":false}))
         }
@@ -924,9 +1005,12 @@ impl Store {
         // Plan the commit from a complete authorized snapshot.
         let (sync, documents) = self.authorized_read(workspace, token, "collect", |db, p| {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
-            let sync =
-                store_content::sync_get(&graph, s(&repository, "id"), string(args, "sync_id", 100)?)?
-                    .ok_or_else(|| Error::bad("Sync not found"))?;
+            let sync = store_content::sync_get(
+                &graph,
+                s(&repository, "id"),
+                string(args, "sync_id", 100)?,
+            )?
+            .ok_or_else(|| Error::bad("Sync not found"))?;
             match s(&sync, "state") {
                 "aborted" => return Err(Error::conflict("Sync was aborted")),
                 "preparing" => {
@@ -994,8 +1078,9 @@ impl Store {
                         {
                             break;
                         }
-                        let content = content
-                            .ok_or_else(|| Error::conflict("Upload missing sources before committing"))?;
+                        let content = content.ok_or_else(|| {
+                            Error::conflict("Upload missing sources before committing")
+                        })?;
                         if graphicle_memory::text::sha256(content.as_bytes()) != document.sha {
                             return Err(Error::bad("Source integrity check failed"));
                         }
@@ -1068,23 +1153,52 @@ impl Store {
         // The two stores cannot commit atomically until the remaining domains
         // migrate; a lost race leaves the graph ahead, which the next sync's
         // replay path reconciles.
-        let repository=self.authorized_read(workspace,token,"collect",|db,p| {
-            repo(db,p,string(args,"repository_id",100)?)
+        let repository = self.authorized_read(workspace, token, "collect", |db, p| {
+            repo(db, p, string(args, "repository_id", 100)?)
         })?;
-        let identifier=s(&repository,"id");
-        let state=store_content::sync_state(&graph,identifier,s(&sync,"id"))?.ok_or_else(||Error::bad("Sync not found"))?;
-        if state=="complete" {return Ok(json!({"snapshot":sync["snapshot"],"current_snapshot":repository["snapshot"],"replayed":true}));}
-        if state!="pending" || repository["snapshot"]!=sync["expected_snapshot"] {return Err(Error::conflict("A newer sync finished first"));}
-        let before=store_content::heads(&graph,identifier)?;
-        let changed:Vec<String>=documents.iter().filter(|d|before.get(&d.path)!=Some(&d.sha)).map(|d|d.path.clone()).collect();
-        let present:BTreeSet<&str>=documents.iter().map(|d|d.path.as_str()).collect();
-        let removed:Vec<_>=before.keys().filter(|path|!present.contains(path.as_str())).cloned().collect();
-        let manifest_docs:Vec<Value>=documents.iter().map(|d|json!({"path":d.path,"sha256":d.sha})).collect();
-        store_content::activate(&graph,&repository,&sync,&json!(manifest_docs),&changed,&removed)?;
-        let changed_paths:BTreeSet<&str>=changed.iter().map(String::as_str).collect();
-        let changed_docs:Vec<(String,String)>=documents.iter().filter(|d|changed_paths.contains(d.path.as_str())).map(|d|(d.path.clone(),d.sha.clone())).collect();
-        let chunk_lines=store_content::chunk_lines_for(&graph,identifier,&changed_docs)?;
-        let (limited,skipped)=store_content::analysis_report(&graph,identifier)?;
+        let identifier = s(&repository, "id");
+        let state = store_content::sync_state(&graph, identifier, s(&sync, "id"))?
+            .ok_or_else(|| Error::bad("Sync not found"))?;
+        if state == "complete" {
+            return Ok(
+                json!({"snapshot":sync["snapshot"],"current_snapshot":repository["snapshot"],"replayed":true}),
+            );
+        }
+        if state != "pending" || repository["snapshot"] != sync["expected_snapshot"] {
+            return Err(Error::conflict("A newer sync finished first"));
+        }
+        let before = store_content::heads(&graph, identifier)?;
+        let changed: Vec<String> = documents
+            .iter()
+            .filter(|d| before.get(&d.path) != Some(&d.sha))
+            .map(|d| d.path.clone())
+            .collect();
+        let present: BTreeSet<&str> = documents.iter().map(|d| d.path.as_str()).collect();
+        let removed: Vec<_> = before
+            .keys()
+            .filter(|path| !present.contains(path.as_str()))
+            .cloned()
+            .collect();
+        let manifest_docs: Vec<Value> = documents
+            .iter()
+            .map(|d| json!({"path":d.path,"sha256":d.sha}))
+            .collect();
+        store_content::activate(
+            &graph,
+            &repository,
+            &sync,
+            &json!(manifest_docs),
+            &changed,
+            &removed,
+        )?;
+        let changed_paths: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
+        let changed_docs: Vec<(String, String)> = documents
+            .iter()
+            .filter(|d| changed_paths.contains(d.path.as_str()))
+            .map(|d| (d.path.clone(), d.sha.clone()))
+            .collect();
+        let chunk_lines = store_content::chunk_lines_for(&graph, identifier, &changed_docs)?;
+        let (limited, skipped) = store_content::analysis_report(&graph, identifier)?;
         self.authorized(workspace,token,"collect",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;let identifier=s(&repository,"id");
             if repository["snapshot"]!=sync["expected_snapshot"] {return Err(Error::conflict("A newer sync finished first"));}
@@ -1122,11 +1236,14 @@ pub fn credential_sources(
     credential: &str,
 ) -> Result<Vec<String>> {
     let mut sources = BTreeSet::new();
-    let projects: Vec<String> =
-        rows(db, "SELECT id FROM repo_projects WHERE workspace_id=?", [workspace])?
-            .iter()
-            .map(|r| s(r, "id").to_string())
-            .collect();
+    let projects: Vec<String> = rows(
+        db,
+        "SELECT id FROM repo_projects WHERE workspace_id=?",
+        [workspace],
+    )?
+    .iter()
+    .map(|r| s(r, "id").to_string())
+    .collect();
     let connectors: Vec<Value> = store.graph().read(|db| {
         crate::store_graph::rows(
             db,
@@ -1244,7 +1361,6 @@ pub fn credential_sources(
     })?;
     Ok(sources.into_iter().collect())
 }
-
 
 /// Additive column migration for tables created by an earlier schema:
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column

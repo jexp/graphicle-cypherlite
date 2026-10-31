@@ -147,17 +147,22 @@ pub fn enqueue_config(
     })
 }
 pub fn ready(db: &Connection, repository: &str, kind: &str, config: &Value) -> Result<()> {
-    if crate::store::graph_for(db)?.read(|g| {
-        graph::one(
-            g,
-            "MATCH (c:ProjectionCleanup {scope: $scope, kind: $kind, config_hash: $hash}) \
+    if crate::store::graph_for(db)?
+        .read(|g| {
+            graph::one(
+                g,
+                "MATCH (c:ProjectionCleanup {scope: $scope, kind: $kind, config_hash: $hash}) \
              WHERE c.state <> 'complete' RETURN c.id AS id LIMIT 1",
-            graph::params(&json!({"scope": repository, "kind": kind, "hash": address_hash(config)})),
-        )
-    })?
-    .is_some()
+                graph::params(
+                    &json!({"scope": repository, "kind": kind, "hash": address_hash(config)}),
+                ),
+            )
+        })?
+        .is_some()
     {
-        return Err(Error::conflict("External cleanup is pending. Run the worker or retry cleanup before publishing this projection"));
+        return Err(Error::conflict(
+            "External cleanup is pending. Run the worker or retry cleanup before publishing this projection",
+        ));
     }
     Ok(())
 }

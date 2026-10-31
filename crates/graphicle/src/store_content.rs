@@ -63,7 +63,11 @@ fn ensure_project(db: &mut Connection, repository: &Value) -> Result<()> {
 /// The paths of `entries` (`[{path, sha256, bytes}]`) whose content the
 /// store does not hold: one `UNWIND` round trip, replacing the SQL store's
 /// per-file `SELECT EXISTS` loop.
-pub fn missing_objects(store: &GraphStore, repository: &str, entries: &Value) -> Result<Vec<String>> {
+pub fn missing_objects(
+    store: &GraphStore,
+    repository: &str,
+    entries: &Value,
+) -> Result<Vec<String>> {
     let shas: Vec<&str> = entries
         .as_array()
         .map(|rows| rows.iter().map(|row| s(row, "sha256")).collect())
@@ -79,7 +83,12 @@ pub fn missing_objects(store: &GraphStore, repository: &str, entries: &Value) ->
             params(vec![("repo", json!(repository)), ("shas", json!(shas))]),
         )?
         .into_iter()
-        .map(|row| (s(&row, "sha256").to_string(), row["bytes"].as_i64().unwrap_or(-1)))
+        .map(|row| {
+            (
+                s(&row, "sha256").to_string(),
+                row["bytes"].as_i64().unwrap_or(-1),
+            )
+        })
         .collect())
     })?;
     let mut missing = Vec::new();
@@ -178,7 +187,12 @@ pub fn object_contents(
             params(vec![("repo", json!(repository)), ("shas", json!(shas))]),
         )?
         .into_iter()
-        .map(|row| (s(&row, "sha256").to_string(), s(&row, "content").to_string()))
+        .map(|row| {
+            (
+                s(&row, "sha256").to_string(),
+                s(&row, "content").to_string(),
+            )
+        })
         .collect())
     })?;
     Ok(shas.iter().map(|sha| found.get(sha).cloned()).collect())
@@ -319,7 +333,10 @@ fn ensure_files(db: &mut Connection, repo: &str, rows_json: &Value) -> Result<Ve
     )?;
     let have: std::collections::BTreeSet<&str> =
         existing.iter().map(|row| s(row, "path")).collect();
-    let missing: Vec<&String> = paths.iter().filter(|path| !have.contains(path.as_str())).collect();
+    let missing: Vec<&String> = paths
+        .iter()
+        .filter(|path| !have.contains(path.as_str()))
+        .collect();
     if !missing.is_empty() {
         rows(
             db,
@@ -363,7 +380,12 @@ fn file_ids(
         params(vec![("repo", json!(repo)), ("paths", json!(paths))]),
     )?
     .into_iter()
-    .map(|row| (s(&row, "path").to_string(), row["id"].as_i64().unwrap_or(-1)))
+    .map(|row| {
+        (
+            s(&row, "path").to_string(),
+            row["id"].as_i64().unwrap_or(-1),
+        )
+    })
     .collect())
 }
 
@@ -461,11 +483,15 @@ pub fn chunk_lines_for(
         )
     })?;
     let wanted: std::collections::BTreeSet<&(String, String)> = files.iter().collect();
-    let mut lines: std::collections::BTreeMap<(String, String), Vec<i64>> = std::collections::BTreeMap::new();
+    let mut lines: std::collections::BTreeMap<(String, String), Vec<i64>> =
+        std::collections::BTreeMap::new();
     for row in found {
         let key = (s(&row, "path").to_string(), s(&row, "sha256").to_string());
         if wanted.contains(&key) {
-            lines.entry(key).or_default().push(row["line"].as_i64().unwrap_or(0));
+            lines
+                .entry(key)
+                .or_default()
+                .push(row["line"].as_i64().unwrap_or(0));
         }
     }
     for lines in lines.values_mut() {
@@ -530,7 +556,10 @@ pub fn outdated_heads(store: &GraphStore, repository: &str, revisions: [&str; 2]
             "MATCH (f:File {repository_id:$repo})-[:HEAD]->(o:Object) \
              OPTIONAL MATCH (f)-[:PARSED_AS]->(p:Parse) WHERE p.sha256 = o.sha256 \
              RETURN count(CASE WHEN p IS NULL OR NOT (p.revision IN $revisions) THEN 1 END) AS n",
-            params(vec![("repo", json!(repository)), ("revisions", json!(revisions))]),
+            params(vec![
+                ("repo", json!(repository)),
+                ("revisions", json!(revisions)),
+            ]),
         )?
         .and_then(|row| row["n"].as_i64())
         .unwrap_or(0))
@@ -609,8 +638,7 @@ pub fn sync_get(store: &GraphStore, repository: &str, sync_id: &str) -> Result<O
 
 /// A sync's state, or `None` when no such sync exists.
 pub fn sync_state(store: &GraphStore, repository: &str, sync_id: &str) -> Result<Option<String>> {
-    Ok(sync_get(store, repository, sync_id)?
-        .map(|row| s(&row, "state").to_string()))
+    Ok(sync_get(store, repository, sync_id)?.map(|row| s(&row, "state").to_string()))
 }
 
 /// Syncs of `repository` still waiting for their manifest or content.
@@ -745,11 +773,7 @@ pub fn head_parses(store: &GraphStore, repository: &str) -> Result<Vec<Value>> {
 /// content}]`), in path order — `memory::documents`' file arm. With
 /// `content` false the content column is empty (`memory::load_contents`
 /// reads the text of the few files a caller needs).
-pub fn head_documents(
-    store: &GraphStore,
-    repository: &str,
-    content: bool,
-) -> Result<Vec<Value>> {
+pub fn head_documents(store: &GraphStore, repository: &str, content: bool) -> Result<Vec<Value>> {
     store.read(|db| {
         rows(
             db,
@@ -788,18 +812,19 @@ pub fn head_bytes(store: &GraphStore, repository: &str) -> Result<BTreeMap<Strin
             params(vec![("repo", json!(repository))]),
         )?
         .into_iter()
-        .map(|row| (s(&row, "path").to_string(), row["bytes"].as_i64().unwrap_or(0)))
+        .map(|row| {
+            (
+                s(&row, "path").to_string(),
+                row["bytes"].as_i64().unwrap_or(0),
+            )
+        })
         .collect())
     })
 }
 
 /// The content of one headed file — the text of the object its head names,
 /// if the file is headed. One statement, no sha round trip.
-pub fn head_content(
-    store: &GraphStore,
-    repository: &str,
-    path: &str,
-) -> Result<Option<String>> {
+pub fn head_content(store: &GraphStore, repository: &str, path: &str) -> Result<Option<String>> {
     store.read(|db| {
         Ok(one(
             db,
@@ -812,7 +837,11 @@ pub fn head_content(
 }
 
 /// One object's content, if present.
-pub fn object_content(store: &GraphStore, repository: &str, sha256: &str) -> Result<Option<String>> {
+pub fn object_content(
+    store: &GraphStore,
+    repository: &str,
+    sha256: &str,
+) -> Result<Option<String>> {
     store.read(|db| {
         Ok(one(
             db,
@@ -1213,8 +1242,16 @@ mod tests {
         assert_eq!(plan[1]["present"], true);
         assert_eq!(plan[1]["parsed"], false, "{plan:?}");
         assert_eq!(plan[1]["chunked"], false, "{plan:?}");
-        let lines = chunk_lines_for(&store, "proj-1", &[("a.py".to_string(), "sha-a".to_string())]).unwrap();
-        assert_eq!(lines[&("a.py".to_string(), "sha-a".to_string())], vec![1, 41]);
+        let lines = chunk_lines_for(
+            &store,
+            "proj-1",
+            &[("a.py".to_string(), "sha-a".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            lines[&("a.py".to_string(), "sha-a".to_string())],
+            vec![1, 41]
+        );
         let found = search_chunks(&store, "proj-1", "borrow", 10).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["line"], 1);
@@ -1253,7 +1290,13 @@ mod tests {
         let heads = heads(&store, "proj-1").unwrap();
         assert_eq!(heads.len(), 2);
         assert_eq!(heads["a.py"], "sha-a");
-        assert_eq!(s(&sync_get(&store, "proj-1", "sync-1").unwrap().unwrap(), "state"), "complete");
+        assert_eq!(
+            s(
+                &sync_get(&store, "proj-1", "sync-1").unwrap().unwrap(),
+                "state"
+            ),
+            "complete"
+        );
         assert_eq!(snapshots(&store, "proj-1", 100).unwrap().len(), 1);
         // One event, sequence 1 from the project's counter.
         let events = store
@@ -1306,9 +1349,20 @@ mod tests {
             &json!({"expected_snapshot":"snap-2","snapshot":"","manifest":"{}","metadata":"{}","state":"preparing"}),
         )
         .unwrap();
-        sync_update(&store, "sync-3", &json!({"manifest":"{\"a\":1}","state":"pending"})).unwrap();
+        sync_update(
+            &store,
+            "sync-3",
+            &json!({"manifest":"{\"a\":1}","state":"pending"}),
+        )
+        .unwrap();
         sync_abort(&store, "proj-1", "sync-3").unwrap();
-        assert_eq!(s(&sync_get(&store, "proj-1", "sync-3").unwrap().unwrap(), "state"), "aborted");
+        assert_eq!(
+            s(
+                &sync_get(&store, "proj-1", "sync-3").unwrap().unwrap(),
+                "state"
+            ),
+            "aborted"
+        );
         sync_delete(&store, "sync-3").unwrap();
         assert!(sync_get(&store, "proj-1", "sync-3").unwrap().is_none());
     }
@@ -1327,7 +1381,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod durability_probe {
     use super::*;
@@ -1338,7 +1391,8 @@ mod durability_probe {
     fn durable_reopen() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("reviews.graph");
-        let project = json!({"id":"proj-1","workspace_id":"ws-1","project_key":"key","name":"Project"});
+        let project =
+            json!({"id":"proj-1","workspace_id":"ws-1","project_key":"key","name":"Project"});
         {
             let store = GraphStore::open(&path).unwrap();
             put_objects(

@@ -41,12 +41,10 @@ pub fn run(
     let group = request.group;
     let min = request.min;
     let graph = store.graph();
-    let identifier = store.authorized_read(
-        &session.workspace,
-        &session.capability,
-        "read",
-        |db, p| Ok(crate::store::s(&crate::store::repo(db, p, repository)?, "id").to_string()),
-    )?;
+    let identifier =
+        store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
+            Ok(crate::store::s(&crate::store::repo(db, p, repository)?, "id").to_string())
+        })?;
     if !super::has_rules(&graph, &identifier)? {
         return Ok(report::no_rules(group, min, &document_errors));
     }
@@ -64,7 +62,9 @@ pub fn run(
             ),
         };
         return Ok(match built["status"].as_str() {
-            Some("failed") => report::failed(&episode, &rule_set, group, min, &detail, &document_errors),
+            Some("failed") => {
+                report::failed(&episode, &rule_set, group, min, &detail, &document_errors)
+            }
             _ => report::waiting(&episode, &rule_set, group, min, &detail, &document_errors),
         });
     }
@@ -75,7 +75,12 @@ pub fn run(
         enqueue_enrich(store, db, &identifier, p, &episode)
     })?;
     let job = match queued["id"].as_str() {
-        Some(id) => job_of(&graph, &identifier, &enrich_input_hash(&rule_set, &episode), id)?,
+        Some(id) => job_of(
+            &graph,
+            &identifier,
+            &enrich_input_hash(&rule_set, &episode),
+            id,
+        )?,
         None => None,
     };
     let Some(job) = job else {
@@ -92,7 +97,14 @@ pub fn run(
         "complete" => {}
         "failed" => {
             let error = job["error"].as_str().unwrap_or("the enrich job failed");
-            return Ok(report::failed(&episode, &rule_set, group, min, error, &document_errors));
+            return Ok(report::failed(
+                &episode,
+                &rule_set,
+                group,
+                min,
+                error,
+                &document_errors,
+            ));
         }
         state => {
             return Ok(report::waiting(
@@ -136,7 +148,12 @@ pub fn run(
 }
 
 /// The enrich job with `id` as the store holds it: its state and result.
-fn job_of(graph: &GraphStore, repository: &str, input_hash: &str, id: &str) -> Result<Option<Value>> {
+fn job_of(
+    graph: &GraphStore,
+    repository: &str,
+    input_hash: &str,
+    id: &str,
+) -> Result<Option<Value>> {
     let row = graph.read(|db| {
         store_graph::one(
             db,

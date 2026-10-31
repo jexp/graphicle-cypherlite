@@ -182,17 +182,15 @@ pub fn rollback(
 
 /// Remove the properties `rows` names (`{id, prop}`) from the nodes or
 /// relationships `on` matches (a variable named `target`).
-fn remove_props(
-    db: &mut cypherlite::Connection,
-    rows: &[Value],
-    on: &str,
-) -> Result<usize> {
+fn remove_props(db: &mut cypherlite::Connection, rows: &[Value], on: &str) -> Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
     store_graph::write(
         db,
-        &format!("UNWIND $rows AS row MATCH {on} WHERE id(target) = row.id REMOVE target[row.prop]"),
+        &format!(
+            "UNWIND $rows AS row MATCH {on} WHERE id(target) = row.id REMOVE target[row.prop]"
+        ),
         store_graph::params(&json!({"rows": rows})),
     )?;
     Ok(rows.len())
@@ -397,8 +395,8 @@ pub(super) fn write_application(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch_rules::tests::{REPO, SHARED, count, rules_graph};
     use crate::arch_rules::enrich;
+    use crate::arch_rules::tests::{REPO, SHARED, count, rules_graph};
 
     #[test]
     fn rollback_removes_exactly_one_rules_writes() {
@@ -415,13 +413,22 @@ mod tests {
             "the rule's relationship is gone"
         );
         assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {rule: 'arch:Test/Connect'}) RETURN count(a) AS n"),
+            count(
+                &graph,
+                "MATCH (a:RuleApplication {rule: 'arch:Test/Connect'}) RETURN count(a) AS n"
+            ),
             0
         );
         // Every other rule's writes are untouched.
-        assert_eq!(count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"), 2);
         assert_eq!(
-            count(&graph, "MATCH (s:Symbol) WHERE s.arch_confidence = 0.8 RETURN count(s) AS n"),
+            count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"),
+            2
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "MATCH (s:Symbol) WHERE s.arch_confidence = 0.8 RETURN count(s) AS n"
+            ),
             3
         );
         assert_eq!(count(&graph, "MATCH (l:Layer) RETURN count(l) AS n"), 1);
@@ -435,7 +442,10 @@ mod tests {
         let removed = rollback(&graph, REPO, "arch:Test/Label", "ep-1").unwrap();
         assert_eq!(removed["labels"], json!(2), "{removed:#}");
         assert_eq!(removed["nodes"], json!(0), "{removed:#}");
-        assert_eq!(count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"), 0);
+        assert_eq!(
+            count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"),
+            0
+        );
         assert_eq!(count(&graph, "MATCH (s:Symbol) RETURN count(s) AS n"), 3);
 
         // The node-creating rule: the node goes with its rule.
@@ -447,7 +457,10 @@ mod tests {
         let removed = rollback(&graph, REPO, "arch:Test/Confidence", "ep-1").unwrap();
         assert_eq!(removed["properties"], json!(3), "{removed:#}");
         assert_eq!(
-            count(&graph, "MATCH (s) WHERE s.arch_confidence IS NOT NULL RETURN count(s) AS n"),
+            count(
+                &graph,
+                "MATCH (s) WHERE s.arch_confidence IS NOT NULL RETURN count(s) AS n"
+            ),
             0
         );
 

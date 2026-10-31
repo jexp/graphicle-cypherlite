@@ -143,7 +143,11 @@ pub(crate) fn file_of(
 
 /// [`file_of`] against the project's cache folder directly ([`read_at`]).
 fn file_in(cache: &Path, episode: &str, extension: &str) -> Option<PathBuf> {
-    Some(cache.join("query").join(format!("{}.{extension}", episode_name(episode)?)))
+    Some(
+        cache
+            .join("query")
+            .join(format!("{}.{extension}", episode_name(episode)?)),
+    )
 }
 
 fn graph_file(db: &Connection, repository: &str, episode: &str) -> Option<PathBuf> {
@@ -179,7 +183,11 @@ fn graph_key(head: &[u8], key: &[u8]) -> bool {
 /// hold (truncated or damaged) is removed, so that the next sync writes it
 /// again, and the graph is read from the store.
 pub fn read(db: &Connection, repository: &str, episode: &str) -> Option<(Graph, SearchIndex)> {
-    read_at(&graph_projection::cache_root(db, repository)?, repository, episode)
+    read_at(
+        &graph_projection::cache_root(db, repository)?,
+        repository,
+        episode,
+    )
 }
 
 /// [`read`] against the project's cache folder directly: the graph store
@@ -493,7 +501,8 @@ pub fn ensure(db: &Connection, repository: &str, retry: bool) -> Result<Value> {
         Some(parts) => parts,
         None => {
             // The graph as every other process reads it from the store.
-            let graph = graph_projection::load(&*crate::store::graph_for(db)?, repository, &episode)?;
+            let graph =
+                graph_projection::load(&*crate::store::graph_for(db)?, repository, &episode)?;
             let index = SearchIndex::new(&graph);
             let saved = graphicle::snapshot::to_bytes(&graph_key, &graph, &index);
             let edges = FileEdges::of(&graph).encode(&graph_key);

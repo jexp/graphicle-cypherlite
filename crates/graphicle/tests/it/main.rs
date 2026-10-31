@@ -76,9 +76,9 @@ mod child_env;
 /// The sync-shaped fixture the architecture suites share.
 mod arch;
 
-mod archived;
 mod arch_enrich;
 mod arch_rules;
+mod archived;
 mod ask;
 mod async_requests;
 mod auto_observe;
@@ -120,7 +120,6 @@ mod observer;
 mod offboard;
 mod one_server;
 mod passage_index;
-mod rule_documents;
 mod permissions_refresh;
 mod pixel;
 mod product_workspace;
@@ -137,6 +136,7 @@ mod retention;
 mod retrieval_defaults;
 mod review_command;
 mod revocation;
+mod rule_documents;
 mod scale_bounds;
 mod see;
 mod selective_integration;
@@ -195,11 +195,11 @@ pub fn gql_write(
 
 /// `("$key", value)` as a params entry.
 #[allow(dead_code)]
-pub fn gp(
-    key: &str,
-    value: serde_json::Value,
-) -> (String, cypherlite::Value) {
-    (key.into(), graphicle_runtime::store_graph::json_to_value(&value))
+pub fn gp(key: &str, value: serde_json::Value) -> (String, cypherlite::Value) {
+    (
+        key.into(),
+        graphicle_runtime::store_graph::json_to_value(&value),
+    )
 }
 
 /// Copy a store's graph directory (`reviews.graph`, the connector/account

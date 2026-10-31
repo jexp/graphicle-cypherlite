@@ -82,14 +82,18 @@ pub fn repository_documents(
     // metadata (`am_binary_heads`, a converters domain table) stays SQL and
     // joins in memory on (path, source sha). With `content` false the
     // content column stays empty, as the SQL arm of 0.1.5 left it.
-    let mut binaries: std::collections::HashMap<(String, String), Value> = std::collections::HashMap::new();
+    let mut binaries: std::collections::HashMap<(String, String), Value> =
+        std::collections::HashMap::new();
     for row in rows(
         db,
         "SELECT path,original_sha,parser,source_sha FROM am_binary_heads WHERE repository_id=?",
         [identifier],
     )? {
         binaries.insert(
-            (s(&row, "path").to_string(), s(&row, "source_sha").to_string()),
+            (
+                s(&row, "path").to_string(),
+                s(&row, "source_sha").to_string(),
+            ),
             row,
         );
     }
