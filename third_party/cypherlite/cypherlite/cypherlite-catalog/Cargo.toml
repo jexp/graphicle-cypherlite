@@ -1,0 +1,11 @@
+[package]
+name = "cypherlite-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Label, relationship-type, and named-index catalog"
+
+[dependencies]
+cypherlite-core = { workspace = true }
+cypherlite-model = { workspace = true }
+serde = { workspace = true }

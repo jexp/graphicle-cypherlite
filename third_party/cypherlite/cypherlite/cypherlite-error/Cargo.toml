@@ -1,0 +1,7 @@
+[package]
+name = "cypherlite-error"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+cypherlite-parser = { workspace = true }

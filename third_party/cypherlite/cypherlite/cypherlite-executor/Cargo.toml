@@ -1,0 +1,32 @@
+[package]
+name = "cypherlite-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "In-memory graph and Cypher physical executor"
+
+[dependencies]
+# The PROFILE clock must read on wasm32 too, not trap (std Instant panics).
+web-time = { workspace = true }
+cypherlite-error = { workspace = true }
+cypherlite-model = { workspace = true }
+cypherlite-parser = { workspace = true }
+chrono = { workspace = true }
+cypherlite-core = { workspace = true }
+cypherlite-front = { workspace = true }
+cypherlite-ir = { workspace = true }
+cypherlite-ontology = { workspace = true }
+cypherlite-planner = { workspace = true }
+cypherlite-catalog = { workspace = true }
+indexmap = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+unicode-normalization = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+cypherlite-test-support = { workspace = true, features = ["nested_eval"] }
+tempfile = { workspace = true }

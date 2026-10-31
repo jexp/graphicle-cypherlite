@@ -1,0 +1,10 @@
+[package]
+name = "cypherlite-model"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+chrono = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

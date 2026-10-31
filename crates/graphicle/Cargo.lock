@@ -742,7 +742,6 @@ dependencies = [
 [[package]]
 name = "cypherlite"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -764,7 +763,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-catalog"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-core",
  "cypherlite-model",
@@ -774,7 +772,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-core"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -790,7 +787,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-error"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-parser",
 ]
@@ -798,7 +794,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-executor"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "chrono",
  "cypherlite-catalog",
@@ -824,7 +819,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-front"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-core",
  "cypherlite-error",
@@ -836,7 +830,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-ir"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
@@ -845,7 +838,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-model"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "chrono",
  "indexmap",
@@ -856,7 +848,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-ontology"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
@@ -871,7 +862,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-parser"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-model",
 ]
@@ -879,7 +869,6 @@ dependencies = [
 [[package]]
 name = "cypherlite-planner"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -891,12 +880,10 @@ dependencies = [
 [[package]]
 name = "cypherlite-splitter"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 
 [[package]]
 name = "cypherlite-storage"
 version = "0.13.0"
-source = "git+https://github.com/neo4j-labs/cypherlite?rev=221329d5269f8e5dcc17a092ca39d2c4716d51e1#221329d5269f8e5dcc17a092ca39d2c4716d51e1"
 dependencies = [
  "crc32fast",
  "cypherlite-catalog",

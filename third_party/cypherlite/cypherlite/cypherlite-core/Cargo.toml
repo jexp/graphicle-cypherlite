@@ -1,0 +1,26 @@
+[package]
+name = "cypherlite-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core values, errors, and IDs for CypherLite"
+
+[dependencies]
+cypherlite-model = { workspace = true }
+# CE kind tokens come from the typed error model (ADR-0149).
+cypherlite-error = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+# Physical file identity (ADR-0097, moved here by ADR-0108).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

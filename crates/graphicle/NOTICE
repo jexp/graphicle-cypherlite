@@ -41,3 +41,10 @@ is kept in licenses/. THIRD_PARTY_LICENSES.html holds the licences of the Rust
 crates linked into the program. The graph engine's own notices and licence
 texts, including its vendored grammars and CPython-derived parts, are in
 ../graphicle-graph/NOTICE, ../graphicle-graph/NOTICE.md and ../graphicle-graph/licenses/.
+
+This program embeds the CypherLite graph engine as a vendored source snapshot
+(third_party/cypherlite, taken from https://github.com/neo4j-labs/cypherlite
+at 221329d5269f8e5dcc17a092ca39d2c4716d51e1, v0.13.0 + 51). CypherLite is a
+Neo4j Labs project licensed under the Apache License, Version 2.0; its
+licence text (LICENSE), its Labs experimental disclaimer
+(LABS_DISCLAIMER.txt) and the snapshot record (VENDOR.md) are in that folder.

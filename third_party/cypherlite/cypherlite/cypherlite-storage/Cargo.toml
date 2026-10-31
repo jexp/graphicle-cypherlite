@@ -1,0 +1,61 @@
+[package]
+name = "cypherlite-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "WAL plus pluggable snapshot codecs (CypherLite JSON, Parquet behind the default-on parquet feature)"
+
+[features]
+default = ["parquet"]
+# Parquet snapshot codec (ADR-0105). Without it, new stores use the JSON codec
+# and Parquet stores fail closed at open.
+parquet = ["dep:arrow", "dep:parquet", "dep:bytes"]
+
+[dependencies]
+cypherlite-catalog = { workspace = true }
+cypherlite-core = { workspace = true }
+cypherlite-executor = { workspace = true }
+cypherlite-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true, optional = true }
+crc32fast = { workspace = true }
+web-time = { workspace = true }
+
+# Parquet/Arrow are native-only (and behind `parquet`); wasm ships MemoryVfs +
+# JSON codec only.
+# fs4 file locking and the host durability barrier are native-only too.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arrow = { version = "54", default-features = false, features = ["json"], optional = true }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"], optional = true }
+getrandom = "0.2"
+fs4 = { workspace = true }
+
+# cypherlite-executor pulls `rand 0.9` which pulls `getrandom 0.3`. On
+# wasm32 every getrandom major in the tree needs a backend feature to route
+# to `crypto.getRandomValues`: 0.2 takes `js`, 0.3 takes `wasm_js`. As of
+# getrandom 0.3.4 the Cargo `wasm_js` feature alone selects the backend on
+# wasm32-unknown-unknown; `--cfg getrandom_backend="wasm_js"` is unnecessary
+# and would override the feature if set, so it must not be. Pinned to 0.3.4
+# because earlier 0.3 releases needed that cfg in addition to the feature.
+# Declared here so any wasm consumer of storage inherits the fix (ADR-0085).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3.4", features = ["wasm_js"] }
+
+# Durability barrier per platform (ADR-0077) and the no-replace rename
+# syscalls in reset (ADR-0097). No-follow opens use the shared
+# cypherlite_core::file_identity::nofollow helper instead.
+# `cfg(unix)` supersedes the narrower linux/macos gate: every Unix host needs
+# libc for the barrier syscalls, not just the two with a native fdatasync barrier.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Property-testing harness for WAL/checkpoint invariants (ADR-0268).
+# Dev-only: never compiled into the library or the released artifact. This is
+# the ONLY crate that adopts proptest; its rand 0.9 requirement unifies with
+# the workspace's rand 0.9 (ADR-0268).
+proptest = "1.11"
+proptest-state-machine = "0.8"
