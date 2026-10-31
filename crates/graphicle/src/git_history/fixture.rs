@@ -7,7 +7,8 @@
 //!
 //! This lives in the crate rather than `tests/it`: the reader's parse corpus
 //! is a set of unit tests (`cargo test --lib git_history`), and those cannot
-//! see integration-test helpers.
+//! see integration-test helpers — nor can the writer's and the enqueue
+//! point's, which share it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

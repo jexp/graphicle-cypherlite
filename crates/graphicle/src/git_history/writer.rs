@@ -31,7 +31,12 @@
 //! keeps pointed at the checkout's head commit. A later run queries it and
 //! walks only `<recorded>..<head>` — the kontext-e pattern, chosen over
 //! `--since`/`--max-count` because a revision range is exact: no clock-skew
-//! gap, no double-read at the boundary. When the recorded head is no longer
+//! gap, no double-read at the boundary. The record also carries the window
+//! that wrote it: a run configured with a wider bound (or a different
+//! `--since`) cannot resume onto it, because the older commits it now
+//! reaches were never walked — it back-fills again, which is also what
+//! fills the boundary stubs a bounded walk leaves behind. When the recorded
+//! head is no longer
 //! an ancestor of `HEAD` (`git merge-base --is-ancestor` fails) the history
 //! was rewritten (rebase, squash, branch deletion) — not incrementally
 //! detectable — so the run marks the head record `:Stale` and returns; the
@@ -140,16 +145,7 @@ pub fn ingest(
                 "reason": "the repository has no commits"}));
         };
         if let Some(recorded) = recorded_head(graph, repository_id)? {
-            if recorded == head {
-                // Nothing new: still refresh the refs (a branch or tag may
-                // have moved while HEAD stood still); the commit walk is
-                // empty by construction.
-                mode = "unchanged";
-                window.range = Some(format!("{head}..{head}"));
-            } else if reader::is_ancestor(dir, &recorded, &head)? {
-                mode = "resume";
-                window.range = Some(format!("{recorded}..{head}"));
-            } else {
+            if recorded.oid != head && !reader::is_ancestor(dir, &recorded.oid, &head)? {
                 // Plan §6: a rewrite is not incrementally detectable. Mark
                 // the head record and let the next run re-ingest; this run
                 // leaves the graph exactly as it found it.
@@ -157,6 +153,22 @@ pub fn ingest(
                 return Ok(json!({"kind": KIND, "mode": "stale", "head": head,
                     "reason": "the recorded head is unreachable; \
                                the next run re-ingests fully"}));
+            } else if !recorded.covers(&window) {
+                // A window the record does not cover — a widened bound, a
+                // different `--since`: the older commits it now reaches were
+                // never walked, so back-fill again under the new bound.
+                // MERGE idempotence keeps it cheap, and the boundary stubs
+                // the bounded walk left gain their facts.
+                mode = "backfill";
+            } else if recorded.oid == head {
+                // Nothing new: still refresh the refs (a branch or tag may
+                // have moved while HEAD stood still); the commit walk is
+                // empty by construction.
+                mode = "unchanged";
+                window.range = Some(format!("{head}..{head}"));
+            } else {
+                mode = "resume";
+                window.range = Some(format!("{}..{head}", recorded.oid));
             }
         } else {
             mode = "backfill";
@@ -165,19 +177,17 @@ pub fn ingest(
     let known_at = now();
     let history = reader::read_history_windowed(dir, &window)?;
     let commits = &history.commits;
-    write_commits(graph, repository_id, commits, &known_at, still_leasing)?;
-    write_parents(graph, repository_id, commits, &known_at, still_leasing)?;
-    write_persons(graph, repository_id, commits, &known_at, still_leasing)?;
-    write_changes(graph, repository_id, commits, still_leasing)?;
-    write_refs(
+    let pass = Pass {
         graph,
         repository_id,
-        &history.branches,
-        &history.tags,
-        &history.head,
-        &known_at,
-        still_leasing,
-    )?;
+        known_at: &known_at,
+        leasing: still_leasing,
+    };
+    write_commits(&pass, commits)?;
+    write_parents(&pass, commits)?;
+    write_persons(&pass, commits)?;
+    write_changes(&pass, commits)?;
+    write_refs(&pass, &history.branches, &history.tags, &history.head, &window)?;
     let mut result = json!({
         "kind": KIND, "mode": mode, "head": history.head,
         "known_at": known_at, "ingested": commits.len(),
@@ -195,19 +205,45 @@ fn merge(into: &mut Value, counts: &Value) {
     }
 }
 
-/// The recorded head: the commit the head record points at. `None` before
-/// the first ingest (or after a rescan of an emptied repository).
-fn recorded_head(graph: &GraphStore, repository_id: &str) -> Result<Option<String>> {
+/// The head record as a run reads it back: the commit it points at and the
+/// back-fill window that wrote it. A run configured with a different window
+/// cannot resume onto the record — the older commits a wider bound reaches
+/// were never walked — so it back-fills again (idempotent, and the boundary
+/// stubs gain their facts).
+struct HeadRecord {
+    oid: String,
+    max_commits: Option<i64>,
+    since: Option<String>,
+}
+
+impl HeadRecord {
+    /// Whether a run configured with `window` can resume onto this record:
+    /// the same bound and `--since`, so everything outside the recorded
+    /// walk stays outside the new one too.
+    fn covers(&self, window: &Window) -> bool {
+        self.max_commits == window.max_commits.map(|max| max as i64)
+            && self.since.as_deref() == window.since.as_deref()
+    }
+}
+
+/// The recorded head record. `None` before the first ingest (or after a
+/// rescan of an emptied repository).
+fn recorded_head(graph: &GraphStore, repository_id: &str) -> Result<Option<HeadRecord>> {
     Ok(graph
         .read(|db| {
             store_graph::one(
                 db,
                 "MATCH (b:Branch {repository_id: $repo, name: $name})-[:AT]->\
-                 (c:Commit {repository_id: $repo}) RETURN c.oid AS oid",
+                 (c:Commit {repository_id: $repo}) \
+                 RETURN c.oid AS oid, b.max_commits AS max_commits, b.since AS since",
                 p(&json!({"repo": repository_id, "name": HEAD_BRANCH})),
             )
         })?
-        .map(|row| store_graph::s(&row, "oid").to_string()))
+        .map(|row| HeadRecord {
+            oid: store_graph::s(&row, "oid").to_string(),
+            max_commits: row["max_commits"].as_i64(),
+            since: row["since"].as_str().map(str::to_string),
+        }))
 }
 
 /// Mark the head record `:Stale` (plan §6): the label sits on the record
@@ -248,22 +284,25 @@ fn rescan(
     })
 }
 
+/// One ingest run's shared context: the store, the repository being
+/// written, the run's record-time stamp and the lease check between
+/// batches. The write passes take it instead of repeating the four.
+struct Pass<'a> {
+    graph: &'a GraphStore,
+    repository_id: &'a str,
+    known_at: &'a str,
+    leasing: &'a dyn Fn() -> Result<()>,
+}
+
 /// Run `query` once per [`BATCH`]-row chunk of `rows`, one transaction per
 /// chunk, the lease checked before each. Every write pass funnels through
 /// here so the batch bound and the lease check live in exactly one place.
-fn batches(
-    graph: &GraphStore,
-    repository_id: &str,
-    rows: &[Value],
-    query: &str,
-    extra: Value,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+fn batches(pass: &Pass, rows: &[Value], query: &str, extra: Value) -> Result<()> {
     for chunk in rows.chunks(BATCH) {
-        still_leasing()?;
-        let mut params = json!({"repo": repository_id, "rows": chunk});
+        (pass.leasing)()?;
+        let mut params = json!({"repo": pass.repository_id, "rows": chunk});
         merge(&mut params, &extra);
-        graph.transaction(|db| {
+        pass.graph.transaction(|db| {
             store_graph::write(db, query, p(&params))?;
             Ok(())
         })?;
@@ -273,13 +312,7 @@ fn batches(
 
 /// The commit pass: commit nodes with their facts, `known_at` on first
 /// sight, and the project's `HAS_COMMIT` edges.
-fn write_commits(
-    graph: &GraphStore,
-    repository_id: &str,
-    commits: &[CommitRecord],
-    known_at: &str,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+fn write_commits(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
     let rows: Vec<Value> = commits
         .iter()
         .map(|commit| {
@@ -292,8 +325,7 @@ fn write_commits(
         })
         .collect();
     batches(
-        graph,
-        repository_id,
+        pass,
         &rows,
         "UNWIND $rows AS row \
          MATCH (p:Project {id: $repo}) \
@@ -303,8 +335,7 @@ fn write_commits(
              c.message = row.message, c.author_date = row.author_date, \
              c.commit_date = row.commit_date \
          MERGE (p)-[:HAS_COMMIT]->(c)",
-        json!({"known_at": known_at}),
-        still_leasing,
+        json!({"known_at": pass.known_at}),
     )
 }
 
@@ -323,27 +354,19 @@ fn message(commit: &CommitRecord) -> String {
 /// set — the history-simplification caveat of the reader's contract, or the
 /// boundary of a resume window — is written as a bare commit stub the next
 /// wider walk fills in.
-fn write_parents(
-    graph: &GraphStore,
-    repository_id: &str,
-    commits: &[CommitRecord],
-    known_at: &str,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+fn write_parents(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
     let oids: Vec<Value> = commits
         .iter()
         .flat_map(|commit| &commit.parents)
         .map(|oid| json!(oid.as_str()))
         .collect();
     batches(
-        graph,
-        repository_id,
+        pass,
         &oids,
         "UNWIND $rows AS oid \
          MERGE (c:Commit {repository_id: $repo, oid: oid}) \
            ON CREATE SET c.known_at = $known_at",
-        json!({"known_at": known_at}),
-        still_leasing,
+        json!({"known_at": pass.known_at}),
     )?;
     let edges: Vec<Value> = commits
         .iter()
@@ -354,15 +377,13 @@ fn write_parents(
         })
         .collect();
     batches(
-        graph,
-        repository_id,
+        pass,
         &edges,
         "UNWIND $rows AS row \
          MATCH (c:Commit {repository_id: $repo, oid: row.commit}) \
          MATCH (p:Commit {repository_id: $repo, oid: row.parent}) \
          MERGE (c)-[:PARENT {position: row.position}]->(p)",
         json!({}),
-        still_leasing,
     )
 }
 
@@ -381,25 +402,20 @@ struct Person {
 /// `COMMITTED {at}` edges. Names are resolved in Rust over the whole run —
 /// a person spans batches, and their `aliases` must merge with what earlier
 /// runs already collected rather than clobber it.
-fn write_persons(
-    graph: &GraphStore,
-    repository_id: &str,
-    commits: &[CommitRecord],
-    known_at: &str,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+fn write_persons(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
     if commits.is_empty() {
         return Ok(());
     }
     // What the store already knows, so a resume run adds to it instead of
     // replacing it.
-    let known: BTreeMap<String, (String, Vec<String>)> = graph
+    let known: BTreeMap<String, (String, Vec<String>)> = pass
+        .graph
         .read(|db| {
             store_graph::rows(
                 db,
                 "MATCH (a:Person {repository_id: $repo}) \
                  RETURN a.email AS email, a.name AS name, a.aliases AS aliases",
-                p(&json!({"repo": repository_id})),
+                p(&json!({"repo": pass.repository_id})),
             )
         })?
         .into_iter()
@@ -478,15 +494,13 @@ fn write_persons(
         })
         .collect();
     batches(
-        graph,
-        repository_id,
+        pass,
         &rows,
         "UNWIND $rows AS row \
          MERGE (a:Person {repository_id: $repo, email: row.email}) \
            ON CREATE SET a.known_at = $known_at \
          SET a.name = row.name, a.aliases = row.aliases",
-        json!({"known_at": known_at}),
-        still_leasing,
+        json!({"known_at": pass.known_at}),
     )?;
     for (people_keys, query) in [
         (
@@ -517,7 +531,7 @@ fn write_persons(
                     .map(move |(oid, at)| json!({"email": email, "oid": oid, "at": at}))
             })
             .collect();
-        batches(graph, repository_id, &rows, query, json!({}), still_leasing)?;
+        batches(pass, &rows, query, json!({}))?;
     }
     Ok(())
 }
@@ -527,12 +541,7 @@ fn write_persons(
 /// each `CONTAINS_CHANGE` from its commit and `MODIFIES` to the
 /// content store's `(:File)` (a stub when the file is not projected yet;
 /// the same key the content store MERGEs fills it).
-fn write_changes(
-    graph: &GraphStore,
-    repository_id: &str,
-    commits: &[CommitRecord],
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+fn write_changes(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
     let rows: Vec<Value> = commits
         .iter()
         .flat_map(|commit| {
@@ -546,8 +555,7 @@ fn write_changes(
         })
         .collect();
     batches(
-        graph,
-        repository_id,
+        pass,
         &rows,
         "UNWIND $rows AS row \
          MATCH (c:Commit {repository_id: $repo, oid: row.commit}) \
@@ -558,23 +566,16 @@ fn write_changes(
          MERGE (f:File {repository_id: $repo, path: row.path}) \
          MERGE (ch)-[:MODIFIES]->(f)",
         json!({}),
-        still_leasing,
     )
 }
 
 /// The refs pass: branches and tags as own nodes with their commit pointers
 /// (`(:Branch)-[:AT]->`, `(:Tag)-[:TAGS]->`), the `HEAD` record the next
-/// run resumes from, and the pruning of refs git no longer lists. Ref
-/// targets outside the emitted set are stubbed like parents.
-fn write_refs(
-    graph: &GraphStore,
-    repository_id: &str,
-    branches: &[GitRef],
-    tags: &[GitRef],
-    head: &str,
-    known_at: &str,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+/// run resumes from — carrying the window that wrote it, so a later run
+/// knows whether it can resume or must re-walk under a changed bound — and
+/// the pruning of refs git no longer lists. Ref targets outside the
+/// emitted set are stubbed like parents.
+fn write_refs(pass: &Pass, branches: &[GitRef], tags: &[GitRef], head: &str, window: &Window) -> Result<()> {
     let head_ref = GitRef {
         name: HEAD_BRANCH.to_string(),
         refname: HEAD_BRANCH.to_string(),
@@ -600,18 +601,15 @@ fn write_refs(
 
     // Commit stubs for ref targets the walk did not emit.
     batches(
-        graph,
-        repository_id,
+        pass,
         &targets,
         "UNWIND $rows AS oid \
          MERGE (c:Commit {repository_id: $repo, oid: oid}) \
            ON CREATE SET c.known_at = $known_at",
-        json!({"known_at": known_at}),
-        still_leasing,
+        json!({"known_at": pass.known_at}),
     )?;
     batches(
-        graph,
-        repository_id,
+        pass,
         &branch_rows,
         "UNWIND $rows AS row \
          MATCH (p:Project {id: $repo}) \
@@ -619,53 +617,59 @@ fn write_refs(
          SET b.ref = row.ref \
          MERGE (p)-[:HAS_BRANCH]->(b)",
         json!({}),
-        still_leasing,
     )?;
     batches(
-        graph,
-        repository_id,
+        pass,
         &branch_rows,
         "UNWIND $rows AS row \
          MATCH (b:Branch {repository_id: $repo, name: row.name}) \
          MATCH (c:Commit {repository_id: $repo, oid: row.target}) \
          MERGE (b)-[:AT]->(c)",
         json!({}),
-        still_leasing,
     )?;
+    // The head record carries the window that wrote it: the resume
+    // decision of the next run reads it back ([`HeadRecord::covers`]).
+    (pass.leasing)()?;
+    pass.graph.transaction(|db| {
+        store_graph::write(
+            db,
+            "MATCH (b:Branch {repository_id: $repo, name: $name}) \
+             SET b.max_commits = $max, b.since = $since",
+            p(&json!({"repo": pass.repository_id, "name": HEAD_BRANCH,
+                "max": window.max_commits, "since": window.since})),
+        )?;
+        Ok(())
+    })?;
     batches(
-        graph,
-        repository_id,
+        pass,
         &tag_rows,
         "UNWIND $rows AS row \
          MATCH (p:Project {id: $repo}) \
          MERGE (t:Tag {repository_id: $repo, name: row.name}) \
          MERGE (p)-[:HAS_TAG]->(t)",
         json!({}),
-        still_leasing,
     )?;
     batches(
-        graph,
-        repository_id,
+        pass,
         &tag_rows,
         "UNWIND $rows AS row \
          MATCH (t:Tag {repository_id: $repo, name: row.name}) \
          MATCH (c:Commit {repository_id: $repo, oid: row.target}) \
          MERGE (t)-[:TAGS]->(c)",
         json!({}),
-        still_leasing,
     )?;
     // Refs git no longer lists go, so the model tracks deletions too. The
     // property-scoped match keeps the prune off the project supernode.
     for (rows, label) in [(branch_names, "Branch"), (tag_names, "Tag")] {
-        still_leasing()?;
-        graph.transaction(|db| {
+        (pass.leasing)()?;
+        pass.graph.transaction(|db| {
             store_graph::write(
                 db,
                 &format!(
                     "MATCH (n:{label} {{repository_id: $repo}}) \
                      WHERE NOT n.name IN $names DETACH DELETE n"
                 ),
-                p(&json!({"repo": repository_id, "names": rows})),
+                p(&json!({"repo": pass.repository_id, "names": rows})),
             )?;
             Ok(())
         })?;
@@ -1062,8 +1066,14 @@ mod tests {
         let interrupted = graph_for("repo-a");
         let history = reader::read_history(repo.root()).unwrap();
         let leasing = || Ok(());
-        write_commits(&interrupted, "repo-a", &history.commits, "t1", &leasing).unwrap();
-        write_parents(&interrupted, "repo-a", &history.commits, "t1", &leasing).unwrap();
+        let partial = Pass {
+            graph: &interrupted,
+            repository_id: "repo-a",
+            known_at: "t1",
+            leasing: &leasing,
+        };
+        write_commits(&partial, &history.commits).unwrap();
+        write_parents(&partial, &history.commits).unwrap();
 
         // The re-run of the same history.
         let result = run(&interrupted, "repo-a", repo.root());
@@ -1297,6 +1307,53 @@ mod tests {
             of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n") > 3,
             "the window's boundary parents are stubbed so the DAG stays connected"
         );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_wider_window_back_fills_again_and_fills_the_boundary_stubs() {
+        let (dir, repo, _scenario) = history_fixture();
+        let graph = graph_for("repo-git");
+        let bounded = Window {
+            max_commits: Some(3),
+            ..Window::default()
+        };
+        super::ingest(&graph, "repo-git", repo.root(), &bounded, &|| Ok(())).unwrap();
+        // The o1 branch's tip is one of the bounded walk's boundary stubs:
+        // present, but with no facts of its own.
+        let o1_tip = repo.rev("o1");
+        let stub = |graph: &GraphStore| {
+            graph.read(|db| {
+                store_graph::one(
+                    db,
+                    "MATCH (c:Commit {repository_id: $repo, oid: $oid}) \
+                     RETURN c.subject AS subject, c.author_date AS author_date",
+                    p(&json!({"repo": "repo-git", "oid": o1_tip})),
+                )
+            })
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(stub(&graph)["subject"], Value::Null, "a stub carries no facts");
+
+        // A wider window cannot resume onto the bounded record: it
+        // back-fills again, and the stubs gain their facts.
+        let widened = run(&graph, "repo-git", repo.root());
+        assert_eq!(widened["mode"], json!("backfill"), "{widened:#}");
+        let filled = stub(&graph);
+        assert_eq!(filled["subject"], json!("o1: add o1"));
+        assert!(
+            filled["author_date"].as_str().is_some_and(|at| !at.is_empty()),
+            "the stub gained its dates too"
+        );
+        assert_eq!(
+            of(&graph, "repo-git",
+               "MATCH (c:Commit $repo_scope) WHERE c.subject IS NOT NULL RETURN count(c) AS n"),
+            repo_count(repo.root())
+        );
+        // The record now covers the default window: nothing more to walk.
+        let settled = run(&graph, "repo-git", repo.root());
+        assert_eq!(settled["mode"], json!("unchanged"), "{settled:#}");
         drop(dir);
     }
 

@@ -180,6 +180,42 @@ fn insert_job(
     Ok(job_id)
 }
 
+/// Requeue a job with a fresh budget: back to `queued`, its attempt count
+/// and `not_before` reset, its error and lease fields cleared. The replay
+/// branch every keyed enqueue shares when it finds a failed or cancelled
+/// job under its key — the one place that reset lives.
+pub(crate) fn requeue_job(graph: &GraphStore, job_id: &str) -> Result<()> {
+    requeue_job_as(graph, job_id, None)
+}
+
+/// [`requeue_job`] that also re-binds the job to `principal`. The replayed
+/// projection is the one member of the family that does this — a restarted
+/// projection runs as the principal whose sync re-requested the head set,
+/// not the one that queued it — so the difference is an argument here,
+/// never a silent drop.
+fn requeue_job_as(graph: &GraphStore, job_id: &str, principal: Option<&str>) -> Result<()> {
+    graph.transaction(|db| {
+        let mut params = json!({"id": job_id, "now": now()});
+        let bind = match principal {
+            Some(hash) => {
+                params["principal"] = json!(hash);
+                ", j.principal_hash=$principal"
+            }
+            None => "",
+        };
+        graph::rows(
+            db,
+            &format!(
+                "MATCH (j:Job {{id: $id}}) SET j.state='queued', j.attempt=0, \
+                 j.not_before=$now, j.updated_at=$now, j.error=NULL, \
+                 j.lease_token=NULL, j.lease_until=NULL{bind}"
+            ),
+            graph::params(&params),
+        )?;
+        Ok(())
+    })
+}
+
 /// Digest of the code job results depend on, recorded in job payloads (a
 /// queued workflow's replay key includes it). Only files of this crate and
 /// the memory engine are hashed, never an extension's, so every edition
@@ -473,14 +509,7 @@ pub fn enqueue_projection(
                 // moved on before it ran) runs again, with every label, now the
                 // tree is current again. It runs as this sync's principal.
                 "failed" | "cancelled" | "complete" => {
-                    graph.transaction(|db| {
-                        graph::rows(
-                            db,
-                            "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL, j.principal_hash=$principal",
-                            graph::params(&json!({"id": s(&existing, "id"), "now": now(), "principal": p.hash})),
-                        )?;
-                        Ok(())
-                    })?;
+                    requeue_job_as(&graph, s(&existing, "id"), Some(p.hash.as_str()))?;
                     state = json!("queued");
                 }
                 // One that waits to retry may run at once.
@@ -959,15 +988,7 @@ pub fn enqueue_enrich(
         )
     })? {
         if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            graph.transaction(|db| {
-                graph::rows(
-                    db,
-                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
-                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
-                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
-                )?;
-                Ok(())
-            })?;
+            requeue_job(&graph, s(&existing, "id"))?;
             return Ok(
                 json!({"id": existing["id"], "state": "queued", "kind": "enrich",
                 "episode": episode, "replayed": true, "queued": true}),
@@ -1093,15 +1114,7 @@ pub fn enqueue_history(
         )
     })? {
         if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            graph.transaction(|db| {
-                graph::rows(
-                    db,
-                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
-                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
-                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
-                )?;
-                Ok(())
-            })?;
+            requeue_job(&graph, s(&existing, "id"))?;
             return Ok(json!({"id": existing["id"], "state": "queued",
                 "kind": crate::git_history::KIND, "replayed": true, "queued": true}));
         }
@@ -2485,4 +2498,145 @@ fn validate_output(schema: &Value, value: &Value) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_history::fixture::{DAY_1, Repo, ada};
+    use crate::git_history::{Window, writer};
+
+    /// A store whose project folder is a git repository, as a sync would
+    /// have left it: the project node, the folder alias and one commit.
+    fn git_project() -> (tempfile::TempDir, Store, Repo) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = Repo::init(&root);
+        repo.write("src/lib.rs", "pub fn run() {}\n");
+        repo.commit(ada(DAY_1), "first", "");
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let graph = store.graph().clone();
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "CREATE (p:Project {id: $id, workspace_id: $ws, project_key: $key})",
+                    graph::params(&json!({"id": "repo-git", "ws": "ws", "key": "repo-git"})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        crate::folders::record(&graph, "ws", "repo-git", &root).unwrap();
+        (dir, store, repo)
+    }
+
+    fn principal() -> Principal {
+        Principal {
+            workspace: "ws".into(),
+            credential: "cred".into(),
+            hash: "hash".into(),
+            role: "owner".into(),
+        }
+    }
+
+    fn enqueue(store: &Store, p: &Principal) -> Value {
+        store
+            .transaction(|db| enqueue_history(store, db, "repo-git", p))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_stale_history_requeues_even_with_an_unmoved_head() {
+        let (dir, store, repo) = git_project();
+        let p = principal();
+        let graph = store.graph().clone();
+
+        // The first enqueue finds nothing under its key.
+        let first = enqueue(&store, &p);
+        assert_eq!(first["queued"], json!(true), "{first:#}");
+        assert_eq!(first["replayed"], json!(false), "{first:#}");
+
+        // The history lands, so the head record exists; HEAD never moves
+        // again in this test.
+        writer::ingest(&graph, "repo-git", repo.root(), &Window::default(), &|| Ok(())).unwrap();
+
+        // The same key replays the waiting job — this is the unmoved,
+        // unstale case.
+        let replay = enqueue(&store, &p);
+        assert_eq!(replay["replayed"], json!(true), "{replay:#}");
+
+        // The head record goes stale the way the detecting run leaves it
+        // (a rewrite was found; the rescan was deferred). The stale flag
+        // folds into the input hash, so the next enqueue queues a NEW job
+        // instead of replaying the finished one.
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (b:Branch {repository_id: $repo, name: 'HEAD'}) \
+                     SET b:Stale, b.stale_since = $now",
+                    graph::params(&json!({"repo": "repo-git", "now": now()})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let rescan = enqueue(&store, &p);
+        assert_eq!(rescan["queued"], json!(true), "{rescan:#}");
+        assert_eq!(
+            rescan["replayed"], json!(false),
+            "a stale history is a new job even though HEAD did not move"
+        );
+        assert_eq!(
+            graph
+                .read(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.id AS id",
+                        graph::params(&json!({
+                            "repo": "repo-git", "kind": crate::git_history::KIND,
+                        })),
+                    )
+                })
+                .unwrap()
+                .len(),
+            2,
+            "one job per input hash: the original and the rescan"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_project_without_a_git_folder_or_head_queues_no_history() {
+        let (dir, store, _repo) = git_project();
+        let p = principal();
+        let graph = store.graph().clone();
+
+        // A folder that is not a git repository at all.
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("plain.txt"), "not a repository\n").unwrap();
+        crate::folders::record(&graph, "ws", "repo-plain", plain.path()).unwrap();
+        let skipped = store
+            .transaction(|db| enqueue_history(&store, db, "repo-plain", &p))
+            .unwrap();
+        assert_eq!(skipped["queued"], json!(false), "{skipped:#}");
+        assert_eq!(skipped["reason"], json!("not a git repository"));
+
+        // A git repository whose HEAD is unborn (no commits yet).
+        let unborn = tempfile::tempdir().unwrap();
+        Repo::init(unborn.path());
+        crate::folders::record(&graph, "ws", "repo-unborn", unborn.path()).unwrap();
+        let empty = store
+            .transaction(|db| enqueue_history(&store, db, "repo-unborn", &p))
+            .unwrap();
+        assert_eq!(empty["queued"], json!(false), "{empty:#}");
+        assert_eq!(empty["reason"], json!("the repository has no commits"));
+
+        // And a project with no recorded folder at all.
+        let folderless = store
+            .transaction(|db| enqueue_history(&store, db, "repo-none", &p))
+            .unwrap();
+        assert_eq!(folderless["queued"], json!(false), "{folderless:#}");
+        assert_eq!(folderless["reason"], json!("the project has no recorded folder"));
+        drop(dir);
+    }
 }

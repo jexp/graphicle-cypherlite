@@ -36,7 +36,7 @@ pub mod reader;
 pub mod writer;
 
 #[cfg(test)]
-mod fixture;
+pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;
 
