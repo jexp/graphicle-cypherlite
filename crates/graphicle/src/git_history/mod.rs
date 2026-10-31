@@ -32,6 +32,7 @@
 
 use chrono::{DateTime, FixedOffset};
 
+pub mod correlation;
 pub mod reader;
 pub mod writer;
 

@@ -153,6 +153,7 @@ pub fn read_history_windowed(dir: &Path, window: &Window) -> Result<History, Rea
 
 /// [`read_history`] with the stdout cap made a parameter, so tests can
 /// exercise the cap without a 128 MiB history.
+#[cfg(test)]
 pub(crate) fn read_history_capped(dir: &Path, limit: u64) -> Result<History, ReadError> {
     read_history_bounded(dir, limit, &Window::default())
 }
@@ -277,7 +278,7 @@ fn check_revision(value: &str) -> Result<(), ReadError> {
 }
 
 /// What one git call produced.
-struct Captured {
+pub(crate) struct Captured {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: String,
@@ -287,7 +288,7 @@ struct Captured {
 /// through `take(limit + 1)`, so memory is bounded by the cap and the byte
 /// past it is detected without buffering more. Stderr drains on its own
 /// thread, so git never blocks on a full pipe.
-fn run_git(dir: &Path, args: &[&str], limit: u64) -> Result<Captured, ReadError> {
+pub(crate) fn run_git(dir: &Path, args: &[&str], limit: u64) -> Result<Captured, ReadError> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -345,7 +346,7 @@ fn run_git(dir: &Path, args: &[&str], limit: u64) -> Result<Captured, ReadError>
 }
 
 /// The stdout of a call that must succeed.
-fn stdout_or_error(captured: Captured) -> Result<Vec<u8>, ReadError> {
+pub(crate) fn stdout_or_error(captured: Captured) -> Result<Vec<u8>, ReadError> {
     if captured.status.success() {
         Ok(captured.stdout)
     } else {

@@ -53,3 +53,86 @@ fn a_sync_of_a_folder_that_is_not_a_git_repository_queues_no_history() {
         json!(0)
     );
 }
+
+/// `git` in the fixture checkout, with a fixed identity and no signing.
+fn git(root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+        .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+        .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+        .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Make the fixture folder a git checkout with its one file committed.
+fn commit_fixture(fixture: &Fixture) -> String {
+    git(&fixture.root, &["init", "-q"]);
+    git(&fixture.root, &["add", "-A"]);
+    git(&fixture.root, &["commit", "-q", "-m", "first"]);
+    git(&fixture.root, &["rev-parse", "HEAD"])
+}
+
+/// The `(:Episode)-[:AT_COMMIT]->(:Commit)` edges of the project.
+fn correlated(fixture: &Fixture) -> Vec<Value> {
+    fixture.query(
+        "MATCH (e:Episode {repository_id: $repo})-[:AT_COMMIT]->(c:Commit {repository_id: $repo}) \
+         RETURN e.episode AS episode, c.oid AS oid",
+        json!({}),
+    )
+}
+
+#[test]
+fn a_sync_at_head_with_a_clean_tree_correlates_the_episode_with_the_commit() {
+    let mut fixture = Fixture::new();
+    let head = commit_fixture(&fixture);
+    fixture.sync_and_build();
+
+    assert_eq!(
+        fixture.count("MATCH (c:Commit {repository_id: $repo}) RETURN count(c) AS n"),
+        1,
+        "the history job ingested the commit"
+    );
+    let edges = correlated(&fixture);
+    assert_eq!(edges.len(), 1, "{edges:#?}");
+    assert_eq!(edges[0]["oid"], json!(head));
+}
+
+#[test]
+fn a_dirty_tree_leaves_the_episode_a_working_tree_snapshot() {
+    let mut fixture = Fixture::new();
+    commit_fixture(&fixture);
+    fixture.write("src/lib.rs", "pub fn run() { /* uncommitted */ }\n");
+    fixture.sync_and_build();
+    assert!(
+        correlated(&fixture).is_empty(),
+        "an uncommitted change keeps the episode off the commit"
+    );
+
+    // Restoring the committed content makes the head set the HEAD tree: the
+    // same sync path now correlates.
+    fixture.write("src/lib.rs", "pub fn run() {}\n");
+    fixture.sync_and_build();
+    assert_eq!(correlated(&fixture).len(), 1);
+}
+
+#[test]
+fn resyncing_the_same_heads_does_not_duplicate_the_edge() {
+    let mut fixture = Fixture::new();
+    commit_fixture(&fixture);
+    fixture.sync_and_build();
+    fixture.sync_and_build();
+    assert_eq!(correlated(&fixture).len(), 1);
+    assert_eq!(
+        fixture.count(
+            "MATCH (:Episode {repository_id: $repo})-[r:AT_COMMIT]->(:Commit {repository_id: $repo}) RETURN count(r) AS n"
+        ),
+        1
+    );
+}

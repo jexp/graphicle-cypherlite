@@ -1122,6 +1122,16 @@ pub fn enqueue_history(
     let Some(head) = crate::git_history::reader::current_head(&folder)? else {
         return skipped("the repository has no commits");
     };
+    // The episode of the current head set is correlated with HEAD here too,
+    // not only by the history job: an unchanged HEAD replays that job rather
+    // than re-running it, and a commit ingested earlier needs no job at all.
+    if let Err(error) = crate::git_history::correlation::correlate_head(&graph, repository, &folder)
+    {
+        eprintln!(
+            "graphicle: could not correlate the episode with HEAD: {}",
+            error.message
+        );
+    }
     let window = crate::git_history::Window::default();
     let stale = crate::git_history::writer::marked_stale(&graph, repository)?;
     let input_hash = crate::git_history::writer::input_hash(&head, &window, stale);
@@ -1208,9 +1218,14 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
             .map(str::to_string),
         range: None,
     };
-    crate::git_history::writer::ingest(&graph, &identifier, &folder, &window, &|| {
-        leased(&graph, job)
-    })
+    let ingested =
+        crate::git_history::writer::ingest(&graph, &identifier, &folder, &window, &|| {
+            leased(&graph, job)
+        })?;
+    // The commits this run ingested may be the ones the episode's head set
+    // is the tree of (episode correlation).
+    crate::git_history::correlation::correlate_head(&graph, &identifier, &folder)?;
+    Ok(ingested)
 }
 
 /// Run `repository`'s waiting graph work in this
