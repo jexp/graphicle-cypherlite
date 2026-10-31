@@ -119,7 +119,7 @@ fn is_clean(folder: &Path) -> std::result::Result<bool, ReadError> {
 }
 
 /// The blobs of `commit`'s tree: path → blob oid, submodules and trees left out.
-fn tree_blobs(
+pub(super) fn tree_blobs(
     folder: &Path,
     commit: &str,
 ) -> std::result::Result<BTreeMap<String, String>, ReadError> {
@@ -154,7 +154,7 @@ fn tree_blobs(
 
 /// The sha256 of each blob's content, keyed by path, as the sync records a
 /// file's head. One `git cat-file --batch` process streams every blob.
-fn blob_digests(
+pub(super) fn blob_digests(
     folder: &Path,
     tree: &BTreeMap<String, String>,
 ) -> std::result::Result<BTreeMap<String, String>, ReadError> {

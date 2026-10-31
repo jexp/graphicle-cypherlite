@@ -287,17 +287,17 @@ fn rescan(
 /// One ingest run's shared context: the store, the repository being
 /// written, the run's record-time stamp and the lease check between
 /// batches. The write passes take it instead of repeating the four.
-struct Pass<'a> {
-    graph: &'a GraphStore,
-    repository_id: &'a str,
-    known_at: &'a str,
-    leasing: &'a dyn Fn() -> Result<()>,
+pub(super) struct Pass<'a> {
+    pub(super) graph: &'a GraphStore,
+    pub(super) repository_id: &'a str,
+    pub(super) known_at: &'a str,
+    pub(super) leasing: &'a dyn Fn() -> Result<()>,
 }
 
 /// Run `query` once per [`BATCH`]-row chunk of `rows`, one transaction per
 /// chunk, the lease checked before each. Every write pass funnels through
 /// here so the batch bound and the lease check live in exactly one place.
-fn batches(pass: &Pass, rows: &[Value], query: &str, extra: Value) -> Result<()> {
+pub(super) fn batches(pass: &Pass, rows: &[Value], query: &str, extra: Value) -> Result<()> {
     for chunk in rows.chunks(BATCH) {
         (pass.leasing)()?;
         let mut params = json!({"repo": pass.repository_id, "rows": chunk});
