@@ -32,6 +32,12 @@
 //! out and never touches another window's pairs. Nothing accumulates across
 //! runs: a rerun of an unchanged history writes the same counts.
 //!
+//! The 90-day window is time-based, but its job is keyed on the head and the
+//! configuration, not the date. An unchanged head therefore replays the
+//! finished job and never re-runs the window, so its edges freeze at the
+//! moment they were first computed: pairs that have since aged out stay
+//! present, and wrong, until the head or the window configuration changes.
+//!
 //! # Supernode
 //!
 //! Every statement matches by key (`repository_id` with `commit`, `path` or

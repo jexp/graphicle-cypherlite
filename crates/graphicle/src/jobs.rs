@@ -1000,52 +1000,19 @@ pub fn enqueue_enrich(
     }
     let rule_set = crate::arch_rules::rule_set_hash(&graph, repository)?;
     let input_hash = enrich_input_hash(&rule_set, episode);
-    if let Some(existing) = graph.read(|db| {
-        graph::one(
-            db,
-            "MATCH (j:Job {repository_id: $repo, kind: 'enrich', input_hash: $hash}) \
-             RETURN j.id AS id, j.state AS state",
-            graph::params(&json!({"repo": repository, "hash": input_hash})),
-        )
-    })? {
-        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            requeue_job(&graph, s(&existing, "id"))?;
-            return Ok(
-                json!({"id": existing["id"], "state": "queued", "kind": "enrich",
-                "episode": episode, "replayed": true, "queued": true}),
-            );
-        }
-        return Ok(
-            json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
-            "episode": episode, "replayed": true, "queued": true}),
-        );
-    }
     let payload = json!({"kind": "enrich", "episode": episode, "rule_set": rule_set,
         "runtime_revision": runtime_revision()});
-    let job_id = graph.transaction(|db| {
-        insert_job(
-            db,
-            &JobSpec {
-                repository,
-                workspace: &p.workspace,
-                kind: "enrich",
-                input_hash: &input_hash,
-                payload: &payload,
-                principal_hash: &p.hash,
-                priority: -1,
-                max_attempts: 3,
-            },
-        )
-    })?;
-    store::event(
+    enqueue_keyed(
+        store,
         db,
         repository,
-        "workflow_queued",
-        json!({"id": job_id, "kind": "enrich", "episode": episode}),
-    )?;
-    Ok(
-        json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
-        "replayed": false, "queued": true}),
+        p,
+        Keyed {
+            kind: "enrich",
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({"episode": episode}),
+        },
     )
 }
 
@@ -1094,6 +1061,84 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
     Ok(report.to_value())
 }
 
+/// One keyed enqueue (see [`enqueue_keyed`]): the job's kind, input hash and
+/// payload, and the kind-specific `fields` its result and `workflow_queued`
+/// event carry beside `id`, `kind` and the replay flags.
+struct Keyed<'a> {
+    kind: &'a str,
+    input_hash: &'a str,
+    payload: &'a Value,
+    fields: Value,
+}
+
+/// Queue a keyed job, or replay the one already under its key. The shared
+/// core of the keyed enqueues (`enrich`, `history`, `coupling`): a job under
+/// (repository, kind, input hash) is replayed, and requeued with a fresh
+/// budget when it failed or was cancelled; otherwise one job is inserted and
+/// announced by a `workflow_queued` event.
+fn enqueue_keyed(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    keyed: Keyed,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    let Keyed {
+        kind,
+        input_hash,
+        payload,
+        fields,
+    } = keyed;
+    let reply = |id: Value, state: Value, replayed: bool| {
+        let mut out = fields.clone();
+        out["id"] = id;
+        out["state"] = state;
+        out["kind"] = json!(kind);
+        out["replayed"] = json!(replayed);
+        out["queued"] = json!(true);
+        out
+    };
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({"repo": repository, "kind": kind, "hash": input_hash})),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            requeue_job(&graph, s(&existing, "id"))?;
+            return Ok(reply(existing["id"].clone(), json!("queued"), true));
+        }
+        return Ok(reply(
+            existing["id"].clone(),
+            existing["state"].clone(),
+            true,
+        ));
+    }
+    let job_id = graph.transaction(|db| {
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind,
+                input_hash,
+                payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
+    })?;
+    let mut event = fields.clone();
+    event["id"] = json!(job_id);
+    event["kind"] = json!(kind);
+    store::event(db, repository, "workflow_queued", event)?;
+    Ok(reply(json!(job_id), json!("queued"), false))
+}
+
 /// Queue the git history ingestion of a project whose folder is a git
 /// repository, after its projection recorded the episode (git-to-graph plan
 /// §4): one `history` job per (repository, `HEAD` sha, window), so a
@@ -1136,50 +1181,21 @@ pub fn enqueue_history(
     let window = crate::git_history::Window::default();
     let stale = crate::git_history::writer::marked_stale(&graph, repository)?;
     let input_hash = crate::git_history::writer::input_hash(&head, &window, stale);
-    if let Some(existing) = graph.read(|db| {
-        graph::one(
-            db,
-            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
-             RETURN j.id AS id, j.state AS state",
-            graph::params(&json!({
-                "repo": repository, "kind": crate::git_history::KIND, "hash": input_hash,
-            })),
-        )
-    })? {
-        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            requeue_job(&graph, s(&existing, "id"))?;
-            return Ok(json!({"id": existing["id"], "state": "queued",
-                "kind": crate::git_history::KIND, "replayed": true, "queued": true}));
-        }
-        return Ok(json!({"id": existing["id"], "state": existing["state"],
-            "kind": crate::git_history::KIND, "replayed": true, "queued": true}));
-    }
     let payload = json!({"kind": crate::git_history::KIND, "head": head,
         "window": {"max_commits": window.max_commits, "since": window.since},
         "format": crate::git_history::writer::FORMAT});
-    let job_id = graph.transaction(|db| {
-        insert_job(
-            db,
-            &JobSpec {
-                repository,
-                workspace: &p.workspace,
-                kind: crate::git_history::KIND,
-                input_hash: &input_hash,
-                payload: &payload,
-                principal_hash: &p.hash,
-                priority: -1,
-                max_attempts: 3,
-            },
-        )
-    })?;
-    store::event(
+    enqueue_keyed(
+        store,
         db,
         repository,
-        "workflow_queued",
-        json!({"id": job_id, "kind": crate::git_history::KIND}),
-    )?;
-    Ok(json!({"id": job_id, "state": "queued", "kind": crate::git_history::KIND,
-        "replayed": false, "queued": true}))
+        p,
+        Keyed {
+            kind: crate::git_history::KIND,
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({}),
+        },
+    )
 }
 
 /// Queue the co-change derivation of a repository once its history is
@@ -1195,50 +1211,22 @@ pub fn enqueue_coupling(
     head: &str,
     config: &crate::git_history::coupling::Config,
 ) -> Result<Value> {
-    let graph = store.graph().clone();
     let kind = crate::git_history::coupling::KIND;
     let input_hash = crate::git_history::coupling::input_hash(head, config);
-    if let Some(existing) = graph.read(|db| {
-        graph::one(
-            db,
-            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
-             RETURN j.id AS id, j.state AS state",
-            graph::params(&json!({"repo": repository, "kind": kind, "hash": input_hash})),
-        )
-    })? {
-        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            requeue_job(&graph, s(&existing, "id"))?;
-            return Ok(json!({"id": existing["id"], "state": "queued", "kind": kind,
-                "replayed": true, "queued": true}));
-        }
-        return Ok(json!({"id": existing["id"], "state": existing["state"], "kind": kind,
-            "replayed": true, "queued": true}));
-    }
     let payload = json!({"kind": kind, "head": head, "config": config.to_json(),
         "format": crate::git_history::coupling::FORMAT});
-    let job_id = graph.transaction(|db| {
-        insert_job(
-            db,
-            &JobSpec {
-                repository,
-                workspace: &p.workspace,
-                kind,
-                input_hash: &input_hash,
-                payload: &payload,
-                principal_hash: &p.hash,
-                priority: -1,
-                max_attempts: 3,
-            },
-        )
-    })?;
-    store::event(
+    enqueue_keyed(
+        store,
         db,
         repository,
-        "workflow_queued",
-        json!({"id": job_id, "kind": kind}),
-    )?;
-    Ok(json!({"id": job_id, "state": "queued", "kind": kind,
-        "replayed": false, "queued": true}))
+        p,
+        Keyed {
+            kind,
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({}),
+        },
+    )
 }
 
 /// Execute a `history` job: ingest the project folder's git history into
@@ -1332,13 +1320,9 @@ fn coupling_job(store: &Store, job: &Job) -> Result<Value> {
         Ok(s(&repository, "id").to_string())
     })?;
     let config = crate::git_history::coupling::Config::from_json(&job.payload["config"]);
-    crate::git_history::coupling::derive(
-        &graph,
-        &identifier,
-        chrono::Utc::now(),
-        &config,
-        &|| leased(&graph, job),
-    )
+    crate::git_history::coupling::derive(&graph, &identifier, chrono::Utc::now(), &config, &|| {
+        leased(&graph, job)
+    })
 }
 
 /// Run `repository`'s waiting graph work in this
@@ -2888,7 +2872,11 @@ mod tests {
             ..Config::default()
         };
         let changed_config = enqueue(&narrower, &head);
-        assert_eq!(changed_config["replayed"], json!(false), "{changed_config:#}");
+        assert_eq!(
+            changed_config["replayed"],
+            json!(false),
+            "{changed_config:#}"
+        );
         // A new head is a new job too.
         let new_head = enqueue(&default, "1111111111111111111111111111111111111111");
         assert_eq!(new_head["replayed"], json!(false), "{new_head:#}");
@@ -2935,7 +2923,10 @@ mod tests {
             .map(|result| result["kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, ["history", "coupling"], "{results:#?}");
-        assert!(results.iter().all(|result| result["ok"] == json!(true)), "{results:#?}");
+        assert!(
+            results.iter().all(|result| result["ok"] == json!(true)),
+            "{results:#?}"
+        );
 
         // The coupling job is keyed on the head the history job ingested.
         let head = repo.rev("HEAD");
