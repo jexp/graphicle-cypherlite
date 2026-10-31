@@ -13,8 +13,12 @@
 //! [`model`] holds the rule structs and every rule check, so the frontends
 //! cannot disagree about what a rule means. [`store`] writes the parsed rules
 //! as `(:ConceptRule)`, `(:ConstraintRule)` and `(:RuleGroup)` nodes.
+//! [`dag`] resolves a document and one of its groups into a run's plan.
 //! [`executor`] applies the stored concept rules to a recorded episode, as
-//! the `enrich` job (architecture-concepts.md §1 and §5).
+//! the `enrich` job (architecture-concepts.md §1 and §5), reporting through
+//! the typed result of [`plan`]; [`provenance`] records and rolls back what
+//! one rule wrote; [`constraints`] evaluates the constraints against the
+//! enriched graph.
 use crate::Result as GraphResult;
 use crate::store_graph::GraphStore;
 use serde_json::{Value, json};
@@ -24,14 +28,19 @@ use std::path::{Path, PathBuf};
 pub mod adoc;
 pub mod analyze;
 pub mod constraints;
+pub mod dag;
 pub mod executor;
 pub mod markdown;
 pub mod model;
+pub mod plan;
+pub mod provenance;
 pub mod report;
 pub mod store;
 
-pub use executor::{enrich, has_rules, rollback};
+pub use executor::{enrich, has_rules};
 pub use model::{Group, Reason, Rule, RuleDocument, RuleError, Severity};
+pub use plan::EnrichReport;
+pub use provenance::rollback;
 pub use store::{rule_set_hash, store};
 
 /// Parse a Markdown rule document. This is the frontend the earlier

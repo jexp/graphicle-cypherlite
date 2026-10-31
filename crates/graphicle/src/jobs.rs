@@ -983,8 +983,8 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
         &report,
         &|| leased(&graph, job),
     )?;
-    report["constraints"] = constraints;
-    Ok(report)
+    report.constraints = Some(constraints);
+    Ok(report.to_value())
 }
 
 /// Run `repository`'s waiting graph work in this

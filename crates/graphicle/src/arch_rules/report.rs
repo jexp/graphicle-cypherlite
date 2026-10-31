@@ -10,6 +10,7 @@
 //! enrich job has not finished is state `waiting` and exits 0; it is neither
 //! a violation nor an error.
 use super::model::Severity;
+use super::plan::{EnrichReport, Status};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
@@ -61,14 +62,14 @@ pub fn exit_code(errors: usize, violations: &[Violation], min: Option<Severity>)
 }
 
 /// The report of a finished enrich run. `job` is the enrich job's result
-/// (`plans` and `constraints`, see [`crate::arch_rules::executor::enrich`]);
-/// `violations` are the episode's rows. With `group`, only that group's plan,
-/// its constraints and its violations are reported; a group the project does
-/// not declare is an error.
+/// (see [`crate::arch_rules::executor::enrich`] and
+/// [`crate::arch_rules::plan`]); `violations` are the episode's rows. With
+/// `group`, only that group's plan, its constraints and its violations are
+/// reported; a group the project does not declare is an error.
 pub fn complete(
     episode: &str,
     rule_set: &str,
-    job: &Value,
+    job: &EnrichReport,
     violations: &[Violation],
     group: Option<&str>,
     min: Option<Severity>,
@@ -80,69 +81,58 @@ pub fn complete(
     let mut failed = 0usize;
     let mut members = BTreeSet::new();
     let mut found_group = group.is_none();
-    for plan in job["plans"].as_array().into_iter().flatten() {
-        let name = plan["group"].as_str().unwrap_or_default();
+    for plan in &job.plans {
+        let name = plan.group.as_str();
         if group == Some(name) {
             found_group = true;
         } else if group.is_some() {
             continue;
         }
-        if let Some(error) = plan["error"].as_str() {
+        if let Some(error) = &plan.error {
             errors.push(format!("group '{name}': {error}"));
         }
-        for item in plan["applied"].as_array().into_iter().flatten() {
-            let rule = item["rule"].as_str().unwrap_or_default();
-            members.insert(rule.to_string());
+        for item in &plan.applied {
+            members.insert(item.rule.clone());
             concepts.push(json!({
-                "rule": rule,
+                "rule": item.rule,
                 "group": name,
-                "labels": item["labels"],
-                "relationships": item["relationships"],
-                "properties": item["properties"],
-                "nodes": item["nodes"],
+                "labels": item.labels,
+                "relationships": item.relationships,
+                "properties": item.properties,
+                "nodes": item.nodes,
             }));
         }
-        for item in plan["failed"].as_array().into_iter().flatten() {
-            let rule = item["rule"].as_str().unwrap_or_default();
-            members.insert(rule.to_string());
+        for item in &plan.failed {
+            members.insert(item.rule.clone());
             failed += 1;
-            errors.push(format!(
-                "rule '{rule}' failed: {}",
-                item["error"].as_str().unwrap_or_default()
-            ));
+            errors.push(format!("rule '{}' failed: {}", item.rule, item.error));
         }
-        for id in plan["skipped"].as_array().into_iter().flatten() {
-            let id = id.as_str().unwrap_or_default();
-            members.insert(id.to_string());
-            skipped.push(id.to_string());
+        for id in &plan.skipped {
+            members.insert(id.clone());
+            skipped.push(id.clone());
         }
-        members.extend(
-            plan["severities"]
-                .as_object()
-                .into_iter()
-                .flat_map(|map| map.keys().cloned()),
-        );
+        members.extend(plan.severities.keys().cloned());
     }
     if let (false, Some(group)) = (found_group, group) {
         errors.push(format!("no rule group '{group}'"));
     }
     let mut constraints = Vec::new();
-    for result in job["constraints"]["results"].as_array().into_iter().flatten() {
-        let rule = result["rule"].as_str().unwrap_or_default();
-        if !members.contains(rule) {
+    for result in job.constraints.as_ref().into_iter().flat_map(|c| &c.results) {
+        if !members.contains(&result.rule) {
             continue;
         }
-        if result["status"] == "error" {
+        if result.status == Status::Error {
             errors.push(format!(
-                "rule '{rule}' failed: {}",
-                result["error"].as_str().unwrap_or_default()
+                "rule '{}' failed: {}",
+                result.rule,
+                result.error.as_deref().unwrap_or_default()
             ));
         }
         constraints.push(json!({
-            "rule": rule,
-            "status": result["status"],
-            "severity": result["severity"],
-            "violations": result["violations"],
+            "rule": result.rule,
+            "status": result.status,
+            "severity": result.severity,
+            "violations": result.violations,
         }));
     }
     let mut selected: Vec<Violation> = violations
@@ -285,6 +275,7 @@ fn by_severity(levels: impl Iterator<Item = Severity>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch_rules::plan::{AppliedRule, Constraints, ConstraintResult, FailedRule, Plan};
 
     fn violation(rule: &str, severity: Severity, path: &str, line: i64) -> Violation {
         Violation {
@@ -298,33 +289,74 @@ mod tests {
     /// An enrich result with two groups: `arch:default` applies a concept and
     /// evaluates two constraints; `arch:strict` selects the same concept and
     /// one constraint, and holds a plan of its own.
-    fn job() -> Value {
-        json!({
-            "kind": "enrich",
-            "episode": "ep-1",
-            "rule_set": "rs",
-            "applied": 1,
-            "failed": 0,
-            "skipped": 0,
-            "plans": [
-                {"group": "arch:default",
-                 "applied": [{"rule": "arch:Layer/Core", "labels": 2, "relationships": 0,
-                              "properties": 1, "nodes": 1}],
-                 "failed": [], "skipped": [],
-                 "severities": {"arch:Layer/Core": "MINOR",
-                                "arch:NoCycle": "MAJOR", "arch:NoBlocker": "BLOCKER"}},
-                {"group": "arch:strict",
-                 "applied": [], "failed": [], "skipped": [],
-                 "severities": {"arch:Layer/Core": "MINOR", "arch:NoCycle": "CRITICAL"}}
+    fn job() -> EnrichReport {
+        let severities = |entries: &[(&str, Severity)]| {
+            entries
+                .iter()
+                .map(|(id, severity)| (id.to_string(), *severity))
+                .collect()
+        };
+        EnrichReport {
+            kind: "enrich".into(),
+            episode: "ep-1".into(),
+            rule_set: "rs".into(),
+            applied: 1,
+            failed: 0,
+            skipped: 0,
+            plans: vec![
+                Plan {
+                    group: "arch:default".into(),
+                    error: None,
+                    applied: vec![AppliedRule {
+                        rule: "arch:Layer/Core".into(),
+                        labels: 2,
+                        relationships: 0,
+                        properties: 1,
+                        nodes: 1,
+                    }],
+                    failed: Vec::new(),
+                    skipped: Vec::new(),
+                    severities: severities(&[
+                        ("arch:Layer/Core", Severity::Minor),
+                        ("arch:NoCycle", Severity::Major),
+                        ("arch:NoBlocker", Severity::Blocker),
+                    ]),
+                },
+                Plan {
+                    group: "arch:strict".into(),
+                    error: None,
+                    applied: Vec::new(),
+                    failed: Vec::new(),
+                    skipped: Vec::new(),
+                    severities: severities(&[
+                        ("arch:Layer/Core", Severity::Minor),
+                        ("arch:NoCycle", Severity::Critical),
+                    ]),
+                },
             ],
-            "constraints": {
-                "violations": 3, "passing": 0, "errors": 0, "skipped": 0,
-                "results": [
-                    {"rule": "arch:NoCycle", "status": "violations", "severity": "MAJOR", "violations": 2},
-                    {"rule": "arch:NoBlocker", "status": "violations", "severity": "BLOCKER", "violations": 1}
-                ]
-            }
-        })
+            constraints: Some(Constraints {
+                violations: 3,
+                passing: 0,
+                errors: 0,
+                skipped: 0,
+                results: vec![
+                    ConstraintResult {
+                        rule: "arch:NoCycle".into(),
+                        status: Status::Violations,
+                        severity: Some(Severity::Major),
+                        violations: Some(2),
+                        error: None,
+                    },
+                    ConstraintResult {
+                        rule: "arch:NoBlocker".into(),
+                        status: Status::Violations,
+                        severity: Some(Severity::Blocker),
+                        violations: Some(1),
+                        error: None,
+                    },
+                ],
+            }),
+        }
     }
 
     fn rows() -> Vec<Violation> {
@@ -401,8 +433,12 @@ mod tests {
     #[test]
     fn a_failed_rule_and_a_plan_error_are_errors() {
         let mut job = job();
-        job["plans"][0]["failed"] = json!([{"rule": "arch:Layer/Core", "error": "boom"}]);
-        job["plans"][1]["error"] = json!("rule 'arch:X' requires 'arch:Y', which matches no concept");
+        job.plans[0].failed = vec![FailedRule {
+            rule: "arch:Layer/Core".into(),
+            error: "boom".into(),
+        }];
+        job.plans[1].error =
+            Some("rule 'arch:X' requires 'arch:Y', which matches no concept".into());
         let report = complete("ep-1", "rs", &job, &rows(), None, Some(Severity::Blocker), &[]);
         assert_eq!(report["exit"], 2);
         let errors: Vec<&str> = report["errors"]

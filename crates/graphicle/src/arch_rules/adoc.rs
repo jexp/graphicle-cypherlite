@@ -372,7 +372,7 @@ fn attributes(inner: &str, line: usize) -> Vec<Attr> {
             continue;
         }
         if let Some((key, value)) = item.split_once('=') {
-            if is_key(key.trim()) {
+            if model::is_key(key.trim()) {
                 out.push(Attr {
                     key: key.trim().to_string(),
                     value: unquote(value),
@@ -428,10 +428,6 @@ fn unquote(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn is_key(key: &str) -> bool {
-    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `[[id]]` or `[[id,reftext]]`: the anchor's id.

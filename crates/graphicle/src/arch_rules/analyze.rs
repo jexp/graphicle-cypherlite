@@ -6,6 +6,7 @@
 //! the job is the only writer. A job still queued or running is reported as
 //! `waiting`, not failed. The pure parts (the exit decision, the report) live
 //! in [`super::report`].
+use super::plan::EnrichReport;
 use super::report::{self, Violation};
 use super::{Severity, rule_set_hash};
 use crate::Result;
@@ -117,6 +118,10 @@ pub fn run(
             &document_errors,
         ));
     }
+    // The stored job result read back through the run's typed view
+    // ([`EnrichReport`]): a shape change is an error here, not a silent
+    // empty report.
+    let result = EnrichReport::from_value(result)?;
     let rows = violation_rows(&graph, &identifier, &episode)?;
     let found: Vec<Violation> = report::violations(&rows);
     Ok(report::complete(

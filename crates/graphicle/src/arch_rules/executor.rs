@@ -7,50 +7,40 @@
 //! rule id) as parameters. What it adds around them:
 //!
 //! - **Order and failure semantics**: the rules come back from the store as
-//!   a [`RuleDocument`] and go through [`crate::arch_rules_dag::resolve`],
-//!   so they run in dependency order with the groups' severity overrides
-//!   applied. A rule whose query fails is rolled back whole (its own
-//!   transaction), reported under `failed`, and its transitive dependents
-//!   move to `skipped` ([`Resolution::skip_after`]) — never a half-applied
-//!   state. Constraints are resolved and carried (their effective
-//!   severities are part of the result) but never executed here; a later
-//!   node evaluates them against the enriched graph.
-//! - **Provenance**: the executor diffs the whole graph inside the rule's
-//!   own transaction — a snapshot before the query, one after — so it knows
-//!   exactly which labels, relationships and properties that rule wrote,
-//!   whatever the query's text. Labels are recorded as
-//!   `(:RuleApplication {repository_id, rule, episode})-[:LABELED
-//!   {label}]->(n)` edges (a Cypher label cannot carry properties);
-//!   relationships the rule created are stamped `concept`/`episode` and
-//!   listed in the application's `provenance` map beside the nodes it
-//!   created and the properties it set. [`rollback`] removes exactly those
-//!   writes. Two whole-store reads per rule is the price of provenance over
-//!   arbitrary Cypher; §9's performance ceiling question measures it.
-//!   The snapshot is unscoped by repository: in a shared multi-project
-//!   store the per-rule cost carries the other projects' nodes too. The
-//!   per-repo-database topology (git-to-graph-plan.md §5) makes this
-//!   correct by construction; until then the ceiling question carries the
-//!   multiplier.
+//!   a [`RuleDocument`] and go through [`super::dag::resolve`], so they run
+//!   in dependency order with the groups' severity overrides applied. A rule
+//!   whose query fails is rolled back whole (its own transaction), reported
+//!   under `failed`, and its transitive dependents move to `skipped`
+//!   ([`super::dag::Resolution::skip_after`]) — never a half-applied state.
+//!   Constraints
+//!   are resolved and carried (their effective severities are part of the
+//!   result) but never executed here; a later node evaluates them against
+//!   the enriched graph.
+//! - **Provenance**: [`super::provenance`] brackets each rule's query with
+//!   whole-store snapshots inside the rule's own transaction, records
+//!   exactly what it wrote, and rolls those writes back on demand; see its
+//!   module doc for the cost and the limits.
 //! - **Idempotence**: a rule whose query is MERGE-based writes nothing the
 //!   second time, so re-applying a rule set to the same episode — a
 //!   replayed job, a retry — records nothing new. The application record
 //!   itself MERGEs on `(repository_id, rule, episode)`.
 //!
-//! Semantics the diff cannot undo: a rule that *deletes* nodes,
-//! relationships, labels or properties (rather than adding them) cannot be
-//! rolled back — the before-state is not kept, only the delta. Concepts are
-//! enrichment (`MERGE`/`SET`); a destructive rule leaves its deletions in
-//! place and is still counted as applied.
-//!
 //! Which rules run: every group the project declared, in group-id order, a
 //! rule applied once across the groups that select it; a project that
 //! declared no group runs every rule (documents without groups — the common
 //! case — clearly intend all of them).
+//!
+//! The run's result is typed ([`EnrichReport`], [`Plan`]): the executor
+//! builds it and serializes it as the `enrich` job's result, and the
+//! constraint evaluator and the analyze report read the same structs back —
+//! the serialized shape is pinned in [`super::plan`].
 use super::model::{Rule, RuleDocument, Severity};
+use super::plan::{AppliedRule, EnrichReport, FailedRule, Plan};
+use super::provenance;
 use super::{Group, rule_set_hash};
 use crate::Result;
-use crate::store_graph::{self, GraphStore, Params};
-use serde_json::{Map, Value, json};
+use crate::store_graph::{self, GraphStore};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The group the executor resolves when the project declared none: every
@@ -61,7 +51,8 @@ const DEFAULT_GROUP: &str = "default";
 /// §1.5: enrichment is the post-processing step of a recorded projection).
 /// `still_leasing` is checked before every rule, so a job whose lease was
 /// cancelled or taken over stops with that error. See the module doc for
-/// order, failure and provenance semantics; the result is the job's:
+/// order, failure and provenance semantics; the result is the job's, as
+/// [`EnrichReport`] (serialized by [`EnrichReport::to_value`]):
 ///
 /// ```json
 /// {"kind": "enrich", "episode": "…", "rule_set": "…", "applied": 2,
@@ -80,14 +71,20 @@ pub fn enrich(
     repository_id: &str,
     episode: &str,
     still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<Value> {
+) -> Result<EnrichReport> {
     let document = rule_document(graph, repository_id)?;
     let rule_set = rule_set_hash(graph, repository_id)?;
     let Some(document) = document else {
-        return Ok(json!({
-            "kind": "enrich", "episode": episode, "rule_set": rule_set,
-            "plans": [], "applied": 0, "failed": 0, "skipped": 0,
-        }));
+        return Ok(EnrichReport {
+            kind: "enrich".into(),
+            episode: episode.into(),
+            rule_set,
+            plans: Vec::new(),
+            applied: 0,
+            failed: 0,
+            skipped: 0,
+            constraints: None,
+        });
     };
     let constraint_ids: BTreeSet<&str> = document
         .constraints
@@ -99,286 +96,117 @@ pub fn enrich(
         .iter()
         .map(|rule| (rule.id.as_str(), rule))
         .collect();
-    let mut applied = BTreeSet::new();
     // One plan per declared group, in group-id order; with no group, one
     // plan of every rule.
+    let mut run = Run {
+        graph,
+        repository_id,
+        episode,
+        document: &document,
+        concepts: &concepts,
+        constraint_ids: &constraint_ids,
+        applied: BTreeSet::new(),
+        still_leasing,
+    };
     let mut plans = Vec::new();
     if document.groups.is_empty() {
-        let document = with_default_group(&document);
-        plans.push(run_plan(
-            graph,
-            repository_id,
-            episode,
-            &document,
-            DEFAULT_GROUP,
-            &concepts,
-            &constraint_ids,
-            &mut applied,
-            still_leasing,
-        )?);
+        let every = with_default_group(&document);
+        run.document = &every;
+        plans.push(run.plan(DEFAULT_GROUP)?);
     } else {
         let mut groups: Vec<&str> = document.groups.iter().map(|g| g.id.as_str()).collect();
         groups.sort_unstable();
         for group in groups {
-            plans.push(run_plan(
-                graph,
-                repository_id,
-                episode,
-                &document,
-                group,
-                &concepts,
-                &constraint_ids,
-                &mut applied,
-                still_leasing,
-            )?);
+            plans.push(run.plan(group)?);
         }
     }
-    let total = |key: &str| {
-        plans
-            .iter()
-            .map(|plan| plan[key].as_array().map_or(0, Vec::len))
-            .sum::<usize>()
-    };
-    let (applied_count, failed_count, skipped_count) =
-        (total("applied"), total("failed"), total("skipped"));
-    Ok(json!({
-        "kind": "enrich", "episode": episode, "rule_set": rule_set,
-        "plans": plans,
-        "applied": applied_count, "failed": failed_count, "skipped": skipped_count,
-    }))
-}
-
-/// Rollback of one rule's application to one episode
-/// (architecture-concepts.md §1): the labels it added are removed (its
-/// `:LABELED` edges name node and label), the relationships it created are
-/// deleted, the properties it set are removed, and nodes it created are
-/// deleted when the removals leave them with no label and no relationship.
-/// The application record goes with them. A rule that was never applied to
-/// the episode rolls back nothing.
-pub fn rollback(
-    graph: &GraphStore,
-    repository_id: &str,
-    rule: &str,
-    episode: &str,
-) -> Result<Value> {
-    graph.transaction(|db| {
-        let key = || {
-            store_graph::params(&json!({"repo": repository_id, "rule": rule, "episode": episode}))
-        };
-        let application = store_graph::one(
-            db,
-            "MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode}) \
-             RETURN a.provenance AS provenance",
-            key(),
-        )?;
-        let Some(application) = application else {
-            return Ok(json!({"rule": rule, "episode": episode, "labels": 0, "relationships": 0,
-                "properties": 0, "nodes": 0}));
-        };
-        let provenance: Value =
-            serde_json::from_str(store_graph::s(&application, "provenance")).unwrap_or_default();
-        let ids = |key: &str| -> Vec<i64> {
-            provenance[key]
-                .as_array()
-                .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        let props = |key: &str| -> Vec<(i64, String)> {
-            provenance[key]
-                .as_object()
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(id, names)| {
-                            Some((id.parse::<i64>().ok()?, names.clone()))
-                        })
-                        .flat_map(|(id, names)| {
-                            names
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(Value::as_str)
-                                .map(move |name| (id, name.to_string()))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        // The rule's labels, read from the application's own edges.
-        let labeled: Vec<(i64, String)> = store_graph::rows(
-            db,
-            "MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode})-[l:LABELED]->(n) \
-             RETURN id(n) AS node, l.label AS label",
-            key(),
-        )?
-        .into_iter()
-        .filter_map(|row| {
-            Some((
-                row["node"].as_i64()?,
-                store_graph::s(&row, "label").to_string(),
-            ))
-        })
-        .collect();
-
-        // The relationships the rule created go first, so the node sweep
-        // below sees the graph without them.
-        let rels = ids("rels");
-        if !rels.is_empty() {
-            store_graph::write(
-                db,
-                "MATCH ()-[r]->() WHERE id(r) IN $ids DELETE r",
-                store_graph::params(&json!({"ids": rels})),
-            )?;
-        }
-        if !labeled.is_empty() {
-            let rows: Vec<Value> = labeled
-                .iter()
-                .map(|(node, label)| json!({"node": node, "label": label}))
-                .collect();
-            store_graph::write(
-                db,
-                "UNWIND $rows AS row MATCH (n) WHERE id(n) = row.node REMOVE n:$(row.label)",
-                store_graph::params(&json!({"rows": rows})),
-            )?;
-        }
-        let node_props: Vec<Value> = props("node_props")
-            .into_iter()
-            .map(|(id, prop)| json!({"id": id, "prop": prop}))
-            .collect();
-        let rel_props: Vec<Value> = props("rel_props")
-            .into_iter()
-            .map(|(id, prop)| json!({"id": id, "prop": prop}))
-            .collect();
-        let prop_count = remove_props(db, &node_props, "(target)")?
-            + remove_props(db, &rel_props, "()-[target]->()")?;
-        // The application's own edges, then the nodes it created that its
-        // removals left empty, then the record itself.
-        store_graph::write(
-            db,
-            "MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode})-[l:LABELED]->() DELETE l",
-            key(),
-        )?;
-        let created = ids("nodes");
-        let mut emptied = Vec::new();
-        if !created.is_empty() {
-            emptied = store_graph::rows(
-                db,
-                "MATCH (n) WHERE id(n) IN $ids \
-                 OPTIONAL MATCH (n)-[r]-() \
-                 RETURN id(n) AS id, labels(n) AS labels, count(r) AS rels",
-                store_graph::params(&json!({"ids": created})),
-            )?
-            .into_iter()
-            .filter(|row| {
-                row["labels"].as_array().is_none_or(Vec::is_empty)
-                    && row["rels"].as_i64().unwrap_or(0) == 0
-            })
-            .filter_map(|row| row["id"].as_i64())
-            .collect::<Vec<_>>();
-            if !emptied.is_empty() {
-                store_graph::write(
-                    db,
-                    "MATCH (n) WHERE id(n) IN $ids DELETE n",
-                    store_graph::params(&json!({"ids": emptied})),
-                )?;
-            }
-        }
-        store_graph::write(
-            db,
-            "MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode}) \
-             DETACH DELETE a",
-            key(),
-        )?;
-        Ok(json!({
-            "rule": rule, "episode": episode,
-            "labels": labeled.len(), "relationships": rels.len(),
-            "properties": prop_count, "nodes": emptied.len(),
-        }))
+    let total = |rules: fn(&Plan) -> usize| plans.iter().map(rules).sum::<usize>();
+    Ok(EnrichReport {
+        kind: "enrich".into(),
+        episode: episode.into(),
+        rule_set,
+        applied: total(|plan| plan.applied.len()),
+        failed: total(|plan| plan.failed.len()),
+        skipped: total(|plan| plan.skipped.len()),
+        plans,
+        constraints: None,
     })
 }
 
-/// Remove the properties `rows` names (`{id, prop}`) from the nodes or
-/// relationships `on` matches (a variable named `target`).
-fn remove_props(
-    db: &mut cypherlite::Connection,
-    rows: &[Value],
-    on: &str,
-) -> Result<usize> {
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    store_graph::write(
-        db,
-        &format!("UNWIND $rows AS row MATCH {on} WHERE id(target) = row.id REMOVE target[row.prop]"),
-        store_graph::params(&json!({"rows": rows})),
-    )?;
-    Ok(rows.len())
+/// What one run's plans share: the store and episode they work on, the
+/// document as resolved, and the lease check before every rule. `applied`
+/// carries the applied ids across the groups of one run.
+struct Run<'a> {
+    graph: &'a GraphStore,
+    repository_id: &'a str,
+    episode: &'a str,
+    document: &'a RuleDocument,
+    concepts: &'a BTreeMap<&'a str, &'a Rule>,
+    constraint_ids: &'a BTreeSet<&'a str>,
+    applied: BTreeSet<String>,
+    still_leasing: &'a dyn Fn() -> Result<()>,
 }
 
-/// Resolve one group and run its plan. Rules an earlier group already
-/// applied in this run are not run again (their queries are MERGE-idempotent
-/// either way; skipping keeps one failure semantics per run). `applied`
-/// carries the applied ids across the groups of one run.
-#[allow(clippy::too_many_arguments)]
-fn run_plan(
-    graph: &GraphStore,
-    repository_id: &str,
-    episode: &str,
-    document: &RuleDocument,
-    group: &str,
-    concepts: &BTreeMap<&str, &Rule>,
-    constraint_ids: &BTreeSet<&str>,
-    applied: &mut BTreeSet<String>,
-    still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<Value> {
-    let resolution = match crate::arch_rules_dag::resolve(document, group) {
-        Ok(resolution) => resolution,
-        Err(error) => {
-            return Ok(json!({"group": group, "error": error.to_string(), "applied": [],
-                "failed": [], "skipped": [], "severities": {}}));
-        }
-    };
-    let mut resolution = resolution;
-    // The plan as resolved; failures below remove members from it again.
-    let mut queue: VecDeque<String> = resolution.order.iter().cloned().collect();
-    let mut applied_rules = Vec::new();
-    let mut failed = Vec::new();
-    while let Some(id) = queue.pop_front() {
-        // Dropped by an earlier failure's skip_after, a constraint (the
-        // later node evaluates those), or an earlier group of this run.
-        if !resolution.order.contains(&id)
-            || constraint_ids.contains(id.as_str())
-            || applied.contains(&id)
-        {
-            continue;
-        }
-        let Some(rule) = concepts.get(id.as_str()) else {
-            continue;
-        };
-        still_leasing()?;
-        match apply_rule(graph, repository_id, episode, rule) {
-            Ok(report) => {
-                applied.insert(id.clone());
-                applied_rules.push(report);
-            }
+impl Run<'_> {
+    /// Resolve one group and run its plan. Rules an earlier group already
+    /// applied in this run are not run again (their queries are
+    /// MERGE-idempotent either way; skipping keeps one failure semantics per
+    /// run).
+    fn plan(&mut self, group: &str) -> Result<Plan> {
+        let resolution = match super::dag::resolve(self.document, group) {
+            Ok(resolution) => resolution,
             Err(error) => {
-                failed.push(json!({"rule": id, "error": error.message}));
-                resolution = resolution.skip_after(&[id.as_str()]);
+                return Ok(Plan {
+                    group: group.to_string(),
+                    error: Some(error.to_string()),
+                    applied: Vec::new(),
+                    failed: Vec::new(),
+                    skipped: Vec::new(),
+                    severities: BTreeMap::new(),
+                });
+            }
+        };
+        let mut resolution = resolution;
+        // The plan as resolved; failures below remove members from it again.
+        let mut queue: VecDeque<String> = resolution.order.iter().cloned().collect();
+        let mut applied = Vec::new();
+        let mut failed = Vec::new();
+        while let Some(id) = queue.pop_front() {
+            // Dropped by an earlier failure's skip_after, a constraint (the
+            // later node evaluates those), or an earlier group of this run.
+            if !resolution.order.contains(&id)
+                || self.constraint_ids.contains(id.as_str())
+                || self.applied.contains(&id)
+            {
+                continue;
+            }
+            let Some(rule) = self.concepts.get(id.as_str()) else {
+                continue;
+            };
+            (self.still_leasing)()?;
+            match apply_rule(self.graph, self.repository_id, self.episode, rule) {
+                Ok(report) => {
+                    self.applied.insert(id.clone());
+                    applied.push(report);
+                }
+                Err(error) => {
+                    failed.push(FailedRule {
+                        rule: id.clone(),
+                        error: error.message,
+                    });
+                    resolution = resolution.skip_after(&[id.as_str()]);
+                }
             }
         }
+        Ok(Plan {
+            group: group.to_string(),
+            error: None,
+            applied,
+            failed,
+            skipped: resolution.skipped,
+            severities: resolution.severities,
+        })
     }
-    let severities: Map<String, Value> = resolution
-        .severities
-        .iter()
-        .map(|(id, severity)| (id.clone(), json!(severity.as_str())))
-        .collect();
-    Ok(json!({
-        "group": group,
-        "applied": applied_rules,
-        "failed": failed,
-        "skipped": resolution.skipped,
-        "severities": Value::Object(severities),
-    }))
 }
 
 /// `document` with the every-rule group of a project that declared none
@@ -494,17 +322,17 @@ pub(super) fn rule_document(graph: &GraphStore, repository_id: &str) -> Result<O
 
 /// One rule's application to one episode: the rule's query runs in its own
 /// graph transaction, between two whole-store snapshots, and the delta
-/// between them becomes the application's provenance. A failure rolls the
-/// transaction back — the rule leaves nothing behind — and surfaces as the
-/// caller's `failed` entry.
+/// between them becomes the application's provenance (see
+/// [`provenance`]). A failure rolls the transaction back — the rule leaves
+/// nothing behind — and surfaces as the caller's `failed` entry.
 fn apply_rule(
     graph: &GraphStore,
     repository_id: &str,
     episode: &str,
     rule: &Rule,
-) -> Result<Value> {
+) -> Result<AppliedRule> {
     graph.transaction(|db| {
-        let before = snapshot(db)?;
+        let before = provenance::snapshot(db)?;
         store_graph::write(
             db,
             &rule.cypher,
@@ -512,212 +340,16 @@ fn apply_rule(
                 "repo": repository_id, "episode": episode, "rule": rule.id,
             })),
         )?;
-        let delta = diff(&before, &snapshot(db)?);
-        write_application(db, repository_id, episode, rule, &delta)?;
-        Ok(json!({
-            "rule": rule.id,
-            "labels": delta.labels.len(),
-            "relationships": delta.created_rels.len(),
-            "properties": delta.node_props.len() + delta.rel_props.len(),
-            "nodes": delta.created_nodes.len(),
-        }))
-    })
-}
-
-/// What one rule's query wrote, as the diff between the snapshots around it.
-#[derive(Default)]
-struct Delta {
-    /// Nodes the rule created.
-    created_nodes: Vec<i64>,
-    /// Relationships the rule created (deleted whole on rollback, with
-    /// their properties).
-    created_rels: Vec<i64>,
-    /// `(node, label)` pairs the rule added — on existing nodes and on the
-    /// ones it created.
-    labels: Vec<(i64, String)>,
-    /// Properties the rule set on nodes — added or changed, on existing
-    /// nodes and on the ones it created.
-    node_props: Vec<(i64, String)>,
-    /// Properties the rule set on relationships that existed before it.
-    rel_props: Vec<(i64, String)>,
-}
-
-impl Delta {
-    fn is_empty(&self) -> bool {
-        self.created_nodes.is_empty()
-            && self.created_rels.is_empty()
-            && self.labels.is_empty()
-            && self.node_props.is_empty()
-            && self.rel_props.is_empty()
-    }
-}
-
-/// The store's nodes and relationships as they stand: the diff substrate.
-/// Two of these bracket one rule's query (see the module doc for the cost).
-struct Snapshot {
-    nodes: BTreeMap<i64, (BTreeSet<String>, Map<String, Value>)>,
-    rels: BTreeMap<i64, Map<String, Value>>,
-}
-
-fn snapshot(db: &mut cypherlite::Connection) -> Result<Snapshot> {
-    let nodes = store_graph::rows(
-        db,
-        "MATCH (n) RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props",
-        Params::new(),
-    )?;
-    let rels = store_graph::rows(
-        db,
-        "MATCH ()-[r]->() RETURN id(r) AS id, properties(r) AS props",
-        Params::new(),
-    )?;
-    let nodes = nodes
-        .into_iter()
-        .filter_map(|row| {
-            let id = row["id"].as_i64()?;
-            let labels = row["labels"]
-                .as_array()
-                .map(|labels| {
-                    labels
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default();
-            let props = row["props"].as_object().cloned().unwrap_or_default();
-            Some((id, (labels, props)))
+        let delta = provenance::diff(&before, &provenance::snapshot(db)?);
+        provenance::write_application(db, repository_id, episode, rule, &delta)?;
+        Ok(AppliedRule {
+            rule: rule.id.clone(),
+            labels: delta.labels.len(),
+            relationships: delta.created_rels.len(),
+            properties: delta.node_props.len() + delta.rel_props.len(),
+            nodes: delta.created_nodes.len(),
         })
-        .collect();
-    let rels = rels
-        .into_iter()
-        .filter_map(|row| {
-            let id = row["id"].as_i64()?;
-            let props = row["props"].as_object().cloned().unwrap_or_default();
-            Some((id, props))
-        })
-        .collect();
-    Ok(Snapshot { nodes, rels })
-}
-
-/// The delta from `before` to `after`: the writes a rule made. Additive
-/// writes only — deletions cannot be rolled back (see the module doc).
-fn diff(before: &Snapshot, after: &Snapshot) -> Delta {
-    let mut delta = Delta::default();
-    for (id, (labels, props)) in &after.nodes {
-        match before.nodes.get(id) {
-            None => {
-                delta.created_nodes.push(*id);
-                delta
-                    .labels
-                    .extend(labels.iter().map(|label| (*id, label.clone())));
-                delta
-                    .node_props
-                    .extend(props.keys().map(|prop| (*id, prop.clone())));
-            }
-            Some((old_labels, old_props)) => {
-                delta.labels.extend(
-                    labels
-                        .iter()
-                        .filter(|label| !old_labels.contains(*label))
-                        .map(|label| (*id, label.clone())),
-                );
-                delta.node_props.extend(
-                    props
-                        .iter()
-                        .filter(|(prop, value)| old_props.get(*prop) != Some(value))
-                        .map(|(prop, _)| (*id, prop.clone())),
-                );
-            }
-        }
-    }
-    for (id, props) in &after.rels {
-        match before.rels.get(id) {
-            None => delta.created_rels.push(*id),
-            Some(old_props) => {
-                delta.rel_props.extend(
-                    props
-                        .iter()
-                        .filter(|(prop, value)| old_props.get(*prop) != Some(value))
-                        .map(|(prop, _)| (*id, prop.clone())),
-                );
-            }
-        }
-    }
-    delta
-}
-
-/// Record the rule's application: the `:RuleApplication` node (MERGEd, so a
-/// replay of the same rule and episode writes nothing), its `:LABELED`
-/// edges for the labels, the `concept`/`episode` stamps on the relationships
-/// the rule created, and the provenance map the rollback reads.
-fn write_application(
-    db: &mut cypherlite::Connection,
-    repository_id: &str,
-    episode: &str,
-    rule: &Rule,
-    delta: &Delta,
-) -> Result<()> {
-    let key = || {
-        store_graph::params(&json!({"repo": repository_id, "rule": rule.id, "episode": episode}))
-    };
-    store_graph::write(
-        db,
-        "MERGE (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode})",
-        key(),
-    )?;
-    if delta.is_empty() {
-        return Ok(());
-    }
-    let grouped = |items: &[(i64, String)]| -> Value {
-        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (id, name) in items {
-            map.entry(id.to_string()).or_default().push(name.clone());
-        }
-        serde_json::to_value(map).unwrap_or_default()
-    };
-    let provenance = json!({
-        "nodes": delta.created_nodes,
-        "rels": delta.created_rels,
-        "node_props": grouped(&delta.node_props),
-        "rel_props": grouped(&delta.rel_props),
     })
-    .to_string();
-    store_graph::write(
-        db,
-        "MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode}) \
-         SET a.provenance = $provenance, a.applied_at = $now",
-        store_graph::params(&json!({
-            "repo": repository_id, "rule": rule.id, "episode": episode,
-            "provenance": provenance, "now": crate::now(),
-        })),
-    )?;
-    if !delta.labels.is_empty() {
-        let rows: Vec<Value> = delta
-            .labels
-            .iter()
-            .map(|(node, label)| json!({"node": node, "label": label}))
-            .collect();
-        store_graph::write(
-            db,
-            "UNWIND $rows AS row \
-             MATCH (a:RuleApplication {repository_id: $repo, rule: $rule, episode: $episode}), (n) \
-             WHERE id(n) = row.node \
-             MERGE (a)-[:LABELED {label: row.label}]->(n)",
-            store_graph::params(&json!({
-                "repo": repository_id, "rule": rule.id, "episode": episode, "rows": rows,
-            })),
-        )?;
-    }
-    if !delta.created_rels.is_empty() {
-        store_graph::write(
-            db,
-            "MATCH ()-[r]->() WHERE id(r) IN $ids SET r.concept = $rule, r.episode = $episode",
-            store_graph::params(&json!({
-                "ids": delta.created_rels, "rule": rule.id, "episode": episode,
-            })),
-        )?;
-    }
-    Ok(())
 }
 
 /// Whether the project holds any rule nodes (a concept or a constraint):
@@ -743,49 +375,15 @@ pub fn has_rules(graph: &GraphStore, repository_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch_rules::{parse, store as store_rules};
-
-    const REPO: &str = "repo";
-
-    /// An in-memory store holding `rules` (a Markdown rule document) and the
-    /// symbols the rules work on.
-    fn fixture(rules: &str, symbols: &[&str]) -> GraphStore {
-        let graph = GraphStore::open_in_memory().unwrap();
-        let document = parse(rules).unwrap();
-        store_rules(&graph, REPO, "rules.md", &document).unwrap();
-        add_symbols(&graph, symbols);
-        graph
-    }
-
-    fn add_symbols(graph: &GraphStore, ids: &[&str]) {
-        graph
-            .transaction(|db| {
-                for id in ids {
-                    store_graph::write(
-                        db,
-                        "CREATE (s:Symbol {repository_id: $repo, stable_id: $id, \
-                         kind: 'function', qualified_name: $id, relpath: 'src/lib.rs'})",
-                        store_graph::params(&json!({"repo": REPO, "id": id})),
-                    )?;
-                }
-                Ok(())
-            })
-            .unwrap();
-    }
+    use crate::arch_rules::tests::{REPO, SHARED, add_symbols, count, rules_graph};
+    use crate::store_graph::Params;
+    use serde_json::Value;
 
     fn enrich(graph: &GraphStore, episode: &str) -> Value {
         let leasing = || Ok(());
-        super::enrich(graph, REPO, episode, &leasing).unwrap()
-    }
-
-    fn count(graph: &GraphStore, cypher: &str) -> i64 {
-        graph
-            .read(|db| {
-                store_graph::rows(db, cypher, store_graph::params(&json!({"repo": REPO})))
-            })
-            .unwrap()[0]["n"]
-            .as_i64()
+        super::enrich(graph, REPO, episode, &leasing)
             .unwrap()
+            .to_value()
     }
 
     /// The store as one comparable value: every node with its labels and
@@ -808,17 +406,9 @@ mod tests {
             .unwrap()
     }
 
-    /// The rules the provenance tests share: a label, a relationship, a
-    /// property and a created node, one rule each, plus a constraint.
-    const SHARED: &str = "````concept\nid: arch:Test/Label\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) WHERE s.stable_id STARTS WITH 'db'\nSET s:Persistence\n```\n````\n\
-````concept\nid: arch:Test/Connect\nrequires: [arch:Test/Label]\n```cypher\nMATCH (a:Symbol {repository_id: $repo, stable_id: 'db_one'}), (b:Symbol {repository_id: $repo, stable_id: 'db_two'})\nMERGE (a)-[:PERSISTS_IN]->(b)\n```\n````\n\
-````concept\nid: arch:Test/Confidence\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) SET s.arch_confidence = 0.8\n```\n````\n\
-````concept\nid: arch:Test/Layer\n```cypher\nMERGE (l:Layer {repository_id: $repo, name: 'Persistence'})\n```\n````\n\
-````constraint\nid: arch:Test/NoCycles\nseverity: BLOCKER\nrequires: [arch:Test/Connect]\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) RETURN s\n```\n````\n";
-
     #[test]
     fn applies_concepts_in_resolution_order_and_carries_constraints() {
-        let graph = fixture(SHARED, &["db_one", "db_two", "plain"]);
+        let graph = rules_graph(SHARED, &["db_one", "db_two", "plain"]);
         let report = enrich(&graph, "ep-1");
 
         // Every concept ran; the constraint did not (a later node evaluates
@@ -940,7 +530,7 @@ mod tests {
     /// The failure probe's store: [`PROBE_RULES`] over an Object node whose
     /// key the failing CREATE duplicates.
     fn graph_with_probe() -> GraphStore {
-        let graph = fixture(PROBE_RULES, &["db_one", "db_two", "plain"]);
+        let graph = rules_graph(PROBE_RULES, &["db_one", "db_two", "plain"]);
         graph
             .transaction(|db| {
                 store_graph::write(
@@ -956,7 +546,7 @@ mod tests {
 
     #[test]
     fn reapplying_the_same_rule_set_to_the_same_episode_changes_nothing() {
-        let graph = fixture(SHARED, &["db_one", "db_two", "plain"]);
+        let graph = rules_graph(SHARED, &["db_one", "db_two", "plain"]);
         enrich(&graph, "ep-1");
         let before = state(&graph);
         let again = enrich(&graph, "ep-1");
@@ -973,64 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn rollback_removes_exactly_one_rules_writes() {
-        let graph = fixture(SHARED, &["db_one", "db_two", "plain"]);
-        enrich(&graph, "ep-1");
-
-        // The middle rule: a relationship between two symbols.
-        let removed = rollback(&graph, REPO, "arch:Test/Connect", "ep-1").unwrap();
-        assert_eq!(removed["relationships"], json!(1), "{removed:#}");
-        assert_eq!(
-            count(&graph, "MATCH ()-[r:PERSISTS_IN]->() RETURN count(r) AS n"),
-            0,
-            "the rule's relationship is gone"
-        );
-        assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {rule: 'arch:Test/Connect'}) RETURN count(a) AS n"),
-            0
-        );
-        // Every other rule's writes are untouched.
-        assert_eq!(count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"), 2);
-        assert_eq!(
-            count(&graph, "MATCH (s:Symbol) WHERE s.arch_confidence = 0.8 RETURN count(s) AS n"),
-            3
-        );
-        assert_eq!(count(&graph, "MATCH (l:Layer) RETURN count(l) AS n"), 1);
-        assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication) RETURN count(a) AS n"),
-            3
-        );
-
-        // The label rule: labels off the symbols it labelled (which it did
-        // not create), the symbols themselves kept.
-        let removed = rollback(&graph, REPO, "arch:Test/Label", "ep-1").unwrap();
-        assert_eq!(removed["labels"], json!(2), "{removed:#}");
-        assert_eq!(removed["nodes"], json!(0), "{removed:#}");
-        assert_eq!(count(&graph, "MATCH (s:Symbol:Persistence) RETURN count(s) AS n"), 0);
-        assert_eq!(count(&graph, "MATCH (s:Symbol) RETURN count(s) AS n"), 3);
-
-        // The node-creating rule: the node goes with its rule.
-        let removed = rollback(&graph, REPO, "arch:Test/Layer", "ep-1").unwrap();
-        assert_eq!(removed["nodes"], json!(1), "{removed:#}");
-        assert_eq!(count(&graph, "MATCH (l:Layer) RETURN count(l) AS n"), 0);
-
-        // The property rule.
-        let removed = rollback(&graph, REPO, "arch:Test/Confidence", "ep-1").unwrap();
-        assert_eq!(removed["properties"], json!(3), "{removed:#}");
-        assert_eq!(
-            count(&graph, "MATCH (s) WHERE s.arch_confidence IS NOT NULL RETURN count(s) AS n"),
-            0
-        );
-
-        // A rule that never ran rolls back nothing.
-        let none = rollback(&graph, REPO, "arch:Test/Missing", "ep-1").unwrap();
-        assert_eq!(none["labels"], json!(0));
-        assert_eq!(none["nodes"], json!(0));
-    }
-
-    #[test]
     fn each_episode_enriches_on_its_own_and_keeps_its_applications() {
-        let graph = fixture(SHARED, &["db_one", "db_two"]);
+        let graph = rules_graph(SHARED, &["db_one", "db_two"]);
         enrich(&graph, "ep-1");
         // The next episode's graph: one more symbol for the rules to find.
         add_symbols(&graph, &["db_late"]);
@@ -1078,7 +612,7 @@ mod tests {
         let rules = "````concept\nid: arch:A\nseverity: MINOR\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) SET s:Grouped\n```\n````\n\
 ````concept\nid: arch:B\nseverity: MAJOR\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) SET s.b_prop = 1\n```\n````\n\
 ````group\nid: arch:picked\ninclude: [arch:A]\noverrides: [arch:A=CRITICAL]\n````\n";
-        let graph = fixture(rules, &["one"]);
+        let graph = rules_graph(rules, &["one"]);
         let report = enrich(&graph, "ep-1");
         assert_eq!(report["applied"], json!(1), "{report:#}");
         let plan = &report["plans"][0];
@@ -1091,7 +625,7 @@ mod tests {
 
     #[test]
     fn has_rules_reads_the_stored_rule_nodes() {
-        let with = fixture(SHARED, &[]);
+        let with = rules_graph(SHARED, &[]);
         assert!(has_rules(&with, REPO).unwrap());
         assert!(!has_rules(&with, "other").unwrap());
         let without = GraphStore::open_in_memory().unwrap();
