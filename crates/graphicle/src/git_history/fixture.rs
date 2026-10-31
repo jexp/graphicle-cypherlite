@@ -31,6 +31,8 @@ pub const DAY_1: &str = "2026-01-01T00:00:00+00:00";
 pub const DAY_2: &str = "2026-01-02T00:00:00+00:00";
 pub const DAY_3: &str = "2026-01-03T00:00:00+00:00";
 pub const DAY_4: &str = "2026-01-04T00:00:00+00:00";
+pub const DAY_5: &str = "2026-01-05T00:00:00+00:00";
+pub const DAY_6: &str = "2026-01-06T00:00:00+00:00";
 
 pub fn ada(date: &'static str) -> Ident {
     Ident {
@@ -284,5 +286,19 @@ pub fn history_fixture() -> (tempfile::TempDir, Repo, Scenario) {
         octopus,
         delete,
     };
+    (dir, repo, scenario)
+}
+
+/// [`history_fixture`] plus two commits by Ada that always change
+/// `src/pay.rs` and `src/tax.rs` together: the known-coupled pair of the
+/// coupling tests. The base history is untouched, so its own pairs stay
+/// what [`history_fixture`] makes them.
+pub fn coupled_fixture() -> (tempfile::TempDir, Repo, Scenario) {
+    let (dir, repo, scenario) = history_fixture();
+    for (day, note) in [(DAY_5, "pay one"), (DAY_6, "pay two")] {
+        repo.write("src/pay.rs", &format!("pay {note}\n"));
+        repo.write("src/tax.rs", &format!("tax {note}\n"));
+        repo.commit(ada(day), &format!("{note}: pay and tax"), "");
+    }
     (dir, repo, scenario)
 }
