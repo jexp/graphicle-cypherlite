@@ -374,10 +374,12 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
                 &worker.store.graph(),
                 repo,
                 p,
-                &value["claims"],
-                input["sources"].as_array().unwrap(),
-                &target_context,
-                &json!({"model":profile.model,"job_id":job.id}),
+                claims::Proposal {
+                    claims: &value["claims"],
+                    sources: input["sources"].as_array().unwrap(),
+                    targets: &target_context,
+                    provider: &json!({"model":profile.model,"job_id":job.id}),
+                },
             )?;
             // A derived result inherits visibility from every source supplied to
             // the model, including disambiguating context it did not cite.

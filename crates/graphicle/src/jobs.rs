@@ -114,20 +114,36 @@ fn job_row(db: &mut GConnection, job_id: &str) -> Result<Option<Value>> {
     Ok(row)
 }
 
+/// A queued job as `insert_job` writes it: the repository and workspace it
+/// is scoped to, its kind, the input hash that dedupes replays, the payload
+/// it answers, the principal that asked for it, and the queue's scheduling
+/// bounds (`priority`, `max_attempts`).
+#[derive(Clone, Copy)]
+struct JobSpec<'a> {
+    repository: &'a str,
+    workspace: &'a str,
+    kind: &'a str,
+    input_hash: &'a str,
+    payload: &'a Value,
+    principal_hash: &'a str,
+    priority: i64,
+    max_attempts: i64,
+}
+
 /// Insert a queued job node and, when the graph knows the project, its
 /// `[:OF]` edge (the content-store node migrates `Project` later; the edge
 /// attaches from then on).
-fn insert_job(
-    db: &mut GConnection,
-    repository: &str,
-    workspace: &str,
-    kind: &str,
-    input_hash: &str,
-    payload: &Value,
-    principal_hash: &str,
-    priority: i64,
-    max_attempts: i64,
-) -> Result<String> {
+fn insert_job(db: &mut GConnection, spec: &JobSpec<'_>) -> Result<String> {
+    let JobSpec {
+        repository,
+        workspace,
+        kind,
+        input_hash,
+        payload,
+        principal_hash,
+        priority,
+        max_attempts,
+    } = *spec;
     let job_id = id();
     let stamp = now();
     let encoded = payload.to_string();
@@ -526,14 +542,16 @@ pub fn enqueue_projection(
     let job_id = graph.transaction(|db| {
         insert_job(
             db,
-            repository,
-            &p.workspace,
-            "project",
-            &input_hash,
-            &payload,
-            &p.hash,
-            -1,
-            3,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "project",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
         )
     })?;
     store::event(
@@ -835,14 +853,16 @@ pub fn enqueue_link(
     let job_id = graph.transaction(|db| {
         insert_job(
             db,
-            repository,
-            &p.workspace,
-            "link",
-            &input_hash,
-            &payload,
-            &p.hash,
-            -1,
-            3,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "link",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
         )
     })?;
     store::event(
@@ -974,14 +994,16 @@ pub fn enqueue_enrich(
     let job_id = graph.transaction(|db| {
         insert_job(
             db,
-            repository,
-            &p.workspace,
-            "enrich",
-            &input_hash,
-            &payload,
-            &p.hash,
-            -1,
-            3,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "enrich",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
         )
     })?;
     store::event(
@@ -1550,14 +1572,16 @@ pub fn queue(
     let identifier_job = graph.transaction(|db| {
         insert_job(
             db,
-            identifier,
-            &p.workspace,
-            kind,
-            &input_hash,
-            &payload,
-            &p.hash,
-            0,
-            max_attempts as i64,
+            &JobSpec {
+                repository: identifier,
+                workspace: &p.workspace,
+                kind,
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: 0,
+                max_attempts: max_attempts as i64,
+            },
         )
     })?;
     store::event(

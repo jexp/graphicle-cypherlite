@@ -163,10 +163,10 @@ fn holds(path: &Path, text: &str) -> bool {
                 if within(&entry.path(), text) {
                     return true;
                 }
-            } else if let Ok(bytes) = std::fs::read(entry.path()) {
-                if bytes.windows(text.len()).any(|w| w == text.as_bytes()) {
-                    return true;
-                }
+            } else if let Ok(bytes) = std::fs::read(entry.path())
+                && bytes.windows(text.len()).any(|w| w == text.as_bytes())
+            {
+                return true;
             }
         }
         false

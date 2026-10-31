@@ -821,10 +821,12 @@ fn reviewed_correction_retires_only_the_target_and_preserves_history() {
                     &f.store.graph(),
                     &repo,
                     p,
-                    &json!([value]),
-                    &sources,
-                    &targets,
-                    &json!({"model":"review fixture"}),
+                    claims::Proposal {
+                        claims: &json!([value]),
+                        sources: &sources,
+                        targets: &targets,
+                        provider: &json!({"model":"review fixture"}),
+                    },
                 )
             })
             .unwrap()

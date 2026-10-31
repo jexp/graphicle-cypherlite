@@ -1109,14 +1109,14 @@ fn forget_reflection(
         .as_array()
         .is_some_and(|v| v.iter().any(|x| x == source))
     {
-        return Ok(graph.transaction(|g| {
+        return graph.transaction(|g| {
             Ok(store_graph::write(
                 g,
                 "MATCH (m:MentalModel {repository_id: $repo}) DETACH DELETE m",
                 store_graph::params(&json!({"repo":repository})),
             )?
             .nodes_deleted as usize)
-        })?);
+        });
     }
     Ok(0)
 }

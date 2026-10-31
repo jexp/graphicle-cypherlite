@@ -391,15 +391,15 @@ fn attributes(inner: &str, line: usize) -> Vec<Attr> {
             // The `source` keyword itself; the language is the next item.
             continue;
         }
-        if let Some((key, value)) = item.split_once('=') {
-            if model::is_key(key.trim()) {
-                out.push(Attr {
-                    key: key.trim().to_string(),
-                    value: unquote(value),
-                    line,
-                });
-                continue;
-            }
+        if let Some((key, value)) = item.split_once('=')
+            && model::is_key(key.trim())
+        {
+            out.push(Attr {
+                key: key.trim().to_string(),
+                value: unquote(value),
+                line,
+            });
+            continue;
         }
         let key = match index {
             _ if is_source => "source",

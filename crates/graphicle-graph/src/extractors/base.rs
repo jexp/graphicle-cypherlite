@@ -109,11 +109,11 @@ fn decode_utf16_with_bom(raw: &[u8]) -> Option<String> {
     if !body.len().is_multiple_of(2) {
         return None;
     }
-    let units = body.chunks_exact(2).map(|u| {
+    let units = body.as_chunks::<2>().0.iter().map(|u| {
         if little {
-            u16::from_le_bytes([u[0], u[1]])
+            u16::from_le_bytes(*u)
         } else {
-            u16::from_be_bytes([u[0], u[1]])
+            u16::from_be_bytes(*u)
         }
     });
     char::decode_utf16(units)
@@ -127,12 +127,14 @@ fn decode_utf32_with_bom(raw: &[u8]) -> Option<String> {
     if !body.len().is_multiple_of(4) {
         return None;
     }
-    body.chunks_exact(4)
+    body.as_chunks::<4>()
+        .0
+        .iter()
         .map(|u| {
             char::from_u32(if little {
-                u32::from_le_bytes([u[0], u[1], u[2], u[3]])
+                u32::from_le_bytes(*u)
             } else {
-                u32::from_be_bytes([u[0], u[1], u[2], u[3]])
+                u32::from_be_bytes(*u)
             })
         })
         .collect()

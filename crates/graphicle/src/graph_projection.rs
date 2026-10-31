@@ -617,11 +617,13 @@ pub fn persist_with_report(
             db,
             store,
             repository,
-            episode,
             graph,
-            &heads,
-            recorded.parent.as_deref(),
-            delta.dirty(),
+            crate::symbols::Recording {
+                episode,
+                heads: &heads,
+                parent: recorded.parent.as_deref(),
+                dirty: delta.dirty(),
+            },
         )?;
     }
     Ok(true)
@@ -1898,7 +1900,7 @@ pub fn project_store(
                 // its own job (architecture-concepts.md §1.5), as it does
                 // behind the projection job; a failure to queue it must not
                 // fail the projection itself.
-                let _ = crate::jobs::enqueue_enrich(store, db, identifier, &p, &episode);
+                let _ = crate::jobs::enqueue_enrich(store, db, identifier, p, &episode);
                 projected
             }
             Some(_) => Err(Error::conflict("Repository changed while projecting")),
@@ -2706,7 +2708,9 @@ pub fn link_workspace(
     }
     let mut repos: Vec<Linkable> = Vec::new();
     for (id, name, episode, current) in candidates {
-        let graph = resident(store, &id, &episode)?;
+        // resident() materializes the episode's graph and registers it in
+        // the live registry; the binding is only its residue.
+        let _graph = resident(store, &id, &episode)?;
         let heads = episode_heads(db, store, &id, &episode)?.unwrap_or_default();
         let manifests = manifests(db, &id, &heads)?;
         let stored = if incremental {
