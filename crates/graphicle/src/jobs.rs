@@ -1218,13 +1218,21 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
             .map(str::to_string),
         range: None,
     };
-    let ingested =
+    let mut ingested =
         crate::git_history::writer::ingest(&graph, &identifier, &folder, &window, &|| {
             leased(&graph, job)
         })?;
     // The commits this run ingested may be the ones the episode's head set
     // is the tree of (episode correlation).
     crate::git_history::correlation::correlate_head(&graph, &identifier, &folder)?;
+    // Changes resolve against the episodes correlation just recorded
+    // (change resolution, episode-lagged by design).
+    ingested["resolution"] = crate::git_history::resolution::resolve(
+        &graph,
+        &identifier,
+        &folder,
+        &|| leased(&graph, job),
+    )?;
     Ok(ingested)
 }
 
