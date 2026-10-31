@@ -64,7 +64,12 @@ fn sections(domain: &str, script: &str) -> Result<Vec<Section>> {
         }
     }
     for section in &mut out {
-        section.statement = section.statement.trim().trim_end_matches(';').trim().to_string();
+        section.statement = section
+            .statement
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
         if section.verify.is_empty() || section.statement.is_empty() {
             return Err(Error::bad(format!(
                 "migrate {domain}: section {} needs a statement and a @verify count",

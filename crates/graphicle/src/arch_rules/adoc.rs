@@ -96,13 +96,19 @@ fn splice(
         let trimmed = text.trim();
         if let Some(target) = include_target(trimmed) {
             if depth >= MAX_INCLUDE_DEPTH {
-                return Err(problem(file, no, "include:: files nest deeper than 8 levels"));
+                return Err(problem(
+                    file,
+                    no,
+                    "include:: files nest deeper than 8 levels",
+                ));
             }
             if target.contains('{') {
                 return Err(problem(
                     file,
                     no,
-                    format!("include target '{target}' uses an attribute reference, which is not supported"),
+                    format!(
+                        "include target '{target}' uses an attribute reference, which is not supported"
+                    ),
                 ));
             }
             let Some(dir) = base else {
@@ -167,7 +173,10 @@ fn scan(lines: &[Line]) -> Result<Vec<RawBlock>, RuleError> {
             pending.anchor.get_or_insert((id.to_string(), no));
             continue;
         }
-        if let Some(inner) = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        if let Some(inner) = text
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
             pending.start(no, file);
             pending.attrs.extend(attributes(inner, no));
             continue;
@@ -277,10 +286,16 @@ fn to_block(kind: Kind, pending: &Pending, body: Option<String>) -> Result<RawBl
     } else if let Some((title, at)) = &pending.title {
         fields.push(field("description", title, *at));
     }
-    if let Some((items, at)) = list_attrs(pending, &["requires", "requiresConcept", "requiresConcepts"]) {
+    if let Some((items, at)) = list_attrs(
+        pending,
+        &["requires", "requiresConcept", "requiresConcepts"],
+    ) {
         fields.push(field("requires", &bracketed(&items), at));
     }
-    if let Some((items, at)) = list_attrs(pending, &["include", "includesConcepts", "includesConstraints"]) {
+    if let Some((items, at)) = list_attrs(
+        pending,
+        &["include", "includesConcepts", "includesConstraints"],
+    ) {
         fields.push(field("include", &bracketed(&items), at));
     }
     if let Some(attr) = single(&ctx, pending, "severity")? {
@@ -311,7 +326,8 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn invalid(&self, message: String) -> RuleError {
-        RuleError::new(self.kind.name(), None, self.line, Reason::Invalid(message)).in_file(self.file)
+        RuleError::new(self.kind.name(), None, self.line, Reason::Invalid(message))
+            .in_file(self.file)
     }
 }
 
@@ -334,7 +350,11 @@ fn single<'a>(ctx: &Ctx, pending: &'a Pending, key: &str) -> Result<Option<&'a A
 fn list_attrs(pending: &Pending, keys: &[&str]) -> Option<(Vec<String>, usize)> {
     let mut items = Vec::new();
     let mut first = None;
-    for attr in pending.attrs.iter().filter(|attr| keys.contains(&attr.key.as_str())) {
+    for attr in pending
+        .attrs
+        .iter()
+        .filter(|attr| keys.contains(&attr.key.as_str()))
+    {
         first.get_or_insert(attr.line);
         items.extend(
             attr.value

@@ -302,7 +302,12 @@ pub fn purge_derived_cache(
         )?;
         Ok(())
     })?;
-    for table in ["am_vectors", "am_document_reads", "am_reports", "am_communities"] {
+    for table in [
+        "am_vectors",
+        "am_document_reads",
+        "am_reports",
+        "am_communities",
+    ] {
         db.execute(
             &format!("DELETE FROM {table} WHERE repository_id=?"),
             [repository],

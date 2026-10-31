@@ -518,7 +518,12 @@ fn converted(
     store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
         let project = crate::store::repo(db, p, repository)?;
         let mut found = std::collections::HashMap::new();
-        if !crate::fresh::converted_here(&store.graph(), &p.workspace, root, s(&project, "snapshot"))? {
+        if !crate::fresh::converted_here(
+            &store.graph(),
+            &p.workspace,
+            root,
+            s(&project, "snapshot"),
+        )? {
             return Ok(found);
         }
         // Binary conversions are SQL (`am_binary_heads`); the heads and
@@ -533,8 +538,11 @@ fn converted(
             if heads.get(&path) != Some(&source_sha) {
                 continue;
             }
-            let Some(text) =
-                crate::store_content::object_content(&store.graph(), s(&project, "id"), &source_sha)?
+            let Some(text) = crate::store_content::object_content(
+                &store.graph(),
+                s(&project, "id"),
+                &source_sha,
+            )?
             else {
                 continue;
             };
@@ -915,7 +923,13 @@ fn sync_folder_with(
             }
             // The folder is this project's from now on.
             crate::folders::record(&store.graph(), &p.workspace, &repository, &root)?;
-            crate::fresh::record(&store.graph(), &p.workspace, &root, &mark, s(&current, "snapshot"))?;
+            crate::fresh::record(
+                &store.graph(),
+                &p.workspace,
+                &root,
+                &mark,
+                s(&current, "snapshot"),
+            )?;
             Ok(())
         },
     )?;
@@ -1534,7 +1548,9 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     if graph_backup.is_dir() {
         let destination = directory.join("reviews.graph");
         let copied = (|| -> Result<()> {
-            std::fs::DirBuilder::new().mode(0o700).create(&destination)?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&destination)?;
             for file in ["manifest.json", "graph.json"] {
                 let source = graph_backup.join(file);
                 if source.is_file() {

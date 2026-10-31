@@ -43,7 +43,9 @@ fn acl_parts(acl: &Value) -> (bool, Vec<String>) {
 /// A JSON column as a graph string property: the engine stores scalars and
 /// lists of scalars, no maps, so config/metadata/cursor JSON is text again.
 fn jtext(value: &Value) -> Result<cypherlite::Value> {
-    Ok(cypherlite::Value::String(serde_json::to_string(value)?.into()))
+    Ok(cypherlite::Value::String(
+        serde_json::to_string(value)?.into(),
+    ))
 }
 
 /// A connector row with its `config` and `cursor` text columns decoded.
@@ -55,7 +57,10 @@ fn decoded(mut connector: Value) -> Result<Value> {
 
 /// One connector by id, from outside a graph transaction (crate-internal
 /// callers with only the store in hand, e.g. `documents::import_binary`).
-pub(crate) fn get_connector_pub(store: &graph::GraphStore, identifier: &str) -> Result<Option<Value>> {
+pub(crate) fn get_connector_pub(
+    store: &graph::GraphStore,
+    identifier: &str,
+) -> Result<Option<Value>> {
     store.read(|db| get_connector(db, identifier))
 }
 
@@ -1312,7 +1317,10 @@ pub async fn probe(worker: &Worker, job: &Job) -> Result<Value> {
         },
     };
     jobs::guarded(&worker.store, job, |_, _, _| {
-        worker.store.graph().transaction(|db| ensure_connector(db, &connector))
+        worker
+            .store
+            .graph()
+            .transaction(|db| ensure_connector(db, &connector))
     })?;
     Ok(
         json!({"status":"connected","kind":kind,"identity":identity,"target":target,"requests":remote.calls,"checked_at":now(),
@@ -1454,11 +1462,24 @@ pub async fn sync(worker: &Worker, job: &Job) -> Result<Value> {
             == cursor["items"].as_array().unwrap().len();
     let generation = if complete {
         Some(jobs::guarded(&worker.store, job, |db, p, _| {
-            worker.store.graph().transaction(|gdb| {
-                ensure_connector(gdb, &connector)
-            })?;
-            let generation = activate(&worker.store.graph(), db, &connector, s(&cursor, "scan_id"), true)?;
-            crate::doc_links::after_sync(&worker.store, db, &job.repository, s(&connector, "id"), p)?;
+            worker
+                .store
+                .graph()
+                .transaction(|gdb| ensure_connector(gdb, &connector))?;
+            let generation = activate(
+                &worker.store.graph(),
+                db,
+                &connector,
+                s(&cursor, "scan_id"),
+                true,
+            )?;
+            crate::doc_links::after_sync(
+                &worker.store,
+                db,
+                &job.repository,
+                s(&connector, "id"),
+                p,
+            )?;
             Ok(generation)
         })?)
     } else {

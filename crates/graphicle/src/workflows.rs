@@ -683,7 +683,7 @@ async fn semantic_rankings_role(
         .filter(|(identity, sha)| valid.get(identity.as_str()) == Some(&sha.as_str()))
         .count();
     // Writes a cached-call record, so it takes the write path.
-let mut query_vectors = {
+    let mut query_vectors = {
         let graph = worker.store.graph();
         jobs::guarded(&worker.store, job, |_, _, _| {
             let queries = graph.transaction(|db| {

@@ -158,7 +158,12 @@ fn unfinished(rounds: &[&Value]) -> bool {
         .is_some_and(|r| r["state"] == "complete" && r["result"]["complete"] == false)
 }
 
-fn decide(store: &Store, db: &Connection, connector: &Value, config: &model::Config) -> Result<Value> {
+fn decide(
+    store: &Store,
+    db: &Connection,
+    connector: &Value,
+    config: &model::Config,
+) -> Result<Value> {
     let id = s(connector, "id");
     let repository_id = s(connector, "repository_id");
     let generation = connector["generation"].as_i64().unwrap_or(0);

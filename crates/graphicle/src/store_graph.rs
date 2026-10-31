@@ -182,9 +182,7 @@ impl GraphStore {
                                 *slot = Arc::downgrade(&database);
                                 return Ok(database);
                             }
-                            Err(cypherlite::Error::Locked(_))
-                                if Instant::now() < deadline =>
-                            {
+                            Err(cypherlite::Error::Locked(_)) if Instant::now() < deadline => {
                                 drop(slot);
                                 std::thread::sleep(LEASE_RETRY);
                             }

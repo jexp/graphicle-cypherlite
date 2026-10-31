@@ -2568,7 +2568,15 @@ fn mcp_in(
                             workspace,
                             capability,
                             "read",
-                            |db, p| crate::folders::named(&app.worker.store.graph(), db, p, named, app.mcp.cwd.as_deref()),
+                            |db, p| {
+                                crate::folders::named(
+                                    &app.worker.store.graph(),
+                                    db,
+                                    p,
+                                    named,
+                                    app.mcp.cwd.as_deref(),
+                                )
+                            },
                         )?;
                         args["repository_id"] = json!(named);
                     }

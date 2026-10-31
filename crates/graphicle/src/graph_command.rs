@@ -185,7 +185,9 @@ pub fn project_with_graph(
     let graph = directory
         .join("reviews.graph")
         .exists()
-        .then(|| crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok())
+        .then(|| {
+            crate::store_graph::GraphStore::open_read_only(directory.join("reviews.graph")).ok()
+        })
         .flatten()?;
     let found = crate::folders::project_for_path(&graph, &db, &principal, folder).ok()??;
     let built = crate::symbols::has_symbol_state(&graph, &found.id)

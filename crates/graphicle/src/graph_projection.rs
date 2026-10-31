@@ -2881,8 +2881,7 @@ pub fn link_workspace(
                 .map(|(_, (repo, surface))| json!([repo.id, surface]))
                 .collect::<Vec<_>>(),
         ]));
-        let reuse =
-            incremental && keep_state && unchanged_link(store, db, &importer.id, &inputs)?;
+        let reuse = incremental && keep_state && unchanged_link(store, db, &importer.id, &inputs)?;
         let report = if reuse {
             reused.push(importer.id.as_str());
             previous_report(store, &importer.id, &importer.episode)?
@@ -3152,7 +3151,9 @@ fn below(path: &str, prefix: &str) -> bool {
 fn nested_prefixes(db: &Connection, repos: &[Linkable]) -> Result<HashMap<String, Vec<String>>> {
     let mut folders: Vec<(&str, PathBuf)> = Vec::with_capacity(repos.len());
     for repo in repos {
-        if let Some(folder) = crate::folders::current_folder(&*crate::store::graph_for(db)?, &repo.id)? {
+        if let Some(folder) =
+            crate::folders::current_folder(&*crate::store::graph_for(db)?, &repo.id)?
+        {
             folders.push((repo.id.as_str(), folder));
         }
     }

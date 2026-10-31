@@ -1864,8 +1864,9 @@ fn another_producers_rows_stay_and_are_not_read_without_it() {
          CREATE (d)-[l:LINKS_TO]->(d) SET l += row.props",
         params,
     );
-    let extension =
-        || f.gcount("MATCH ()-[l:LINKS_TO]->() WHERE l.producer='an-extension' RETURN count(l) AS n");
+    let extension = || {
+        f.gcount("MATCH ()-[l:LINKS_TO]->() WHERE l.producer='an-extension' RETURN count(l) AS n")
+    };
     assert_eq!(extension(), 1);
     // The page changes: the job rewrites its own rows only.
     let edited = format!("{PROTOCOL}\nSee also the release notes.\n");

@@ -314,7 +314,9 @@ mod tests {
                         db,
                         "CREATE (s:Symbol {repository_id: $repo, stable_id: $id, \
                          kind: 'function', qualified_name: $id, relpath: $path, line: 7})",
-                        store_graph::params(&json!({"repo": REPO, "id": id, "path": format!("src/{id}.rs")})),
+                        store_graph::params(
+                            &json!({"repo": REPO, "id": id, "path": format!("src/{id}.rs")}),
+                        ),
                     )?;
                 }
                 Ok(())
@@ -366,15 +368,28 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:#?}");
         let constraint = parse(&rules).unwrap().constraints[0].rule_sha.clone();
         for row in &rows {
-            assert_eq!(row["severity"], json!("BLOCKER"), "override applied: {row:#}");
+            assert_eq!(
+                row["severity"],
+                json!("BLOCKER"),
+                "override applied: {row:#}"
+            );
             assert_eq!(row["sha"], json!(constraint));
             assert_eq!(row["episode"], json!("ep-1"));
             assert_eq!(row["line"], json!(7));
-            assert!(row["path"].as_str().unwrap().starts_with("src/bad_"), "{row:#}");
-            assert!(row["node"].as_str().unwrap().contains("stable_id"), "{row:#}");
+            assert!(
+                row["path"].as_str().unwrap().starts_with("src/bad_"),
+                "{row:#}"
+            );
+            assert!(
+                row["node"].as_str().unwrap().contains("stable_id"),
+                "{row:#}"
+            );
         }
         assert_eq!(
-            count(&graph, "MATCH (v:Violation)-[:IN_PROJECT]->(:Project {id: 'repo'}) RETURN count(v) AS n"),
+            count(
+                &graph,
+                "MATCH (v:Violation)-[:IN_PROJECT]->(:Project {id: 'repo'}) RETURN count(v) AS n"
+            ),
             2
         );
     }
@@ -390,13 +405,19 @@ mod tests {
         run(&graph, "ep-1");
         run(&graph, "ep-1");
         assert_eq!(
-            count(&graph, "MATCH (v:Violation {episode: 'ep-1'}) RETURN count(v) AS n"),
+            count(
+                &graph,
+                "MATCH (v:Violation {episode: 'ep-1'}) RETURN count(v) AS n"
+            ),
             1
         );
         // Another episode keeps its own rows.
         run(&graph, "ep-2");
         assert_eq!(
-            count(&graph, "MATCH (v:Violation {episode: 'ep-2'}) RETURN count(v) AS n"),
+            count(
+                &graph,
+                "MATCH (v:Violation {episode: 'ep-2'}) RETURN count(v) AS n"
+            ),
             1
         );
         assert_eq!(count(&graph, "MATCH (v:Violation) RETURN count(v) AS n"), 2);

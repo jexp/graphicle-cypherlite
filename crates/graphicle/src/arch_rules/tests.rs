@@ -41,9 +41,7 @@ pub(crate) fn add_symbols(graph: &GraphStore, ids: &[&str]) {
 /// The first row's `n` of a `$repo`-scoped count query.
 pub(crate) fn count(graph: &GraphStore, cypher: &str) -> i64 {
     graph
-        .read(|db| {
-            store_graph::rows(db, cypher, store_graph::params(&json!({"repo": REPO})))
-        })
+        .read(|db| store_graph::rows(db, cypher, store_graph::params(&json!({"repo": REPO}))))
         .unwrap()[0]["n"]
         .as_i64()
         .unwrap()
@@ -66,7 +64,11 @@ fn fixture(name: &str) -> PathBuf {
 /// The document with block line numbers cleared: two frontends place the same
 /// rule at different lines, so the comparison is on content.
 fn without_lines(mut document: RuleDocument) -> RuleDocument {
-    for rule in document.concepts.iter_mut().chain(document.constraints.iter_mut()) {
+    for rule in document
+        .concepts
+        .iter_mut()
+        .chain(document.constraints.iter_mut())
+    {
         rule.line = 0;
     }
     for group in &mut document.groups {
@@ -112,10 +114,19 @@ fn adoc_spells_severity_and_requires_as_jqa_does() {
     let document = parse_file(&fixture("git.adoc")).unwrap();
 
     // `severity=MINOR` as a bare attribute, `severity="MAJOR"` quoted.
-    assert_eq!(rule(&document, "fixture-git:CommitsPerMonth").severity, Severity::Minor);
-    assert_eq!(rule(&document, "fixture-git:BusFactorRisk").severity, Severity::Major);
+    assert_eq!(
+        rule(&document, "fixture-git:CommitsPerMonth").severity,
+        Severity::Minor
+    );
+    assert_eq!(
+        rule(&document, "fixture-git:BusFactorRisk").severity,
+        Severity::Major
+    );
     // No severity on a concept: INFO.
-    assert_eq!(rule(&document, "fixture-git:PersonsByEmail").severity, Severity::Info);
+    assert_eq!(
+        rule(&document, "fixture-git:PersonsByEmail").severity,
+        Severity::Info
+    );
 
     // `requiresConcept` (one reference) and `requiresConcepts` (a list).
     assert_eq!(
@@ -127,14 +138,18 @@ fn adoc_spells_severity_and_requires_as_jqa_does() {
         vec!["fixture-git:ChurnPerFile", "fixture-git:CommitsWithParents"]
     );
     // A jQA `role="concept"` (quoted) and `verify=` are read.
-    assert_eq!(rule(&document, "fixture-git:ChurnPerFile").description, "Count the commits that change each file.");
+    assert_eq!(
+        rule(&document, "fixture-git:ChurnPerFile").description,
+        "Count the commits that change each file."
+    );
 }
 
 #[test]
 fn adoc_example_in_the_format_doc_parses() {
     // The AsciiDoc example in docs/architecture-rules.md must parse as shown.
     let doc = include_str!("../../../../docs/architecture-rules.md");
-    let start = doc.find("```asciidoc\n[[arch:Layer/Persistence]]").unwrap() + "```asciidoc\n".len();
+    let start =
+        doc.find("```asciidoc\n[[arch:Layer/Persistence]]").unwrap() + "```asciidoc\n".len();
     let end = start + doc[start..].find("\n```\n").unwrap();
     let example = parse_adoc(&doc[start..end], None).unwrap();
     assert_eq!(example.concepts.len(), 1);
@@ -142,7 +157,10 @@ fn adoc_example_in_the_format_doc_parses() {
     assert_eq!(example.groups.len(), 1);
     assert_eq!(example.concepts[0].severity, Severity::Minor);
     assert_eq!(example.concepts[0].requires, vec!["arch:Module/*"]);
-    assert_eq!(example.groups[0].overrides, vec![("arch:NoCycles".to_string(), Severity::Major)]);
+    assert_eq!(
+        example.groups[0].overrides,
+        vec![("arch:NoCycles".to_string(), Severity::Major)]
+    );
 }
 
 #[test]
@@ -178,7 +196,10 @@ fn store_writes_the_same_nodes_from_either_frontend() {
             })
             .unwrap();
         assert_eq!(rows.len(), 2, "{label}: {rows:?}");
-        assert_eq!(rows[0]["n"], rows[1]["n"], "{label} counts match across frontends");
+        assert_eq!(
+            rows[0]["n"], rows[1]["n"],
+            "{label} counts match across frontends"
+        );
     }
 
     let sha = |repo: &str| {
@@ -195,7 +216,10 @@ fn store_writes_the_same_nodes_from_either_frontend() {
             .expect("concept node")
     };
     assert_eq!(sha("repo-a")["sha"], sha("repo-b")["sha"]);
-    assert_eq!(sha("repo-a")["sha"], json!(rule(&from_adoc, "fixture-git:ChurnPerFile").rule_sha));
+    assert_eq!(
+        sha("repo-a")["sha"],
+        json!(rule(&from_adoc, "fixture-git:ChurnPerFile").rule_sha)
+    );
 }
 
 #[test]
@@ -224,20 +248,30 @@ fn store_merges_rules_per_project() {
 fn parse_file_dispatches_on_extension() {
     let not_a_rule_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let error = parse_file(&not_a_rule_file).unwrap_err();
-    assert!(error.to_string().contains("expected .md or .adoc"), "{error}");
+    assert!(
+        error.to_string().contains("expected .md or .adoc"),
+        "{error}"
+    );
 }
 
 #[test]
 fn adoc_rejects_unknown_and_repeated_attributes() {
-    let unknown = adoc("[[arch:X]]\n[source,cypher,role=concept,severty=INFO]\n----\nRETURN 1\n----\n");
+    let unknown =
+        adoc("[[arch:X]]\n[source,cypher,role=concept,severty=INFO]\n----\nRETURN 1\n----\n");
     assert_eq!(unknown.kind, "concept");
     assert_eq!(unknown.line, 1, "a block is reported at its first line");
-    assert!(unknown.to_string().contains("unknown attribute 'severty'"), "{unknown}");
+    assert!(
+        unknown.to_string().contains("unknown attribute 'severty'"),
+        "{unknown}"
+    );
 
     let repeated = adoc(
         "[[arch:X]]\n[source,cypher,role=constraint,severity=INFO,severity=MAJOR]\n----\nRETURN 1\n----\n",
     );
-    assert!(repeated.to_string().contains("'severity' repeated"), "{repeated}");
+    assert!(
+        repeated.to_string().contains("'severity' repeated"),
+        "{repeated}"
+    );
 }
 
 #[test]
@@ -245,8 +279,12 @@ fn adoc_rejects_bodies_and_references_it_cannot_honour() {
     let sql = adoc("[[arch:X]]\n[source,sql,role=concept]\n----\nSELECT 1\n----\n");
     assert!(sql.to_string().contains("[source,cypher] listing"), "{sql}");
 
-    let reference = adoc("[[arch:X]]\n[source,cypher,role=concept,severity={level}]\n----\nRETURN 1\n----\n");
-    assert!(reference.to_string().contains("attribute reference"), "{reference}");
+    let reference =
+        adoc("[[arch:X]]\n[source,cypher,role=concept,severity={level}]\n----\nRETURN 1\n----\n");
+    assert!(
+        reference.to_string().contains("attribute reference"),
+        "{reference}"
+    );
 
     let unclosed = adoc("[[arch:X]]\n[source,cypher,role=concept]\n----\nRETURN 1\n");
     assert_eq!(unclosed.reason, Reason::Unclosed);
@@ -258,9 +296,8 @@ fn adoc_rejects_bodies_and_references_it_cannot_honour() {
 
 #[test]
 fn adoc_rejects_disagreeing_anchor_and_id_and_duplicates() {
-    let disagree = adoc(
-        "[[arch:X]]\n[source,cypher,role=concept,id=arch:Y]\n----\nRETURN 1\n----\n",
-    );
+    let disagree =
+        adoc("[[arch:X]]\n[source,cypher,role=concept,id=arch:Y]\n----\nRETURN 1\n----\n");
     assert!(disagree.to_string().contains("disagree"), "{disagree}");
 
     let duplicate = adoc(
@@ -273,11 +310,19 @@ fn adoc_rejects_disagreeing_anchor_and_id_and_duplicates() {
 
 #[test]
 fn adoc_refuses_conditionals_and_includes_without_a_folder() {
-    let conditional = adoc("ifdef::env-github[]\n[[arch:X]]\n[source,cypher,role=concept]\n----\nRETURN 1\n----\nendif::[]\n");
-    assert!(conditional.to_string().contains("conditional directives"), "{conditional}");
+    let conditional = adoc(
+        "ifdef::env-github[]\n[[arch:X]]\n[source,cypher,role=concept]\n----\nRETURN 1\n----\nendif::[]\n",
+    );
+    assert!(
+        conditional.to_string().contains("conditional directives"),
+        "{conditional}"
+    );
 
     let include = adoc("include::queries/churn.adoc[]\n");
-    assert!(include.to_string().contains("needs the document's folder"), "{include}");
+    assert!(
+        include.to_string().contains("needs the document's folder"),
+        "{include}"
+    );
 }
 
 #[test]
@@ -295,7 +340,10 @@ fn adoc_names_the_included_file_of_a_broken_block() {
     assert_eq!(error.kind, "constraint");
     assert_eq!(error.id.as_deref(), Some("arch:Broken"));
     assert_eq!(error.line, 1);
-    assert!(error.file.as_deref().unwrap().ends_with("broken.adoc"), "{error:?}");
+    assert!(
+        error.file.as_deref().unwrap().ends_with("broken.adoc"),
+        "{error:?}"
+    );
     assert!(error.to_string().contains("broken.adoc"), "{error}");
 }
 

@@ -117,7 +117,12 @@ pub fn complete(
         errors.push(format!("no rule group '{group}'"));
     }
     let mut constraints = Vec::new();
-    for result in job.constraints.as_ref().into_iter().flat_map(|c| &c.results) {
+    for result in job
+        .constraints
+        .as_ref()
+        .into_iter()
+        .flat_map(|c| &c.results)
+    {
         if !members.contains(&result.rule) {
             continue;
         }
@@ -184,7 +189,15 @@ pub fn waiting(
     detail: &str,
     document_errors: &[String],
 ) -> Value {
-    shell("waiting", episode, rule_set, group, min, detail, document_errors.to_vec())
+    shell(
+        "waiting",
+        episode,
+        rule_set,
+        group,
+        min,
+        detail,
+        document_errors.to_vec(),
+    )
 }
 
 /// A run whose work failed; the failure is its one error (exit 2).
@@ -210,7 +223,11 @@ pub fn invalid(group: Option<&str>, min: Option<Severity>, errors: Vec<String>) 
 /// The project declares no rules: said plainly, exit 0. When rule documents
 /// exist but do not parse, the run is `invalid` and exits 2 with their errors.
 pub fn no_rules(group: Option<&str>, min: Option<Severity>, document_errors: &[String]) -> Value {
-    let state = if document_errors.is_empty() { "no_rules" } else { "invalid" };
+    let state = if document_errors.is_empty() {
+        "no_rules"
+    } else {
+        "invalid"
+    };
     shell(state, "", "", group, min, "", document_errors.to_vec())
 }
 
@@ -275,7 +292,7 @@ fn by_severity(levels: impl Iterator<Item = Severity>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch_rules::plan::{AppliedRule, Constraints, ConstraintResult, FailedRule, Plan};
+    use crate::arch_rules::plan::{AppliedRule, ConstraintResult, Constraints, FailedRule, Plan};
 
     fn violation(rule: &str, severity: Severity, path: &str, line: i64) -> Violation {
         Violation {
@@ -391,7 +408,15 @@ mod tests {
 
     #[test]
     fn the_default_report_covers_every_group_once_and_sorts_by_severity() {
-        let report = complete("ep-1", "rs", &job(), &rows(), None, Some(Severity::Major), &[]);
+        let report = complete(
+            "ep-1",
+            "rs",
+            &job(),
+            &rows(),
+            None,
+            Some(Severity::Major),
+            &[],
+        );
         assert_eq!(report["state"], "complete");
         assert_eq!(report["exit"], 1);
         assert_eq!(report["errors"], json!([]));
@@ -408,7 +433,15 @@ mod tests {
 
     #[test]
     fn a_group_restricts_the_report_to_its_own_members() {
-        let report = complete("ep-1", "rs", &job(), &rows(), Some("arch:strict"), None, &[]);
+        let report = complete(
+            "ep-1",
+            "rs",
+            &job(),
+            &rows(),
+            Some("arch:strict"),
+            None,
+            &[],
+        );
         assert_eq!(report["group"], "arch:strict");
         assert_eq!(report["exit"], 0, "no gate without --min-severity");
         let rules: Vec<&str> = report["violations"]
@@ -439,7 +472,15 @@ mod tests {
         }];
         job.plans[1].error =
             Some("rule 'arch:X' requires 'arch:Y', which matches no concept".into());
-        let report = complete("ep-1", "rs", &job, &rows(), None, Some(Severity::Blocker), &[]);
+        let report = complete(
+            "ep-1",
+            "rs",
+            &job,
+            &rows(),
+            None,
+            Some(Severity::Blocker),
+            &[],
+        );
         assert_eq!(report["exit"], 2);
         let errors: Vec<&str> = report["errors"]
             .as_array()
@@ -459,7 +500,14 @@ mod tests {
 
     #[test]
     fn a_waiting_or_empty_run_exits_zero_and_says_why() {
-        let waiting = waiting("ep-2", "rs", None, Some(Severity::Major), "the enrich job is queued", &[]);
+        let waiting = waiting(
+            "ep-2",
+            "rs",
+            None,
+            Some(Severity::Major),
+            "the enrich job is queued",
+            &[],
+        );
         assert_eq!(waiting["state"], "waiting");
         assert_eq!(waiting["detail"], "the enrich job is queued");
         assert_eq!(waiting["exit"], 0);
@@ -470,7 +518,11 @@ mod tests {
 
     #[test]
     fn an_invalid_document_or_a_failed_job_exits_two() {
-        let invalid = invalid(None, None, vec!["rule document docs/architecture/a.md: bad key".into()]);
+        let invalid = invalid(
+            None,
+            None,
+            vec!["rule document docs/architecture/a.md: bad key".into()],
+        );
         assert_eq!(invalid["state"], "invalid");
         assert_eq!(invalid["exit"], 2);
         let failed = failed("ep-3", "rs", None, None, "store is full", &[]);
@@ -484,7 +536,15 @@ mod tests {
     #[test]
     fn the_json_report_matches_its_schema() {
         let found = [violation("arch:NoCycle", Severity::Major, "src/a.rs", 4)];
-        let report = complete("ep-1", "rs", &job(), &found, Some("arch:default"), Some(Severity::Major), &[]);
+        let report = complete(
+            "ep-1",
+            "rs",
+            &job(),
+            &found,
+            Some("arch:default"),
+            Some(Severity::Major),
+            &[],
+        );
         let fixture: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/arch_rules/analyze_report.json"
         ))
@@ -494,15 +554,27 @@ mod tests {
 
     #[test]
     fn a_malformed_document_is_reported_and_exits_two() {
-        let document_errors = vec!["docs/architecture/a.md: rule 'arch:X' has no cypher".to_string()];
-        let report = complete("ep-1", "rs", &job(), &[], None, Some(Severity::Blocker), &document_errors);
+        let document_errors =
+            vec!["docs/architecture/a.md: rule 'arch:X' has no cypher".to_string()];
+        let report = complete(
+            "ep-1",
+            "rs",
+            &job(),
+            &[],
+            None,
+            Some(Severity::Blocker),
+            &document_errors,
+        );
         assert_eq!(report["errors"], json!(document_errors));
         assert_eq!(report["exit"], 2);
         let none = no_rules(None, None, &document_errors);
         assert_eq!(none["state"], "invalid");
         assert_eq!(none["exit"], 2);
         let waiting = waiting("ep-2", "rs", None, None, "queued", &document_errors);
-        assert_eq!(waiting["exit"], 2, "a malformed document errors even while the job waits");
+        assert_eq!(
+            waiting["exit"], 2,
+            "a malformed document errors even while the job waits"
+        );
     }
 
     #[test]

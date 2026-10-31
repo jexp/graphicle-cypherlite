@@ -10,8 +10,7 @@
 //! suite never reads the repository's own `docs/architecture/`.
 use graphicle_runtime::{
     arch_rules::{self, Severity, analyze},
-    limits,
-    local,
+    limits, local,
     platform::CanonicalExt,
     store::s,
 };
@@ -143,7 +142,10 @@ fn a_rule_document_parses_into_rules_with_exact_properties() {
     assert_eq!(label.requires, vec!["arch:Test/Base", "arch:Test/Layer/*"]);
     assert_eq!(label.severity, Severity::Minor);
     assert_eq!(label.description, "Labels the symbols");
-    assert_eq!(label.cypher, "MATCH (s:Symbol {repository_id: $repo}) SET s:ArchTest");
+    assert_eq!(
+        label.cypher,
+        "MATCH (s:Symbol {repository_id: $repo}) SET s:ArchTest"
+    );
     assert_eq!(label.line, 10);
     let constraint = &document.constraints[0];
     assert_eq!(constraint.id, "arch:Test/NoBare");
@@ -153,7 +155,10 @@ fn a_rule_document_parses_into_rules_with_exact_properties() {
     let group = &document.groups[0];
     assert_eq!(group.id, "arch:default");
     assert_eq!(group.include, vec!["arch:Test/*"]);
-    assert_eq!(group.overrides, vec![("arch:Test/NoBare".to_string(), Severity::Major)]);
+    assert_eq!(
+        group.overrides,
+        vec![("arch:Test/NoBare".to_string(), Severity::Major)]
+    );
     assert_eq!(group.description, "The test pack");
 
     // Synced, the same rules are nodes whose properties hold the same
@@ -170,7 +175,10 @@ fn a_rule_document_parses_into_rules_with_exact_properties() {
     );
     assert_eq!(node.len(), 1, "{node:#?}");
     assert_eq!(node[0]["description"], json!("Labels the symbols"));
-    assert_eq!(node[0]["requires"], json!(r#"["arch:Test/Base","arch:Test/Layer/*"]"#));
+    assert_eq!(
+        node[0]["requires"],
+        json!(r#"["arch:Test/Base","arch:Test/Layer/*"]"#)
+    );
     assert_eq!(node[0]["severity"], json!("MINOR"));
     assert_eq!(node[0]["line"], json!(10));
     assert_eq!(node[0]["source"], json!("docs/architecture/rules.md"));
@@ -180,7 +188,10 @@ fn a_rule_document_parses_into_rules_with_exact_properties() {
         json!({}),
     );
     assert_eq!(group[0]["include"], json!(r#"["arch:Test/*"]"#));
-    assert_eq!(group[0]["overrides"], json!(r#"["arch:Test/NoBare=MAJOR"]"#));
+    assert_eq!(
+        group[0]["overrides"],
+        json!(r#"["arch:Test/NoBare=MAJOR"]"#)
+    );
 }
 
 #[test]
@@ -195,7 +206,11 @@ fn a_malformed_block_is_reported_by_name_and_writes_no_rules() {
     );
     let synced = f.sync();
     let skipped = &synced["rules"]["skipped"];
-    assert_eq!(skipped[0]["path"], json!("docs/architecture/rules.md"), "{synced:#}");
+    assert_eq!(
+        skipped[0]["path"],
+        json!("docs/architecture/rules.md"),
+        "{synced:#}"
+    );
     let reason = skipped[0]["reason"].as_str().unwrap();
     assert!(reason.contains("'arch:Test/Bad'"), "{reason}");
     assert!(reason.contains("missing cypher body"), "{reason}");
@@ -206,11 +221,18 @@ fn a_malformed_block_is_reported_by_name_and_writes_no_rules() {
     // (exit 2), not a clean run.
     let errors = arch_rules::document_errors(&f.root, limits::current().file_bytes);
     assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].starts_with("docs/architecture/rules.md: "), "{errors:?}");
+    assert!(
+        errors[0].starts_with("docs/architecture/rules.md: "),
+        "{errors:?}"
+    );
     let report = f.analyze(None);
     assert_eq!(report["exit"], json!(2), "{report:#}");
     assert!(
-        report["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("'arch:Test/Bad'")),
+        report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("'arch:Test/Bad'")),
         "{report:#}"
     );
 }
@@ -224,12 +246,18 @@ fn a_requires_cycle_is_rejected_with_its_rules_named() {
     let synced = f.sync();
     assert_eq!(synced["rules"]["parsed"], json!(1), "{synced:#}");
     local::build_graph(&f.store, &f.session, &f.repo, false).unwrap();
-    assert_eq!(f.count("MATCH (r:ConceptRule {repository_id: $repo}) RETURN count(r) AS n"), 2);
+    assert_eq!(
+        f.count("MATCH (r:ConceptRule {repository_id: $repo}) RETURN count(r) AS n"),
+        2
+    );
 
     // The job's plan is the error: it names both rules, applies nothing.
     let result = f.enrich_result();
     let error = result["plans"][0]["error"].as_str().unwrap();
-    assert_eq!(error, "rule cycle through 'arch:Cycle/A', 'arch:Cycle/B'", "{result:#}");
+    assert_eq!(
+        error, "rule cycle through 'arch:Cycle/A', 'arch:Cycle/B'",
+        "{result:#}"
+    );
     assert_eq!(result["applied"], json!(0), "{result:#}");
     assert_eq!(f.count("MATCH (a:RuleApplication) RETURN count(a) AS n"), 0);
 
@@ -254,7 +282,11 @@ fn applying_a_rule_set_twice_to_one_episode_changes_nothing() {
     let episode = f.episode();
     let first = f.state();
     assert!(first["labelled"].as_i64().unwrap() > 0, "{first:#}");
-    assert_eq!(first["violations"], json!([]), "the constraint finds nothing once labelled");
+    assert_eq!(
+        first["violations"],
+        json!([]),
+        "the constraint finds nothing once labelled"
+    );
 
     // The integrated path again: a sync of the same tree is the same episode,
     // so the completed job replays and the store is what it was.
@@ -273,7 +305,11 @@ fn applying_a_rule_set_twice_to_one_episode_changes_nothing() {
     let (report, constraints) = (run.to_value(), constraints.to_value());
     assert_eq!(report["applied"], json!(1), "{report:#}");
     assert_eq!(constraints["violations"], json!(0), "{constraints:#}");
-    assert_eq!(f.state(), first, "the second application left the store as it was");
+    assert_eq!(
+        f.state(),
+        first,
+        "the second application left the store as it was"
+    );
 }
 
 #[test]
@@ -284,10 +320,19 @@ fn rolling_back_one_rule_removes_exactly_its_writes() {
     let episode = f.episode();
     let symbols = f.count("MATCH (s:Symbol {repository_id: $repo}) RETURN count(s) AS n");
     assert!(symbols > 0);
-    assert_eq!(f.count("MATCH (s:Symbol:ArchTest {repository_id: $repo}) RETURN count(s) AS n"), symbols);
+    assert_eq!(
+        f.count("MATCH (s:Symbol:ArchTest {repository_id: $repo}) RETURN count(s) AS n"),
+        symbols
+    );
     assert_eq!(f.count("MATCH (s:Symbol {repository_id: $repo}) WHERE s.arch_mark IS NOT NULL RETURN count(s) AS n"), symbols);
-    assert_eq!(f.count("MATCH (n:ArchNote {repository_id: $repo}) RETURN count(n) AS n"), 1);
-    assert_eq!(f.count("MATCH (a:RuleApplication {repository_id: $repo}) RETURN count(a) AS n"), 3);
+    assert_eq!(
+        f.count("MATCH (n:ArchNote {repository_id: $repo}) RETURN count(n) AS n"),
+        1
+    );
+    assert_eq!(
+        f.count("MATCH (a:RuleApplication {repository_id: $repo}) RETURN count(a) AS n"),
+        3
+    );
 
     // Roll back the property rule through the store, as the executor's
     // rollback is called for one (rule, episode).
@@ -304,8 +349,14 @@ fn rolling_back_one_rule_removes_exactly_its_writes() {
         f.count("MATCH (a:RuleApplication {repository_id: $repo, rule: 'arch:Test/Mark'}) RETURN count(a) AS n"),
         0
     );
-    assert_eq!(f.count("MATCH (s:Symbol:ArchTest {repository_id: $repo}) RETURN count(s) AS n"), symbols);
-    assert_eq!(f.count("MATCH (n:ArchNote {repository_id: $repo}) RETURN count(n) AS n"), 1);
+    assert_eq!(
+        f.count("MATCH (s:Symbol:ArchTest {repository_id: $repo}) RETURN count(s) AS n"),
+        symbols
+    );
+    assert_eq!(
+        f.count("MATCH (n:ArchNote {repository_id: $repo}) RETURN count(n) AS n"),
+        1
+    );
     assert_eq!(
         f.count("MATCH (a:RuleApplication {repository_id: $repo, rule: 'arch:Test/Label'}) RETURN count(a) AS n"),
         1
@@ -336,25 +387,47 @@ fn a_constraint_that_finds_rows_writes_violations_with_severity_and_episode() {
          ORDER BY rule, path",
         json!({}),
     );
-    assert!(!violations.is_empty(), "the constraint finds the fixture's symbols");
+    assert!(
+        !violations.is_empty(),
+        "the constraint finds the fixture's symbols"
+    );
     for row in &violations {
         assert_eq!(row["rule"], json!("arch:Test/NoRun"), "{row:#}");
         assert_eq!(row["episode"], json!(episode), "{row:#}");
         assert_eq!(row["severity"], json!("MAJOR"), "{row:#}");
         assert_eq!(row["path"], json!("src/lib.rs"), "{row:#}");
     }
-    assert_eq!(f.count("MATCH (v:Violation {rule: 'arch:Test/Nothing'}) RETURN count(v) AS n"), 0);
+    assert_eq!(
+        f.count("MATCH (v:Violation {rule: 'arch:Test/Nothing'}) RETURN count(v) AS n"),
+        0
+    );
 
     // The analysis reports the same rows, in the episode's report, with the
     // gate applied: a MAJOR gate sees them, a BLOCKER gate does not.
     let gated = f.analyze(Some(Severity::Major));
     assert_eq!(gated["episode"], json!(episode), "{gated:#}");
-    assert_eq!(gated["violations"].as_array().unwrap().len(), violations.len(), "{gated:#}");
-    assert_eq!(gated["violations"][0]["severity"], json!("MAJOR"), "{gated:#}");
-    assert_eq!(gated["violations"][0]["path"], json!("src/lib.rs"), "{gated:#}");
+    assert_eq!(
+        gated["violations"].as_array().unwrap().len(),
+        violations.len(),
+        "{gated:#}"
+    );
+    assert_eq!(
+        gated["violations"][0]["severity"],
+        json!("MAJOR"),
+        "{gated:#}"
+    );
+    assert_eq!(
+        gated["violations"][0]["path"],
+        json!("src/lib.rs"),
+        "{gated:#}"
+    );
     assert_eq!(gated["exit"], json!(1), "{gated:#}");
     let blocker = f.analyze(Some(Severity::Blocker));
-    assert_eq!(blocker["violations"].as_array().unwrap().len(), violations.len(), "{blocker:#}");
+    assert_eq!(
+        blocker["violations"].as_array().unwrap().len(),
+        violations.len(),
+        "{blocker:#}"
+    );
     assert_eq!(blocker["exit"], json!(0), "{blocker:#}");
 }
 
@@ -433,18 +506,31 @@ fn analyze_exits_1_on_a_gated_violation_and_0_when_clean_or_ungated() {
     let cli = Cli::new();
     cli.write_rules(VIOLATING_RULES);
     let synced = cli.run(&["sync"]);
-    assert!(synced.status.success(), "{}", String::from_utf8_lossy(&synced.stderr));
+    assert!(
+        synced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
 
     // A MAJOR violation gated at MAJOR: exit 1.
     let (code, gated) = cli.analyze(&["--min-severity", "MAJOR"]);
     assert_eq!(code, 1, "{gated:#}");
-    assert!(gated["counts"]["violations"].as_i64().unwrap() > 0, "{gated:#}");
-    assert_eq!(gated["counts"]["by_severity"]["MAJOR"], gated["counts"]["violations"], "{gated:#}");
+    assert!(
+        gated["counts"]["violations"].as_i64().unwrap() > 0,
+        "{gated:#}"
+    );
+    assert_eq!(
+        gated["counts"]["by_severity"]["MAJOR"], gated["counts"]["violations"],
+        "{gated:#}"
+    );
 
     // The same violations, ungated: reported, and exit 0.
     let (code, ungated) = cli.analyze(&[]);
     assert_eq!(code, 0, "{ungated:#}");
-    assert_eq!(ungated["counts"]["violations"], gated["counts"]["violations"], "{ungated:#}");
+    assert_eq!(
+        ungated["counts"]["violations"], gated["counts"]["violations"],
+        "{ungated:#}"
+    );
 
     // A gate above every violation is clean: exit 0.
     let (code, clean) = cli.analyze(&["--min-severity", "BLOCKER"]);

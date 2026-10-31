@@ -2387,7 +2387,8 @@ impl Store {
                     crate::identifier_route::Routed::Answered(packet) => return Ok(packet),
                     crate::identifier_route::Routed::Retrieval(route) => route,
                 };
-                let mut packet = project_packet(&self.graph(), db, p, &repository, args, embedding, reranker)?.1;
+                let mut packet =
+                    project_packet(&self.graph(), db, p, &repository, args, embedding, reranker)?.1;
                 let mut route = route;
                 // A question that asks more about the names it gives keeps
                 // them: the identifier arm ranks their files.
@@ -2402,7 +2403,8 @@ impl Store {
             // one project's questions only.
             crate::workspace::Scope::Workspace => {
                 let (on, defaulted) = crate::identifier_route::switch(args)?;
-                let mut packet = crate::workspace::context(&self.graph(), db, p, args, embedding, reranker)?;
+                let mut packet =
+                    crate::workspace::context(&self.graph(), db, p, args, embedding, reranker)?;
                 let mut route =
                     json!({"path":"retrieval","reason":"workspace","defaulted":defaulted});
                 route[crate::identifier_route::FIELD] = json!(on);
@@ -2608,11 +2610,9 @@ pub fn project_packet(
         }
         None => json!({"status":"no_passages"}),
     };
-    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))?
-        .with_folder(crate::folders::current_folder(
-            crate::store::graph_for(db)?.as_ref(),
-            s(repository, "id"),
-        )?);
+    let lookup = crate::doc_links::Lookup::new(db, s(repository, "id"))?.with_folder(
+        crate::folders::current_folder(crate::store::graph_for(db)?.as_ref(), s(repository, "id"))?,
+    );
     if crate::observer::KeyMode::parse(args.get("note_keys"))?.is_some() {
         rankings[crate::observer::NOTE_KEYS] = json!(crate::observer::notes_for(
             db,

@@ -944,9 +944,9 @@ fn folder_locations_do_not_change_the_deletion_state() {
                 .and_then(|row| row["n"].as_i64())
                 .unwrap();
                 Ok((
-                    f.store
-                        .graph()
-                        .read(|g| graphicle_runtime::deletion::state(g, f.ws(), &project, Some(db)))?,
+                    f.store.graph().read(|g| {
+                        graphicle_runtime::deletion::state(g, f.ws(), &project, Some(db))
+                    })?,
                     aliases,
                 ))
             })

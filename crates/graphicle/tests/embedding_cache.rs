@@ -148,12 +148,28 @@ async fn a_second_project_reuses_cached_vectors_and_embeds_only_new_passages() {
     }))
     .unwrap();
 
-    let (first, first_vectors) = embed(&store, &ws, &key, &configuration, "first", &["route", "worker", "queue"]).await;
+    let (first, first_vectors) = embed(
+        &store,
+        &ws,
+        &key,
+        &configuration,
+        "first",
+        &["route", "worker", "queue"],
+    )
+    .await;
     assert_eq!(first["embedded_passages"], 3, "{first}");
     assert_eq!(first["cached_passages"], 0, "{first}");
     assert_eq!(requests.lock().unwrap().len(), 1);
 
-    let (second, second_vectors) = embed(&store, &ws, &key, &configuration, "second", &["route", "worker", "queue"]).await;
+    let (second, second_vectors) = embed(
+        &store,
+        &ws,
+        &key,
+        &configuration,
+        "second",
+        &["route", "worker", "queue"],
+    )
+    .await;
     assert_eq!(second["embedded_passages"], 0, "{second}");
     assert_eq!(second["cached_passages"], 3, "{second}");
     assert_eq!(second["complete"], true, "{second}");
@@ -165,7 +181,15 @@ async fn a_second_project_reuses_cached_vectors_and_embeds_only_new_passages() {
     assert_eq!(first_vectors, expected(&["route", "worker", "queue"]));
     assert_eq!(second_vectors, first_vectors);
 
-    let (third, third_vectors) = embed(&store, &ws, &key, &configuration, "third", &["route", "changed", "queue"]).await;
+    let (third, third_vectors) = embed(
+        &store,
+        &ws,
+        &key,
+        &configuration,
+        "third",
+        &["route", "changed", "queue"],
+    )
+    .await;
     assert_eq!(third["embedded_passages"], 1, "{third}");
     assert_eq!(third["cached_passages"], 2, "{third}");
     let requests = requests.lock().unwrap();

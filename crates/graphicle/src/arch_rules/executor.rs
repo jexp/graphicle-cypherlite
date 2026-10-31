@@ -229,7 +229,10 @@ fn with_default_group(document: &RuleDocument) -> RuleDocument {
 /// `:RuleGroup` in `(source, line)` order — the order the rule documents
 /// declared them in, which the resolver's tie-breaking keeps. `None` when
 /// the project holds no rule nodes.
-pub(super) fn rule_document(graph: &GraphStore, repository_id: &str) -> Result<Option<RuleDocument>> {
+pub(super) fn rule_document(
+    graph: &GraphStore,
+    repository_id: &str,
+) -> Result<Option<RuleDocument>> {
     let rules = |label: &str| -> Result<Vec<(String, usize, Rule)>> {
         let rows = graph.read(|db| {
             store_graph::rows(
@@ -247,8 +250,8 @@ pub(super) fn rule_document(graph: &GraphStore, repository_id: &str) -> Result<O
             .into_iter()
             .filter_map(|row| {
                 let severity = Severity::parse(store_graph::s(&row, "severity"))?;
-                let requires: Vec<String> = serde_json::from_str(store_graph::s(&row, "requires"))
-                    .unwrap_or_default();
+                let requires: Vec<String> =
+                    serde_json::from_str(store_graph::s(&row, "requires")).unwrap_or_default();
                 let line = row["line"].as_i64().unwrap_or_default() as usize;
                 Some((
                     store_graph::s(&row, "source").to_string(),
@@ -455,16 +458,25 @@ mod tests {
             1
         );
         assert_eq!(
-            count(&graph, "MATCH (s:Symbol) WHERE s.arch_confidence = 0.8 RETURN count(s) AS n"),
+            count(
+                &graph,
+                "MATCH (s:Symbol) WHERE s.arch_confidence = 0.8 RETURN count(s) AS n"
+            ),
             3
         );
         assert_eq!(
-            count(&graph, "MATCH (l:Layer {name: 'Persistence'}) RETURN count(l) AS n"),
+            count(
+                &graph,
+                "MATCH (l:Layer {name: 'Persistence'}) RETURN count(l) AS n"
+            ),
             1
         );
         // One application record per concept and episode.
         assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {episode: 'ep-1'}) RETURN count(a) AS n"),
+            count(
+                &graph,
+                "MATCH (a:RuleApplication {episode: 'ep-1'}) RETURN count(a) AS n"
+            ),
             4
         );
         // The labels are recorded as LABELED edges of the rule that set them.
@@ -503,17 +515,26 @@ mod tests {
         // requires nothing runs on.
         let skipped = report["plans"][0]["skipped"].as_array().unwrap().clone();
         assert_eq!(
-            skipped.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>(),
+            skipped
+                .iter()
+                .filter_map(|s| s.as_str())
+                .collect::<Vec<_>>(),
             vec!["arch:Test/Dependent", "arch:Test/NoCycles"],
             "{report:#}"
         );
         // Nothing of the failed rule is left behind.
         assert_eq!(
-            count(&graph, "MATCH (s) WHERE s.b_mark IS NOT NULL RETURN count(s) AS n"),
+            count(
+                &graph,
+                "MATCH (s) WHERE s.b_mark IS NOT NULL RETURN count(s) AS n"
+            ),
             0
         );
         assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {rule: 'arch:Test/Connect'}) RETURN count(a) AS n"),
+            count(
+                &graph,
+                "MATCH (a:RuleApplication {rule: 'arch:Test/Connect'}) RETURN count(a) AS n"
+            ),
             0
         );
         // Its dependency and the independent rule both applied.
@@ -522,7 +543,10 @@ mod tests {
             2
         );
         assert_eq!(
-            count(&graph, "MATCH (s:Symbol) WHERE s.d_mark = 'x' RETURN count(s) AS n"),
+            count(
+                &graph,
+                "MATCH (s:Symbol) WHERE s.d_mark = 'x' RETURN count(s) AS n"
+            ),
             3
         );
     }
@@ -582,11 +606,17 @@ mod tests {
         );
         // Both episodes keep their own application records.
         assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {episode: 'ep-1'}) RETURN count(a) AS n"),
+            count(
+                &graph,
+                "MATCH (a:RuleApplication {episode: 'ep-1'}) RETURN count(a) AS n"
+            ),
             4
         );
         assert_eq!(
-            count(&graph, "MATCH (a:RuleApplication {episode: 'ep-2'}) RETURN count(a) AS n"),
+            count(
+                &graph,
+                "MATCH (a:RuleApplication {episode: 'ep-2'}) RETURN count(a) AS n"
+            ),
             4
         );
         // The episodes' applications are distinguishable: ep-1's label rule
@@ -617,10 +647,23 @@ mod tests {
         assert_eq!(report["applied"], json!(1), "{report:#}");
         let plan = &report["plans"][0];
         assert_eq!(plan["group"], json!("arch:picked"));
-        assert_eq!(plan["severities"]["arch:A"], json!("CRITICAL"), "{report:#}");
+        assert_eq!(
+            plan["severities"]["arch:A"],
+            json!("CRITICAL"),
+            "{report:#}"
+        );
         // The rule the group does not include did not run.
-        assert_eq!(count(&graph, "MATCH (s) WHERE s.b_prop IS NOT NULL RETURN count(s) AS n"), 0);
-        assert_eq!(count(&graph, "MATCH (s:Symbol:Grouped) RETURN count(s) AS n"), 1);
+        assert_eq!(
+            count(
+                &graph,
+                "MATCH (s) WHERE s.b_prop IS NOT NULL RETURN count(s) AS n"
+            ),
+            0
+        );
+        assert_eq!(
+            count(&graph, "MATCH (s:Symbol:Grouped) RETURN count(s) AS n"),
+            1
+        );
     }
 
     #[test]

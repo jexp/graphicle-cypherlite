@@ -122,8 +122,8 @@ pub fn start(
     let secret = store.save_secret(workspace, &format!("oauth-verifier:{state_hash}"), &binding)?;
     let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    store.transaction(|db|{
-        authorize_hash(db,workspace,&principal.hash,"admin")?;
+    store.transaction(|db| {
+        authorize_hash(db, workspace, &principal.hash, "admin")?;
         Ok(())
     })?;
     store.graph().transaction(|db|{
@@ -244,8 +244,13 @@ pub async fn callback(
         graph::write(db,"MATCH (p:OAuthPending {state_hash: $state_hash}) SET p.used = true",Params::from([("state_hash".into(),json_to_value(&json!(state_hash)))]))?;
         Ok(p)
     })?;
-    store.transaction(|db|{
-        authorize_hash(db,s(&pending,"workspace_id"),s(&pending,"principal_hash"),"admin")?;
+    store.transaction(|db| {
+        authorize_hash(
+            db,
+            s(&pending, "workspace_id"),
+            s(&pending, "principal_hash"),
+            "admin",
+        )?;
         Ok(())
     })?;
     let workspace = s(&pending, "workspace_id");
@@ -340,9 +345,8 @@ pub async fn callback(
                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
         });
     let identifier = id();
-    let principal = store.transaction(|db| {
-        authorize_hash(db, workspace, s(&pending, "principal_hash"), "admin")
-    })?;
+    let principal = store
+        .transaction(|db| authorize_hash(db, workspace, s(&pending, "principal_hash"), "admin"))?;
     store.graph().transaction(|db|{
         graph::write(db,"CREATE (a:OAuthAccount {id: $id, workspace_id: $workspace, provider: $provider, external_id: $external, email: $email, display_name: $display, token_secret: $token_secret, refresh_secret: $refresh_secret, expires_at: $expiry, scopes: $scopes, state: 'active', updated_at: $now})",Params::from([
             ("id".into(),json_to_value(&json!(identifier))),
@@ -394,9 +398,7 @@ async fn refresh_as(
     permission: &str,
     identifier: &str,
 ) -> Result<Value> {
-    store.transaction(|db| {
-        authorize_hash(db, workspace, principal, permission).map(|_| ())
-    })?;
+    store.transaction(|db| authorize_hash(db, workspace, principal, permission).map(|_| ()))?;
     let account = store.graph().read(|db| {
         graph::one(
             db,
@@ -561,7 +563,7 @@ pub async fn resources(
     args: &Value,
 ) -> Result<Value> {
     let account_id = string(args, "account_id", 100)?;
-    store.authorized(workspace,token,"admin",|_,_|Ok(()))?;
+    store.authorized(workspace, token, "admin", |_, _| Ok(()))?;
     let account=store.graph().read(|db|{
         graph::one(db,&format!("MATCH (a:OAuthAccount {{workspace_id: $workspace, id: $id, provider: 'atlassian', state: 'active'}}) RETURN {ACCOUNT_COLS}"),Params::from([("workspace".into(),json_to_value(&json!(workspace))),("id".into(),json_to_value(&json!(account_id)))]))
     })?.ok_or_else(||Error::bad("Choose a connected Atlassian account"))?;

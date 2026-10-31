@@ -543,7 +543,9 @@ fn analyse_batch(
         let contents: Vec<(&str, &str, String)> = group
             .iter()
             .zip(found)
-            .map(|((path, sha), content)| (path.as_str(), sha.as_str(), content.unwrap_or_default()))
+            .map(|((path, sha), content)| {
+                (path.as_str(), sha.as_str(), content.unwrap_or_default())
+            })
             .collect();
         let done = cache::par_map(
             &contents,

@@ -262,13 +262,13 @@ pub fn skip_reason(
             repository,
             s(row, "episode"),
         )?
-            .map(|recorded| {
-                let changed = heads
-                    .iter()
-                    .filter(|(path, sha)| recorded.get(*path) != Some(*sha))
-                    .count();
-                changed + recorded.keys().filter(|p| !heads.contains_key(*p)).count()
-            }),
+        .map(|recorded| {
+            let changed = heads
+                .iter()
+                .filter(|(path, sha)| recorded.get(*path) != Some(*sha))
+                .count();
+            changed + recorded.keys().filter(|p| !heads.contains_key(*p)).count()
+        }),
         None => None,
     };
     Ok(
@@ -616,8 +616,11 @@ impl Plan {
             if let Some(lag) = &self.lag {
                 diagnostics["episode_lag"] = json!(lag.changed);
                 diagnostics["current_episode"] = json!(lag.current);
-                diagnostics["projection"] =
-                    json!(crate::jobs::projection_state(graph_store, repository, &lag.current)?);
+                diagnostics["projection"] = json!(crate::jobs::projection_state(
+                    graph_store,
+                    repository,
+                    &lag.current
+                )?);
                 diagnostics["withheld_changed"] = json!(withheld);
                 diagnostics["withheld_stale_edges"] = json!(stale);
             }

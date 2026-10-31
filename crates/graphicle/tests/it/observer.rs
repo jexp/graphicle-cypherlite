@@ -99,8 +99,7 @@ impl Fixture {
             .unwrap()
             .iter()
             .map(|row| {
-                let notes: Value =
-                    serde_json::from_str(row["notes"].as_str().unwrap()).unwrap();
+                let notes: Value = serde_json::from_str(row["notes"].as_str().unwrap()).unwrap();
                 (
                     row["source_id"].as_str().unwrap().to_string(),
                     notes.as_array().unwrap().len(),

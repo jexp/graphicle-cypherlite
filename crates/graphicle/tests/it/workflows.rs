@@ -1059,8 +1059,7 @@ async fn basic_answers_use_configured_semantic_search_and_can_disable_it() {
                 "MATCH (j:Job {id: $id}) RETURN j.payload AS payload",
                 graphicle_runtime::store_graph::params(&json!({"id": s(&job, "id")})),
             )?;
-            let payload: Value =
-                serde_json::from_str(s(&payload.unwrap(), "payload"))?;
+            let payload: Value = serde_json::from_str(s(&payload.unwrap(), "payload"))?;
             assert!(payload["embedding_key"].is_null());
             Ok(())
         })
