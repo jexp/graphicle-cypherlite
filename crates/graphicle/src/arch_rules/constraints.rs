@@ -25,7 +25,8 @@
 //! transaction), reported with status `error`, and leaves no rows. A
 //! constraint that requires a concept that failed is reported `skipped`.
 use super::executor::rule_document;
-use super::model::Rule;
+use super::model::{Rule, Severity};
+use super::plan::{ConstraintResult, Constraints, EnrichReport, Status};
 use crate::Result;
 use crate::store_graph::{self, GraphStore};
 use serde_json::{Map, Value, json};
@@ -39,15 +40,16 @@ pub const VIOLATION: &str = "Violation";
 const FIXED: &[&str] = &["repository_id", "episode", "rule", "rule_sha", "severity"];
 
 /// Evaluate the project's constraints against `episode` after its concepts
-/// applied. `enrich` is the enrich run's report (see
+/// applied. `enrich` is the enrich run's result (see
 /// [`super::executor::enrich`]): the constraint's effective severity is read
-/// from its `severities`, and a constraint in a plan's `skipped` list is not
-/// run. A constraint several groups select is evaluated once, with the
-/// severity of the first group in plan order that selects it (the executor
-/// applies a rule once across groups the same way); one skipped in any plan
-/// is skipped.
+/// from its plans' `severities`, and a constraint in a plan's `skipped` list
+/// is not run. A constraint several groups select is evaluated once, with
+/// the severity of the first group in plan order that selects it (the
+/// executor applies a rule once across groups the same way); one skipped in
+/// any plan is skipped.
 ///
-/// Returns the evaluation report:
+/// Returns the evaluation as [`Constraints`] (serialized by
+/// [`Constraints::to_value`]):
 /// `{"violations": n, "passing": n, "errors": n, "skipped": n,
 ///   "results": [{"rule", "status", "severity", "violations", "error"}]}`
 /// with status `passing`, `violations`, `error`, `skipped` or `not_selected`,
@@ -56,23 +58,21 @@ pub fn evaluate(
     graph: &GraphStore,
     repository_id: &str,
     episode: &str,
-    enrich: &Value,
+    enrich: &EnrichReport,
     still_leasing: &dyn Fn() -> Result<()>,
-) -> Result<Value> {
+) -> Result<Constraints> {
     let constraints = match rule_document(graph, repository_id)? {
         Some(document) => document.constraints,
         None => Vec::new(),
     };
     let mut skipped_anywhere = BTreeSet::new();
-    let mut selected: BTreeMap<String, String> = BTreeMap::new();
-    for plan in enrich["plans"].as_array().into_iter().flatten() {
-        for id in plan["skipped"].as_array().into_iter().flatten() {
-            skipped_anywhere.extend(id.as_str().map(str::to_string));
-        }
-        for (id, severity) in plan["severities"].as_object().into_iter().flatten() {
-            if let (false, Some(severity)) = (selected.contains_key(id), severity.as_str()) {
-                selected.insert(id.clone(), severity.to_string());
-            }
+    let mut selected: BTreeMap<String, Severity> = BTreeMap::new();
+    for plan in &enrich.plans {
+        skipped_anywhere.extend(plan.skipped.iter().cloned());
+        for (id, severity) in &plan.severities {
+            // The first plan that selects the constraint wins, as the
+            // executor applies a rule once across groups.
+            selected.entry(id.clone()).or_insert(*severity);
         }
     }
 
@@ -82,26 +82,43 @@ pub fn evaluate(
     for rule in &constraints {
         if skipped_anywhere.contains(&rule.id) {
             skipped += 1;
-            results.push(json!({"rule": rule.id, "status": "skipped"}));
+            results.push(ConstraintResult {
+                rule: rule.id.clone(),
+                status: Status::Skipped,
+                severity: None,
+                violations: None,
+                error: None,
+            });
             continue;
         }
         let Some(severity) = selected.get(&rule.id) else {
-            results.push(json!({"rule": rule.id, "status": "not_selected"}));
+            results.push(ConstraintResult {
+                rule: rule.id.clone(),
+                status: Status::NotSelected,
+                severity: None,
+                violations: None,
+                error: None,
+            });
             continue;
         };
         still_leasing()?;
-        match evaluate_one(graph, repository_id, episode, rule, severity) {
+        match evaluate_one(graph, repository_id, episode, rule, *severity) {
             Ok(count) => {
                 evaluated.push(rule.id.clone());
                 let status = if count == 0 {
                     passing += 1;
-                    "passing"
+                    Status::Passing
                 } else {
                     violations += count;
-                    "violations"
+                    Status::Violations
                 };
-                results.push(json!({"rule": rule.id, "status": status,
-                    "severity": severity, "violations": count}));
+                results.push(ConstraintResult {
+                    rule: rule.id.clone(),
+                    status,
+                    severity: Some(*severity),
+                    violations: Some(count),
+                    error: None,
+                });
             }
             Err(error) => {
                 errors += 1;
@@ -109,8 +126,13 @@ pub fn evaluate(
                 // earlier evaluation of this episode are still there; they
                 // are not this run's result.
                 graph.transaction(|db| clear_rule(db, repository_id, episode, &rule.id))?;
-                results.push(json!({"rule": rule.id, "status": "error",
-                    "severity": severity, "error": error.message}));
+                results.push(ConstraintResult {
+                    rule: rule.id.clone(),
+                    status: Status::Error,
+                    severity: Some(*severity),
+                    violations: None,
+                    error: Some(error.message),
+                });
             }
         }
     }
@@ -126,10 +148,13 @@ pub fn evaluate(
         )?;
         Ok(())
     })?;
-    Ok(json!({
-        "violations": violations, "passing": passing, "errors": errors,
-        "skipped": skipped, "results": results,
-    }))
+    Ok(Constraints {
+        violations,
+        passing,
+        errors,
+        skipped,
+        results,
+    })
 }
 
 /// Evaluate one constraint for `episode` in one transaction: its previous
@@ -140,7 +165,7 @@ fn evaluate_one(
     repository_id: &str,
     episode: &str,
     rule: &Rule,
-    severity: &str,
+    severity: Severity,
 ) -> Result<usize> {
     graph.transaction(|db| {
         clear_rule(db, repository_id, episode, &rule.id)?;
@@ -198,7 +223,7 @@ fn violation_props(
     repository_id: &str,
     episode: &str,
     rule: &Rule,
-    severity: &str,
+    severity: Severity,
     row: &Value,
 ) -> Map<String, Value> {
     let mut props = Map::new();
@@ -298,13 +323,13 @@ mod tests {
         graph
     }
 
-    /// Enrich `episode`, then evaluate its constraints, as the job does.
+    /// Enrich `episode`, then evaluate its constraints, as the job does:
+    /// the run's result, with the constraint half attached.
     fn run(graph: &GraphStore, episode: &str) -> Value {
         let leasing = || Ok(());
         let mut report = executor::enrich(graph, REPO, episode, &leasing).unwrap();
-        let constraints = evaluate(graph, REPO, episode, &report, &leasing).unwrap();
-        report["constraints"] = constraints;
-        report
+        report.constraints = Some(evaluate(graph, REPO, episode, &report, &leasing).unwrap());
+        report.to_value()
     }
 
     fn query(graph: &GraphStore, cypher: &str) -> Vec<Value> {

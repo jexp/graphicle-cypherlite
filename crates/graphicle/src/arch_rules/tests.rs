@@ -7,6 +7,56 @@ use crate::store_graph::{self, GraphStore, Params};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+/// The repository id the rule engine's in-memory fixtures share.
+pub(crate) const REPO: &str = "repo";
+
+/// An in-memory store holding `rules` (a Markdown rule document) and the
+/// symbols the rules work on: the fixture of the executor's, the
+/// provenance's and the constraints' tests.
+pub(crate) fn rules_graph(rules: &str, symbols: &[&str]) -> GraphStore {
+    let graph = GraphStore::open_in_memory().unwrap();
+    let document = parse(rules).unwrap();
+    store(&graph, REPO, "rules.md", &document).unwrap();
+    add_symbols(&graph, symbols);
+    graph
+}
+
+/// The symbols `ids` as `src/lib.rs` functions of [`REPO`].
+pub(crate) fn add_symbols(graph: &GraphStore, ids: &[&str]) {
+    graph
+        .transaction(|db| {
+            for id in ids {
+                store_graph::write(
+                    db,
+                    "CREATE (s:Symbol {repository_id: $repo, stable_id: $id, \
+                     kind: 'function', qualified_name: $id, relpath: 'src/lib.rs'})",
+                    store_graph::params(&json!({"repo": REPO, "id": id})),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The first row's `n` of a `$repo`-scoped count query.
+pub(crate) fn count(graph: &GraphStore, cypher: &str) -> i64 {
+    graph
+        .read(|db| {
+            store_graph::rows(db, cypher, store_graph::params(&json!({"repo": REPO})))
+        })
+        .unwrap()[0]["n"]
+        .as_i64()
+        .unwrap()
+}
+
+/// The rules the engine's tests share: a label, a relationship, a property
+/// and a created node, one rule each, plus a constraint.
+pub(crate) const SHARED: &str = "````concept\nid: arch:Test/Label\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) WHERE s.stable_id STARTS WITH 'db'\nSET s:Persistence\n```\n````\n\
+````concept\nid: arch:Test/Connect\nrequires: [arch:Test/Label]\n```cypher\nMATCH (a:Symbol {repository_id: $repo, stable_id: 'db_one'}), (b:Symbol {repository_id: $repo, stable_id: 'db_two'})\nMERGE (a)-[:PERSISTS_IN]->(b)\n```\n````\n\
+````concept\nid: arch:Test/Confidence\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) SET s.arch_confidence = 0.8\n```\n````\n\
+````concept\nid: arch:Test/Layer\n```cypher\nMERGE (l:Layer {repository_id: $repo, name: 'Persistence'})\n```\n````\n\
+````constraint\nid: arch:Test/NoCycles\nseverity: BLOCKER\nrequires: [arch:Test/Connect]\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) RETURN s\n```\n````\n";
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/arch_rules/jqa-git")

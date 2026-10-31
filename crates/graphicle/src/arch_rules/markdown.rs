@@ -87,7 +87,7 @@ fn metadata(kind: Kind, meta: &[&str], line: usize) -> Result<Vec<Field>, RuleEr
             continue;
         }
         match text.split_once(':') {
-            Some((key, value)) if is_key(key.trim()) => fields.push(Field {
+            Some((key, value)) if model::is_key(key.trim()) => fields.push(Field {
                 key: key.trim().to_string(),
                 value: value.trim().to_string(),
                 line: at,
@@ -103,10 +103,6 @@ fn metadata(kind: Kind, meta: &[&str], line: usize) -> Result<Vec<Field>, RuleEr
         }
     }
     Ok(fields)
-}
-
-fn is_key(key: &str) -> bool {
-    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A line that opens a fence: the backtick count and the info string.

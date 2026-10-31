@@ -4,6 +4,7 @@
 //! rule grammar (keys, ids, severities, patterns, bodies) and assembles the
 //! [`RuleDocument`]. Rule semantics live here and nowhere else.
 use crate::digest;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -13,8 +14,11 @@ const CONCEPT_KEYS: &[&str] = &["id", "description", "requires", "severity"];
 const CONSTRAINT_KEYS: &[&str] = &["id", "description", "requires", "severity"];
 const GROUP_KEYS: &[&str] = &["id", "description", "include", "overrides"];
 
-/// The severity ladder of the architecture layer, lowest first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// The severity ladder of the architecture layer, lowest first. Serializes
+/// as the ladder's names (`"INFO"`…`"BLOCKER"`), the spelling the frontends
+/// read and the rule store keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
     Info,
     Minor,
@@ -222,6 +226,12 @@ pub(super) struct Field {
     pub key: String,
     pub value: String,
     pub line: usize,
+}
+
+/// Whether `key` is a metadata key as either frontend reads it: ASCII
+/// letters, digits and underscores, not empty.
+pub(super) fn is_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A rule block as a frontend read it: its kind, the line it starts on, the

@@ -73,6 +73,9 @@ mod fork_guard;
 /// The fixture-home environment of the command-line suites' children.
 mod child_env;
 
+/// The sync-shaped fixture the architecture suites share.
+mod arch;
+
 mod archived;
 mod arch_enrich;
 mod arch_rules;

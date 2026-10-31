@@ -13,15 +13,16 @@ use graphicle_runtime::{
     limits,
     local,
     platform::CanonicalExt,
-    store::{Store, s},
-    store_graph::{self, GraphStore, rows},
+    store::s,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::{Command, Output, Stdio},
 };
 use tempfile::TempDir;
+
+use crate::arch::Fixture;
 
 /// The fixture program's folders: the system's, and no tool of the machine
 /// running the tests.
@@ -51,72 +52,9 @@ const CYCLE_RULES: &str = "# Cycle\n\n\
 ````concept\nid: arch:Cycle/A\nrequires: [arch:Cycle/B]\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) RETURN s\n```\n````\n\n\
 ````concept\nid: arch:Cycle/B\nrequires: [arch:Cycle/A]\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) RETURN s\n```\n````\n";
 
-struct Fixture {
-    _dir: TempDir,
-    root: PathBuf,
-    store: Store,
-    session: local::Session,
-    repo: String,
-}
-
+/// The suite's own probes over the shared fixture: the current episode, the
+/// enrich job's result, the store state the rules wrote, and the analysis.
 impl Fixture {
-    fn new() -> Self {
-        crate::edition_setup();
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
-        let store = Store::open(dir.path().join("store")).unwrap();
-        let mut session = local::session(&store, true).unwrap();
-        let synced = local::sync(&store, &mut session, &root, None).unwrap();
-        let repo = s(&synced, "repository_id").to_string();
-        Self {
-            _dir: dir,
-            root,
-            store,
-            session,
-            repo,
-        }
-    }
-
-    fn write(&self, path: &str, text: &str) {
-        let path = self.root.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
-
-    fn sync(&mut self) -> Value {
-        local::sync(&self.store, &mut self.session, &self.root, Some(&self.repo)).unwrap()
-    }
-
-    /// Sync and build the graph, as `graphicle sync` does: the drain runs
-    /// the projection job and the enrich job it queued.
-    fn sync_and_build(&mut self) -> Value {
-        self.sync();
-        local::build_graph(&self.store, &self.session, &self.repo, false).unwrap()
-    }
-
-    fn graph(&self) -> GraphStore {
-        (*self.store.graph()).clone()
-    }
-
-    /// Rows of a Cypher probe over the `$repo`-scoped graph store, with
-    /// extra parameters merged in.
-    fn query(&self, cypher: &str, extra: Value) -> Vec<Value> {
-        let mut params = Map::new();
-        params.insert("repo".into(), json!(self.repo));
-        for (key, value) in extra.as_object().into_iter().flatten() {
-            params.insert(key.clone(), value.clone());
-        }
-        self.graph()
-            .read(|db| rows(db, cypher, store_graph::params(&Value::Object(params))))
-            .unwrap()
-    }
-
-    fn count(&self, cypher: &str) -> i64 {
-        self.query(cypher, json!({}))[0]["n"].as_i64().unwrap()
-    }
-
     /// The episode the project is at (the latest recorded).
     fn episode(&self) -> String {
         self.query(
@@ -329,8 +267,10 @@ fn applying_a_rule_set_twice_to_one_episode_changes_nothing() {
     // completed job replays, so this is the application itself.
     let graph = f.graph();
     let never = || Ok(());
-    let report = arch_rules::enrich(&graph, &f.repo, &episode, &never).unwrap();
-    let constraints = arch_rules::constraints::evaluate(&graph, &f.repo, &episode, &report, &never).unwrap();
+    let run = arch_rules::enrich(&graph, &f.repo, &episode, &never).unwrap();
+    let constraints =
+        arch_rules::constraints::evaluate(&graph, &f.repo, &episode, &run, &never).unwrap();
+    let (report, constraints) = (run.to_value(), constraints.to_value());
     assert_eq!(report["applied"], json!(1), "{report:#}");
     assert_eq!(constraints["violations"], json!(0), "{constraints:#}");
     assert_eq!(f.state(), first, "the second application left the store as it was");

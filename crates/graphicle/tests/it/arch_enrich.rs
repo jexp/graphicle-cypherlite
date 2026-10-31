@@ -4,87 +4,19 @@
 //! the drain runs it after the projection; a project without rules queues
 //! nothing; a new episode re-runs the rule set with its own application
 //! records.
-use graphicle_runtime::{
-    arch_rules,
-    jobs,
-    local,
-    store::{Store, s},
-    store_graph::{self, GraphStore, rows},
-};
-use serde_json::{Map, Value, json};
-use tempfile::TempDir;
+use graphicle_runtime::{arch_rules, jobs, store::s};
+use serde_json::{Value, json};
+
+use crate::arch::Fixture;
 
 const RULES: &str = "# Architecture rules\n\n\
 Every symbol of the project belongs to the test concept.\n\n\
 ````concept\nid: arch:Test/Label\nseverity: MINOR\ndescription: Every symbol is test material\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) SET s:ArchTest\n```\n````\n\
 ````constraint\nid: arch:Test/Ungrouped\nseverity: MAJOR\nrequires: [arch:Test/Label]\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) WHERE NOT s:ArchTest RETURN s\n```\n````\n";
 
-struct Fixture {
-    _dir: TempDir,
-    root: std::path::PathBuf,
-    store: Store,
-    session: local::Session,
-    repo: String,
-}
-
+/// The suite's own probes over the shared fixture: the enrich jobs, the
+/// recorded episodes and the label rule's applications.
 impl Fixture {
-    fn new() -> Self {
-        crate::edition_setup();
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
-        let store = Store::open(dir.path().join("store")).unwrap();
-        let mut session = local::session(&store, true).unwrap();
-        let synced = local::sync(&store, &mut session, &root, None).unwrap();
-        let repo = s(&synced, "repository_id").to_string();
-        Self {
-            _dir: dir,
-            root,
-            store,
-            session,
-            repo,
-        }
-    }
-
-    fn write(&self, path: &str, text: &str) {
-        let path = self.root.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
-
-    fn sync(&mut self) -> Value {
-        local::sync(&self.store, &mut self.session, &self.root, Some(&self.repo)).unwrap()
-    }
-
-    /// Sync and build the graph, as `graphicle sync` does: the drain runs
-    /// the projection job and the enrich job it queued.
-    fn sync_and_build(&mut self) -> Value {
-        self.sync();
-        local::build_graph(&self.store, &self.session, &self.repo, false).unwrap()
-    }
-
-    fn graph(&self) -> GraphStore {
-        (*self.store.graph()).clone()
-    }
-
-    /// Rows of a Cypher probe over the `$repo`-scoped graph store, with
-    /// extra parameters merged in.
-    fn query(&self, cypher: &str, extra: Value) -> Vec<Value> {
-        let mut params = Map::new();
-        params.insert("repo".into(), json!(self.repo));
-        for (key, value) in extra.as_object().into_iter().flatten() {
-            params.insert(key.clone(), value.clone());
-        }
-        self.graph()
-            .read(|db| rows(db, cypher, store_graph::params(&Value::Object(params))))
-            .unwrap()
-    }
-
-    fn count(&self, cypher: &str) -> i64 {
-        self.query(cypher, json!({}))[0]["n"].as_i64().unwrap()
-    }
-
     /// The enrich jobs of the project, oldest first: `{id, state,
     /// input_hash, episode, result}` with `result` decoded.
     fn enrich_jobs(&self) -> Vec<Value> {
