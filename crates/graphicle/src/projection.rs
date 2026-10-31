@@ -192,11 +192,11 @@ pub fn status(store: &Store, workspace: &str, token: &str) -> Result<Value> {
         Ok(json!({"cleanups": crate::store::graph_for(db)?.read(|g| {
             graph::rows(
                 g,
-                &format!("MATCH (c:ProjectionCleanup {{workspace_id: $ws}}) \
+                "MATCH (c:ProjectionCleanup {workspace_id: $ws}) \
                      RETURN c.id AS id, c.scope AS scope, c.kind AS kind, c.state AS state, \
                             c.attempts AS attempts, c.reason AS reason, c.error AS error, \
                             c.created_at AS created_at, c.updated_at AS updated_at \
-                     ORDER BY c.updated_at DESC LIMIT 200"),
+                     ORDER BY c.updated_at DESC LIMIT 200",
                 graph::params(&json!({"ws": workspace})),
             )
         })?}))

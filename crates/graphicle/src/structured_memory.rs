@@ -24,10 +24,9 @@ pub fn attach(graph: &GraphStore, repository: &str, args: &Value, data: &mut Val
         data["recall"] = serde_json::to_value(metadata(value)?)?;
     } else if let Some(identifier) = args["memory_id"].as_str()
         && let Some(prior) = memory::memory_row(graph, repository, identifier)?
+        && let Some(value) = prior["data"].get("recall")
     {
-        if let Some(value) = prior["data"].get("recall") {
-            data["recall"] = serde_json::to_value(metadata(value)?)?;
-        }
+        data["recall"] = serde_json::to_value(metadata(value)?)?;
     }
     Ok(())
 }

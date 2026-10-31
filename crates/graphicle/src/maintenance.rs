@@ -487,7 +487,6 @@ pub(crate) fn delete_project_sql(
     p: &store::Principal,
     identifier: &str,
     mut removed: Value,
-    graph_cache: bool,
 ) -> Result<Value> {
     let connectors: Vec<String> = store::rows(
         db,
@@ -852,10 +851,10 @@ impl Store {
                         // Legacy SQL store (project mid-migration).
                         let mut scratch=Vec::with_capacity(copies.len());
                         for copy in &copies {
-                            scratch.push(delete_project_sql(db,p,copy,json!({}),false)?);
+                            scratch.push(delete_project_sql(db,p,copy,json!({}))?);
                         }
                         let removed=if copies.is_empty() {json!({})} else {json!({"pr_scratch_projects":copies})};
-                        let receipt=delete_project_sql(db,p,&identifier,removed,false)?;
+                        let receipt=delete_project_sql(db,p,&identifier,removed)?;
                         let mut result=json!({"deleted":true,"local_backups_are_separate":true,"receipt":receipt});
                         if !scratch.is_empty() {result["pr_scratch_projects"]=json!(scratch);}
                         return Ok(result);
@@ -965,11 +964,13 @@ impl Store {
             let store = graph_store(self)?;
             return backup_graph(&store, path);
         }
-        use std::os::unix::fs::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let file = options.open(path)?;
         drop(file);
         let result = (|| {

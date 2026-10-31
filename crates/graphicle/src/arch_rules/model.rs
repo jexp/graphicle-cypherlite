@@ -524,7 +524,7 @@ fn overrides_of(
             let (id, severity_text) = item
                 .split_once('=')
                 .ok_or_else(|| invalid(format!("override '{item}' is not 'id=SEVERITY'")))?;
-            pattern(id.trim()).map_err(&invalid)?;
+            pattern(id.trim()).map_err(invalid)?;
             let severity = Severity::parse(severity_text.trim())
                 .ok_or_else(|| invalid(format!("override '{item}' has an unknown severity")))?;
             Ok((id.trim().to_string(), severity))

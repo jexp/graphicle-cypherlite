@@ -469,10 +469,10 @@ impl Store {
         // second sync) must still open the store, read through the read-only
         // handle `Store::graph` falls back to, and fail at the write if it
         // turns out to write. Only a genuine open failure is fatal here.
-        if let Err(error) = graph_in(directory) {
-            if !error.message.contains("storage locked") {
-                return Err(error);
-            }
+        if let Err(error) = graph_in(directory)
+            && !error.message.contains("storage locked")
+        {
+            return Err(error);
         }
         let db = store.connect()?;
         // A store that needs a newer program is refused before anything in
@@ -1430,7 +1430,6 @@ fn check_reader(db: &Connection) -> Result<()> {
 /// Additive column migration for tables created by an earlier schema:
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column
 /// added later is appended here when `pragma_table_info` lacks it.
-
 pub fn ensure_column(db: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
     let present = rows(db, &format!("PRAGMA table_info({table})"), [])?
         .iter()

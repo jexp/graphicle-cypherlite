@@ -212,10 +212,12 @@ fn claims_entities_and_links_live_in_the_graph() {
                 &f.store.graph(),
                 &repository,
                 p,
-                &json!([claim]),
-                &sources,
-                &[],
-                &json!({"model":"probe"}),
+                claims::Proposal {
+                    claims: &json!([claim]),
+                    sources: &sources,
+                    targets: &[],
+                    provider: &json!({"model":"probe"}),
+                },
             )?;
             Ok(s(&result["drafts"][0], "memory_id").to_string())
         })

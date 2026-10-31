@@ -435,7 +435,7 @@ impl Store {
     pub fn connector_list(&self, workspace: &str, token: &str, args: &Value) -> Result<Value> {
         self.authorized_read(workspace,token,"admin",|db,p| {
             let repository=repo(db,p,string(args,"repository_id",100)?)?;
-            let mut values=self.graph().read(|gdb|graph::rows(gdb,&format!("MATCH (c:Connector {{repository_id: $repository}}) RETURN c.id AS id, c.name AS name, c.kind AS kind, c.state AS state, c.config AS config, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error ORDER BY c.name"),Params::from([("repository".into(),json_to_value(&json!(s(&repository,"id"))))])))?;
+            let mut values=self.graph().read(|gdb|graph::rows(gdb,"MATCH (c:Connector {repository_id: $repository}) RETURN c.id AS id, c.name AS name, c.kind AS kind, c.state AS state, c.config AS config, c.cursor AS cursor, c.generation AS generation, c.last_sync AS last_sync, c.error AS error ORDER BY c.name",Params::from([("repository".into(),json_to_value(&json!(s(&repository,"id"))))])))?;
             for value in &mut values {
                 store::decode(value,"config")?;store::decode(value,"cursor")?;
                 let cursor=value["cursor"].clone();value["pending_scan"]=json!(!cursor.is_null());value["cursor"]=cursor.get("index").cloned().unwrap_or(Value::Null);

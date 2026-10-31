@@ -1172,7 +1172,7 @@ fn backups_are_scrubbed_by_the_extension_too() {
     })
     .unwrap();
     drop(live);
-    let dir = f.store.directory.join("backup.graph()");
+    let dir = f.store.directory.join("backup.graph");
     f.store.backup(&dir).unwrap();
     let count = |store: &GraphStore| -> i64 {
         store

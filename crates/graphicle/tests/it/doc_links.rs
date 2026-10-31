@@ -17,7 +17,7 @@ use graphicle_runtime::{
     atlassian, connectors, doc_links, documents, graph_projection,
     jobs::{self, Worker},
     model,
-    store::{self, Store, s},
+    store::{Store, s},
     store_graph::{self, Params, json_to_value},
 };
 use serde_json::{Value, json};
@@ -122,13 +122,6 @@ impl Fixture {
     }
     fn read(&self, token: &str, args: Value) -> graphicle_runtime::Result<Value> {
         doc_links::read(&self.store, &self.workspace, token, &args)
-    }
-    fn count(&self, sql: &str) -> i64 {
-        self.store
-            .read(|db| Ok(store::one(db, sql, [])?.unwrap()))
-            .unwrap()["n"]
-            .as_i64()
-            .unwrap()
     }
     /// Run a read-only Cypher query against the store's graph (the link
     /// rows live there, not in the SQL store).

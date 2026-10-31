@@ -5,7 +5,7 @@ target/
 target-agent/
 /dist/
 # Parser sources prepared by crates/graphicle/tools/prepare_parser_sources.py.
-/.tslp-root/
+/.tslp-root
 # Offline Docker inputs (crates/graphicle/tools/prepare_linux_context.py).
 /deploy/.offline/
 # The code graph that graphicle and graphicle-graph write in each project they

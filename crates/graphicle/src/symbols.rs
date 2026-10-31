@@ -365,21 +365,33 @@ fn rows_of(
     out
 }
 
-/// After `persist_with_report` recorded `episode` for the current head set
-/// `heads`: the table follows it. When the table described the latest
-/// episode before this one (`parent`), only the files the projection
-/// rewrote (`dirty`, the delta's owner groups) are replaced; otherwise the
-/// whole table is rebuilt from `graph`.
+/// After `persist_with_report` recorded an episode for the current head
+/// set: the table follows it. When the table described the latest episode
+/// before this one (`parent`), only the files the projection rewrote
+/// (`dirty`, the delta's owner groups) are replaced; otherwise the whole
+/// table is rebuilt from `graph`.
+pub(crate) struct Recording<'a> {
+    pub episode: &'a str,
+    pub heads: &'a BTreeMap<String, String>,
+    pub parent: Option<&'a str>,
+    pub dirty: &'a BTreeSet<String>,
+}
+
+/// Write the recording: replace the live-symbol table for [`Recording`]'s
+/// episode, by its dirty files when it is incremental.
 pub(crate) fn record(
     db: &Connection,
     gstore: &GraphStore,
     repository: &str,
-    episode: &str,
     graph: &Graph,
-    heads: &BTreeMap<String, String>,
-    parent: Option<&str>,
-    dirty: &BTreeSet<String>,
+    recording: Recording<'_>,
 ) -> Result<()> {
+    let Recording {
+        episode,
+        heads,
+        parent,
+        dirty,
+    } = recording;
     let incremental = parent.is_some() && table_episode(gstore, repository)?.as_deref() == parent;
     let owners = incremental.then_some(dirty);
     replace(
