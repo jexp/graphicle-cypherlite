@@ -53,8 +53,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::{CommitRecord, GitRef, Window};
 use super::reader;
+use super::{CommitRecord, GitRef, Window};
 use crate::store_graph::{self, GraphStore};
 use crate::{Result, digest, now};
 use serde_json::{Value, json};
@@ -187,7 +187,13 @@ pub fn ingest(
     write_parents(&pass, commits)?;
     write_persons(&pass, commits)?;
     write_changes(&pass, commits)?;
-    write_refs(&pass, &history.branches, &history.tags, &history.head, &window)?;
+    write_refs(
+        &pass,
+        &history.branches,
+        &history.tags,
+        &history.head,
+        &window,
+    )?;
     let mut result = json!({
         "kind": KIND, "mode": mode, "head": history.head,
         "known_at": known_at, "ingested": commits.len(),
@@ -439,7 +445,12 @@ fn write_persons(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
         // The log is newest first: the first name seen for an email is the
         // newest one, every later (older) name an alias.
         for side in [
-            (&commit.author_name, &commit.author_email, &commit.author_date, false),
+            (
+                &commit.author_name,
+                &commit.author_email,
+                &commit.author_date,
+                false,
+            ),
             (
                 &commit.committer_name,
                 &commit.committer_email,
@@ -575,7 +586,13 @@ fn write_changes(pass: &Pass, commits: &[CommitRecord]) -> Result<()> {
 /// knows whether it can resume or must re-walk under a changed bound — and
 /// the pruning of refs git no longer lists. Ref targets outside the
 /// emitted set are stubbed like parents.
-fn write_refs(pass: &Pass, branches: &[GitRef], tags: &[GitRef], head: &str, window: &Window) -> Result<()> {
+fn write_refs(
+    pass: &Pass,
+    branches: &[GitRef],
+    tags: &[GitRef],
+    head: &str,
+    window: &Window,
+) -> Result<()> {
     let head_ref = GitRef {
         name: HEAD_BRANCH.to_string(),
         refname: HEAD_BRANCH.to_string(),
@@ -761,7 +778,10 @@ mod tests {
 
     /// `found` scoped to one repository.
     fn of(graph: &GraphStore, repository_id: &str, cypher: &str) -> i64 {
-        let query = cypher.replace("$repo_scope", &format!("{{repository_id: '{repository_id}'}}"));
+        let query = cypher.replace(
+            "$repo_scope",
+            &format!("{{repository_id: '{repository_id}'}}"),
+        );
         found(graph, &query, json!({"repo": repository_id}))
     }
 
@@ -831,9 +851,19 @@ mod tests {
         assert_eq!(result["head"], json!(repo.rev("HEAD")));
         let expected = repo_count(repo.root());
         assert_eq!(result["commits"], json!(expected), "{result:#}");
-        assert_eq!(of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"), expected);
         assert_eq!(
-            total(&graph, "MATCH (:Project {id: 'repo-git'})-[:HAS_COMMIT]->() RETURN count(*) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ),
+            expected
+        );
+        assert_eq!(
+            total(
+                &graph,
+                "MATCH (:Project {id: 'repo-git'})-[:HAS_COMMIT]->() RETURN count(*) AS n"
+            ),
             expected,
             "one HAS_COMMIT edge per commit, from the project anchor"
         );
@@ -865,23 +895,24 @@ mod tests {
         // Ordered parents: the merge keeps first parent first, the octopus
         // keeps three in git's order.
         let parents = |oid: &str| {
-            graph.read(|db| {
-                store_graph::rows(
-                    db,
-                    "MATCH (:Commit {repository_id: $repo, oid: $oid})-[r:PARENT]->(p) \
+            graph
+                .read(|db| {
+                    store_graph::rows(
+                        db,
+                        "MATCH (:Commit {repository_id: $repo, oid: $oid})-[r:PARENT]->(p) \
                      RETURN r.position AS pos, p.oid AS oid ORDER BY pos",
-                    p(&json!({"repo": "repo-git", "oid": oid})),
-                )
-            })
-            .unwrap()
-            .into_iter()
-            .map(|row| {
-                (
-                    row["pos"].as_i64().unwrap_or_default(),
-                    row["oid"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect::<Vec<_>>()
+                        p(&json!({"repo": "repo-git", "oid": oid})),
+                    )
+                })
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    (
+                        row["pos"].as_i64().unwrap_or_default(),
+                        row["oid"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             parents(&scenario.merge),
@@ -901,7 +932,14 @@ mod tests {
 
         // Two authors, deduped by lowercased email, named by their newest
         // commit, one AUTHORED edge per commit they wrote, at their date.
-        assert_eq!(of(&graph, "repo-git", "MATCH (a:Person $repo_scope) RETURN count(a) AS n"), 2);
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (a:Person $repo_scope) RETURN count(a) AS n"
+            ),
+            2
+        );
         let ada = graph
             .read(|db| {
                 store_graph::one(
@@ -983,8 +1021,11 @@ mod tests {
         // commit itself has no Change at it — the old path lives in
         // `old_path`, load-time rename resolution.
         assert_eq!(
-            of(&graph, "repo-git",
-               "MATCH (ch:Change $repo_scope) WHERE ch.path = 'src/common.rs' RETURN count(ch) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (ch:Change $repo_scope) WHERE ch.path = 'src/common.rs' RETURN count(ch) AS n"
+            ),
             1
         );
         assert_eq!(
@@ -999,12 +1040,19 @@ mod tests {
 
         // Branches and tags as own nodes, with the HEAD record among them.
         assert_eq!(
-            of(&graph, "repo-git", "MATCH (b:Branch $repo_scope) RETURN count(b) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (b:Branch $repo_scope) RETURN count(b) AS n"
+            ),
             5,
             "feat, main, o1, o2 and the HEAD record"
         );
         assert_eq!(
-            total(&graph, "MATCH (:Project {id: 'repo-git'})-[:HAS_BRANCH]->(:Branch) RETURN count(*) AS n"),
+            total(
+                &graph,
+                "MATCH (:Project {id: 'repo-git'})-[:HAS_BRANCH]->(:Branch) RETURN count(*) AS n"
+            ),
             5
         );
         assert_eq!(
@@ -1039,7 +1087,14 @@ mod tests {
 
         // Every touched path has its File (a stub here; the content store
         // MERGEs the same key when it projects).
-        assert_eq!(of(&graph, "repo-git", "MATCH (f:File $repo_scope) RETURN count(f) AS n"), FILES);
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (f:File $repo_scope) RETURN count(f) AS n"
+            ),
+            FILES
+        );
         drop(dir);
     }
 
@@ -1096,7 +1151,11 @@ mod tests {
         let (dir, repo, _scenario) = history_fixture();
         let graph = graph_for("repo-git");
         run(&graph, "repo-git", repo.root());
-        let before = of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n");
+        let before = of(
+            &graph,
+            "repo-git",
+            "MATCH (c:Commit $repo_scope) RETURN count(c) AS n",
+        );
 
         repo.write("src/later.rs", "later\n");
         repo.commit(fixture::ada(fixture::DAY_1), "later: add", "");
@@ -1106,7 +1165,11 @@ mod tests {
         assert_eq!(result["mode"], json!("resume"), "{result:#}");
         assert_eq!(result["ingested"], json!(1));
         assert_eq!(
-            of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ),
             before + 1
         );
         // The new commit's parent edge reaches the recorded head, and the
@@ -1130,7 +1193,14 @@ mod tests {
             1
         );
         // No duplicate persons for the old commits.
-        assert_eq!(of(&graph, "repo-git", "MATCH (a:Person $repo_scope) RETURN count(a) AS n"), 2);
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (a:Person $repo_scope) RETURN count(a) AS n"
+            ),
+            2
+        );
         assert!(!marked_stale(&graph, "repo-git").unwrap());
         drop(dir);
     }
@@ -1141,8 +1211,16 @@ mod tests {
         let graph = graph_for("repo-git");
         run(&graph, "repo-git", repo.root());
         let old_tip = repo.rev("HEAD");
-        let commits = of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n");
-        let changes = of(&graph, "repo-git", "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n");
+        let commits = of(
+            &graph,
+            "repo-git",
+            "MATCH (c:Commit $repo_scope) RETURN count(c) AS n",
+        );
+        let changes = of(
+            &graph,
+            "repo-git",
+            "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n",
+        );
 
         // A history rewrite: amending the tip leaves the recorded head
         // unreachable (its object survives, its ref does not).
@@ -1155,18 +1233,38 @@ mod tests {
         assert_eq!(detected["mode"], json!("stale"), "{detected:#}");
         assert!(marked_stale(&graph, "repo-git").unwrap());
         assert_eq!(
-            total(&graph, "MATCH (b:Branch {repository_id: 'repo-git', name: 'HEAD'}) WHERE b:Stale RETURN count(b) AS n"),
+            total(
+                &graph,
+                "MATCH (b:Branch {repository_id: 'repo-git', name: 'HEAD'}) WHERE b:Stale RETURN count(b) AS n"
+            ),
             1,
             "the mark sits on the head record itself"
         );
-        assert_eq!(of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"), commits);
-        assert_eq!(of(&graph, "repo-git", "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n"), changes);
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ),
+            commits
+        );
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n"
+            ),
+            changes
+        );
 
         // The next run: a full re-ingest under a new known_at.
         let rescanned = run(&graph, "repo-git", repo.root());
         assert_eq!(rescanned["mode"], json!("rescan"), "{rescanned:#}");
         assert_eq!(rescanned["head"], json!(new_tip));
-        assert!(!marked_stale(&graph, "repo-git").unwrap(), "the rescan clears the mark");
+        assert!(
+            !marked_stale(&graph, "repo-git").unwrap(),
+            "the rescan clears the mark"
+        );
         // The vanished tip's anchored facts are gone; the rewritten tip is
         // in, with the same history length (an amend rewrites one commit).
         assert_eq!(
@@ -1186,15 +1284,43 @@ mod tests {
             ),
             1
         );
-        assert_eq!(of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"), commits);
         assert_eq!(
-            total(&graph, "MATCH (:Change {repository_id: 'repo-git'})-[:MODIFIES]->(:File {repository_id: 'repo-git'}) RETURN count(*) AS n"),
-            of(&graph, "repo-git", "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ),
+            commits
+        );
+        assert_eq!(
+            total(
+                &graph,
+                "MATCH (:Change {repository_id: 'repo-git'})-[:MODIFIES]->(:File {repository_id: 'repo-git'}) RETURN count(*) AS n"
+            ),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (ch:Change $repo_scope) RETURN count(ch) AS n"
+            ),
             "every surviving change still modifies its file"
         );
         // Persons and files survive the rescan: they are shared.
-        assert_eq!(of(&graph, "repo-git", "MATCH (a:Person $repo_scope) RETURN count(a) AS n"), 2);
-        assert_eq!(of(&graph, "repo-git", "MATCH (f:File $repo_scope) RETURN count(f) AS n"), FILES);
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (a:Person $repo_scope) RETURN count(a) AS n"
+            ),
+            2
+        );
+        assert_eq!(
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (f:File $repo_scope) RETURN count(f) AS n"
+            ),
+            FILES
+        );
         drop(dir);
     }
 
@@ -1244,15 +1370,24 @@ mod tests {
         );
         // No edge crosses repositories — the fork shape's whole point.
         for edge in [
-            "PARENT", "CONTAINS_CHANGE", "MODIFIES", "AUTHORED", "COMMITTED", "AT", "TAGS",
+            "PARENT",
+            "CONTAINS_CHANGE",
+            "MODIFIES",
+            "AUTHORED",
+            "COMMITTED",
+            "AT",
+            "TAGS",
         ] {
             assert_eq!(
-                total(&graph, &format!(
-                    "MATCH (a)-[:{edge}]->(b) \
+                total(
+                    &graph,
+                    &format!(
+                        "MATCH (a)-[:{edge}]->(b) \
                      WHERE (a.repository_id = 'repo-a' AND b.repository_id = 'repo-b') \
                         OR (a.repository_id = 'repo-b' AND b.repository_id = 'repo-a') \
                      RETURN count(*) AS n"
-                )),
+                    )
+                ),
                 0,
                 "a {edge} edge crossed repositories"
             );
@@ -1280,7 +1415,11 @@ mod tests {
             1
         );
         assert_eq!(
-            of(&graph, "repo-b", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"),
+            of(
+                &graph,
+                "repo-b",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ),
             repo_count(repo.root()) + 1
         );
         drop(dir);
@@ -1299,12 +1438,19 @@ mod tests {
         // Three commits came back with their facts; their parents outside
         // the window exist as boundary stubs.
         assert_eq!(
-            of(&graph, "repo-git",
-               "MATCH (c:Commit $repo_scope) WHERE c.subject IS NOT NULL RETURN count(c) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) WHERE c.subject IS NOT NULL RETURN count(c) AS n"
+            ),
             3
         );
         assert!(
-            of(&graph, "repo-git", "MATCH (c:Commit $repo_scope) RETURN count(c) AS n") > 3,
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) RETURN count(c) AS n"
+            ) > 3,
             "the window's boundary parents are stubbed so the DAG stays connected"
         );
         drop(dir);
@@ -1323,18 +1469,23 @@ mod tests {
         // present, but with no facts of its own.
         let o1_tip = repo.rev("o1");
         let stub = |graph: &GraphStore| {
-            graph.read(|db| {
-                store_graph::one(
-                    db,
-                    "MATCH (c:Commit {repository_id: $repo, oid: $oid}) \
+            graph
+                .read(|db| {
+                    store_graph::one(
+                        db,
+                        "MATCH (c:Commit {repository_id: $repo, oid: $oid}) \
                      RETURN c.subject AS subject, c.author_date AS author_date",
-                    p(&json!({"repo": "repo-git", "oid": o1_tip})),
-                )
-            })
-            .unwrap()
-            .unwrap()
+                        p(&json!({"repo": "repo-git", "oid": o1_tip})),
+                    )
+                })
+                .unwrap()
+                .unwrap()
         };
-        assert_eq!(stub(&graph)["subject"], Value::Null, "a stub carries no facts");
+        assert_eq!(
+            stub(&graph)["subject"],
+            Value::Null,
+            "a stub carries no facts"
+        );
 
         // A wider window cannot resume onto the bounded record: it
         // back-fills again, and the stubs gain their facts.
@@ -1343,12 +1494,17 @@ mod tests {
         let filled = stub(&graph);
         assert_eq!(filled["subject"], json!("o1: add o1"));
         assert!(
-            filled["author_date"].as_str().is_some_and(|at| !at.is_empty()),
+            filled["author_date"]
+                .as_str()
+                .is_some_and(|at| !at.is_empty()),
             "the stub gained its dates too"
         );
         assert_eq!(
-            of(&graph, "repo-git",
-               "MATCH (c:Commit $repo_scope) WHERE c.subject IS NOT NULL RETURN count(c) AS n"),
+            of(
+                &graph,
+                "repo-git",
+                "MATCH (c:Commit $repo_scope) WHERE c.subject IS NOT NULL RETURN count(c) AS n"
+            ),
             repo_count(repo.root())
         );
         // The record now covers the default window: nothing more to walk.
@@ -1372,7 +1528,11 @@ mod tests {
         let head = "a".repeat(40);
         let plain = input_hash(&head, &window, false);
         assert_eq!(plain, input_hash(&head, &window, false));
-        assert_ne!(plain, input_hash(&"b".repeat(40), &window, false), "a new HEAD is a new job");
+        assert_ne!(
+            plain,
+            input_hash(&"b".repeat(40), &window, false),
+            "a new HEAD is a new job"
+        );
         assert_ne!(
             plain,
             input_hash(&head, &window, true),

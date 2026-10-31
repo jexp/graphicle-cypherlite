@@ -36,7 +36,8 @@ fn a_sync_of_a_folder_that_is_not_a_git_repository_queues_no_history() {
         .last()
         .expect("the drain ran the projection job");
     assert_eq!(
-        latest["state"], json!("complete"),
+        latest["state"],
+        json!("complete"),
         "the projection itself succeeds: {latest:#}"
     );
     // The enqueue point reported the folder as out of scope — a skip, not

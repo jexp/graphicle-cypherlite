@@ -158,11 +158,7 @@ pub(crate) fn read_history_capped(dir: &Path, limit: u64) -> Result<History, Rea
     read_history_bounded(dir, limit, &Window::default())
 }
 
-fn read_history_bounded(
-    dir: &Path,
-    limit: u64,
-    window: &Window,
-) -> Result<History, ReadError> {
+fn read_history_bounded(dir: &Path, limit: u64, window: &Window) -> Result<History, ReadError> {
     let head = current_head(dir)?;
     let Some(head) = head else {
         return Err(ReadError::NoCommits);

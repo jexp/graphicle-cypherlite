@@ -137,10 +137,7 @@ impl Repo {
     /// unchanged tree; returns the rewritten tip. A history rewrite with no
     /// side branches: the recorded head becomes unreachable.
     pub fn amend(&self, ident: Ident, subject: &str) -> String {
-        self.run(
-            &["commit", "-q", "--amend", "-m", subject],
-            ident,
-        );
+        self.run(&["commit", "-q", "--amend", "-m", subject], ident);
         self.rev("HEAD")
     }
 

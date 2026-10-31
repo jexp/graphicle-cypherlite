@@ -462,7 +462,10 @@ fn current_head_is_none_for_an_unborn_repository() {
 #[test]
 fn current_head_reads_the_checkout_head() {
     let (_dir, repo, _scenario) = history_fixture();
-    assert_eq!(current_head(repo.root()).unwrap().as_deref(), Some(repo.rev("HEAD").as_str()));
+    assert_eq!(
+        current_head(repo.root()).unwrap().as_deref(),
+        Some(repo.rev("HEAD").as_str())
+    );
 }
 
 #[test]
@@ -503,7 +506,12 @@ fn a_resume_range_reads_only_the_new_commits() {
         range: Some(format!("{head}..{head}")),
         ..Window::default()
     };
-    assert!(read_history_windowed(repo.root(), &same).unwrap().commits.is_empty());
+    assert!(
+        read_history_windowed(repo.root(), &same)
+            .unwrap()
+            .commits
+            .is_empty()
+    );
     drop(dir);
 }
 

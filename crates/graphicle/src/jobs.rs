@@ -1262,9 +1262,7 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
         max_commits: job.payload["window"]["max_commits"]
             .as_u64()
             .map(|max| max as usize),
-        since: job.payload["window"]["since"]
-            .as_str()
-            .map(str::to_string),
+        since: job.payload["window"]["since"].as_str().map(str::to_string),
         range: None,
     };
     let mut ingested =
@@ -1276,12 +1274,10 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
     crate::git_history::correlation::correlate_head(&graph, &identifier, &folder)?;
     // Changes resolve against the episodes correlation just recorded
     // (change resolution, episode-lagged by design).
-    ingested["resolution"] = crate::git_history::resolution::resolve(
-        &graph,
-        &identifier,
-        &folder,
-        &|| leased(&graph, job),
-    )?;
+    ingested["resolution"] =
+        crate::git_history::resolution::resolve(&graph, &identifier, &folder, &|| {
+            leased(&graph, job)
+        })?;
     // The history is complete at this head: its co-change derivation waits
     // on it (git-to-graph plan §5). A result without a head queued nothing.
     if let Some(head) = ingested["head"].as_str().map(str::to_string) {
@@ -1427,8 +1423,7 @@ pub fn drain_projection_until(
         let Some(job) = store.lease_job_of_kind(repository, crate::git_history::KIND)? else {
             break;
         };
-        let result =
-            crate::phase::phase("job_history", || run_history(store, &job));
+        let result = crate::phase::phase("job_history", || run_history(store, &job));
         results.push(match &result {
             Ok(value) => json!({"job": job.id, "kind": crate::git_history::KIND, "ok": true,
                 "mode": value["mode"], "commits": value["commits"]}),
@@ -2711,7 +2706,10 @@ mod tests {
 
         // The history lands, so the head record exists; HEAD never moves
         // again in this test.
-        writer::ingest(&graph, "repo-git", repo.root(), &Window::default(), &|| Ok(())).unwrap();
+        writer::ingest(&graph, "repo-git", repo.root(), &Window::default(), &|| {
+            Ok(())
+        })
+        .unwrap();
 
         // The same key replays the waiting job — this is the unmoved,
         // unstale case.
@@ -2736,7 +2734,8 @@ mod tests {
         let rescan = enqueue(&store, &p);
         assert_eq!(rescan["queued"], json!(true), "{rescan:#}");
         assert_eq!(
-            rescan["replayed"], json!(false),
+            rescan["replayed"],
+            json!(false),
             "a stale history is a new job even though HEAD did not move"
         );
         assert_eq!(
@@ -2789,7 +2788,10 @@ mod tests {
             .transaction(|db| enqueue_history(&store, db, "repo-none", &p))
             .unwrap();
         assert_eq!(folderless["queued"], json!(false), "{folderless:#}");
-        assert_eq!(folderless["reason"], json!("the project has no recorded folder"));
+        assert_eq!(
+            folderless["reason"],
+            json!("the project has no recorded folder")
+        );
         drop(dir);
     }
 
