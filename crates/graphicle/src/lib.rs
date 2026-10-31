@@ -30,6 +30,7 @@ pub mod fix;
 pub mod folders;
 pub mod fresh;
 pub mod git_hooks;
+pub mod git_history;
 pub mod graph;
 pub mod graph_command;
 pub mod graph_delta;
