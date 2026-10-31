@@ -1149,14 +1149,16 @@ pub fn enqueue_history(
     let job_id = graph.transaction(|db| {
         insert_job(
             db,
-            repository,
-            &p.workspace,
-            crate::git_history::KIND,
-            &input_hash,
-            &payload,
-            &p.hash,
-            -1,
-            3,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: crate::git_history::KIND,
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
         )
     })?;
     store::event(
