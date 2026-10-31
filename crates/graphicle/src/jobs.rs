@@ -327,6 +327,7 @@ const KINDS: &[(&str, &str)] = &[
     ("link", "read"),
     ("enrich", "read"),
     (crate::git_history::KIND, "read"),
+    (crate::git_history::coupling::KIND, "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -1181,6 +1182,65 @@ pub fn enqueue_history(
         "replayed": false, "queued": true}))
 }
 
+/// Queue the co-change derivation of a repository once its history is
+/// complete at `head` (git-to-graph plan §5): one `coupling` job per
+/// (repository, `HEAD` sha, window configuration), so a repeated history job
+/// over an unchanged head and configuration replays it. A failed or cancelled
+/// job starts again with a fresh budget.
+pub fn enqueue_coupling(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    head: &str,
+    config: &crate::git_history::coupling::Config,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    let kind = crate::git_history::coupling::KIND;
+    let input_hash = crate::git_history::coupling::input_hash(head, config);
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({"repo": repository, "kind": kind, "hash": input_hash})),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            requeue_job(&graph, s(&existing, "id"))?;
+            return Ok(json!({"id": existing["id"], "state": "queued", "kind": kind,
+                "replayed": true, "queued": true}));
+        }
+        return Ok(json!({"id": existing["id"], "state": existing["state"], "kind": kind,
+            "replayed": true, "queued": true}));
+    }
+    let payload = json!({"kind": kind, "head": head, "config": config.to_json(),
+        "format": crate::git_history::coupling::FORMAT});
+    let job_id = graph.transaction(|db| {
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind,
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
+    })?;
+    store::event(
+        db,
+        repository,
+        "workflow_queued",
+        json!({"id": job_id, "kind": kind}),
+    )?;
+    Ok(json!({"id": job_id, "state": "queued", "kind": kind,
+        "replayed": false, "queued": true}))
+}
+
 /// Execute a `history` job: ingest the project folder's git history into
 /// the store (git-to-graph plan §2–§4 and §6), resuming from the recorded
 /// head or rescanning when it went stale. The job's lease is renewed while
@@ -1191,7 +1251,7 @@ pub fn run_history(store: &Store, job: &Job) -> Result<Value> {
 
 fn history_job(store: &Store, job: &Job) -> Result<Value> {
     let graph = store.graph().clone();
-    let (identifier, folder) = store.read(|db| {
+    let (identifier, folder, p) = store.read(|db| {
         leased(&graph, job)?;
         let p = authorize_hash(
             db,
@@ -1203,6 +1263,7 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
         Ok((
             s(&repository, "id").to_string(),
             crate::folders::current_folder(&graph, s(&repository, "id"))?,
+            p,
         ))
     })?;
     let Some(folder) = folder else {
@@ -1233,7 +1294,51 @@ fn history_job(store: &Store, job: &Job) -> Result<Value> {
         &folder,
         &|| leased(&graph, job),
     )?;
+    // The history is complete at this head: its co-change derivation waits
+    // on it (git-to-graph plan §5). A result without a head queued nothing.
+    if let Some(head) = ingested["head"].as_str().map(str::to_string) {
+        store.transaction(|db| {
+            enqueue_coupling(
+                store,
+                db,
+                &identifier,
+                &p,
+                &head,
+                &crate::git_history::coupling::Config::default(),
+            )
+        })?;
+    }
     Ok(ingested)
+}
+
+/// Execute a `coupling` job: recompute the co-change edges of the project's
+/// history for each configured window (git-to-graph plan §5). The job's
+/// lease is renewed while it runs.
+pub fn run_coupling(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || coupling_job(store, job))
+}
+
+fn coupling_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let identifier = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission(crate::git_history::coupling::KIND)?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok(s(&repository, "id").to_string())
+    })?;
+    let config = crate::git_history::coupling::Config::from_json(&job.payload["config"]);
+    crate::git_history::coupling::derive(
+        &graph,
+        &identifier,
+        chrono::Utc::now(),
+        &config,
+        &|| leased(&graph, job),
+    )
 }
 
 /// Run `repository`'s waiting graph work in this
@@ -1346,6 +1451,21 @@ pub fn drain_projection_until(
             Err(error) => {
                 json!({"job": job.id, "kind": crate::git_history::KIND, "ok": false, "error": error.message})
             }
+        });
+        store.finish_job(&job, result)?;
+    }
+    // The co-change derivation each completed history queued (plan §5).
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, crate::git_history::coupling::KIND)?
+        else {
+            break;
+        };
+        let result = crate::phase::phase("job_coupling", || run_coupling(store, &job));
+        results.push(match &result {
+            Ok(value) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
+                "ok": true, "windows": value["windows"]}),
+            Err(error) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
+                "ok": false, "error": error.message}),
         });
         store.finish_job(&job, result)?;
     }
@@ -2686,6 +2806,175 @@ mod tests {
             .unwrap();
         assert_eq!(folderless["queued"], json!(false), "{folderless:#}");
         assert_eq!(folderless["reason"], json!("the project has no recorded folder"));
+        drop(dir);
+    }
+
+    /// [`git_project`] under a real workspace, so a leased job authorizes:
+    /// the owner's principal is the workspace's capability hash. The commit
+    /// changes two files together, so the derivation has a pair to write.
+    fn coupled_project() -> (tempfile::TempDir, Store, Repo, Principal) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = Repo::init(&root);
+        repo.write("src/a.rs", "a\n");
+        repo.write("src/b.rs", "b\n");
+        repo.commit(ada(DAY_1), "first", "");
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let created = store.create_workspace("coupling").unwrap();
+        let workspace = created["id"].as_str().unwrap().to_string();
+        let token = created["capability"].as_str().unwrap();
+        let graph = store.graph().clone();
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "CREATE (p:Project {id: $id, workspace_id: $ws, project_key: $key})",
+                    graph::params(&json!({"id": "repo-git", "ws": workspace, "key": "repo-git"})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // The relational row `store::repo` authorizes a job's repository by.
+        store
+            .transaction(|db| {
+                db.execute(
+                    "INSERT INTO repo_projects(id,workspace_id,project_key,name,created_at,updated_at) \
+                     VALUES(?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "repo-git", workspace, "repo-git", "repo-git",
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        crate::folders::record(&graph, &workspace, "repo-git", &root).unwrap();
+        let p = Principal {
+            workspace,
+            credential: "owner".into(),
+            hash: graphicle_memory::text::sha256(token.as_bytes()),
+            role: "owner".into(),
+        };
+        (dir, store, repo, p)
+    }
+
+    #[test]
+    fn a_history_job_queues_a_coupling_job_keyed_on_window_config_and_head() {
+        use crate::git_history::coupling::{Config, CoupledWindow, input_hash};
+        let (dir, store, repo, p) = coupled_project();
+        let graph = store.graph().clone();
+        let head = repo.rev("HEAD");
+        let enqueue = |config: &Config, head: &str| {
+            store
+                .transaction(|db| enqueue_coupling(&store, db, "repo-git", &p, head, config))
+                .unwrap()
+        };
+        let default = Config::default();
+
+        // The first enqueue finds nothing under its key.
+        let first = enqueue(&default, &head);
+        assert_eq!(first["queued"], json!(true), "{first:#}");
+        assert_eq!(first["replayed"], json!(false), "{first:#}");
+        // The same window configuration and head replay the waiting job.
+        let replay = enqueue(&default, &head);
+        assert_eq!(replay["replayed"], json!(true), "{replay:#}");
+        assert_eq!(replay["id"], first["id"], "{replay:#}");
+        // A changed window configuration is a new job.
+        let narrower = Config {
+            windows: vec![CoupledWindow {
+                key: "all".into(),
+                days: None,
+            }],
+            ..Config::default()
+        };
+        let changed_config = enqueue(&narrower, &head);
+        assert_eq!(changed_config["replayed"], json!(false), "{changed_config:#}");
+        // A new head is a new job too.
+        let new_head = enqueue(&default, "1111111111111111111111111111111111111111");
+        assert_eq!(new_head["replayed"], json!(false), "{new_head:#}");
+        assert_ne!(new_head["id"], first["id"]);
+        assert_eq!(
+            graph
+                .read(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.id AS id",
+                        graph::params(&json!({
+                            "repo": "repo-git",
+                            "kind": crate::git_history::coupling::KIND,
+                        })),
+                    )
+                })
+                .unwrap()
+                .len(),
+            3,
+            "one job per input hash"
+        );
+        assert_eq!(first["kind"], json!("coupling"));
+        assert_eq!(
+            input_hash(&head, &default),
+            input_hash(&head, &Config::from_json(&default.to_json())),
+            "the payload form keys the same job"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn the_history_job_completes_into_a_coupling_job_that_drains_after_it() {
+        let (dir, store, repo, p) = coupled_project();
+        let graph = store.graph().clone();
+        let queued = store
+            .transaction(|db| enqueue_history(&store, db, "repo-git", &p))
+            .unwrap();
+        assert_eq!(queued["queued"], json!(true), "{queued:#}");
+
+        // The drain runs the history job, then the coupling job it queued.
+        let results = drain_projection(&store, "repo-git").unwrap();
+        let kinds: Vec<&str> = results
+            .iter()
+            .map(|result| result["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["history", "coupling"], "{results:#?}");
+        assert!(results.iter().all(|result| result["ok"] == json!(true)), "{results:#?}");
+
+        // The coupling job is keyed on the head the history job ingested.
+        let head = repo.rev("HEAD");
+        let job = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) \
+                     RETURN j.state AS state, j.input_hash AS hash",
+                    graph::params(&json!({
+                        "repo": "repo-git",
+                        "kind": crate::git_history::coupling::KIND,
+                    })),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job["state"], json!("complete"), "{job:#}");
+        assert_eq!(
+            job["hash"],
+            json!(crate::git_history::coupling::input_hash(
+                &head,
+                &crate::git_history::coupling::Config::default()
+            )),
+        );
+        // And it wrote the pair the commit made.
+        let pair = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (a:File {repository_id: $repo, path: 'src/a.rs'})\
+                     -[r:CO_CHANGED {window: 'all'}]->(b:File {repository_id: $repo, path: 'src/b.rs'}) \
+                     RETURN r.count AS count",
+                    graph::params(&json!({"repo": "repo-git"})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair["count"], json!(1), "{pair:#}");
         drop(dir);
     }
 }

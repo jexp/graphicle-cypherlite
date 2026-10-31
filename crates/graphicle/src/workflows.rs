@@ -190,6 +190,14 @@ pub async fn execute(worker: &Worker, job: &Job) -> Result<Value> {
                 .await
                 .map_err(|_| Error::bad("Git history ingestion interrupted"))?
         }
+        crate::git_history::coupling::KIND => {
+            let store = worker.store.clone();
+            let job = job.clone();
+            // Batched writes over the commit graph; off the async executor.
+            tokio::task::spawn_blocking(move || jobs::run_coupling(&store, &job))
+                .await
+                .map_err(|_| Error::bad("Co-change derivation interrupted"))?
+        }
         _ => match crate::extension::installed().job(worker, job) {
             Some(run) => run.await,
             // Known by name, run only by an extension (never leased without one).
