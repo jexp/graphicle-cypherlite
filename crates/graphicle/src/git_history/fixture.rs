@@ -7,7 +7,8 @@
 //!
 //! This lives in the crate rather than `tests/it`: the reader's parse corpus
 //! is a set of unit tests (`cargo test --lib git_history`), and those cannot
-//! see integration-test helpers.
+//! see integration-test helpers — nor can the writer's and the enqueue
+//! point's, which share it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,12 +58,18 @@ impl Repo {
     /// Create a repository at `root` on branch `main`.
     pub fn init(root: &Path) -> Self {
         std::fs::create_dir_all(root).expect("create the fixture repository directory");
-        let repo = Self {
-            root: root.to_path_buf(),
-            config: tempfile::NamedTempFile::new().expect("create the empty git config"),
-        };
+        let repo = Self::wrap(root);
         repo.run(&["init", "-q", "-b", "main"], ada(DAY_1));
         repo
+    }
+
+    /// Wrap a repository that already exists at `root` (a clone, say) with
+    /// this fixture's isolated config and identity helpers.
+    pub fn wrap(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            config: tempfile::NamedTempFile::new().expect("create the empty git config"),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -124,6 +131,17 @@ impl Repo {
         self.run(&["tag", "-a", name, "-m", name, target], ident);
     }
 
+    /// `git commit --amend -q -m subject` as `ident` over the staged or
+    /// unchanged tree; returns the rewritten tip. A history rewrite with no
+    /// side branches: the recorded head becomes unreachable.
+    pub fn amend(&self, ident: Ident, subject: &str) -> String {
+        self.run(
+            &["commit", "-q", "--amend", "-m", subject],
+            ident,
+        );
+        self.rev("HEAD")
+    }
+
     /// The sha `rev` names.
     pub fn rev(&self, rev: &str) -> String {
         self.run(&["rev-parse", rev], ada(DAY_1))
@@ -168,6 +186,34 @@ impl Repo {
             .trim()
             .to_string()
     }
+}
+
+/// `git clone -q source dest` with the fixture's isolated config: a fork
+/// shape — every sha of the source, its own history from here on. The
+/// clone comes back wrapped as a [`Repo`].
+pub fn clone(source: &Path, dest: &Path) -> Repo {
+    let config = tempfile::NamedTempFile::new().expect("create the empty git config");
+    let output = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(source)
+        .arg(dest)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", config.path())
+        .env("GIT_AUTHOR_NAME", ADA)
+        .env("GIT_AUTHOR_EMAIL", ADA_EMAIL)
+        .env("GIT_COMMITTER_NAME", ADA)
+        .env("GIT_COMMITTER_EMAIL", ADA_EMAIL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("clone the fixture repository");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Repo::wrap(dest)
 }
 
 /// The shas and names of [`history_fixture`]'s commits.

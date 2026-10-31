@@ -206,15 +206,10 @@ pub fn migrate(db: &Connection) -> Result<()> {
                 crate::store_graph::params(&json!({"ws": workspace})),
             )
         })? {
-            let stamp = now();
-            graph.transaction(|g| {
-                crate::store_graph::rows(
-                    g,
-                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
-                    crate::store_graph::params(&json!({"id": s(&latest, "id"), "now": stamp})),
-                )?;
-                Ok(())
-            })?;
+            // The shared requeue reset (jobs::requeue_job): the finished
+            // link job of a workspace whose mention links went stale runs
+            // again with a fresh budget.
+            crate::jobs::requeue_job(&graph, s(&latest, "id"))?;
         }
     }
     Ok(())

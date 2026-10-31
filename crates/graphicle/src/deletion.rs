@@ -107,6 +107,15 @@ const HISTORY: &[&str] = &[
     "ProjectionCleanup",
     "RuleApplication",
     "Violation",
+    // Git history (git-to-graph plan §2): immutable facts about the
+    // repository's past — work records, not memory. A re-ingest of the same
+    // repository must not change a state digest, and two stores that synced
+    // the same repository at different times digest equally.
+    "Commit",
+    "Person",
+    "Change",
+    "Branch",
+    "Tag",
     TOMBSTONES,
     "OAuthPending",
 ];
@@ -156,6 +165,14 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     ("Assertion", "gf_timeline", Scoped::Repository),
     ("Backend", "am_backends", Scoped::Global),
     ("BinaryHead", "am_binary_heads", Scoped::Repository),
+    // Git history's own labels (git-to-graph plan §2, written by
+    // git_history::writer; :Commit was already in the catalog from the
+    // migration). Immutable facts of the repository: they walk with their
+    // project, and they are HISTORY below — a record of work, not memory.
+    ("Branch", "Branch", Scoped::Repository),
+    ("Change", "Change", Scoped::Repository),
+    ("Person", "Person", Scoped::Repository),
+    ("Tag", "Tag", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),
