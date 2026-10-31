@@ -3,8 +3,10 @@
 //! (git-to-graph plan §2 and §3).
 //!
 //! [`reader::read_history`] runs git and returns a [`History`]. Nothing in
-//! this module touches the graph store: the writer maps these structs onto
-//! `(:Commit)`, `(:Change)`, `(:Branch)` and `(:Tag)` itself.
+//! the reader touches the graph store: [`writer`] maps these structs onto
+//! `(:Commit)`, `(:Change)`, `(:Branch)`, `(:Tag)`, `(:Person)` and `(:File)`,
+//! and [`writer::ingest`] is the `history` job's body (resume and rescan,
+//! plan §4 and §6).
 //!
 //! Field contract:
 //! - [`History`]: `head` (the `HEAD` commit oid), `branches` and `tags`
@@ -31,6 +33,7 @@
 use chrono::{DateTime, FixedOffset};
 
 pub mod reader;
+pub mod writer;
 
 #[cfg(test)]
 mod fixture;
@@ -38,6 +41,23 @@ mod fixture;
 mod tests;
 
 pub use reader::{ParseError, ReadError, parse_log, read_history};
+pub use writer::KIND;
+
+/// How a history read is bounded (plan §4): the first run's back-fill bound
+/// (`max_commits`, `since`) and the resume range `<recorded head>..<head>`
+/// that walks only the commits the store does not have yet. The default is
+/// generous on purpose — everything, capped only by the reader's log-byte
+/// budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Window {
+    /// `--max-count`: the back-fill bound. `None` reads all of it.
+    pub max_commits: Option<usize>,
+    /// `--since` as git takes it (a date). `None` reads all of it.
+    pub since: Option<String>,
+    /// A revision range (`<old>..<new>`) for a resume run, set by
+    /// [`writer::ingest`] — never by configuration.
+    pub range: Option<String>,
+}
 
 /// What a commit did to one path, git's name-status letter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

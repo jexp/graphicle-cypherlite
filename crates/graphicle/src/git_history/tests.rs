@@ -2,9 +2,12 @@
 //! fixture of [`super::fixture`]; the malformed-record cases are hand-written
 //! bytes in the exact `-z` shape, since git never emits them.
 
-use super::fixture::{DAY_1, Repo, history_fixture};
-use super::reader::{ReadError, parse_log, read_history, read_history_capped};
-use super::{ChangeKind, CommitRecord};
+use super::fixture::{DAY_1, Repo, ada, history_fixture};
+use super::reader::{
+    ReadError, current_head, is_ancestor, parse_log, read_history, read_history_capped,
+    read_history_windowed,
+};
+use super::{ChangeKind, CommitRecord, Window};
 
 fn hex(digit: char) -> String {
     digit.to_string().repeat(40)
@@ -447,4 +450,97 @@ fn parsed_commit_dates_compare_as_instants() {
         first.author_date,
         chrono::DateTime::parse_from_rfc3339(DAY_1).unwrap()
     );
+}
+
+#[test]
+fn current_head_is_none_for_an_unborn_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    Repo::init(dir.path());
+    assert_eq!(current_head(dir.path()).unwrap(), None);
+}
+
+#[test]
+fn current_head_reads_the_checkout_head() {
+    let (_dir, repo, _scenario) = history_fixture();
+    assert_eq!(current_head(repo.root()).unwrap().as_deref(), Some(repo.rev("HEAD").as_str()));
+}
+
+#[test]
+fn is_ancestor_follows_reachability() {
+    let (dir, repo, scenario) = history_fixture();
+    let head = repo.rev("HEAD");
+    assert!(is_ancestor(repo.root(), &scenario.first, &head).unwrap());
+    assert!(!is_ancestor(repo.root(), &head, &scenario.first).unwrap());
+    // A rewritten tip: the old head keeps its object but loses reachability.
+    let old_tip = head.clone();
+    repo.amend(ada(DAY_1), "rewritten");
+    assert!(!is_ancestor(repo.root(), &old_tip, &repo.rev("HEAD")).unwrap());
+    drop(dir);
+}
+
+#[test]
+fn a_resume_range_reads_only_the_new_commits() {
+    let (dir, repo, _scenario) = history_fixture();
+    let recorded = repo.rev("HEAD");
+    repo.write("src/later.rs", "later\n");
+    repo.commit(ada(DAY_1), "later: add", "");
+    let head = repo.rev("HEAD");
+
+    let window = Window {
+        range: Some(format!("{recorded}..{head}")),
+        ..Window::default()
+    };
+    let history = read_history_windowed(repo.root(), &window).unwrap();
+    assert_eq!(history.commits.len(), 1);
+    assert_eq!(history.commits[0].oid, head);
+    assert_eq!(history.commits[0].parents, [recorded]);
+    assert_eq!(history.head, head);
+    // The refs come back whole: a resume run still refreshes them.
+    assert_eq!(history.branches.len(), 4);
+
+    // An empty range (nothing new) reads nothing.
+    let same = Window {
+        range: Some(format!("{head}..{head}")),
+        ..Window::default()
+    };
+    assert!(read_history_windowed(repo.root(), &same).unwrap().commits.is_empty());
+    drop(dir);
+}
+
+#[test]
+fn a_max_count_window_bounds_the_walk() {
+    let (_dir, repo, _scenario) = history_fixture();
+    let window = Window {
+        max_commits: Some(2),
+        ..Window::default()
+    };
+    let history = read_history_windowed(repo.root(), &window).unwrap();
+    assert_eq!(history.commits.len(), 2);
+    assert_eq!(history.commits[0].oid, repo.rev("HEAD"));
+    // The head is the checkout's, not the window's oldest commit.
+    assert_eq!(history.head, repo.rev("HEAD"));
+}
+
+#[test]
+fn a_window_value_that_poses_as_an_option_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    Repo::init(dir.path());
+    let repo = Repo::wrap(dir.path());
+    repo.write("a.txt", "a\n");
+    repo.commit(ada(DAY_1), "first", "");
+    for window in [
+        Window {
+            since: Some("--exec=touch /tmp/pwned".into()),
+            ..Window::default()
+        },
+        Window {
+            range: Some("HEAD --all".into()),
+            ..Window::default()
+        },
+    ] {
+        assert!(matches!(
+            read_history_windowed(repo.root(), &window),
+            Err(ReadError::Malformed(_))
+        ));
+    }
 }

@@ -274,6 +274,7 @@ const KINDS: &[(&str, &str)] = &[
     ("project", "read"),
     ("link", "read"),
     ("enrich", "read"),
+    (crate::git_history::KIND, "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -676,6 +677,14 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
             Ok(queued) => queued,
             Err(error) => json!({"error": error.message}),
         };
+        // Git history follows a completed projection for a project whose
+        // folder is a git repository (git-to-graph plan §4); a failure to
+        // queue it — or a folder that is not a repository — must not fail
+        // the projection itself.
+        out["history"] = match enqueue_history(store, db, identifier, &p) {
+            Ok(queued) => queued,
+            Err(error) => json!({"error": error.message}),
+        };
         // Work extensions queue after a projection, which the projection
         // drain runs next. Listed only when an
         // extension queued something, so Core's result is unchanged.
@@ -1041,6 +1050,132 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
     Ok(report.to_value())
 }
 
+/// Queue the git history ingestion of a project whose folder is a git
+/// repository, after its projection recorded the episode (git-to-graph plan
+/// §4): one `history` job per (repository, `HEAD` sha, window), so a
+/// repeated sync of an unchanged checkout replays it. A folder that is not
+/// a git repository — or a repository with no commits — queues nothing and
+/// never fails the sync; a stale-marked history changes the input hash, so
+/// the rescan runs even though `HEAD` did not move. A failed or cancelled
+/// job starts again with a fresh budget.
+pub fn enqueue_history(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    let skipped = |reason: &str| {
+        Ok(json!({"kind": crate::git_history::KIND, "queued": false, "reason": reason}))
+    };
+    let Some(folder) = crate::folders::current_folder(&graph, repository)? else {
+        return skipped("the project has no recorded folder");
+    };
+    if !folder.join(".git").exists() {
+        return skipped("not a git repository");
+    }
+    // A folder that is a repository but unreadable to git (or with git not
+    // installed) queues nothing either; the sync it follows must succeed.
+    let Some(head) = crate::git_history::reader::current_head(&folder)? else {
+        return skipped("the repository has no commits");
+    };
+    let window = crate::git_history::Window::default();
+    let stale = crate::git_history::writer::marked_stale(&graph, repository)?;
+    let input_hash = crate::git_history::writer::input_hash(&head, &window, stale);
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({
+                "repo": repository, "kind": crate::git_history::KIND, "hash": input_hash,
+            })),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            graph.transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
+                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
+                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
+                )?;
+                Ok(())
+            })?;
+            return Ok(json!({"id": existing["id"], "state": "queued",
+                "kind": crate::git_history::KIND, "replayed": true, "queued": true}));
+        }
+        return Ok(json!({"id": existing["id"], "state": existing["state"],
+            "kind": crate::git_history::KIND, "replayed": true, "queued": true}));
+    }
+    let payload = json!({"kind": crate::git_history::KIND, "head": head,
+        "window": {"max_commits": window.max_commits, "since": window.since},
+        "format": crate::git_history::writer::FORMAT});
+    let job_id = graph.transaction(|db| {
+        insert_job(
+            db,
+            repository,
+            &p.workspace,
+            crate::git_history::KIND,
+            &input_hash,
+            &payload,
+            &p.hash,
+            -1,
+            3,
+        )
+    })?;
+    store::event(
+        db,
+        repository,
+        "workflow_queued",
+        json!({"id": job_id, "kind": crate::git_history::KIND}),
+    )?;
+    Ok(json!({"id": job_id, "state": "queued", "kind": crate::git_history::KIND,
+        "replayed": false, "queued": true}))
+}
+
+/// Execute a `history` job: ingest the project folder's git history into
+/// the store (git-to-graph plan §2–§4 and §6), resuming from the recorded
+/// head or rescanning when it went stale. The job's lease is renewed while
+/// it runs.
+pub fn run_history(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || history_job(store, job))
+}
+
+fn history_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let (identifier, folder) = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission(crate::git_history::KIND)?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok((
+            s(&repository, "id").to_string(),
+            crate::folders::current_folder(&graph, s(&repository, "id"))?,
+        ))
+    })?;
+    let Some(folder) = folder else {
+        return Ok(json!({"kind": crate::git_history::KIND, "skipped": true,
+            "reason": "the project has no recorded folder"}));
+    };
+    let window = crate::git_history::Window {
+        max_commits: job.payload["window"]["max_commits"]
+            .as_u64()
+            .map(|max| max as usize),
+        since: job.payload["window"]["since"]
+            .as_str()
+            .map(str::to_string),
+        range: None,
+    };
+    crate::git_history::writer::ingest(&graph, &identifier, &folder, &window, &|| {
+        leased(&graph, job)
+    })
+}
+
 /// Run `repository`'s waiting graph work in this
 /// process, as a worker would. First every ready `project` job, then the
 /// `link` jobs they queued (a workspace keeps one waiting `link` job, which
@@ -1132,6 +1267,25 @@ pub fn drain_projection_until(
             Ok(value) => json!({"job": job.id, "kind": "enrich", "ok": true,
                 "applied": value["applied"], "failed": value["failed"], "skipped": value["skipped"]}),
             Err(error) => json!({"job": job.id, "kind": "enrich", "ok": false, "error": error.message}),
+        });
+        store.finish_job(&job, result)?;
+    }
+    // The git history ingestion each completed projection queued
+    // (git-to-graph plan §4): one job per (repository, HEAD, window), so
+    // the drain leaves the project's history current. Background
+    // derivation, like the enrichment before it.
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, crate::git_history::KIND)? else {
+            break;
+        };
+        let result =
+            crate::phase::phase("job_history", || run_history(store, &job));
+        results.push(match &result {
+            Ok(value) => json!({"job": job.id, "kind": crate::git_history::KIND, "ok": true,
+                "mode": value["mode"], "commits": value["commits"]}),
+            Err(error) => {
+                json!({"job": job.id, "kind": crate::git_history::KIND, "ok": false, "error": error.message})
+            }
         });
         store.finish_job(&job, result)?;
     }

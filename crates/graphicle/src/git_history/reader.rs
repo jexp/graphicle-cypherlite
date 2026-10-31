@@ -20,7 +20,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use chrono::{DateTime, FixedOffset};
 
-use super::{Change, ChangeKind, CommitRecord, GitRef, History};
+use super::{Change, ChangeKind, CommitRecord, GitRef, History, Window};
 
 /// The most bytes any one git call may write to stdout (cypherlite's 128 MiB
 /// log cap). The byte past it kills the child and fails the read, so nothing
@@ -98,6 +98,14 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// A read failure as the crate's error (the writer's job fails with git's
+/// own message; the enqueue point reports it instead of failing the sync).
+impl From<ReadError> for crate::Error {
+    fn from(error: ReadError) -> Self {
+        crate::Error::bad(error.to_string())
+    }
+}
+
 /// A `git log` record that did not parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -133,23 +141,31 @@ impl std::error::Error for ParseError {}
 /// Runs `git rev-parse --verify -q HEAD`, `git for-each-ref`, and the one
 /// `git log` call of plan §3. An unborn `HEAD` is [`ReadError::NoCommits`].
 pub fn read_history(dir: &Path) -> Result<History, ReadError> {
-    read_history_capped(dir, LOG_LIMIT)
+    read_history_bounded(dir, LOG_LIMIT, &Window::default())
+}
+
+/// [`read_history`] under a [`Window`] (plan §4): the back-fill bound and
+/// the resume range become `--max-count`/`--since` and the log's revision
+/// range.
+pub fn read_history_windowed(dir: &Path, window: &Window) -> Result<History, ReadError> {
+    read_history_bounded(dir, LOG_LIMIT, window)
 }
 
 /// [`read_history`] with the stdout cap made a parameter, so tests can
 /// exercise the cap without a 128 MiB history.
 pub(crate) fn read_history_capped(dir: &Path, limit: u64) -> Result<History, ReadError> {
-    let head = run_git(dir, &["rev-parse", "--verify", "-q", "HEAD"], limit)?;
-    if !head.status.success() {
-        // `--verify -q` exits 1 silently for an unborn HEAD; anything else
-        // (not a repository, say) is a real failure.
-        if head.status.code() == Some(1) && head.stderr.is_empty() {
-            return Err(ReadError::NoCommits);
-        }
-        return Err(git_failure(&head));
-    }
-    let head = oid_from_output(&head.stdout)
-        .ok_or_else(|| ReadError::Malformed("HEAD is not a commit id".to_string()))?;
+    read_history_bounded(dir, limit, &Window::default())
+}
+
+fn read_history_bounded(
+    dir: &Path,
+    limit: u64,
+    window: &Window,
+) -> Result<History, ReadError> {
+    let head = current_head(dir)?;
+    let Some(head) = head else {
+        return Err(ReadError::NoCommits);
+    };
 
     let refs = run_git(
         dir,
@@ -158,7 +174,9 @@ pub(crate) fn read_history_capped(dir: &Path, limit: u64) -> Result<History, Rea
     )?;
     let (branches, tags) = parse_refs(&stdout_or_error(refs)?)?;
 
-    let log = run_git(dir, &log_args(), limit)?;
+    let args = log_args(window)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let log = run_git(dir, &argv, limit)?;
     let commits = parse_log(&stdout_or_error(log)?).map_err(ReadError::Parse)?;
 
     Ok(History {
@@ -169,10 +187,54 @@ pub(crate) fn read_history_capped(dir: &Path, limit: u64) -> Result<History, Rea
     })
 }
 
+/// The `HEAD` commit oid of the repository at `dir`: `None` when `HEAD` is
+/// unborn (a repository with no commits). This is the cheap call the
+/// history job's enqueue point makes for its input hash.
+pub fn current_head(dir: &Path) -> Result<Option<String>, ReadError> {
+    let head = run_git(dir, &["rev-parse", "--verify", "-q", "HEAD"], LOG_LIMIT)?;
+    if !head.status.success() {
+        // `--verify -q` exits 1 silently for an unborn HEAD; anything else
+        // (not a repository, say) is a real failure.
+        if head.status.code() == Some(1) && head.stderr.is_empty() {
+            return Ok(None);
+        }
+        return Err(git_failure(&head));
+    }
+    oid_from_output(&head.stdout)
+        .map(Some)
+        .ok_or_else(|| ReadError::Malformed("HEAD is not a commit id".to_string()))
+}
+
+/// Whether `ancestor` is reachable from `descendant`
+/// (`git merge-base --is-ancestor`): the resumability check of plan §6. A
+/// recorded head that is no longer an ancestor of `HEAD` means the history
+/// was rewritten (rebase, squash, branch deletion) and only a full re-ingest
+/// can catch it.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, ReadError> {
+    if !is_oid(ancestor) || !is_oid(descendant) {
+        return Err(ReadError::Malformed(
+            "merge-base needs two commit ids".to_string(),
+        ));
+    }
+    let check = run_git(
+        dir,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        LOG_LIMIT,
+    )?;
+    match check.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_failure(&check)),
+    }
+}
+
 /// The `git log` argv of plan §3, program name excluded (`-C DIR` is added
 /// by [`run_git`]). `-- .` scopes the walk to the directory git runs in.
-fn log_args() -> Vec<&'static str> {
-    vec![
+/// A [`Window`] adds `--max-count`/`--since` and the revision range before
+/// the pathspec; a window value that could pose as a git option is
+/// rejected here, before any subprocess runs.
+fn log_args(window: &Window) -> Result<Vec<String>, ReadError> {
+    let mut args: Vec<String> = [
         "-c",
         "log.showSignature=false",
         "--no-pager",
@@ -183,10 +245,35 @@ fn log_args() -> Vec<&'static str> {
         "--name-status",
         "-z",
         "-M",
-        LOG_FORMAT,
-        "--",
-        ".",
     ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if let Some(max) = window.max_commits {
+        args.push(format!("--max-count={max}"));
+    }
+    if let Some(since) = &window.since {
+        check_revision(since)?;
+        args.push(format!("--since={since}"));
+    }
+    if let Some(range) = &window.range {
+        check_revision(range)?;
+        args.push(range.clone());
+    }
+    args.push(LOG_FORMAT.to_string());
+    args.push("--".into());
+    args.push(".".into());
+    Ok(args)
+}
+
+/// A `--since` value or revision range git receives on its own argv slot:
+/// it must not pose as an option or smuggle a second argument. A value that
+/// starts with `-` or contains whitespace is rejected before git runs.
+fn check_revision(value: &str) -> Result<(), ReadError> {
+    let bad = || ReadError::Malformed(format!("bad revision or date: {value:?}"));
+    (!value.is_empty() && !value.starts_with('-') && !value.chars().any(char::is_whitespace))
+        .then_some(())
+        .ok_or_else(bad)
 }
 
 /// What one git call produced.
