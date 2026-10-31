@@ -36,17 +36,27 @@
 //! # TOUCHES: the span rule
 //!
 //! Candidates are the `:SymbolHead` rows of the change's path at the basis
-//! sha. For a rename (`old_path` set), the survivors of `:SymbolMove` chains
-//! from the `:Symbol` identities under `old_path` are added too, so a symbol
-//! that moved with its file resolves to the symbol that survived. A candidate
-//! is touched when a changed line range (git's `-U0` hunks in the new file,
-//! 1-based and inclusive) overlaps its span `[line_start, line_next - 1]`;
-//! with no `line_next` the span runs to the end of the file. The edge carries
-//! the overlap. A candidate with no `:Symbol` node gets no edge.
+//! sha. A candidate is touched when a changed line range (git's `-U0` hunks
+//! in the new file, 1-based and inclusive) overlaps its span
+//! `[line_start, line_next - 1]`; with no `line_next` the span runs to the
+//! end of the file. The edge carries `basis: 'span'` and the overlap. A
+//! candidate with no `:Symbol` node gets no edge.
 //!
-//! Line information is best-effort. When the provider has none for a change
-//! (a binary file, say), the change gets no `TOUCHES` edge and is counted in
-//! `no_line_info`; that is not an error.
+//! **Rename by symbol move.** `:SymbolHead` is the current-version table, so
+//! after a rename and further edits its rows for the new path describe a
+//! newer sha than the change's basis. When the basis-sha candidate set is
+//! empty and the change is a rename (`old_path` set), the rename's symbols
+//! are followed through `:SymbolMove` chains from the `:Symbol` identities
+//! under `old_path` to the chain's surviving identity. That identity gets a
+//! `TOUCHES` edge with `basis: 'move'` and no line properties: the edge says
+//! which symbol survived, but no span is applied, because the survivor's
+//! span describes a version the change does not.
+//!
+//! Line information is best-effort. Hunks come from one batched `git log`
+//! over the commits that have span candidates. When a change has no hunk
+//! entry (a binary file, a pure rename with no content edit, a path git
+//! quotes), it gets no span `TOUCHES` edge and is counted in `no_line_info`;
+//! that is not an error.
 //!
 //! # Supernode and idempotence
 //!
@@ -56,12 +66,14 @@
 //! written through [`super::writer`]'s batches, so the lease is checked
 //! between them.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
 use super::correlation;
-use super::reader::{self, LOG_LIMIT};
+use super::reader::{LOG_LIMIT, ReadError};
 use super::writer::{self, Pass};
 use crate::store_graph::{self, GraphStore};
 use crate::{Result, store_content};
@@ -125,6 +137,7 @@ struct Counts {
     modifies_episode: usize,
     modifies_head: usize,
     touches: usize,
+    moved: usize,
     no_line_info: usize,
     unresolved: usize,
 }
@@ -135,10 +148,24 @@ impl Counts {
             "changes": self.changes,
             "modifies": {"episode": self.modifies_episode, "head": self.modifies_head},
             "touches": self.touches,
+            "moved": self.moved,
             "no_line_info": self.no_line_info,
             "unresolved": self.unresolved,
         })
     }
+}
+
+/// The changed ranges per `(commit, new path)`, as one git pass reports
+/// them. An entry with no ranges is a file with no changed lines.
+pub type HunkMap = BTreeMap<(String, String), Vec<LineRange>>;
+
+/// The symbols one change can touch: the spans to match against its
+/// changed lines, and, when there are none at its basis, the line-less
+/// survivors of its rename's symbol moves.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Candidates {
+    spans: Vec<Span>,
+    moved: Vec<String>,
 }
 
 /// Resolve every change of `repository_id` against the episode world at
@@ -154,20 +181,20 @@ pub fn resolve(
         repository_id,
         folder,
         still_leasing,
-        &mut |commit, old, path| git_hunks(folder, commit, old, path),
+        &mut |commits| Ok(git_hunks(folder, commits)?),
     )
 }
 
-/// [`resolve`] with the line provider injected: `lines(commit, old_path,
-/// path)` returns the changed ranges of the new file, or `None` when the
-/// change has no line information. Called only for changes that have
-/// candidate symbols, so no git runs for the rest.
+/// [`resolve`] with the hunk provider injected: `hunks(commits)` returns the
+/// changed ranges of each `(commit, new path)` it covers. A change with no
+/// entry has no line information. Called once, and only when some change
+/// has span candidates, so no git runs for the rest.
 pub fn resolve_with(
     graph: &GraphStore,
     repository_id: &str,
     folder: &Path,
     still_leasing: &dyn Fn() -> Result<()>,
-    lines: &mut dyn FnMut(&str, Option<&str>, &str) -> Result<Option<Vec<LineRange>>>,
+    hunks: &mut dyn FnMut(&BTreeSet<String>) -> Result<HunkMap>,
 ) -> Result<Value> {
     let changes = changes(graph, repository_id)?;
     let episodes = episodes_at_commit(graph, repository_id)?;
@@ -179,6 +206,8 @@ pub fn resolve_with(
     };
     let mut modifies: Vec<Value> = Vec::new();
     let mut touches: Vec<Value> = Vec::new();
+    // Changes with span candidates, awaiting the one hunk pass.
+    let mut spanned: Vec<(&ChangeRow, Vec<Span>)> = Vec::new();
     for change in &changes {
         let basis = if change.kind == "D" {
             None
@@ -215,30 +244,46 @@ pub fn resolve_with(
             "episode": basis.episode, "sha256": basis.sha256,
         }));
         let candidates = symbol_candidates(graph, repository_id, change, &basis.sha256)?;
-        if candidates.is_empty() {
-            continue;
+        if !candidates.spans.is_empty() {
+            spanned.push((change, candidates.spans));
         }
-        match lines(&change.commit, change.old_path.as_deref(), &change.path)? {
-            None => counts.no_line_info += 1,
-            Some(ranges) => {
-                for span in &candidates {
-                    let hits: Vec<LineRange> = ranges
-                        .iter()
-                        .filter_map(|range| span.overlap(*range))
-                        .collect();
-                    let (Some(first), Some(last)) = (
-                        hits.iter().map(|hit| hit.0).min(),
-                        hits.iter().map(|hit| hit.1).max(),
-                    ) else {
-                        continue;
-                    };
-                    counts.touches += 1;
-                    touches.push(json!({
-                        "commit": change.commit, "path": change.path,
-                        "stable_id": span.stable_id,
-                        "line_start": first, "line_end": last,
-                    }));
-                }
+        for stable_id in candidates.moved {
+            counts.moved += 1;
+            counts.touches += 1;
+            touches.push(json!({
+                "commit": change.commit, "path": change.path, "stable_id": stable_id,
+                "basis": "move", "line_start": null, "line_end": null,
+            }));
+        }
+    }
+    if !spanned.is_empty() {
+        let commits: BTreeSet<String> = spanned
+            .iter()
+            .map(|(change, _)| change.commit.clone())
+            .collect();
+        let hunk_map = hunks(&commits)?;
+        for (change, spans) in &spanned {
+            let Some(ranges) = hunk_map.get(&(change.commit.clone(), change.path.clone())) else {
+                counts.no_line_info += 1;
+                continue;
+            };
+            for span in spans {
+                let hits: Vec<LineRange> = ranges
+                    .iter()
+                    .filter_map(|range| span.overlap(*range))
+                    .collect();
+                let (Some(first), Some(last)) = (
+                    hits.iter().map(|hit| hit.0).min(),
+                    hits.iter().map(|hit| hit.1).max(),
+                ) else {
+                    continue;
+                };
+                counts.touches += 1;
+                touches.push(json!({
+                    "commit": change.commit, "path": change.path,
+                    "stable_id": span.stable_id, "basis": "span",
+                    "line_start": first, "line_end": last,
+                }));
             }
         }
     }
@@ -290,56 +335,51 @@ fn episodes_at_commit(graph: &GraphStore, repository_id: &str) -> Result<BTreeMa
         .collect())
 }
 
-/// The symbols a change can touch: the `:SymbolHead` rows of its path at
-/// the basis sha, plus the survivors of the rename chains from the old
-/// path's `:Symbol` identities (rename changes only). Sorted by stable id.
+/// The symbols a change can touch. The `:SymbolHead` rows of its path at the
+/// basis sha are the spans. When there are none, and the change is a rename,
+/// the surviving identities of the rename's symbol moves are the `moved`
+/// candidates, which get no span. Sorted by stable id.
 fn symbol_candidates(
     graph: &GraphStore,
     repository_id: &str,
     change: &ChangeRow,
     sha256: &str,
-) -> Result<Vec<Span>> {
-    let mut spans: BTreeMap<String, Span> = BTreeMap::new();
-    let direct = read(
+) -> Result<Candidates> {
+    let rows = read(
         graph,
         "MATCH (s:SymbolHead {repository_id: $repo, relpath: $path}) \
          WHERE s.sha256 = $sha AND s.stable_id <> '' \
-         RETURN s.stable_id AS stable_id, s.line_start AS line_start, s.line_next AS line_next",
+         RETURN s.stable_id AS stable_id, s.line_start AS line_start, s.line_next AS line_next \
+         ORDER BY s.stable_id",
         json!({"repo": repository_id, "path": change.path, "sha": sha256}),
     )?;
-    for row in &direct {
-        let span = span_of(row);
-        spans.insert(span.stable_id.clone(), span);
-    }
-    if let Some(old) = &change.old_path {
-        let survivors = follow_moves(graph, repository_id, old)?;
-        if !survivors.is_empty() {
-            let rows = read(
-                graph,
-                "MATCH (s:SymbolHead {repository_id: $repo, relpath: $path}) \
-                 WHERE s.sha256 = $sha AND s.stable_id IN $ids \
-                 RETURN s.stable_id AS stable_id, s.line_start AS line_start, s.line_next AS line_next",
-                json!({"repo": repository_id, "path": change.path, "sha": sha256,
-                       "ids": survivors.iter().collect::<Vec<_>>()}),
-            )?;
-            for row in &rows {
-                let span = span_of(row);
-                spans.entry(span.stable_id.clone()).or_insert(span);
-            }
+    let spans: Vec<Span> = rows.iter().filter_map(span_of).collect();
+    let mut candidates = Candidates {
+        spans,
+        moved: Vec::new(),
+    };
+    if candidates.spans.is_empty() {
+        if let Some(old) = &change.old_path {
+            candidates.moved = follow_moves(graph, repository_id, old)?
+                .into_iter()
+                .collect();
         }
     }
-    Ok(spans.into_values().collect())
+    Ok(candidates)
 }
 
-/// The surviving symbol ids of the `:Symbol` identities under `relpath`:
-/// every id a `:SymbolMove` chain from them reaches, at most [`MAX_HOPS`]
-/// hops deep. A symbol that did not move has no survivors.
+/// The surviving symbol ids of the `:Symbol` identities under `relpath`: the
+/// ids at the end of their `:SymbolMove` chains, that is, reached by a move
+/// and not moved on again. A chain longer than [`MAX_HOPS`] stops there, and
+/// its last reached ids count as survivors. A symbol that did not move has
+/// no survivor.
 fn follow_moves(
     graph: &GraphStore,
     repository_id: &str,
     relpath: &str,
 ) -> Result<BTreeSet<String>> {
-    let mut survivors = BTreeSet::new();
+    let mut reached = BTreeSet::new();
+    let mut moved_from = BTreeSet::new();
     let mut frontier: Vec<String> = read(
         graph,
         "MATCH (s:Symbol {repository_id: $repo, relpath: $path}) RETURN s.stable_id AS id",
@@ -355,65 +395,164 @@ fn follow_moves(
         let moved = read(
             graph,
             "MATCH (m:SymbolMove {repository_id: $repo}) WHERE m.from_stable_id IN $ids \
-             RETURN m.to_stable_id AS id",
+             RETURN m.from_stable_id AS from, m.to_stable_id AS id",
             json!({"repo": repository_id, "ids": frontier}),
         )?;
+        moved_from.extend(moved.iter().map(|row| text(row, "from")));
         frontier = moved
             .iter()
             .map(|row| text(row, "id"))
-            .filter(|id| survivors.insert(id.clone()))
+            .filter(|id| reached.insert(id.clone()))
             .collect();
     }
-    Ok(survivors)
+    Ok(reached.difference(&moved_from).cloned().collect())
 }
 
-fn span_of(row: &Value) -> Span {
-    Span {
-        stable_id: text(row, "stable_id"),
-        line_start: row["line_start"].as_u64().unwrap_or(1).max(1),
-        line_next: row["line_next"].as_u64(),
+/// A `:SymbolHead` row as a span. A row without a usable `line_start` (a
+/// positive integer) or with a `line_next` that is not an integer is
+/// malformed: it is skipped, never coerced to a span.
+fn span_of(row: &Value) -> Option<Span> {
+    let stable_id = text(row, "stable_id");
+    let line_start = row["line_start"].as_u64().filter(|line| *line >= 1)?;
+    let line_next = match &row["line_next"] {
+        Value::Null => None,
+        next => Some(next.as_u64()?),
+    };
+    if stable_id.is_empty() {
+        return None;
     }
+    Some(Span {
+        stable_id,
+        line_start,
+        line_next,
+    })
 }
 
-/// The changed line ranges of `commit` in the new file, from git's `-U0`
-/// hunks. A pure deletion marks the line it fell after. A rename is diffed
-/// across both paths, so only its content edits count.
-fn git_hunks(
-    folder: &Path,
-    commit: &str,
-    old_path: Option<&str>,
-    path: &str,
-) -> Result<Option<Vec<LineRange>>> {
-    let mut args = vec!["show", "-U0", "-M", "--format=", "--no-color", commit, "--"];
-    if let Some(old) = old_path {
-        args.push(old);
+/// The changed ranges of every `(commit, new path)` in `commits`, from one
+/// `git log --no-walk --stdin -p -U0 -M` process: the commits are fed on
+/// stdin, so one git serves them all, as the reader's one `git log` and the
+/// correlation's one `cat-file --batch` do. The diff prefixes are pinned, so
+/// a user's diff configuration cannot change the headers read here.
+fn git_hunks(folder: &Path, commits: &BTreeSet<String>) -> std::result::Result<HunkMap, ReadError> {
+    if commits.is_empty() {
+        return Ok(HunkMap::new());
     }
-    args.push(path);
-    let captured = reader::run_git(folder, &args, LOG_LIMIT)?;
-    let stdout = reader::stdout_or_error(captured)?;
-    Ok(Some(parse_hunks(&String::from_utf8_lossy(&stdout))))
-}
-
-/// The new-side ranges of a `-U0` diff: `@@ -a[,b] +c[,d] @@`.
-fn parse_hunks(diff: &str) -> Vec<LineRange> {
-    diff.lines()
-        .filter(|line| line.starts_with("@@ "))
-        .filter_map(|line| {
-            let new_side = line
-                .split_whitespace()
-                .find(|field| field.starts_with('+'))?;
-            let (start, count) = match new_side[1..].split_once(',') {
-                Some((start, count)) => (start.parse::<u64>().ok()?, count.parse::<u64>().ok()?),
-                None => (new_side[1..].parse::<u64>().ok()?, 1),
-            };
-            if count == 0 {
-                let line = start.max(1);
-                Some((line, line))
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args([
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "-p",
+            "-U0",
+            "-M",
+            "--no-color",
+            "--no-ext-diff",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--format=%H",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ReadError::GitNotInstalled
             } else {
-                Some((start, start + count - 1))
+                ReadError::Io(format!("failed to run git: {error}"))
             }
-        })
-        .collect()
+        })?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let oids: Vec<String> = commits.iter().cloned().collect();
+    // On its own thread: git reads each commit as it writes its diff, so
+    // writing everything first could fill the stdout pipe and stall both.
+    let writer = std::thread::spawn(move || {
+        for oid in oids {
+            if writeln!(stdin, "{oid}").is_err() {
+                break;
+            }
+        }
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ReadError::Io(format!("failed to read git output: {error}")))?;
+    let _ = writer.join();
+    if !output.status.success() {
+        return Err(ReadError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    if output.stdout.len() as u64 > LOG_LIMIT {
+        return Err(ReadError::LogTooLarge { limit: LOG_LIMIT });
+    }
+    Ok(parse_hunk_log(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// A batched `-p -U0` log: a 40-hex line opens a commit, `diff --git` opens a
+/// file, and the `+++ b/<path>` header of that file (before its first `@@`)
+/// names the new path. Only the new side of each hunk counts. A file with no
+/// `+++` header (binary, a pure rename, a deletion) gets no entry, and neither
+/// does a path git quotes, so both count as having no line information.
+fn parse_hunk_log(log: &str) -> HunkMap {
+    let mut map = HunkMap::new();
+    let mut commit: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut in_header = false;
+    for line in log.lines() {
+        if is_oid(line) {
+            commit = Some(line.to_string());
+            path = None;
+            in_header = false;
+        } else if line.starts_with("diff --git ") {
+            path = None;
+            in_header = true;
+        } else if line.starts_with("@@ ") {
+            in_header = false;
+            if let (Some(commit), Some(path), Some(range)) = (&commit, &path, hunk_range(line)) {
+                map.entry((commit.clone(), path.clone()))
+                    .or_default()
+                    .push(range);
+            }
+        } else if in_header {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                path = rest
+                    .strip_prefix("b/")
+                    .map(|new| new.trim_end_matches('\t').to_string());
+                if let (Some(commit), Some(path)) = (&commit, &path) {
+                    map.entry((commit.clone(), path.clone())).or_default();
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Whether `line` is a full commit id: 40 lowercase hex digits.
+fn is_oid(line: &str) -> bool {
+    line.len() == 40
+        && line
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// The new-side range of a hunk header `@@ -a[,b] +c[,d] @@`. A pure
+/// deletion (`d` is 0) marks the line it fell after.
+fn hunk_range(header: &str) -> Option<LineRange> {
+    let new_side = header
+        .split_whitespace()
+        .find(|field| field.starts_with('+'))?;
+    let (start, count) = match new_side[1..].split_once(',') {
+        Some((start, count)) => (start.parse::<u64>().ok()?, count.parse::<u64>().ok()?),
+        None => (new_side[1..].parse::<u64>().ok()?, 1),
+    };
+    if count == 0 {
+        let line = start.max(1);
+        Some((line, line))
+    } else {
+        Some((start, start + count - 1))
+    }
 }
 
 fn write_modifies(
@@ -448,7 +587,7 @@ fn write_touches(
          MATCH (ch:Change {repository_id: $repo, commit: row.commit, path: row.path}) \
          MATCH (s:Symbol {repository_id: $repo, stable_id: row.stable_id}) \
          MERGE (ch)-[t:TOUCHES]->(s) \
-         SET t.line_start = row.line_start, t.line_end = row.line_end",
+         SET t.basis = row.basis, t.line_start = row.line_start, t.line_end = row.line_end",
         json!({}),
     )
 }
@@ -577,13 +716,21 @@ mod tests {
         read(graph, cypher, params).unwrap()
     }
 
-    /// Resolve with no line information anywhere.
-    fn no_lines(_: &str, _: Option<&str>, _: &str) -> Result<Option<Vec<LineRange>>> {
-        Ok(None)
+    /// The hunk provider of a run with no line information anywhere.
+    fn no_hunks(_: &BTreeSet<String>) -> Result<HunkMap> {
+        Ok(HunkMap::new())
     }
 
     fn resolve_no_lines(graph: &GraphStore, repository_id: &str, repo: &Repo) -> Value {
-        resolve_with(graph, repository_id, repo.root(), &|| Ok(()), &mut no_lines).unwrap()
+        resolve_with(graph, repository_id, repo.root(), &|| Ok(()), &mut no_hunks).unwrap()
+    }
+
+    /// A hunk map from `(commit, new path, changed ranges)` entries.
+    fn hunks_of(entries: &[(&str, &str, Vec<LineRange>)]) -> HunkMap {
+        entries
+            .iter()
+            .map(|(commit, path, ranges)| ((commit.to_string(), path.to_string()), ranges.clone()))
+            .collect()
     }
 
     fn head_sha(graph: &GraphStore, repository_id: &str, path: &str) -> String {
@@ -652,13 +799,10 @@ mod tests {
         live(&graph, "repo-git", "beta", "src/shared.rs", &sha, 4, None);
 
         // The touch commit changed line 2 only; no other commit has lines.
-        let counts = resolve_with(
-            &graph,
-            "repo-git",
-            repo.root(),
-            &|| Ok(()),
-            &mut |commit, _, _| Ok((commit == touch).then(|| vec![(2, 2)])),
-        )
+        let hunks = hunks_of(&[(&touch, "src/shared.rs", vec![(2, 2)])]);
+        let counts = resolve_with(&graph, "repo-git", repo.root(), &|| Ok(()), &mut |_| {
+            Ok(hunks.clone())
+        })
         .unwrap();
 
         let rows = query(
@@ -719,17 +863,14 @@ mod tests {
         let survivors = follow_moves(&graph, "repo-git", "src/common.rs").unwrap();
         assert_eq!(
             survivors.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["mid_alpha", "shared_alpha"],
-            "the chain reaches the survivor through the intermediate id"
+            ["shared_alpha"],
+            "the chain's end is the survivor; the intermediate id moved on"
         );
 
-        resolve_with(
-            &graph,
-            "repo-git",
-            repo.root(),
-            &|| Ok(()),
-            &mut |commit, _, _| Ok((commit == scenario.rename).then(|| vec![(2, 2)])),
-        )
+        let hunks = hunks_of(&[(&scenario.rename, "src/shared.rs", vec![(2, 2)])]);
+        resolve_with(&graph, "repo-git", repo.root(), &|| Ok(()), &mut |_| {
+            Ok(hunks.clone())
+        })
         .unwrap();
 
         let rows = query(
@@ -794,11 +935,135 @@ mod tests {
         assert_eq!(edges_once, edges());
     }
 
+    /// The lagged rename: `src/shared.rs` carries a newer version than the
+    /// rename's basis, so its `:SymbolHead` rows describe another sha and the
+    /// basis-sha candidates are empty. The symbols moved from `src/common.rs`
+    /// with `common_alpha`'s chain, when `with_move` is set.
+    fn lagged_rename(with_move: bool) -> (Value, GraphStore) {
+        let (_dir, repo, _scenario, _touch, graph, _episode) = setup("repo-git");
+        identity(&graph, "repo-git", "common_alpha", "src/common.rs");
+        identity(&graph, "repo-git", "shared_alpha", "src/shared.rs");
+        live(
+            &graph,
+            "repo-git",
+            "shared_alpha",
+            "src/shared.rs",
+            "a-newer-sha",
+            1,
+            Some(4),
+        );
+        if with_move {
+            movement(&graph, "repo-git", "common_alpha", "shared_alpha");
+        }
+        let counts = resolve_no_lines(&graph, "repo-git", &repo);
+        (counts, graph)
+    }
+
     #[test]
-    fn a_zero_line_hunk_marks_the_line_it_fell_after() {
+    fn a_lagged_rename_touches_the_survivor_by_its_symbol_move() {
+        let (counts, graph) = lagged_rename(true);
+
+        let rows = query(
+            &graph,
+            "MATCH (ch:Change {repository_id: $repo, kind: 'R'})-[t:TOUCHES]->(s:Symbol) \
+             RETURN s.stable_id AS stable_id, t.basis AS basis, \
+                    t.line_start AS line_start, t.line_end AS line_end",
+            json!({"repo": "repo-git"}),
+        );
+        assert_eq!(rows.len(), 1, "the rename's survivor is touched");
+        assert_eq!(rows[0]["stable_id"], "shared_alpha");
+        assert_eq!(rows[0]["basis"], "move");
+        assert!(
+            rows[0]["line_start"].is_null() && rows[0]["line_end"].is_null(),
+            "no span is applied to a version the symbol table does not describe"
+        );
+        assert_eq!(counts["moved"], 1);
+        assert_eq!(counts["no_line_info"], 0);
+    }
+
+    /// The mutation check for the test above: the same lagged rename without
+    /// its symbol move has no candidate at all.
+    #[test]
+    fn a_lagged_rename_without_its_symbol_move_gets_no_touch() {
+        let (counts, graph) = lagged_rename(false);
+
+        let touches = query(
+            &graph,
+            "MATCH ()-[t:TOUCHES]->() RETURN count(t) AS n",
+            json!({}),
+        );
+        assert_eq!(touches[0]["n"], 0);
+        assert_eq!(counts["moved"], 0);
+    }
+
+    #[test]
+    fn a_batched_log_splits_hunks_per_commit_and_path() {
+        let commit = "a".repeat(40);
+        let log = format!(
+            "{commit}\n\
+             \n\
+             diff --git a/x.rs b/x.rs\n\
+             index 1..2 100644\n\
+             --- a/x.rs\n\
+             +++ b/x.rs\n\
+             @@ -3 +3 @@\n\
+             -x\n\
+             +y\n\
+             @@ -10,2 +11,0 @@\n\
+             diff --git a/bin.dat b/bin.dat\n\
+             Binary files a/bin.dat and b/bin.dat differ\n\
+             diff --git a/gone.rs b/gone.rs\n\
+             deleted file mode 100644\n\
+             --- a/gone.rs\n\
+             +++ /dev/null\n\
+             @@ -1,2 +0,0 @@\n\
+             -a\n\
+             -b\n\
+             diff --git a/t.rs b/t.rs\n\
+             --- a/t.rs\n\
+             +++ b/t.rs\n\
+             @@ -1 +1 @@\n\
+             -x\n\
+             +++ y\n"
+        );
+        let map = parse_hunk_log(&log);
+        let key = |path: &str| (commit.clone(), path.to_string());
+        assert_eq!(map[&key("x.rs")], vec![(3, 3), (11, 11)]);
+        assert!(!map.contains_key(&key("bin.dat")), "binary: no line info");
+        assert!(!map.contains_key(&key("gone.rs")), "deletion: no new path");
+        // A content line `+++ y` inside a hunk is content, not a file header.
+        assert_eq!(map[&key("t.rs")], vec![(1, 1)]);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn a_malformed_span_row_is_skipped_not_coerced_to_line_one() {
+        let ok = json!({"stable_id": "a", "line_start": 4, "line_next": null});
+        assert_eq!(
+            span_of(&ok),
+            Some(Span {
+                stable_id: "a".into(),
+                line_start: 4,
+                line_next: None
+            })
+        );
+        assert_eq!(
+            span_of(&json!({"stable_id": "a", "line_start": null})),
+            None
+        );
+        assert_eq!(span_of(&json!({"stable_id": "a", "line_start": 0})), None);
+        assert_eq!(
+            span_of(&json!({"stable_id": "a", "line_start": 2, "line_next": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn hunk_headers_give_the_new_side_range() {
         // `+11,0`: a pure deletion after line 11; `+1,3`: three added lines.
-        let diff = "@@ -3 +3 @@\n-x\n+y\n@@ -10,2 +11,0 @@\n@@ -0,0 +1,3 @@\n";
-        assert_eq!(parse_hunks(diff), vec![(3, 3), (11, 11), (1, 3)]);
+        assert_eq!(hunk_range("@@ -10,2 +11,0 @@"), Some((11, 11)));
+        assert_eq!(hunk_range("@@ -0,0 +1,3 @@ fn x"), Some((1, 3)));
+        assert_eq!(hunk_range("@@ -3 +3 @@"), Some((3, 3)));
     }
 
     /// A `:Symbol` identity under `relpath`.
