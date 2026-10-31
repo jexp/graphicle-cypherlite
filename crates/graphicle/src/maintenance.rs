@@ -964,11 +964,13 @@ impl Store {
             let store = graph_store(self)?;
             return backup_graph(&store, path);
         }
-        use std::os::unix::fs::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let file = options.open(path)?;
         drop(file);
         let result = (|| {

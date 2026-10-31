@@ -1530,11 +1530,13 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         let destination = directory.join("reviews.sqlite3");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&destination)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        options.open(&destination)?;
         if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
             let _ = std::fs::remove_file(&destination);
             return Err(error.into());
@@ -1548,9 +1550,14 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     if graph_backup.is_dir() {
         let destination = directory.join("reviews.graph");
         let copied = (|| -> Result<()> {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&destination)?;
+            #[cfg(unix)]
+            {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&destination)?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(&destination)?;
             for file in ["manifest.json", "graph.json"] {
                 let source = graph_backup.join(file);
                 if source.is_file() {
