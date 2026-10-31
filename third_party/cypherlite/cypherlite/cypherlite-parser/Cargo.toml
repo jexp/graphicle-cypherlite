@@ -1,0 +1,15 @@
+[package]
+name = "cypherlite-parser"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+cypherlite-model = { workspace = true }
+
+[dev-dependencies]
+cypherlite-test-support = { workspace = true }
+# Drift guard for the generated Unicode tables (ADR-0182). Dev-only: the
+# canonical SHA-256 replaces the hand-rolled test helper and is never compiled
+# into the shipped engine (precedent: cypherlite-storage's tempfile/proptest,
+# ADR-0268).
+sha2 = { workspace = true }

@@ -1,0 +1,184 @@
+[workspace]
+resolver = "2"
+# Vendored snapshot (see VENDOR.md): only the engine crates and the shared
+# test-support crate are included; surfaces/, clients/, docs/ and the other
+# testing/ crates are not part of this copy.
+members = ["cypherlite/*", "testing/cypherlite-test-support"]
+# Deliberately outside the default set (plain `cargo build` / `cargo test`
+# skips them): surfaces/cypherlite-python is a pyo3 cdylib linked through
+# maturin, testing/xtask backs the `cargo xtask` maintenance command, and
+# testing/cypherlite-graph-examples is the Neo4j-docker differential suite
+# (ADR-0144). Build any of them explicitly with `-p`.
+default-members = [
+    "cypherlite/cypherlite-model",
+    "cypherlite/cypherlite-parser",
+    "cypherlite/cypherlite-error",
+    "cypherlite/cypherlite-splitter",
+    "cypherlite/cypherlite-core",
+    "cypherlite/cypherlite-catalog",
+    "cypherlite/cypherlite-ir",
+    "cypherlite/cypherlite-front",
+    "cypherlite/cypherlite-planner",
+    "cypherlite/cypherlite-executor",
+    "cypherlite/cypherlite-ontology",
+    "cypherlite/cypherlite-storage",
+    "cypherlite/cypherlite",
+    "testing/cypherlite-test-support",
+]
+
+[workspace.package]
+version = "0.13.0"
+edition = "2021"
+repository = "https://github.com/neo4j-labs/cypherlite"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# CypherLite crates
+cypherlite-model = { path = "cypherlite/cypherlite-model" }
+cypherlite-parser = { path = "cypherlite/cypherlite-parser" }
+cypherlite-error = { path = "cypherlite/cypherlite-error" }
+cypherlite-formatter = { path = "surfaces/cypherlite-formatter" }
+cypherlite-splitter = { path = "cypherlite/cypherlite-splitter" }
+cypherlite-arrow = { path = "surfaces/cypherlite-arrow" }
+cypherlite-tck = { path = "testing/cypherlite-tck" }
+
+# Runtime crates
+cypherlite-core = { path = "cypherlite/cypherlite-core" }
+cypherlite-catalog = { path = "cypherlite/cypherlite-catalog" }
+cypherlite-ir = { path = "cypherlite/cypherlite-ir" }
+cypherlite-front = { path = "cypherlite/cypherlite-front" }
+cypherlite-planner = { path = "cypherlite/cypherlite-planner" }
+cypherlite-executor = { path = "cypherlite/cypherlite-executor" }
+cypherlite-ontology = { path = "cypherlite/cypherlite-ontology" }
+cypherlite-storage = { path = "cypherlite/cypherlite-storage", default-features = false }
+cypherlite = { path = "cypherlite/cypherlite", default-features = false }
+cypherlite-load = { path = "surfaces/cypherlite-load" }
+cypherlite-auth = { path = "surfaces/cypherlite-auth" }
+cypherlite-bolt = { path = "surfaces/cypherlite-bolt" }
+cypherlite-http = { path = "surfaces/cypherlite-http" }
+cypherlite-mcp = { path = "surfaces/cypherlite-mcp" }
+cypherlite-serve = { path = "surfaces/cypherlite-serve" }
+cypherlite-datasets = { path = "testing/cypherlite-datasets" }
+cypherlite-test-support = { path = "testing/cypherlite-test-support" }
+
+# Data types
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde", "wasmbind"] }
+chrono-tz = "0.10"
+indexmap = { version = "2", features = ["serde"] }
+unicode-normalization = "0.1"
+regex = "1"
+thiserror = "2"
+
+# Spatial
+geo = "0.29"
+wkt = { version = "0.11", features = ["geo-types"] }
+geojson = { version = "0.24", features = ["geo-types"] }
+
+# Serialization
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+quick-xml = "0.37"
+# YAML 1.2 for the ontology document format (ADR-0227 §5, the R6 record).
+# Pure safe Rust, no build script, small tree; `encoding` (non-UTF-8 input
+# decoding) is unused — documents arrive as UTF-8 text.
+saphyr = { version = "0.2", default-features = false }
+# The event-stream parser saphyr builds on (same crate release): used
+# directly for the ontology depth screen.
+saphyr-parser = { version = "0.2", default-features = false }
+
+# REPL
+rustyline = "14"
+crossterm = "0.28"
+
+# Python bindings
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+# Arrow (CypherLite). Match MemoryDB Cloud / iggy chrono (Arrow 54).
+arrow = { version = "54", features = ["json"] }
+arrow-array = "54"
+arrow-schema = "54"
+arrow-ipc = "54"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+base64 = "0.22"
+# HTTP/1.1 request-head parsing for the HTTP surfaces (ADR-0234). Pure
+# byte-slice parser, zero transitive deps.
+httparse = "1.10"
+# gzip response compression on the HTTP Query API (ADR-0385). The pure-Rust
+# miniz_oxide backend is the one ureq's default `gzip` feature already
+# compiles: no C toolchain, no libz-sys, no new lockfile package.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+ureq = "3.4"
+sha2 = "0.10"
+# SSHSIG verification for release `SHA256SUMS` (ADR-0115). Pure Rust, no
+# native build; `alloc` is needed for `PublicKey::verify`/`SshSig`.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
+
+# CypherLite storage / Bolt / CLI
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+clap = { version = "4", features = ["derive", "env"] }
+# Bolt TLS (ADR-0109/ADR-0226): sync rustls over the peeked TcpStream. Keep
+# rustls on the pure-Rust `ring` provider: the tree already resolves
+# rustls/ring, and enabling default features would pull in the C/cmake
+# `aws-lc-rs` build.
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
+rustls-pemfile = "2"
+# Bolt over WebSocket (ADR-0266/ADR-0226). Server-side accept only
+# ("handshake" is the RFC 6455 handshake machinery); TLS is already
+# terminated by rustls (ADR-0109), so no tungstenite TLS feature.
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# SIGINT/SIGTERM handling without a runtime (ADR-0264/ADR-0226).
+signal-hook = "0.3"
+libc = "0.2"
+bytes = "1"
+url = "2"
+walkdir = "2"
+rand = "0.9"
+crc32fast = "1"
+dashmap = "6"
+rustc-hash = "2"
+# Advisory file locks: cypherlite-storage's bundle locks and the
+# query-latency per-dataset ensure lock (single pin for both consumers).
+fs4 = "=0.8.4"
+# Native uses std::time::Instant; wasm32 has no monotonic clock in std. `web-time`
+# is a drop-in that maps to `performance.now()` on wasm32 (ADR-0085).
+web-time = "1"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+overflow-checks = false
+incremental = false
+
+# ADR-0212: corpus profile for conformance corpora (TCK, CIP-eval,
+# cookbook) — release without the opt-level 3 passes: compiles noticeably
+# faster, runs within ~1-5% of release, no debug info.
+[profile.corpus]
+inherits = "release"
+opt-level = 2
+debug = false
+
+# ADR-0253: exec-heavy unit/integration suites (cypherlite, executor,
+# storage, datasets) run 3-15x faster at opt-level 1 while debug assertions
+# and overflow checks stay on; cheap suites pay seconds of extra compile.
+# The suite x profile matrix behind this knob lives in
+# docs/testing/runtime.md. The corpus family keeps its own corpus profile
+# (ADR-0212, ADR-0252).
+[profile.test]
+opt-level = 1
+
+# ADR-0244: release code with line tables, so a sampling profiler
+# (`query-latency profile`, samply, perf) shows symbolized frames and source
+# lines. Diagnostic builds only; released artifacts never use it.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

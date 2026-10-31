@@ -1,0 +1,14 @@
+[package]
+name = "cypherlite-ontology"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+cypherlite-core = { workspace = true }
+cypherlite-parser = { workspace = true }
+indexmap = { workspace = true }
+saphyr = { workspace = true }
+saphyr-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

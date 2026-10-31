@@ -1,0 +1,540 @@
+{
+  "schema": "https://neo4j.com/docs/ontology-graph-spec/1.0.0/schema.json",
+  "version": "1",
+  "id": "cypherlite-ontology-example",
+  "name": "CypherLite main-shape validator example",
+  "description": "CypherLite-authored example for the main Ontology Graph Spec 1.0.0 shape (ADR-0364 §6). Validation-only: it contains main-valid constructs that db.ontology.apply rejects.",
+  "nodes": {
+    "person": {
+      "label": "Person",
+      "name": "Person",
+      "description": "A person known to the graph.",
+      "aliases": ["Individual"],
+      "reference": "https://example.com/ontology/Person",
+      "properties": {
+        "id": {
+          "type": "STRING",
+          "key": true,
+          "name": "Identifier",
+          "description": "Stable person identifier.",
+          "reference": "https://example.com/ontology/Person#id"
+        },
+        "name": {
+          "type": "STRING",
+          "must_exist": true,
+          "unique": true,
+          "one_of": ["Ada", "Grace", "Linus"],
+          "pattern": "^[A-Z][a-z]+$"
+        },
+        "email": {
+          "type": "STRING",
+          "unique": true
+        },
+        "score": {
+          "type": "INTEGER",
+          "dimension": null,
+          "must_exist": null,
+          "unique": null,
+          "key": null,
+          "name": null
+        },
+        "location": {
+          "type": "POINT"
+        },
+        "embedding": {
+          "type": "VECTOR<FLOAT>",
+          "dimension": 3
+        },
+        "tags": {
+          "type": "LIST<STRING>",
+          "name": "Tags"
+        },
+        "": {
+          "type": "STRING",
+          "description": "Empty property names are main-valid and accepted."
+        }
+      },
+      "constraints": {
+        "person-id-key": {
+          "type": "KEY",
+          "properties": ["id"],
+          "label": null,
+          "name": "person_id_key",
+          "extensions": {
+            "custom": {
+              "owner": "cypherlite"
+            }
+          }
+        },
+        "person-name-exists": {
+          "type": "EXISTS",
+          "properties": ["name"],
+          "label": "Person",
+          "name": null
+        },
+        "person-email-unique": {
+          "type": "UNIQUE",
+          "properties": ["email"],
+          "name": "person_email_unique"
+        },
+        "person-name-type": {
+          "type": "PROPERTY_TYPE",
+          "properties": ["name"],
+          "name": "person_name_type"
+        },
+        "person-empty-properties": {
+          "type": "EXISTS",
+          "properties": [],
+          "name": null
+        }
+      },
+      "extensions": {
+        "indexes": {
+          "person-range": {
+            "type": "RANGE",
+            "labels": ["Person"],
+            "properties": ["name"],
+            "options": null,
+            "custom": {},
+            "name": null
+          },
+          "person-text": {
+            "type": "TEXT",
+            "labels": ["Person"],
+            "properties": ["name", "email"],
+            "options": null,
+            "custom": {
+              "source": "cypherlite"
+            },
+            "name": "person_text"
+          },
+          "person-lookup": {
+            "type": "LOOKUP",
+            "labels": [],
+            "properties": []
+          },
+          "person-fulltext": {
+            "type": "FULLTEXT",
+            "labels": ["Person"],
+            "properties": ["name", "email"],
+            "options": {
+              "type": "FULLTEXT",
+              "fulltext.default_analyzer": "standard-no-stop-words",
+              "fulltext.analyzer": null,
+              "fulltext.eventually_consistent": true,
+              "fulltext.eventually_consistent_apply_parallelism": 2,
+              "fulltext.eventually_consistent_refresh_interval": "1s",
+              "fulltext.eventually_consistent_refresh_parallelism": 1,
+              "fulltext.eventually_consistent_index_update_queue_max_length": 1000
+            },
+            "custom": {},
+            "name": "person_fulltext"
+          },
+          "person-point": {
+            "type": "POINT",
+            "labels": ["Person"],
+            "properties": ["location"],
+            "options": {
+              "type": "POINT",
+              "spatial.cartesian.min": [0, 0],
+              "spatial.cartesian.max": [100.5, 100.5],
+              "spatial.cartesian-3d.min": [0, 0, 0],
+              "spatial.cartesian-3d.max": [1, 1, 1],
+              "spatial.wgs-84.min": [-90, -180],
+              "spatial.wgs-84.max": [90, 180],
+              "spatial.wgs-84-3d.min": [-90, -180, -1000],
+              "spatial.wgs-84-3d.max": [90, 180, 10000]
+            },
+            "name": null
+          },
+          "person-vector": {
+            "type": "VECTOR",
+            "labels": ["Person"],
+            "properties": ["embedding"],
+            "options": {
+              "type": "VECTOR",
+              "vector.dimensions": 3,
+              "vector.similarity_function": "cosine",
+              "vector.default_search_expansion_factor": 2.0,
+              "vector.quantization.enabled": false,
+              "vector.quantization.type": "scalar",
+              "vector.hnsw.m": 16,
+              "vector.hnsw.ef_construction": 200
+            },
+            "custom": {},
+            "name": "person_embedding"
+          }
+        },
+        "display": {
+          "x": 100,
+          "y": 200.5,
+          "colour": "#FF8800",
+          "custom": {
+            "icon": "person"
+          }
+        },
+        "custom": {
+          "owner": "cypherlite",
+          "note": null
+        }
+      }
+    },
+    "movie": {
+      "labels": {
+        "identifier": "Movie",
+        "implied": ["Media"],
+        "optional": ["Classic"],
+        "extensions": {
+          "custom": {
+            "identifier": "Movie"
+          }
+        }
+      },
+      "name": null,
+      "description": "A film.",
+      "properties": {
+        "id": {
+          "type": "STRING",
+          "key": true
+        },
+        "title": {
+          "type": "STRING",
+          "must_exist": true
+        }
+      },
+      "constraints": {
+        "movie-title-key": {
+          "type": "KEY",
+          "properties": ["title"],
+          "name": null
+        }
+      },
+      "extensions": {
+        "custom": {
+          "owner": "cypherlite"
+        }
+      }
+    },
+    "no-identifier": {
+      "label": null,
+      "labels": {
+        "identifier": null,
+        "implied": ["Anonymous"],
+        "optional": [],
+        "extensions": {
+          "custom": {}
+        }
+      },
+      "name": null,
+      "description": "Accepted at validation; apply fails with a Mapping error because there is no identifying label.",
+      "properties": {
+        "note": {
+          "type": "STRING"
+        }
+      }
+    },
+    "type-showcase": {
+      "label": "TypeShowcase",
+      "name": "Type showcase",
+      "description": "Every Neo4jType token of main's closed enum.",
+      "properties": {
+        "any": { "type": "ANY" },
+        "list-any": { "type": "LIST<ANY>" },
+        "boolean": { "type": "BOOLEAN" },
+        "list-boolean": { "type": "LIST<BOOLEAN>" },
+        "date": { "type": "DATE" },
+        "list-date": { "type": "LIST<DATE>" },
+        "duration": { "type": "DURATION" },
+        "list-duration": { "type": "LIST<DURATION>" },
+        "float32": { "type": "FLOAT32" },
+        "list-float32": { "type": "LIST<FLOAT32>" },
+        "float": { "type": "FLOAT" },
+        "list-float": { "type": "LIST<FLOAT>" },
+        "integer8": { "type": "INTEGER8" },
+        "list-integer8": { "type": "LIST<INTEGER8>" },
+        "integer16": { "type": "INTEGER16" },
+        "list-integer16": { "type": "LIST<INTEGER16>" },
+        "integer32": { "type": "INTEGER32" },
+        "list-integer32": { "type": "LIST<INTEGER32>" },
+        "integer": { "type": "INTEGER" },
+        "list-integer": { "type": "LIST<INTEGER>" },
+        "local-datetime": { "type": "LOCAL DATETIME" },
+        "list-local-datetime": { "type": "LIST<LOCAL DATETIME>" },
+        "local-time": { "type": "LOCAL TIME" },
+        "list-local-time": { "type": "LIST<LOCAL TIME>" },
+        "point": { "type": "POINT" },
+        "list-point": { "type": "LIST<POINT>" },
+        "string": { "type": "STRING" },
+        "list-string": { "type": "LIST<STRING>" },
+        "vector-float": { "type": "VECTOR<FLOAT>", "dimension": 3 },
+        "vector-float32": { "type": "VECTOR<FLOAT32>", "dimension": 3 },
+        "vector-integer": { "type": "VECTOR<INTEGER>", "dimension": 3 },
+        "vector-integer32": { "type": "VECTOR<INTEGER32>", "dimension": 3 },
+        "vector-integer16": { "type": "VECTOR<INTEGER16>", "dimension": 3 },
+        "vector-integer8": { "type": "VECTOR<INTEGER8>", "dimension": 3 },
+        "zoned-datetime": { "type": "ZONED DATETIME" },
+        "list-zoned-datetime": { "type": "LIST<ZONED DATETIME>" },
+        "zoned-time": { "type": "ZONED TIME" },
+        "list-zoned-time": { "type": "LIST<ZONED TIME>" },
+        "uuid": { "type": "UUID" }
+      },
+      "extensions": {
+        "custom": {
+          "purpose": "pin every Neo4jType token"
+        }
+      }
+    }
+  },
+  "relationships": {
+    "acted-in": {
+      "type": "ACTED_IN",
+      "from": {
+        "node": "person",
+        "label": "Person",
+        "min_count": 0,
+        "max_count": null
+      },
+      "to": {
+        "node": "movie",
+        "label": "Movie",
+        "count": null
+      },
+      "name": "Acted in",
+      "description": "A person acted in a film.",
+      "aliases": ["ACTED"],
+      "reference": "https://example.com/ontology/ACTED_IN",
+      "properties": {
+        "roles": {
+          "type": "LIST<STRING>",
+          "name": "Roles",
+          "extensions": {
+            "custom": {
+              "ordered": true
+            }
+          }
+        }
+      },
+      "constraints": {
+        "acted-in-roles-unique": {
+          "type": "UNIQUE",
+          "properties": ["roles"],
+          "name": null
+        }
+      },
+      "extensions": {
+        "indexes": {
+          "acted-in-roles-range": {
+            "type": "RANGE",
+            "properties": ["roles"],
+            "options": null,
+            "custom": {},
+            "name": null
+          },
+          "acted-in-roles-vector": {
+            "type": "VECTOR",
+            "properties": ["roles"],
+            "options": null,
+            "custom": {},
+            "name": "acted_in_roles_vector"
+          }
+        },
+        "custom": {
+          "owner": "cypherlite"
+        }
+      }
+    },
+    "label-only": {
+      "type": "LABEL_ONLY",
+      "from": {
+        "label": "Person"
+      },
+      "to": {
+        "node": "movie"
+      },
+      "description": "A label-only target is accepted at validation; apply fails with a Mapping error."
+    },
+    "empty-targets": {
+      "type": "EMPTY",
+      "from": {},
+      "to": {
+        "count": null,
+        "min_count": -1,
+        "max_count": null
+      },
+      "description": "Empty and negative-count targets are accepted at validation; apply fails because from has no node."
+    },
+    "produced": {
+      "type": "PRODUCED",
+      "from": {
+        "node": "person",
+        "count": 2
+      },
+      "to": {
+        "node": "movie",
+        "min_count": 1,
+        "max_count": 5
+      },
+      "name": null,
+      "properties": {
+        "since": {
+          "type": "DATE",
+          "must_exist": true
+        },
+        "roles": {
+          "type": "LIST<STRING>"
+        }
+      },
+      "constraints": {
+        "produced-composite-key": {
+          "type": "KEY",
+          "properties": ["since", "roles"],
+          "name": "produced_composite_key",
+          "extensions": {
+            "custom": {}
+          }
+        },
+        "produced-since-exists": {
+          "type": "EXISTS",
+          "properties": ["since"],
+          "name": null
+        }
+      },
+      "extensions": {
+        "indexes": {
+          "produced-since-text": {
+            "type": "TEXT",
+            "properties": ["since"],
+            "options": null,
+            "custom": {},
+            "name": null
+          }
+        },
+        "custom": {
+          "owner": "cypherlite"
+        }
+      }
+    }
+  },
+  "extensions": {
+    "tables": {
+      "people": {
+        "source": "sql/people.csv",
+        "columns": [
+          {
+            "name": "person_id",
+            "type": "varchar",
+            "size": 64,
+            "suggested": "STRING",
+            "supported": ["STRING", "UUID"],
+            "dimension": null,
+            "custom": {
+              "nullable": false
+            }
+          },
+          {
+            "name": "name",
+            "type": "varchar",
+            "suggested": "STRING"
+          }
+        ],
+        "primary_keys": ["person_id"],
+        "foreign_keys": {
+          "people_favourite_movie": {
+            "columns": ["favourite_movie"],
+            "references": {
+              "table": "movies",
+              "columns": ["movie_id"],
+              "custom": {
+                "on_delete": "set null"
+              }
+            },
+            "custom": {
+              "deferred": false
+            }
+          }
+        },
+        "custom": {
+          "format": "csv"
+        }
+      },
+      "movies": {
+        "source": "sql/movies.csv",
+        "columns": [
+          {
+            "name": "movie_id",
+            "type": "varchar",
+            "suggested": "STRING"
+          },
+          {
+            "name": "embedding",
+            "type": "vector",
+            "suggested": "VECTOR<FLOAT>",
+            "dimension": 3
+          }
+        ],
+        "primary_keys": ["movie_id"],
+        "foreign_keys": {},
+        "custom": {}
+      }
+    },
+    "mappings": {
+      "import": [
+        {
+          "type": "NODE",
+          "node": "person",
+          "table": "people",
+          "properties": {
+            "id": {
+              "column": "person_id"
+            },
+            "name": {
+              "column": "name"
+            }
+          },
+          "mode": "MERGE",
+          "match_label": "Person",
+          "key": ["id"],
+          "depends_on": "",
+          "id": "people-nodes"
+        },
+        {
+          "type": "RELATIONSHIP",
+          "relationship": "acted-in",
+          "table": "people",
+          "from_node": {
+            "label": "Person",
+            "properties": {
+              "id": {
+                "column": "person_id"
+              }
+            }
+          },
+          "to_node": {
+            "label": "Movie"
+          },
+          "match_label": null,
+          "properties": {
+            "roles": {
+              "column": "roles"
+            }
+          },
+          "mode": "CREATE",
+          "key": ["id"],
+          "depends_on": "people-nodes",
+          "id": "people-relationships"
+        },
+        {
+          "type": "QUERY",
+          "table": "people",
+          "query": "MATCH (p:Person) RETURN p",
+          "depends_on": "",
+          "id": "people-query"
+        }
+      ]
+    },
+    "custom": {
+      "owner": "cypherlite",
+      "role": "validator fixture"
+    }
+  }
+}
