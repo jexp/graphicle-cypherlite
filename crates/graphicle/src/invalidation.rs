@@ -110,11 +110,7 @@ fn record_in(
     Ok(())
 }
 
-fn forget_in(
-    db: &mut GraphConnection,
-    workspace: &str,
-    dependent: (&str, &str),
-) -> Result<()> {
+fn forget_in(db: &mut GraphConnection, workspace: &str, dependent: (&str, &str)) -> Result<()> {
     rows(
         db,
         "MATCH (d:Artifact {workspace: $w, kind: $k, id: $id})-[r:DEPENDS_ON]->() DELETE r",
@@ -143,12 +139,7 @@ fn mark_in(
     Ok(())
 }
 
-fn clear_in(
-    db: &mut GraphConnection,
-    workspace: &str,
-    kind: &str,
-    id: &str,
-) -> Result<bool> {
+fn clear_in(db: &mut GraphConnection, workspace: &str, kind: &str, id: &str) -> Result<bool> {
     let found = one(
         db,
         "MATCH (a:Artifact:Stale {workspace: $w, kind: $k, id: $id}) \
@@ -174,7 +165,11 @@ pub fn record_dependency(
 }
 
 /// Remove every dependency edge recorded for `dependent` (before re-recording).
-pub fn forget_dependent(graph: &GraphStore, workspace: &str, dependent: (&str, &str)) -> Result<()> {
+pub fn forget_dependent(
+    graph: &GraphStore,
+    workspace: &str,
+    dependent: (&str, &str),
+) -> Result<()> {
     graph.transaction(|db| forget_in(db, workspace, dependent))
 }
 
@@ -261,9 +256,7 @@ pub fn clear_stale_prefix(
              RETURN count(a) AS n",
             params.clone(),
         )?;
-        Ok(found
-            .and_then(|row| row["n"].as_u64())
-            .unwrap_or(0) as usize)
+        Ok(found.and_then(|row| row["n"].as_u64()).unwrap_or(0) as usize)
     })
 }
 
@@ -544,7 +537,13 @@ pub fn record_memory(
             .flatten()
             .map(|(k, _)| k)
         {
-            record_in(db, workspace, dependent, (FILE, &file_id(repository, path)), &stamp)?;
+            record_in(
+                db,
+                workspace,
+                dependent,
+                (FILE, &file_id(repository, path)),
+                &stamp,
+            )?;
         }
         for key in ["evidence_links", "native_sources"] {
             for origin in data[key].as_object().into_iter().flatten().map(|(k, _)| k) {
@@ -764,7 +763,12 @@ pub fn permissions_changed(
         None => Vec::new(),
     };
     for source in revoked_sources {
-        marked.extend(invalidate_source(graph, workspace, (SOURCE, source), reason)?);
+        marked.extend(invalidate_source(
+            graph,
+            workspace,
+            (SOURCE, source),
+            reason,
+        )?);
     }
     marked.sort();
     marked.dedup();
@@ -809,10 +813,19 @@ mod tests {
         mark_stale(&graph, "w", GRAPH_NODE, "r1:a", "x").unwrap();
         mark_stale(&graph, "w", GRAPH_NODE, "r1:b", "x").unwrap();
         mark_stale(&graph, "w", GRAPH_NODE, "r2:a", "x").unwrap();
-        assert_eq!(clear_stale_prefix(&graph, "w", GRAPH_NODE, "r1:").unwrap(), 2);
+        assert_eq!(
+            clear_stale_prefix(&graph, "w", GRAPH_NODE, "r1:").unwrap(),
+            2
+        );
         assert_eq!(freshness(&graph, "w").unwrap().stale_count, 1);
-        assert_eq!(repository_freshness(&graph, "w", "r2").unwrap().stale_count, 1);
-        assert_eq!(repository_freshness(&graph, "w", "r1").unwrap().stale_count, 0);
+        assert_eq!(
+            repository_freshness(&graph, "w", "r2").unwrap().stale_count,
+            1
+        );
+        assert_eq!(
+            repository_freshness(&graph, "w", "r1").unwrap().stale_count,
+            0
+        );
     }
 
     #[test]

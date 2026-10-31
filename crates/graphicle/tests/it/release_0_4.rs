@@ -293,13 +293,14 @@ async fn atlassian_full_scan_keeps_comments_dates_and_handles_revocation() {
             .await;
         assert_eq!(probe["state"], "complete", "{probe}");
         assert_eq!(probe["result"]["evidence"], "local_fixture_response");
-        let texts = serde_json::to_string(
-            &crate::gql(
-                &f.store,
-                "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.content AS content",
-                graphicle_runtime::store_graph::Params::from([crate::gp("connector", json!(s(&c, "id")))]),
-            ),
-        )
+        let texts = serde_json::to_string(&crate::gql(
+            &f.store,
+            "MATCH (d:ConnectorDoc {connector_id: $connector}) RETURN d.content AS content",
+            graphicle_runtime::store_graph::Params::from([crate::gp(
+                "connector",
+                json!(s(&c, "id")),
+            )]),
+        ))
         .unwrap();
         if kind == "jira" {
             assert!(texts.contains("access check has not passed"));

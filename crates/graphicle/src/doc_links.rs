@@ -1141,12 +1141,14 @@ fn note_row(found: &mut HashSet<String>, label: Option<&str>, owner: &str) {
     }
 }
 
+/// One symbol version as [`symbol_versions`] returns it: the label (a
+/// symbol need not have one), the owner, the episode it became valid in,
+/// and the episode it stopped being valid in (`None` while current).
+type SymbolVersion = (Option<String>, String, String, Option<String>);
+
 /// The versions of a project's symbols (label from the version's canonical
 /// attributes, owner, validity window), read from the graph store.
-fn symbol_versions(
-    db: &Connection,
-    project: &str,
-) -> Result<Vec<(Option<String>, String, String, Option<String>)>> {
+fn symbol_versions(db: &Connection, project: &str) -> Result<Vec<SymbolVersion>> {
     // The store handle stays bound for the connection's scope: a dropped
     // handle leaves the engine alive through the connection while the
     // registry entry dies — the next `graph_for` would miss the registry
@@ -1259,7 +1261,7 @@ fn changed(
     };
     let mut found = HashSet::new();
     for (label, owner, from, to) in symbol_versions(db, project)? {
-        if in_range(&from) || to.as_deref().is_some_and(&in_range) {
+        if in_range(&from) || to.as_deref().is_some_and(in_range) {
             note_row(&mut found, label.as_deref(), &owner);
         }
     }
@@ -2009,7 +2011,10 @@ fn current_sha(db: &Connection, document: &Document) -> Result<Option<String>> {
 /// the resolved symbol, and edges back to the document for the rest.
 fn write(db: &mut cypherlite::Connection, computed: &Computed) -> Result<usize> {
     let document = &computed.document;
-    let key = [("repo", json!(document.project)), ("doc", json!(document.id))];
+    let key = [
+        ("repo", json!(document.project)),
+        ("doc", json!(document.id)),
+    ];
     store_graph::rows(
         db,
         "MATCH (d:ConnectorDoc {repository_id: $repo, id: $doc})-[l:LINKS_TO]->() \
@@ -2153,11 +2158,9 @@ pub fn after_sync(
             })?
             .iter()
             .any(|row| {
-                serde_json::from_str::<Value>(s(row, "metadata"))
-                    .is_ok_and(|metadata| {
-                        metadata["provider_metadata"]["schema"].as_str()
-                            != Some(SDK_SESSION_SCHEMA)
-                    })
+                serde_json::from_str::<Value>(s(row, "metadata")).is_ok_and(|metadata| {
+                    metadata["provider_metadata"]["schema"].as_str() != Some(SDK_SESSION_SCHEMA)
+                })
             });
     // Link rows of this connector's documents that remain to be removed:
     // their own nodes carry the row state (`source_kind`) and the connector
@@ -2626,7 +2629,6 @@ pub struct Lookup<'a> {
     db: &'a Connection,
     graph: std::sync::Arc<GraphStore>,
     repository: String,
-    producers: String,
     /// The folder the project was last synced from, when the caller names
     /// it ([`Lookup::with_folder`]): `source_age` dates files there.
     folder: Option<std::path::PathBuf>,
@@ -2660,7 +2662,6 @@ impl<'a> Lookup<'a> {
             db,
             graph: graph_of(db)?,
             repository: repository.to_string(),
-            producers: json!(producers()).to_string(),
             folder: None,
         })
     }
@@ -4027,11 +4028,6 @@ mod tests {
             let result = crate::jobs::run_projection(&self.store, &job);
             self.store.finish_job(&job, result).unwrap();
         }
-        fn count(&self, sql: &str) -> i64 {
-            self.store
-                .read(|db| Ok(db.query_row(sql, [], |row| row.get(0))?))
-                .unwrap()
-        }
         fn graph_count(&self, cypher: &str) -> i64 {
             self.store
                 .graph()
@@ -4068,7 +4064,10 @@ mod tests {
             ("docs/a.md", page),
         ]);
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 1);
+        assert_eq!(
+            unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"),
+            1
+        );
         unit.sync(&[
             ("wire.py", "def parse_header(line):\n    return line\n"),
             ("docs/a.md", page),
@@ -4117,9 +4116,7 @@ mod tests {
         assert_eq!(summary["requeued"], true, "{summary}");
         assert_eq!(summary["relinked"], 0);
         assert_eq!(
-            unit.graph_count(
-                "MATCH (d:ConnectorDoc {id: 'file:docs/b.md'}) RETURN count(d) AS n"
-            ),
+            unit.graph_count("MATCH (d:ConnectorDoc {id: 'file:docs/b.md'}) RETURN count(d) AS n"),
             0
         );
         assert_eq!(
@@ -4137,7 +4134,10 @@ mod tests {
         );
         // That job reads the new episode: both pages link to the edited code.
         crate::jobs::drain_projection(&unit.store, &unit.repo).unwrap();
-        assert_eq!(unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"), 2);
+        assert_eq!(
+            unit.graph_count("MATCH (d:ConnectorDoc) RETURN count(d) AS n"),
+            2
+        );
         let sha = graphicle_memory::text::sha256(edited.as_bytes());
         assert_eq!(
             unit.graph_count(&format!(

@@ -1,0 +1,13 @@
+[package]
+name = "cypherlite-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Bind OpenCypher AST to a logical plan"
+
+[dependencies]
+cypherlite-parser = { workspace = true }
+cypherlite-core = { workspace = true }
+cypherlite-ir = { workspace = true }
+cypherlite-front = { workspace = true }
+cypherlite-catalog = { workspace = true }

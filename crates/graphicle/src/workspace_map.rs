@@ -115,7 +115,13 @@ fn map(
     let mut incoming: BTreeMap<String, usize> = BTreeMap::new();
     let mut edges = 0usize;
     for &source in &members {
-        for edge in graph_projection::live_cross_edges(db, graph_store.as_ref(), p, source, CrossDirection::Outgoing)? {
+        for edge in graph_projection::live_cross_edges(
+            db,
+            graph_store.as_ref(),
+            p,
+            source,
+            CrossDirection::Outgoing,
+        )? {
             let target = s(&edge, "target_repository_id");
             if target == source || !members.contains(target) {
                 continue;
@@ -178,13 +184,15 @@ fn map(
 /// The file set the project's symbols were projected from, and whether it is
 /// the project's current one (otherwise its graph waits for a projection).
 fn graph(db: &Connection, id: &str) -> Result<Value> {
-    Ok(match symbols::table_episode(crate::store::graph_for(db)?.as_ref(), id)? {
-        Some(episode) => {
-            let current = episode == graph_projection::current_episode(db, id)?;
-            json!({"episode":episode,"current":current})
-        }
-        None => json!({"episode":null,"current":false}),
-    })
+    Ok(
+        match symbols::table_episode(crate::store::graph_for(db)?.as_ref(), id)? {
+            Some(episode) => {
+                let current = episode == graph_projection::current_episode(db, id)?;
+                json!({"episode":episode,"current":current})
+            }
+            None => json!({"episode":null,"current":false}),
+        },
+    )
 }
 
 /// What one project holds, as the caller's own reads of it show (see the

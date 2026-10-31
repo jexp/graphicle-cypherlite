@@ -1,0 +1,14 @@
+mod accounting;
+mod coalesce;
+mod copy_source;
+mod cover;
+mod harness;
+mod legacy_dupes;
+mod load_range;
+mod manifest;
+mod ontology;
+mod paths;
+mod plan;
+mod recovery;
+mod theater;
+mod writer;

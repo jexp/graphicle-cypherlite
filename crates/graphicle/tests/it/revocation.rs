@@ -541,7 +541,10 @@ fn revocation_matches_credential_ids_exactly_not_as_substrings() {
         "CREATE (sp:SourcePermission {connector_id: $connector, source_id: 'plan', principals: $principals, complete: true, checked_at: $now, generation: $generation})",
         graphicle_runtime::store_graph::Params::from([
             crate::gp("connector", json!(f.connector)),
-            crate::gp("principals", json!(json!([{"type":"user","id":"U-AB"}]).to_string())),
+            crate::gp(
+                "principals",
+                json!(json!([{"type":"user","id":"U-AB"}]).to_string()),
+            ),
             crate::gp("now", json!(graphicle_runtime::now())),
             crate::gp("generation", json!(generation)),
         ]),
@@ -557,11 +560,13 @@ fn revocation_matches_credential_ids_exactly_not_as_substrings() {
 
     let expected = |connector: &str, doc: &str| format!("connector:{connector}:{doc}");
     assert_eq!(
-        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-a").unwrap(),
+        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-a")
+            .unwrap(),
         vec![expected(&connectors[0], "doc")]
     );
     assert_eq!(
-        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-ab").unwrap(),
+        graphicle_runtime::store::credential_sources(&f.store, &db, &f.workspace, "cred-ab")
+            .unwrap(),
         {
             let mut both = vec![
                 expected(&connectors[1], "doc"),

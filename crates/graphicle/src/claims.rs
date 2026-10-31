@@ -68,16 +68,31 @@ pub fn current(
     }
     Ok(output)
 }
+/// The claims a caller proposes, with the context they were read from and
+/// the provider that would write them: the claims themselves, the source
+/// documents they cite (`sources`, the view the result is stamped with),
+/// the memories they make statements about (`targets`), and the provider
+/// record saved with them.
+pub struct Proposal<'a> {
+    pub claims: &'a Value,
+    pub sources: &'a [Value],
+    pub targets: &'a [Value],
+    pub provider: &'a Value,
+}
+
 pub fn propose(
     db: &Connection,
     graph: &GraphStore,
     repository: &Value,
     p: &Principal,
-    claims: &Value,
-    sources: &[Value],
-    targets: &[Value],
-    provider: &Value,
+    proposal: Proposal<'_>,
 ) -> Result<Value> {
+    let Proposal {
+        claims,
+        sources,
+        targets,
+        provider,
+    } = proposal;
     let identifier = s(repository, "id");
     let checked = native(
         "interpretation.validate",
@@ -417,10 +432,12 @@ impl Store {
                     &self.graph(),
                     &repository,
                     p,
-                    &args["claims"],
-                    prepared["context"]["sources"].as_array().unwrap(),
-                    prepared["context"]["targets"].as_array().unwrap(),
-                    &json!({"kind":"caller_supplied","model_calls":0}),
+                    Proposal {
+                        claims: &args["claims"],
+                        sources: prepared["context"]["sources"].as_array().unwrap(),
+                        targets: prepared["context"]["targets"].as_array().unwrap(),
+                        provider: &json!({"kind":"caller_supplied","model_calls":0}),
+                    },
                 )
             },
         )

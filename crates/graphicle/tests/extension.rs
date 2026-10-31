@@ -621,10 +621,9 @@ fn deletion_honours_the_extension_history_and_retained_tables() {
     let f = Fixture::new();
     // Extension tables are graph labels now: the probe's retained history
     // lives on the graph store.
-    let graph = graphicle_runtime::store_graph::GraphStore::open(
-        f.store.directory.join("reviews.graph"),
-    )
-    .unwrap();
+    let graph =
+        graphicle_runtime::store_graph::GraphStore::open(f.store.directory.join("reviews.graph"))
+            .unwrap();
     graph
         .transaction(|db| {
             db.query("CREATE (:ProbeRow {id: 'kept', workspace_id: 'w'})")?;
@@ -665,10 +664,9 @@ fn store_open_runs_extension_migrations_after_the_core_schema() {
     let f = Fixture::new();
     // Extension migrations run on the graph store (`Extension::migrate`
     // takes the `GraphStore`), after the core graph type and indexes.
-    let graph = graphicle_runtime::store_graph::GraphStore::open(
-        f.store.directory.join("reviews.graph"),
-    )
-    .unwrap();
+    let graph =
+        graphicle_runtime::store_graph::GraphStore::open(f.store.directory.join("reviews.graph"))
+            .unwrap();
     let found = graph
         .read(|db| {
             Ok(graphicle_runtime::store_graph::rows(
@@ -1166,7 +1164,10 @@ fn backups_are_scrubbed_by_the_extension_too() {
     let mut params = Params::new();
     params.insert("ws".into(), json_to_value(&json!(f.workspace)));
     live.transaction(|db| {
-        db.query_with_params("CREATE (:ProbeRow {id: 'row', workspace_id: $ws})", params.clone())?;
+        db.query_with_params(
+            "CREATE (:ProbeRow {id: 'row', workspace_id: $ws})",
+            params.clone(),
+        )?;
         Ok(())
     })
     .unwrap();
@@ -1176,14 +1177,19 @@ fn backups_are_scrubbed_by_the_extension_too() {
     let count = |store: &GraphStore| -> i64 {
         store
             .read(|db| {
-                Ok(one(db, "MATCH (n:ProbeRow) RETURN count(n) AS n", Params::new())?
-                    .and_then(|r| r["n"].as_i64())
-                    .unwrap_or(0))
+                Ok(
+                    one(db, "MATCH (n:ProbeRow) RETURN count(n) AS n", Params::new())?
+                        .and_then(|r| r["n"].as_i64())
+                        .unwrap_or(0),
+                )
             })
             .unwrap()
     };
     assert_eq!(count(&GraphStore::open(&dir).unwrap()), 0);
-    assert_eq!(count(&GraphStore::open(f.store.directory.join("reviews.graph")).unwrap()), 1);
+    assert_eq!(
+        count(&GraphStore::open(f.store.directory.join("reviews.graph")).unwrap()),
+        1
+    );
 }
 
 /// The vault seals with the key of the extension that holds a store's,
@@ -1277,7 +1283,9 @@ async fn declared_job_kinds_are_leased_and_unknown_kinds_wait() {
     f.store
         .graph()
         .transaction(|db| {
-            for (id, kind, priority) in [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)] {
+            for (id, kind, priority) in
+                [("unknown-job", "future_kind", 5), ("probe-job", "probe", 0)]
+            {
                 graphicle_runtime::store_graph::rows(
                     db,
                     "CREATE (j:Job {id: $id}) SET j += $job",

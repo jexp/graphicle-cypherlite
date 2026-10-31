@@ -53,19 +53,6 @@ const PROBES: &[&str] = &[
     "Which running shoes do I use?",
 ];
 
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
-}
-
 struct Provider {
     config: model::Config,
     task: tokio::task::JoinHandle<()>,

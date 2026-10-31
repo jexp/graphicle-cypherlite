@@ -56,15 +56,20 @@ fn sections(domain: &str, script: &str) -> Result<Vec<Section>> {
                 .last_mut()
                 .ok_or_else(|| Error::bad(format!("migrate {domain}: @verify before @csv")))?;
             section.verify = verify.trim().trim_end_matches(';').to_string();
-        } else if !line.starts_with("--") {
-            if let Some(section) = out.last_mut() {
-                section.statement.push_str(line);
-                section.statement.push('\n');
-            }
+        } else if !line.starts_with("--")
+            && let Some(section) = out.last_mut()
+        {
+            section.statement.push_str(line);
+            section.statement.push('\n');
         }
     }
     for section in &mut out {
-        section.statement = section.statement.trim().trim_end_matches(';').trim().to_string();
+        section.statement = section
+            .statement
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
         if section.verify.is_empty() || section.statement.is_empty() {
             return Err(Error::bad(format!(
                 "migrate {domain}: section {} needs a statement and a @verify count",

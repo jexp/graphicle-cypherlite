@@ -1,0 +1,49 @@
+[package]
+name = "cypherlite-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared test-only helpers for the CypherLite workspace (big-stack runner, platform samplers, fixture files, loopback Query API fixture)"
+publish = false
+
+# The loopback fixture is split in two: the wire side (client exchanges,
+# request builders, response parsers, scripted servers — `wire`, needing
+# only flate2 for the gzip inflater) and the loader bridge (`loopback_opts`
+# builds `LoadOpts`, so `loopback` pulls cypherlite-load and serde_json).
+# The fixture itself serves over std::net, no HTTP stack.
+[dependencies]
+cypherlite-bolt = { workspace = true, optional = true }
+# `nested_eval`'s kind parse-back asserts the ADR-0395 row
+# (`ErrorKind::NestedEvaluationBudgetExceeded`).
+cypherlite-error = { workspace = true, optional = true }
+# The same helper's expected error text is built from the executor's
+# canonical budget constant, so the asserted contract cannot drift from
+# the enforced one.
+cypherlite-executor = { workspace = true, optional = true }
+cypherlite-core = { workspace = true }
+cypherlite-load = { workspace = true, optional = true }
+# The `wire` fixture's gzip inflate helper (the wire tests' gzip bodies).
+flate2 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# The scratch git config behind `git::Repo` and the fixture kits' scratch
+# repositories: a test-only dependency, promoted from dev-only so the library
+# module (not just this crate's own tests) can create and clean them up.
+tempfile = { workspace = true }
+
+# The platform samplers in `sampling` (`getrusage`, `task_info`).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+bolt = ["dep:cypherlite-bolt"]
+# The ADR-0395 budget assertion (`nested_eval`): pulls the error registry
+# and the executor's budget constant. Only the two budget-test consumers
+# (cypherlite-executor and cypherlite as dev-deps) enable it, so the
+# general-purpose users of this crate do not compile the engine.
+nested_eval = ["dep:cypherlite-error", "dep:cypherlite-executor"]
+# The wire fixtures: raw client, request builders, response parsers,
+# scripted servers. No loader.
+wire = ["dep:flate2"]
+# The full loopback Query API fixture: `wire` plus the `LoadOpts` bridge the
+# pull/loader tests use.
+loopback = ["wire", "dep:cypherlite-load", "dep:serde_json"]

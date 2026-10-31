@@ -1,0 +1,29 @@
+= Git history rules
+:toc:
+
+This document is the Git-history rule set of the fixture project. Its rules
+are written in the jQAssistant AsciiDoc convention; the rule blocks live in
+the included files, and this prose is ignored.
+
+// A line comment between rules is ignored.
+
+////
+A comment block may hold a rule that is not one:
+
+[source,cypher,role=concept]
+----
+MATCH (n) RETURN n
+----
+////
+
+include::queries/authors.adoc[]
+
+include::queries/churn.adoc[]
+
+include::queries/coupling.adoc[]
+
+[[fixture-git]]
+[role=group, includesConcepts="fixture-git:*", overrides="fixture-git:ChurnPerFile=MAJOR"]
+== Git group
+
+The group selects every rule above and raises one of them.

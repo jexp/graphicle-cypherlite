@@ -101,16 +101,17 @@ impl Fixture {
                 let graph = store::graph_for(db)?;
                 let prefix = format!("{project}:");
                 let mut own = Vec::new();
-                for edge in graphicle_runtime::invalidation::dependencies(
-                    graph.as_ref(),
-                    workspace,
-                )? {
-                    if edge.source_id.starts_with(&prefix)
-                        || edge.dependent_id.starts_with(&prefix)
+                for edge in
+                    graphicle_runtime::invalidation::dependencies(graph.as_ref(), workspace)?
+                {
+                    if edge.source_id.starts_with(&prefix) || edge.dependent_id.starts_with(&prefix)
                     {
                         own.push(format!(
                             "{}:{}:{}:{}",
-                            edge.dependent_kind, edge.dependent_id, edge.source_kind, edge.source_id
+                            edge.dependent_kind,
+                            edge.dependent_id,
+                            edge.source_kind,
+                            edge.source_id
                         ));
                     }
                 }
@@ -162,10 +163,10 @@ fn holds(path: &Path, text: &str) -> bool {
                 if within(&entry.path(), text) {
                     return true;
                 }
-            } else if let Ok(bytes) = std::fs::read(entry.path()) {
-                if bytes.windows(text.len()).any(|w| w == text.as_bytes()) {
-                    return true;
-                }
+            } else if let Ok(bytes) = std::fs::read(entry.path())
+                && bytes.windows(text.len()).any(|w| w == text.as_bytes())
+            {
+                return true;
             }
         }
         false

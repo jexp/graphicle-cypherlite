@@ -17,7 +17,7 @@ use graphicle_runtime::{
     atlassian, connectors, doc_links, documents, graph_projection,
     jobs::{self, Worker},
     model,
-    store::{self, Store, s},
+    store::{Store, s},
     store_graph::{self, Params, json_to_value},
 };
 use serde_json::{Value, json};
@@ -122,13 +122,6 @@ impl Fixture {
     }
     fn read(&self, token: &str, args: Value) -> graphicle_runtime::Result<Value> {
         doc_links::read(&self.store, &self.workspace, token, &args)
-    }
-    fn count(&self, sql: &str) -> i64 {
-        self.store
-            .read(|db| Ok(store::one(db, sql, [])?.unwrap()))
-            .unwrap()["n"]
-            .as_i64()
-            .unwrap()
     }
     /// Run a read-only Cypher query against the store's graph (the link
     /// rows live there, not in the SQL store).
@@ -1864,8 +1857,9 @@ fn another_producers_rows_stay_and_are_not_read_without_it() {
          CREATE (d)-[l:LINKS_TO]->(d) SET l += row.props",
         params,
     );
-    let extension =
-        || f.gcount("MATCH ()-[l:LINKS_TO]->() WHERE l.producer='an-extension' RETURN count(l) AS n");
+    let extension = || {
+        f.gcount("MATCH ()-[l:LINKS_TO]->() WHERE l.producer='an-extension' RETURN count(l) AS n")
+    };
     assert_eq!(extension(), 1);
     // The page changes: the job rewrites its own rows only.
     let edited = format!("{PROTOCOL}\nSee also the release notes.\n");

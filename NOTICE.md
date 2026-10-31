@@ -17,6 +17,7 @@ archives.
 |---|---|---|---|
 | The `graphicle` program (`crates/graphicle/`) | `crates/graphicle/NOTICE`, `crates/graphicle/NOTICE.md`, with `UPSTREAM.json` and `GRAMMAR_NOTICES.json` | `crates/graphicle/licenses/`: adapted sources, the web fonts, the 48 grammar projects linked into the program (`crates/graphicle/licenses/grammars/`) and crates whose packages carry no licence text (`crates/graphicle/licenses/upstream-crates/`) | `crates/graphicle/THIRD_PARTY_LICENSES.html` |
 | Graph engine (`crates/graphicle-graph/`, the `graphicle-graph` program) | `crates/graphicle-graph/NOTICE`, `crates/graphicle-graph/NOTICE.md` | `crates/graphicle-graph/licenses/`, with the vendored grammars' texts in `crates/graphicle-graph/licenses/vendor/` | `crates/graphicle-graph/licenses/THIRD_PARTY_LICENSES.html` |
+| CypherLite engine (vendored snapshot, `third_party/cypherlite/`) | `third_party/cypherlite/VENDOR.md` and `LABS_DISCLAIMER.txt` | `third_party/cypherlite/LICENSE` (Apache-2.0) | covered by the `graphicle` program's page |
 | Memory library (`crates/graphicle-memory/`) | `crates/graphicle-memory/NOTICE.md`, with `UPSTREAM.json` and `GRAMMAR_NOTICES.json` | `crates/graphicle-memory/licenses/`, with the linked grammars' texts in `crates/graphicle-memory/licenses/grammars/` | covered by the two programs' pages |
 
 In the release archives these are `licenses/graphicle/…`,

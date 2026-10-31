@@ -210,12 +210,9 @@ pub(crate) fn converted_here(
     folder: &Path,
     snapshot: &str,
 ) -> Result<bool> {
-    let record: Option<String> = crate::folders::folder_of(
-        store,
-        workspace,
-        &crate::folders::folder_key(folder),
-    )?
-    .and_then(|row| row["freshness"].as_str().map(str::to_string));
+    let record: Option<String> =
+        crate::folders::folder_of(store, workspace, &crate::folders::folder_key(folder))?
+            .and_then(|row| row["freshness"].as_str().map(str::to_string));
     Ok(record
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
         .is_some_and(|record| {
@@ -226,7 +223,12 @@ pub(crate) fn converted_here(
         }))
 }
 
-fn write_record(store: &crate::store_graph::GraphStore, workspace: &str, folder: &Path, record: &Record) -> Result<()> {
+fn write_record(
+    store: &crate::store_graph::GraphStore,
+    workspace: &str,
+    folder: &Path,
+    record: &Record,
+) -> Result<()> {
     crate::folders::set_freshness(
         store,
         workspace,
@@ -354,37 +356,40 @@ fn check_at(
     folder: Option<&Path>,
 ) -> Result<Check> {
     let started = Instant::now();
-    let baseline = store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
-        let repository = crate::store::repo(db, p, project)?;
-        if crate::folders::is_pr_scratch(db, project)? {
-            return Ok(None);
-        }
-        let row = match folder {
-            Some(folder) => crate::folders::folder_of(
-                &store.graph(),
-                &p.workspace,
-                &crate::folders::folder_key(folder),
-            )?
-            .filter(|row| row["repository_id"] == project && row["path"].is_string()),
-            None => crate::folders::folders_of(&store.graph(), project)?.into_iter().next(),
-        };
-        Ok(row.map(|row| Baseline {
-            folder: PathBuf::from(s(&row, "path")),
-            synced_at: s(&row, "updated_at").to_string(),
-            record: row["freshness"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Record>(text).ok())
-                .filter(|record| record.v == 1),
-            snapshot: s(&repository, "snapshot").to_string(),
-            binaries: repository["metadata"]["excluded"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|item| item["reason"] == "unsupported_binary")
-                .map(|item| s(item, "path").to_string())
-                .collect(),
-        }))
-    })?;
+    let baseline =
+        store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
+            let repository = crate::store::repo(db, p, project)?;
+            if crate::folders::is_pr_scratch(db, project)? {
+                return Ok(None);
+            }
+            let row = match folder {
+                Some(folder) => crate::folders::folder_of(
+                    &store.graph(),
+                    &p.workspace,
+                    &crate::folders::folder_key(folder),
+                )?
+                .filter(|row| row["repository_id"] == project && row["path"].is_string()),
+                None => crate::folders::folders_of(&store.graph(), project)?
+                    .into_iter()
+                    .next(),
+            };
+            Ok(row.map(|row| Baseline {
+                folder: PathBuf::from(s(&row, "path")),
+                synced_at: s(&row, "updated_at").to_string(),
+                record: row["freshness"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Record>(text).ok())
+                    .filter(|record| record.v == 1),
+                snapshot: s(&repository, "snapshot").to_string(),
+                binaries: repository["metadata"]["excluded"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["reason"] == "unsupported_binary")
+                    .map(|item| s(item, "path").to_string())
+                    .collect(),
+            }))
+        })?;
     let Some(baseline) = baseline else {
         return Ok(Check::without(project, State::NotFolder, None));
     };

@@ -147,17 +147,22 @@ pub fn enqueue_config(
     })
 }
 pub fn ready(db: &Connection, repository: &str, kind: &str, config: &Value) -> Result<()> {
-    if crate::store::graph_for(db)?.read(|g| {
-        graph::one(
-            g,
-            "MATCH (c:ProjectionCleanup {scope: $scope, kind: $kind, config_hash: $hash}) \
+    if crate::store::graph_for(db)?
+        .read(|g| {
+            graph::one(
+                g,
+                "MATCH (c:ProjectionCleanup {scope: $scope, kind: $kind, config_hash: $hash}) \
              WHERE c.state <> 'complete' RETURN c.id AS id LIMIT 1",
-            graph::params(&json!({"scope": repository, "kind": kind, "hash": address_hash(config)})),
-        )
-    })?
-    .is_some()
+                graph::params(
+                    &json!({"scope": repository, "kind": kind, "hash": address_hash(config)}),
+                ),
+            )
+        })?
+        .is_some()
     {
-        return Err(Error::conflict("External cleanup is pending. Run the worker or retry cleanup before publishing this projection"));
+        return Err(Error::conflict(
+            "External cleanup is pending. Run the worker or retry cleanup before publishing this projection",
+        ));
     }
     Ok(())
 }
@@ -187,11 +192,11 @@ pub fn status(store: &Store, workspace: &str, token: &str) -> Result<Value> {
         Ok(json!({"cleanups": crate::store::graph_for(db)?.read(|g| {
             graph::rows(
                 g,
-                &format!("MATCH (c:ProjectionCleanup {{workspace_id: $ws}}) \
+                "MATCH (c:ProjectionCleanup {workspace_id: $ws}) \
                      RETURN c.id AS id, c.scope AS scope, c.kind AS kind, c.state AS state, \
                             c.attempts AS attempts, c.reason AS reason, c.error AS error, \
                             c.created_at AS created_at, c.updated_at AS updated_at \
-                     ORDER BY c.updated_at DESC LIMIT 200"),
+                     ORDER BY c.updated_at DESC LIMIT 200",
                 graph::params(&json!({"ws": workspace})),
             )
         })?}))

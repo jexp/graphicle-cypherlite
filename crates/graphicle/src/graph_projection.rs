@@ -617,11 +617,13 @@ pub fn persist_with_report(
             db,
             store,
             repository,
-            episode,
             graph,
-            &heads,
-            recorded.parent.as_deref(),
-            delta.dirty(),
+            crate::symbols::Recording {
+                episode,
+                heads: &heads,
+                parent: recorded.parent.as_deref(),
+                dirty: delta.dirty(),
+            },
         )?;
     }
     Ok(true)
@@ -1893,7 +1895,13 @@ pub fn project_store(
                     resident(&gstore, identifier, &episode)?;
                     clear_stale_when_current(db, &gstore, identifier)?;
                 }
-                info(&gstore, identifier, &episode, !recorded)
+                let projected = info(&gstore, identifier, &episode, !recorded);
+                // The rule-set enrichment follows the recorded episode as
+                // its own job (architecture-concepts.md §1.5), as it does
+                // behind the projection job; a failure to queue it must not
+                // fail the projection itself.
+                let _ = crate::jobs::enqueue_enrich(store, db, identifier, p, &episode);
+                projected
             }
             Some(_) => Err(Error::conflict("Repository changed while projecting")),
             None => {
@@ -2700,7 +2708,9 @@ pub fn link_workspace(
     }
     let mut repos: Vec<Linkable> = Vec::new();
     for (id, name, episode, current) in candidates {
-        let graph = resident(store, &id, &episode)?;
+        // resident() materializes the episode's graph and registers it in
+        // the live registry; the binding is only its residue.
+        let _graph = resident(store, &id, &episode)?;
         let heads = episode_heads(db, store, &id, &episode)?.unwrap_or_default();
         let manifests = manifests(db, &id, &heads)?;
         let stored = if incremental {
@@ -2875,8 +2885,7 @@ pub fn link_workspace(
                 .map(|(_, (repo, surface))| json!([repo.id, surface]))
                 .collect::<Vec<_>>(),
         ]));
-        let reuse =
-            incremental && keep_state && unchanged_link(store, db, &importer.id, &inputs)?;
+        let reuse = incremental && keep_state && unchanged_link(store, db, &importer.id, &inputs)?;
         let report = if reuse {
             reused.push(importer.id.as_str());
             previous_report(store, &importer.id, &importer.episode)?
@@ -3146,7 +3155,9 @@ fn below(path: &str, prefix: &str) -> bool {
 fn nested_prefixes(db: &Connection, repos: &[Linkable]) -> Result<HashMap<String, Vec<String>>> {
     let mut folders: Vec<(&str, PathBuf)> = Vec::with_capacity(repos.len());
     for repo in repos {
-        if let Some(folder) = crate::folders::current_folder(&*crate::store::graph_for(db)?, &repo.id)? {
+        if let Some(folder) =
+            crate::folders::current_folder(&*crate::store::graph_for(db)?, &repo.id)?
+        {
             folders.push((repo.id.as_str(), folder));
         }
     }

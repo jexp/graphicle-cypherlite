@@ -182,9 +182,7 @@ impl GraphStore {
                                 *slot = Arc::downgrade(&database);
                                 return Ok(database);
                             }
-                            Err(cypherlite::Error::Locked(_))
-                                if Instant::now() < deadline =>
-                            {
+                            Err(cypherlite::Error::Locked(_)) if Instant::now() < deadline => {
                                 drop(slot);
                                 std::thread::sleep(LEASE_RETRY);
                             }
@@ -422,6 +420,23 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
                         connector IS STRING, updated_at IS STRING}),
     (k:DocLinkCheckpoint => {repository_id IS STRING IS KEY, episode IS STRING, updated_at IS STRING}),
     (t:DocLinkState => {workspace_id IS STRING IS KEY, rules IS STRING, updated_at IS STRING}),
+    (cr:ConceptRule => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                        description IS STRING, requires IS STRING, severity IS STRING,
+                        cypher IS STRING, rule_sha IS STRING NOT NULL, source IS STRING}),
+    (xr:ConstraintRule => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                           description IS STRING, requires IS STRING, severity IS STRING,
+                           cypher IS STRING, rule_sha IS STRING NOT NULL, source IS STRING}),
+    (rg:RuleGroup => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                      description IS STRING, include IS STRING, overrides IS STRING,
+                      rule_sha IS STRING NOT NULL, source IS STRING}),
+    (rs:RuleSource => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL,
+                       doc_sha IS STRING NOT NULL}),
+    (ra:RuleApplication => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
+                            episode IS STRING NOT NULL, provenance IS STRING,
+                            applied_at IS STRING}),
+    (vi:Violation => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
+                      episode IS STRING NOT NULL, severity IS STRING NOT NULL,
+                      rule_sha IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -430,6 +445,11 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (r:Run) REQUIRE (r.repository_id, r.external_key) IS KEY,
     CONSTRAINT FOR (d:DeletionReceipt) REQUIRE (d.workspace_id, d.sequence) IS KEY,
     CONSTRAINT FOR (q:ConnectorDoc) REQUIRE (q.repository_id, q.id) IS KEY,
+    CONSTRAINT FOR (cr:ConceptRule) REQUIRE (cr.repository_id, cr.id) IS KEY,
+    CONSTRAINT FOR (xr:ConstraintRule) REQUIRE (xr.repository_id, xr.id) IS KEY,
+    CONSTRAINT FOR (rg:RuleGroup) REQUIRE (rg.repository_id, rg.id) IS KEY,
+    CONSTRAINT FOR (rs:RuleSource) REQUIRE (rs.repository_id, rs.source) IS KEY,
+    CONSTRAINT FOR (ra:RuleApplication) REQUIRE (ra.repository_id, ra.rule, ra.episode) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)

@@ -158,9 +158,7 @@ fn repo_params(repository: &str) -> Params {
 fn heads(g: &mut GraphConnection, filter: &str, params: Params) -> Result<Vec<Live>> {
     Ok(sg::rows(
         g,
-        &format!(
-            "MATCH (s:SymbolHead {{repository_id: $repo}}) {filter} RETURN {HEAD_RETURN}"
-        ),
+        &format!("MATCH (s:SymbolHead {{repository_id: $repo}}) {filter} RETURN {HEAD_RETURN}"),
         params,
     )?
     .iter()
@@ -173,7 +171,11 @@ fn heads_of(g: &mut GraphConnection, repository: &str) -> Result<Vec<Live>> {
     heads(g, "WHERE s.stable_id <> ''", repo_params(repository))
 }
 
-fn heads_in(g: &mut GraphConnection, repository: &str, owners: &BTreeSet<String>) -> Result<Vec<Live>> {
+fn heads_in(
+    g: &mut GraphConnection,
+    repository: &str,
+    owners: &BTreeSet<String>,
+) -> Result<Vec<Live>> {
     let mut params = repo_params(repository);
     params.insert("owners".to_string(), json_to_value(&json!(owners)));
     heads(g, "WHERE s.relpath IN $owners", params)
@@ -182,14 +184,14 @@ fn heads_in(g: &mut GraphConnection, repository: &str, owners: &BTreeSet<String>
 fn heads_of_file(g: &mut GraphConnection, repository: &str, path: &str) -> Result<Vec<Live>> {
     let mut params = repo_params(repository);
     params.insert("path".to_string(), json_to_value(&json!(path)));
-    heads(
-        g,
-        "WHERE s.relpath = $path",
-        params,
-    )
+    heads(g, "WHERE s.relpath = $path", params)
 }
 
-pub fn by_ids(g: &mut GraphConnection, repository: &str, ids: &BTreeSet<String>) -> Result<Vec<Live>> {
+pub fn by_ids(
+    g: &mut GraphConnection,
+    repository: &str,
+    ids: &BTreeSet<String>,
+) -> Result<Vec<Live>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -363,21 +365,33 @@ fn rows_of(
     out
 }
 
-/// After `persist_with_report` recorded `episode` for the current head set
-/// `heads`: the table follows it. When the table described the latest
-/// episode before this one (`parent`), only the files the projection
-/// rewrote (`dirty`, the delta's owner groups) are replaced; otherwise the
-/// whole table is rebuilt from `graph`.
+/// After `persist_with_report` recorded an episode for the current head
+/// set: the table follows it. When the table described the latest episode
+/// before this one (`parent`), only the files the projection rewrote
+/// (`dirty`, the delta's owner groups) are replaced; otherwise the whole
+/// table is rebuilt from `graph`.
+pub(crate) struct Recording<'a> {
+    pub episode: &'a str,
+    pub heads: &'a BTreeMap<String, String>,
+    pub parent: Option<&'a str>,
+    pub dirty: &'a BTreeSet<String>,
+}
+
+/// Write the recording: replace the live-symbol table for [`Recording`]'s
+/// episode, by its dirty files when it is incremental.
 pub(crate) fn record(
     db: &Connection,
     gstore: &GraphStore,
     repository: &str,
-    episode: &str,
     graph: &Graph,
-    heads: &BTreeMap<String, String>,
-    parent: Option<&str>,
-    dirty: &BTreeSet<String>,
+    recording: Recording<'_>,
 ) -> Result<()> {
+    let Recording {
+        episode,
+        heads,
+        parent,
+        dirty,
+    } = recording;
     let incremental = parent.is_some() && table_episode(gstore, repository)?.as_deref() == parent;
     let owners = incremental.then_some(dirty);
     replace(
@@ -414,7 +428,14 @@ pub fn ensure(
     }
     let handle = graph_projection::resident(gstore, repository, episode)?;
     let graph: &Graph = &handle;
-    replace(db, gstore, repository, episode, rows_of(graph, &heads, None), None)?;
+    replace(
+        db,
+        gstore,
+        repository,
+        episode,
+        rows_of(graph, &heads, None),
+        None,
+    )?;
     Ok(true)
 }
 
@@ -1252,8 +1273,15 @@ fn pin_pending_in(db: &Connection, g: &mut GraphConnection, repository: &str) ->
         let file = match files.entry((path.to_string(), sha.to_string())) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let described =
-                    describe(db, g, repository, episode.as_deref(), &mut manifest, path, sha)?;
+                let described = describe(
+                    db,
+                    g,
+                    repository,
+                    episode.as_deref(),
+                    &mut manifest,
+                    path,
+                    sha,
+                )?;
                 let content = match described {
                     // The object lives in the content store; read it through
                     // this transaction's own connection (`g`), not a second
@@ -1615,7 +1643,10 @@ impl<'a> Lander<'a> {
             };
             let mut params = repo_params(repository);
             params.insert("path".to_string(), json_to_value(&json!(identity.relpath)));
-            params.insert("name".to_string(), json_to_value(&json!(identity.qualified_name)));
+            params.insert(
+                "name".to_string(),
+                json_to_value(&json!(identity.qualified_name)),
+            );
             let mut rows = graph.read(|g| {
                 heads(
                     g,
@@ -1926,7 +1957,10 @@ impl Check {
             };
             if &row.revision != revision {
                 let mut params = repo_params(repository);
-                params.insert("path".to_string(), json_to_value(&json!(row.identity.relpath)));
+                params.insert(
+                    "path".to_string(),
+                    json_to_value(&json!(row.identity.relpath)),
+                );
                 params.insert(
                     "qualified".to_string(),
                     json_to_value(&json!(row.identity.qualified_name)),
@@ -2145,7 +2179,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open(dir.path()).unwrap();
         let data = json!({"symbols":[{"state":"pending","relpath":"a.py","sha256":"s1","byte_start":5,"byte_end":9,"rung":"quote","source":"file:a.py"}]});
-        store.transaction(|db| record_pins(db, "r1", "m1", &data)).unwrap();
+        store
+            .transaction(|db| record_pins(db, "r1", "m1", &data))
+            .unwrap();
         let pins = store
             .graph()
             .read(|g| {

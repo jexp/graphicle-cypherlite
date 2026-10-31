@@ -1,0 +1,1 @@
+{"nodes":[{"id":0,"labels":["Person"],"properties":{"age":37,"name":"Ada"}}],"relationships":[],"indexes":[],"constraints":[],"next_node_id":1,"next_rel_id":0,"graph_type":null,"read_only":false}

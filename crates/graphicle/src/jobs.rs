@@ -12,15 +12,15 @@ use crate::{
     store::{self, Principal, Store, authorize_hash, decode, one, repo, s},
     store_graph::{self as graph, GraphStore},
 };
+/// A graph-store connection (cypherlite), as handed out by
+/// [`GraphStore::connection`].
+use cypherlite::Connection as GConnection;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
-/// A graph-store connection (cypherlite), as handed out by
-/// [`GraphStore::connection`].
-use cypherlite::Connection as GConnection;
 
 // All work is serialized by repository unless both jobs explicitly opt into
 // independent observer sources. Prefix intersection is conservative: even a
@@ -114,20 +114,36 @@ fn job_row(db: &mut GConnection, job_id: &str) -> Result<Option<Value>> {
     Ok(row)
 }
 
+/// A queued job as `insert_job` writes it: the repository and workspace it
+/// is scoped to, its kind, the input hash that dedupes replays, the payload
+/// it answers, the principal that asked for it, and the queue's scheduling
+/// bounds (`priority`, `max_attempts`).
+#[derive(Clone, Copy)]
+struct JobSpec<'a> {
+    repository: &'a str,
+    workspace: &'a str,
+    kind: &'a str,
+    input_hash: &'a str,
+    payload: &'a Value,
+    principal_hash: &'a str,
+    priority: i64,
+    max_attempts: i64,
+}
+
 /// Insert a queued job node and, when the graph knows the project, its
 /// `[:OF]` edge (the content-store node migrates `Project` later; the edge
 /// attaches from then on).
-fn insert_job(
-    db: &mut GConnection,
-    repository: &str,
-    workspace: &str,
-    kind: &str,
-    input_hash: &str,
-    payload: &Value,
-    principal_hash: &str,
-    priority: i64,
-    max_attempts: i64,
-) -> Result<String> {
+fn insert_job(db: &mut GConnection, spec: &JobSpec<'_>) -> Result<String> {
+    let JobSpec {
+        repository,
+        workspace,
+        kind,
+        input_hash,
+        payload,
+        principal_hash,
+        priority,
+        max_attempts,
+    } = *spec;
     let job_id = id();
     let stamp = now();
     let encoded = payload.to_string();
@@ -160,9 +176,18 @@ fn insert_job(
         node["parallel_sources"] = json!(flag);
     }
     if let Some(include) = payload["include"].as_array() {
-        node["include"] = json!(include.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>());
+        node["include"] = json!(
+            include
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+        );
     }
-    graph::rows(db, "CREATE (j:Job {id: $id}) SET j += $job", graph::params(&json!({"id": job_id, "job": node})))?;
+    graph::rows(
+        db,
+        "CREATE (j:Job {id: $id}) SET j += $job",
+        graph::params(&json!({"id": job_id, "job": node})),
+    )?;
     graph::rows(
         db,
         "MATCH (j:Job {id: $id}), (p:Project {id: $repo}) CREATE (j)-[:OF]->(p)",
@@ -177,7 +202,7 @@ fn insert_job(
 /// computes the same revision.
 pub fn runtime_revision() -> &'static str {
     static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    REVISION.get_or_init(||digest(&json!({"version":env!("CARGO_PKG_VERSION"),"workflows":include_str!("workflows.rs"),"observer":include_str!("observer.rs"),"search":include_str!("search.rs"),"query":include_str!("query.rs"),"workflow_retrieval":include_str!("workflow_retrieval.rs"),"evidence":include_str!("evidence.rs"),"memory_evidence":include_str!("memory_evidence.rs"),"memory":include_str!("memory.rs"),"graph":include_str!("graph.rs"),"models":include_str!("model.rs"),"claims":include_str!("claims.rs"),"answer_review":include_str!("answer_review.rs"),"connectors":include_str!("connectors.rs"),"atlassian":include_str!("atlassian.rs"),"projection":include_str!("projection.rs"),"permissions":include_str!("permissions.rs"),"semantic_contract":include_str!("../../graphicle-memory/src/semantic.rs"),"retrieval":include_str!("../../graphicle-memory/src/retrieval.rs"),"packing":include_str!("../../graphicle-memory/src/packing.rs"),"ingest":include_str!("../../graphicle-memory/src/ingest.rs"),"text":include_str!("../../graphicle-memory/src/text.rs"),"core":graphicle_memory::structure::REVISION})))
+    REVISION.get_or_init(||digest(&json!({"version":env!("CARGO_PKG_VERSION"),"workflows":include_str!("workflows.rs"),"observer":include_str!("observer.rs"),"search":include_str!("search.rs"),"query":include_str!("query.rs"),"workflow_retrieval":include_str!("workflow_retrieval.rs"),"evidence":include_str!("evidence.rs"),"memory_evidence":include_str!("memory_evidence.rs"),"memory":include_str!("memory.rs"),"graph":include_str!("graph.rs"),"models":include_str!("model.rs"),"claims":include_str!("claims.rs"),"answer_review":include_str!("answer_review.rs"),"connectors":include_str!("connectors.rs"),"atlassian":include_str!("atlassian.rs"),"projection":include_str!("projection.rs"),"permissions":include_str!("permissions.rs"),"arch_rules_executor":include_str!("arch_rules/executor.rs"),"semantic_contract":include_str!("../../graphicle-memory/src/semantic.rs"),"retrieval":include_str!("../../graphicle-memory/src/retrieval.rs"),"packing":include_str!("../../graphicle-memory/src/packing.rs"),"ingest":include_str!("../../graphicle-memory/src/ingest.rs"),"text":include_str!("../../graphicle-memory/src/text.rs"),"core":graphicle_memory::structure::REVISION})))
 }
 
 #[derive(Clone)]
@@ -264,6 +289,7 @@ const KINDS: &[(&str, &str)] = &[
     ("refresh", "propose"),
     ("project", "read"),
     ("link", "read"),
+    ("enrich", "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -514,7 +540,19 @@ pub fn enqueue_projection(
     )?;
     // Background derivation: never ahead of work a caller is waiting on.
     let job_id = graph.transaction(|db| {
-        insert_job(db, repository, &p.workspace, "project", &input_hash, &payload, &p.hash, -1, 3)
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "project",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
     })?;
     store::event(
         db,
@@ -627,7 +665,8 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         if current != expected {
             return Ok(skipped(&current));
         }
-        let info = crate::graph_projection::project_prebuilt(db, &store.graph(), identifier, &p, built)?;
+        let info =
+            crate::graph_projection::project_prebuilt(db, &store.graph(), identifier, &p, built)?;
         for label in &labels {
             crate::graph_projection::label_episode(
                 db,
@@ -648,11 +687,23 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
             Ok(queued) => queued,
             Err(error) => json!({"error": error.message}),
         };
+        // The rule-set enrichment follows the recorded episode as its own
+        // job (architecture-concepts.md §1.5); a failure to queue it must
+        // not fail the projection itself.
+        out["enrich"] = match enqueue_enrich(store, db, identifier, &p, &info.episode) {
+            Ok(queued) => queued,
+            Err(error) => json!({"error": error.message}),
+        };
         // Work extensions queue after a projection, which the projection
         // drain runs next. Listed only when an
         // extension queued something, so Core's result is unchanged.
-        let followed =
-            crate::extension::installed().after_projection(&store.graph(), db, &p, identifier, &info.episode);
+        let followed = crate::extension::installed().after_projection(
+            &store.graph(),
+            db,
+            &p,
+            identifier,
+            &info.episode,
+        );
         if !followed.is_empty() {
             out["after_projection"] = json!(followed);
         }
@@ -671,7 +722,8 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
                     .as_object()
                     .is_some_and(|counts| counts.values().any(|n| n.as_u64().unwrap_or(0) > 0));
                 let signed = if any {
-                    let remaining = crate::retention::legacy::remaining(db, identifier, &retention)?;
+                    let remaining =
+                        crate::retention::legacy::remaining(db, identifier, &retention)?;
                     Some(crate::deletion::legacy::rows_receipt(
                         db,
                         &p,
@@ -799,7 +851,19 @@ pub fn enqueue_link(
         payload["after"] = json!(running);
     }
     let job_id = graph.transaction(|db| {
-        insert_job(db, repository, &p.workspace, "link", &input_hash, &payload, &p.hash, -1, 3)
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "link",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
     })?;
     store::event(
         db,
@@ -871,10 +935,140 @@ fn import_link_job(store: &Store, job: &Job) -> Result<Value> {
     })
 }
 
+/// The `input_hash` of the one `enrich` job per (rule set, episode)
+/// (architecture-concepts.md §5): the cache key that makes a replayed
+/// projection's enrichment the same job.
+pub fn enrich_input_hash(rule_set: &str, episode: &str) -> String {
+    digest(&json!({"kind": "enrich", "rule_set": rule_set, "episode": episode}))
+}
+
+/// Queue the rule-set enrichment of `episode` after its projection recorded
+/// it: one job per (rule set, episode), so a repeated completion replays it
+/// and a failed or cancelled one starts again with a fresh budget. A project
+/// without rule nodes queues nothing. The rule set is read as it stands at
+/// queue time; the job applies whatever it finds when it runs and reports
+/// that rule set's hash in its result.
+pub fn enqueue_enrich(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    episode: &str,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    if !crate::arch_rules::has_rules(&graph, repository)? {
+        return Ok(json!({"kind": "enrich", "episode": episode, "queued": false}));
+    }
+    let rule_set = crate::arch_rules::rule_set_hash(&graph, repository)?;
+    let input_hash = enrich_input_hash(&rule_set, episode);
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: 'enrich', input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({"repo": repository, "hash": input_hash})),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            graph.transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
+                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
+                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
+                )?;
+                Ok(())
+            })?;
+            return Ok(
+                json!({"id": existing["id"], "state": "queued", "kind": "enrich",
+                "episode": episode, "replayed": true, "queued": true}),
+            );
+        }
+        return Ok(
+            json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
+            "episode": episode, "replayed": true, "queued": true}),
+        );
+    }
+    let payload = json!({"kind": "enrich", "episode": episode, "rule_set": rule_set,
+        "runtime_revision": runtime_revision()});
+    let job_id = graph.transaction(|db| {
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind: "enrich",
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
+    })?;
+    store::event(
+        db,
+        repository,
+        "workflow_queued",
+        json!({"id": job_id, "kind": "enrich", "episode": episode}),
+    )?;
+    Ok(
+        json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
+        "replayed": false, "queued": true}),
+    )
+}
+
+/// Execute an `enrich` job: apply the project's concept rules to the
+/// episode's recorded graph (`arch_rules::executor`). The episode is skipped
+/// when a newer one was recorded before the job ran — that episode's
+/// projection queued its own enrichment, the same way a moved-on head set
+/// skips a projection. A rule that fails is reported in the result with its
+/// dependents skipped; only a store or lease failure fails the job. The
+/// job's lease is renewed while it runs.
+pub fn run_enrich(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || enrich_job(store, job))
+}
+
+fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let episode = s(&job.payload, "episode").to_string();
+    let (current, identifier) = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission("enrich")?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok((
+            crate::graph_projection::current_episode(db, s(&repository, "id"))?,
+            s(&repository, "id").to_string(),
+        ))
+    })?;
+    if current != episode {
+        return Ok(json!({"skipped": true,
+            "reason": "a newer episode was recorded before enrichment", "episode": episode,
+            "current_episode": current}));
+    }
+    let mut report = crate::arch_rules::executor::enrich(&graph, &identifier, &episode, &|| {
+        leased(&graph, job)
+    })?;
+    // The constraints read the graph the concepts just enriched, in the same job.
+    let constraints =
+        crate::arch_rules::constraints::evaluate(&graph, &identifier, &episode, &report, &|| {
+            leased(&graph, job)
+        })?;
+    report.constraints = Some(constraints);
+    Ok(report.to_value())
+}
+
 /// Run `repository`'s waiting graph work in this
 /// process, as a worker would. First every ready `project` job, then the
 /// `link` jobs they queued (a workspace keeps one waiting `link` job, which
-/// may belong to another of its projects), then the jobs of the kinds
+/// may belong to another of its projects), then this repository's `enrich`
+/// jobs (the rule-set enrichment a completed projection queued), then the
+/// jobs of the kinds
 /// extensions declare to follow projections
 /// ([`crate::extension::JobKind::after_projection`]). `graphicle sync`, `mcp`,
 /// `ask`, `run --wait` and `pr` call it; a query never does.
@@ -946,6 +1140,22 @@ pub fn drain_projection_until(
             });
             store.finish_job(&job, result)?;
         }
+    }
+    // The rule-set enrichment each completed projection queued
+    // (architecture-concepts.md §1.5): one job per (rule set, episode), so
+    // the drain leaves the episode fully post-processed. A failing rule is
+    // part of the job's result; the job itself only fails on store errors.
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, "enrich")? else {
+            break;
+        };
+        let result = crate::phase::phase("job_enrich", || run_enrich(store, &job));
+        results.push(match &result {
+            Ok(value) => json!({"job": job.id, "kind": "enrich", "ok": true,
+                "applied": value["applied"], "failed": value["failed"], "skipped": value["skipped"]}),
+            Err(error) => json!({"job": job.id, "kind": "enrich", "ok": false, "error": error.message}),
+        });
+        store.finish_job(&job, result)?;
     }
     let kinds = crate::extension::installed().post_projection_kinds();
     if !kinds.is_empty() && !stopped() {
@@ -1029,7 +1239,7 @@ pub fn guarded_read<T>(
 /// The job still holds its lease, its principal still has the permission, and
 /// the sources and reviewed memory it was queued against are unchanged.
 fn still_valid(store: &Store, db: &Connection, job: &Job) -> Result<(Principal, Value)> {
-        check_lease(&store.graph(), &job.id, &job.lease)?;
+    check_lease(&store.graph(), &job.id, &job.lease)?;
     let p = authorize_hash(
         db,
         &job.workspace,
@@ -1362,14 +1572,16 @@ pub fn queue(
     let identifier_job = graph.transaction(|db| {
         insert_job(
             db,
-            identifier,
-            &p.workspace,
-            kind,
-            &input_hash,
-            &payload,
-            &p.hash,
-            0,
-            max_attempts as i64,
+            &JobSpec {
+                repository: identifier,
+                workspace: &p.workspace,
+                kind,
+                input_hash: &input_hash,
+                payload: &payload,
+                principal_hash: &p.hash,
+                priority: 0,
+                max_attempts: max_attempts as i64,
+            },
         )
     })?;
     store::event(
@@ -1470,9 +1682,7 @@ impl Store {
             let repository = repo(db, p, string(args, "repository_id", 100)?)?;
             let old = self
                 .graph()
-                .read(|gdb| {
-                    job_row(gdb, string(args, "job_id", 100)?)
-                })?
+                .read(|gdb| job_row(gdb, string(args, "job_id", 100)?))?
                 .filter(|old| s(old, "repository_id") == s(&repository, "id"))
                 .ok_or_else(|| Error::bad("Job unavailable"))?;
             if p.role != "owner" && s(&old, "principal_hash") != p.hash {
@@ -1634,8 +1844,13 @@ impl Store {
             }
             let authorized = self
                 .read(|db| {
-                    authorize_hash(db, s(&row, "workspace_id"), s(&row, "principal_hash"), permission)
-                        .map(|_| ())
+                    authorize_hash(
+                        db,
+                        s(&row, "workspace_id"),
+                        s(&row, "principal_hash"),
+                        permission,
+                    )
+                    .map(|_| ())
                 })
                 .is_ok();
             if !authorized {
@@ -1659,7 +1874,9 @@ impl Store {
                 graph::one(
                     db,
                     &LEASE_CAS,
-                    graph::params(&json!({"id": s(&row, "id"), "now": stamp, "lease": lease, "until": until})),
+                    graph::params(
+                        &json!({"id": s(&row, "id"), "now": stamp, "lease": lease, "until": until}),
+                    ),
                 )
             })?;
             if taken.is_some() {
@@ -1728,7 +1945,12 @@ impl Store {
             return Ok(());
         };
         self.transaction(|db| {
-            store::event(db, &job.repository, "workflow_finished", json!({"id": job.id, "state": state}))
+            store::event(
+                db,
+                &job.repository,
+                "workflow_finished",
+                json!({"id": job.id, "state": state}),
+            )
         })
     }
 }

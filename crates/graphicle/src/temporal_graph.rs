@@ -469,11 +469,11 @@ pub fn hyperedges_at(
                 out.insert(key.clone(), value.clone());
             }
         }
-        if let Some(text) = out.get("attributes").and_then(Value::as_str) {
-            if let Value::Object(blob) = serde_json::from_str::<Value>(text)? {
-                for (key, value) in blob {
-                    attributes.entry(key).or_insert(value);
-                }
+        if let Some(text) = out.get("attributes").and_then(Value::as_str)
+            && let Value::Object(blob) = serde_json::from_str::<Value>(text)?
+        {
+            for (key, value) in blob {
+                attributes.entry(key).or_insert(value);
             }
         }
         out.remove("attributes");
