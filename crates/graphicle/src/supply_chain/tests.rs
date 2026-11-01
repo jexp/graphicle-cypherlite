@@ -115,26 +115,6 @@ fn count(graph: &GraphStore, cypher: &str, params: Value) -> i64 {
     row(graph, cypher, params)["n"].as_i64().unwrap_or_default()
 }
 
-/// The store as one comparable value: every node's labels and properties,
-/// every relationship's type and properties.
-fn state(graph: &GraphStore) -> Value {
-    graph
-        .read(|db| {
-            let nodes = store_graph::rows(
-                db,
-                "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props",
-                p(&json!({})),
-            )?;
-            let rels = store_graph::rows(
-                db,
-                "MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS props",
-                p(&json!({})),
-            )?;
-            Ok(json!({"nodes": nodes, "rels": rels}))
-        })
-        .unwrap()
-}
-
 /// The package nodes of `repository_id`, by purl.
 fn packages(graph: &GraphStore, repository_id: &str) -> i64 {
     count(
@@ -314,9 +294,9 @@ fn re_ingesting_an_unchanged_lockfile_writes_nothing_new() {
     let dir = folder(FIXTURE);
     let graph = graph_for(REPO);
     let first = ingest(&graph, REPO, dir.path()).unwrap().unwrap();
-    let before = state(&graph);
+    let before = store_graph::test_state(&graph);
     let second = ingest(&graph, REPO, dir.path()).unwrap().unwrap();
-    assert_eq!(state(&graph), before);
+    assert_eq!(store_graph::test_state(&graph), before);
     assert_eq!(first, second);
     assert_eq!(packages(&graph, REPO), 4);
     assert_eq!(first["versions"], json!(4));
@@ -690,9 +670,9 @@ fn resolution_is_recomputed_never_accumulated() {
     assert!(unresolved(&graph, REPO, "newdep")["reason"].is_string());
 
     // Re-running on unchanged facts writes the same state.
-    let before = state(&graph);
+    let before = store_graph::test_state(&graph);
     let second = resolve::resolve(&graph, REPO).unwrap().unwrap();
-    assert_eq!(state(&graph), before);
+    assert_eq!(store_graph::test_state(&graph), before);
     assert_eq!(first, second);
 
     // A re-lock that adds the crate turns the negative evidence around:

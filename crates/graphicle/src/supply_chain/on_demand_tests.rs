@@ -162,26 +162,6 @@ fn rows(graph: &GraphStore, cypher: &str, params: Value) -> Vec<Value> {
         .unwrap()
 }
 
-/// The store as one comparable value: every node's properties, every
-/// relationship's type and properties (tests.rs's `state`).
-fn state(graph: &GraphStore) -> Value {
-    graph
-        .read(|db| {
-            let nodes = store_graph::rows(
-                db,
-                "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props",
-                store_graph::params(&json!({})),
-            )?;
-            let rels = store_graph::rows(
-                db,
-                "MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS props",
-                store_graph::params(&json!({})),
-            )?;
-            Ok(json!({"nodes": nodes, "rels": rels}))
-        })
-        .unwrap()
-}
-
 fn licenses(key: &str, expressions: &[&str]) -> Fact {
     Fact::Licenses {
         purl_at_version: key.to_owned(),
@@ -521,9 +501,9 @@ async fn a_pinned_answer_re_runs_from_pins_against_a_changed_world() {
 
     // Re-pinning the re-run's answer is idempotent: the same edge, the same
     // state (lock.rs's re-ingest discipline).
-    let before = state(&graph);
+    let before = store_graph::test_state(&graph);
     let again = pin(&graph, REPO, &rerun.consumed, "report-7", KNOWN_AT, AS_OF).unwrap();
-    assert_eq!(state(&graph), before);
+    assert_eq!(store_graph::test_state(&graph), before);
     assert_eq!(again, report);
 }
 

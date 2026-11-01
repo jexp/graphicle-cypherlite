@@ -762,6 +762,30 @@ pub fn write(db: &mut Connection, cypher: &str, params: Params) -> Result<cypher
     Ok(db.query_with_params(cypher, params)?.stats)
 }
 
+/// The store as one comparable value: every node's labels and properties,
+/// every relationship's type and properties. The idempotence tests' shared
+/// snapshot (git_history's writer, the lockfile ingest, the pin path): two
+/// runs over the same facts produce equal values, so a test compares these
+/// for equality. Test-only; the production surface never snapshots a store.
+#[cfg(test)]
+pub(crate) fn test_state(graph: &GraphStore) -> Json {
+    graph
+        .read(|db| {
+            let nodes = rows(
+                db,
+                "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props",
+                params(&serde_json::json!({})),
+            )?;
+            let rels = rows(
+                db,
+                "MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS props",
+                params(&serde_json::json!({})),
+            )?;
+            Ok(serde_json::json!({"nodes": nodes, "rels": rels}))
+        })
+        .unwrap()
+}
+
 /// Bytes as a base64 string: the engine's `Value` has no byte-string
 /// variant, so byte columns are stored as base64 text (see
 /// `docs/store-api.md`, value-mapping conventions).

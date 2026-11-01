@@ -38,10 +38,11 @@
 //!
 //! Pins are evidence, not sync state. A license edge is keyed by its
 //! expression *and* `as_of`, so pins accumulate rather than replace each
-//! other; a property family holds its newest pin, and a re-run whose
-//! `as_of` no longer matches finds no pin and falls through to the
-//! read-through layer — pinned only when, and as long as, the answer needs
-//! it.
+//! other — two pins at the same `as_of` that saw different worlds union on
+//! the license edges (every expression either one named), while a property
+//! family keeps the last pin's values. A re-run whose `as_of` no longer
+//! matches finds no pin and falls through to the read-through layer —
+//! pinned only when, and as long as, the answer needs it.
 
 use crate::store_graph::{self, GraphStore};
 use crate::supply_chain::deps_dev::{self, Client};
