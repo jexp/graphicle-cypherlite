@@ -64,10 +64,12 @@ const VERSIONS: &str = "MATCH (pk:Package {repository_id: $repo, purl: $key})-[:
 const REQUIRES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
     -[:REQUIRES {origin: 'cargo.lock'}]->(t:PackageVersion {repository_id: $repo}) \
     RETURN t.name AS name, t.version AS version ORDER BY name, version";
-/// The advisories OSV reported for one locked version.
+/// The advisories OSV reported for one locked version, with the fixed version
+/// each names for it.
 const ADVISORIES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
-    -[:AFFECTED_BY]->(a:Advisory {repository_id: $repo}) \
-    RETURN a.osv_id AS osv_id, a.title AS title, a.url AS url ORDER BY osv_id";
+    -[r:AFFECTED_BY]->(a:Advisory {repository_id: $repo}) \
+    RETURN a.osv_id AS osv_id, a.title AS title, a.url AS url, r.fixed_in AS fixed_in \
+    ORDER BY osv_id";
 /// OSV's clean scan of one locked version, when it found nothing.
 const CLEAN: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
     -[r:SCANNED_CLEAN]->(:AdvisoryCorpus {repository_id: $repo}) \
@@ -86,6 +88,10 @@ const AFFECTED: &str = "MATCH (f:File {repository_id: $repo, path: $file})\
 /// The license expressions pinned for one version, with their `as_of`.
 const PINNED: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
     -[r:LICENSED_AS {origin: 'deps.dev'}]->(:License) RETURN r.as_of AS as_of";
+/// The manifest requirements pinned for one version, with their `as_of`.
+const PINNED_REQUIRES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
+    -[r:REQUIRES {origin: 'deps.dev'}]->(:PackageVersion {repository_id: $repo}) \
+    RETURN r.as_of AS as_of";
 
 /// The one field a call names, of `fields`, and its value.
 fn named<'a>(args: &'a Value, fields: &[&'static str]) -> Result<(&'static str, &'a str)> {
@@ -301,9 +307,26 @@ async fn requirements_of(
     out
 }
 
+/// The newest `as_of` of the requirements pinned for `key`.
+fn newest_requirement_pin(
+    graph: &GraphStore,
+    repository: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    Ok(rows(
+        graph,
+        PINNED_REQUIRES,
+        json!({"repo": repository, "key": key}),
+    )?
+    .iter()
+    .filter_map(|row| row["as_of"].as_str().map(str::to_owned))
+    .max())
+}
+
 /// The `deps_of` answer: the packages a symbol's or a file's imports resolve
 /// to, their locked versions, what each version's lockfile edges say, and the
-/// manifest requirements the read-through layer has (deps.dev, on a miss).
+/// manifest requirements — the newest pin first, the read-through layer
+/// (deps.dev) only on a miss.
 pub fn deps_of(store: &Store, workspace: &str, token: &str, args: &Value) -> Result<Value> {
     let (field, value) = named(args, &["symbol", "file"])?;
     let repository = project(store, workspace, token, args)?;
@@ -329,11 +352,25 @@ pub fn deps_of(store: &Store, workspace: &str, token: &str, args: &Value) -> Res
         }
         packages.push((purl, sites, locked));
     }
-    // The read-through layer, for the locked versions only, when any exist.
+    // Pinned first, per version: the newest pin answers, and only a version
+    // no pin covers is fetched through the read-through layer.
     let mut requirements = BTreeMap::new();
-    if !version_keys.is_empty() {
+    let mut missing = Vec::new();
+    for key in &version_keys {
+        let pinned = match newest_requirement_pin(&graph, &repository, key)? {
+            Some(as_of) => on_demand::pinned_requirements(&graph, &repository, key, &as_of)?,
+            None => None,
+        };
+        match pinned {
+            Some(Fact::Requirements { dependencies, .. }) => {
+                requirements.insert(key.clone(), Some(dependencies));
+            }
+            _ => missing.push(key.clone()),
+        }
+    }
+    if !missing.is_empty() {
         let on_demand = on_demand::on(&store.directory)?;
-        let keys = version_keys.clone();
+        let keys = missing;
         let fetched =
             on_network(move || Ok(runtime()?.block_on(requirements_of(&on_demand, &keys))))?;
         for (key, answer) in fetched {
@@ -446,7 +483,8 @@ fn version_status(
         "version": facts.version,
         "status": status,
         "advisories": advisories.iter().map(|a| json!({
-            "osv_id": text(a, "osv_id"), "title": text(a, "title"), "url": text(a, "url")
+            "osv_id": text(a, "osv_id"), "title": text(a, "title"), "url": text(a, "url"),
+            "fixed_in": a["fixed_in"]
         })).collect::<Vec<_>>(),
         "as_of": as_of,
         "source": source,

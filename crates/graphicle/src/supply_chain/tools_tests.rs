@@ -5,7 +5,8 @@
 //! and deps.dev answers are the golden fixtures; no test reaches the network.
 
 use super::lock;
-use super::on_demand::{self, Fact};
+use super::on_demand::{self, Fact, Requirement};
+use super::on_demand_tests::LOCK_WITH_DEPS;
 use super::osv::{self, Client};
 use super::osv_tests::LOCK;
 use super::resolve;
@@ -37,6 +38,12 @@ const SERDE_KEY: &str = "pkg:cargo/serde@1.0.200";
 const KNOWN_AT: &str = "2026-11-01T04:00:00Z";
 const AS_OF: &str = "2026-10-01T00:00:00Z";
 const RUSTSEC_ID: &str = "RUSTSEC-2020-0071";
+
+/// An `as_of` no pin in this file matches.
+const UNPINNED_AS_OF: &str = "2026-12-01T00:00:00Z";
+
+/// OSV's answer for [`LOCK_WITH_DEPS`]: four queries, none affected.
+const QUERYBATCH_CLEAN: &str = r#"{"results": [{}, {}, {}, {}]}"#;
 
 /// A project with the lockfile, the import facts and the OSV scan written.
 struct Fixture {
@@ -328,6 +335,12 @@ fn vuln_impact_on_a_package_names_its_advisories_or_its_clean_scan() {
         advisories.iter().any(|a| a["osv_id"] == RUSTSEC_ID),
         "{time}"
     );
+    // The advisory names the fixed version for the locked one.
+    let rustsec = advisories
+        .iter()
+        .find(|a| a["osv_id"] == RUSTSEC_ID)
+        .unwrap();
+    assert_eq!(rustsec["fixed_in"], "0.2.23", "{time}");
     assert_eq!(file(&time, APP)["citation"], "src/app.rs:3");
     // serde has no advisory: the clean scan answers, with its date and source.
     let serde = fixture
@@ -383,6 +396,57 @@ fn deps_of_takes_the_requirements_from_the_read_through_layer_on_a_miss() {
 }
 
 #[test]
+fn deps_of_takes_the_requirements_from_a_pin_and_fetches_nothing() {
+    // A lockfile whose `time` has its own dependencies, so a pinned manifest
+    // requirement joins onto the lockfile's resolved edges.
+    let fixture = Fixture::with(LOCK_WITH_DEPS, QUERYBATCH_CLEAN);
+    let manifest = Fact::Requirements {
+        purl_at_version: TIME_KEY.to_owned(),
+        dependencies: vec![
+            Requirement {
+                name: "const_fn".to_owned(),
+                requirement: "^0.4.2".to_owned(),
+                kind: "normal".to_owned(),
+                optional: false,
+                features: vec![],
+                target: String::new(),
+            },
+            Requirement {
+                name: "libc".to_owned(),
+                requirement: "^0.2".to_owned(),
+                kind: "normal".to_owned(),
+                optional: true,
+                features: vec![],
+                target: "cfg(unix)".to_owned(),
+            },
+        ],
+    };
+    on_demand::pin(
+        &fixture.graph(),
+        &fixture.repo,
+        &[manifest],
+        "analysis-1",
+        KNOWN_AT,
+        AS_OF,
+    )
+    .unwrap();
+    // A wire that panics on any request: the pin must answer alone.
+    let wire = on_demand::install_panic();
+    let answer = fixture
+        .call("deps_of", json!({"symbol": "time::OffsetDateTime"}))
+        .unwrap();
+    let requirements = answer["packages"][0]["versions"][0]["requirements"]
+        .as_array()
+        .unwrap();
+    assert_eq!(requirements.len(), 2, "{answer}");
+    assert_eq!(requirements[0]["name"], "const_fn");
+    assert_eq!(requirements[0]["requirement"], "^0.4.2");
+    assert_eq!(requirements[1]["name"], "libc");
+    assert_eq!(requirements[1]["target"], "cfg(unix)");
+    assert_eq!(wire.calls(), 0);
+}
+
+#[test]
 fn license_of_answers_from_a_pin_and_fetches_nothing() {
     let fixture = Fixture::new();
     on_demand::pin(
@@ -407,6 +471,42 @@ fn license_of_answers_from_a_pin_and_fetches_nothing() {
     assert_eq!(license["expressions"], json!(["MIT OR Apache-2.0"]));
     assert_eq!(license["as_of"], AS_OF);
     assert_eq!(answer["summary"]["pinned"], 1);
+    assert_eq!(wire.calls(), 0);
+}
+
+#[test]
+fn an_as_of_no_pin_matches_answers_unknown_and_fetches_nothing() {
+    let fixture = Fixture::new();
+    // The pin is at AS_OF; the call names a later as_of, and the read-through
+    // layer answers only the current deps.dev data: no fall-through.
+    on_demand::pin(
+        &fixture.graph(),
+        &fixture.repo,
+        &[Fact::Licenses {
+            purl_at_version: TIME_KEY.to_owned(),
+            expressions: vec!["MIT OR Apache-2.0".to_owned()],
+        }],
+        "analysis-1",
+        KNOWN_AT,
+        AS_OF,
+    )
+    .unwrap();
+    let wire = on_demand::install_panic();
+    let answer = fixture
+        .call(
+            "license_of",
+            json!({"package": "time", "as_of": UNPINNED_AS_OF}),
+        )
+        .unwrap();
+    assert_eq!(answer["licenses"][0]["source"], "unknown");
+    assert_eq!(answer["licenses"][0]["expressions"], json!([]));
+    let not_known = answer["not_known"][0].as_str().unwrap();
+    assert!(
+        not_known.contains(&format!(
+            "no license of {TIME_KEY} is pinned at {UNPINNED_AS_OF}"
+        )),
+        "{answer}"
+    );
     assert_eq!(wire.calls(), 0);
 }
 

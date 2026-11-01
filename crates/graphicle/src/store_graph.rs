@@ -479,6 +479,13 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     (ad:Advisory => {repository_id IS STRING NOT NULL, osv_id IS STRING NOT NULL,
                      title IS STRING, aliases IS STRING, url IS STRING}),
     (ac:AdvisoryCorpus => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL}),
+    // The unresolved imports of the resolution (supply-chain plan §3; written
+    // by supply_chain::resolve): one node per (symbol, crate) that matched no
+    // local path, member or locked crate — negative evidence with the reason.
+    (up:UnresolvedPackage => {repository_id IS STRING NOT NULL, origin IS STRING NOT NULL,
+                              symbol IS STRING NOT NULL, package IS STRING NOT NULL,
+                              use_path IS STRING, relpath IS STRING, line IS INTEGER,
+                              reason IS STRING}),
     // deps.dev license facts (supply-chain plan §2; written only by the pin
     // path of supply_chain::on_demand): one node per distinct SPDX
     // expression, NOASSERTION when deps.dev lists none, so the licenses of
@@ -505,6 +512,8 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (pv:PackageVersion) REQUIRE (pv.repository_id, pv.purl_at_version) IS KEY,
     CONSTRAINT FOR (ad:Advisory) REQUIRE (ad.repository_id, ad.osv_id) IS KEY,
     CONSTRAINT FOR (ac:AdvisoryCorpus) REQUIRE (ac.repository_id, ac.source) IS KEY,
+    CONSTRAINT FOR (up:UnresolvedPackage) REQUIRE (up.repository_id, up.origin, up.symbol,
+                                                   up.package) IS KEY,
     CONSTRAINT FOR (lc:License) REQUIRE (lc.repository_id, lc.spdx) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
@@ -579,6 +588,10 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX package_version_key IF NOT EXISTS FOR (pv:PackageVersion) ON (pv.repository_id, pv.purl_at_version)",
     // OSV advisories (supply_chain::osv): the MERGE anchor of the advisory batches.
     "CREATE INDEX advisory_key IF NOT EXISTS FOR (ad:Advisory) ON (ad.repository_id, ad.osv_id)",
+    // The unresolved imports of the resolution (supply_chain::resolve): the
+    // MERGE anchor of the unresolved batches.
+    "CREATE INDEX unresolved_key IF NOT EXISTS FOR (u:UnresolvedPackage) \
+     ON (u.repository_id, u.origin, u.symbol, u.package)",
     // deps.dev license facts (supply_chain::on_demand): the MERGE anchor of
     // the license pin batches.
     "CREATE INDEX license_key IF NOT EXISTS FOR (lc:License) ON (lc.repository_id, lc.spdx)",

@@ -20,9 +20,11 @@
 //!
 //! A version the answer lists no advisory for is `SCANNED_CLEAN` as of the
 //! query. The edge points at the project's `AdvisoryCorpus` node (source
-//! `osv`), so the claim names the corpus it was checked against. A version whose answer was paged (`next_page_token`) is not: the
-//! answer is incomplete, so the version is listed under `truncated` and
-//! claims nothing.
+//! `osv`), so the claim names the corpus it was checked against. A version
+//! whose answer was paged (`next_page_token`) is not: the answer is
+//! incomplete, so the version is listed under `truncated` and claims nothing
+//! — and the writer leaves whatever a finished scan recorded for it in
+//! place, so a truncated re-scan erases no evidence.
 //!
 //! # Scope and identity
 //!
@@ -335,7 +337,7 @@ pub struct Advisory {
     pub aliases: Vec<String>,
     pub url: Option<String>,
     /// The CVSS 3 vector string, when OSV carries one.
-    pub cvss3: Option<String>,
+    pub cvss3_vector: Option<String>,
 }
 
 /// What one query read: the hits, the advisories they name, and the versions
@@ -424,7 +426,7 @@ fn advisory(vuln: &Vuln) -> Advisory {
             .iter()
             .find(|reference| reference.kind == "ADVISORY")
             .map(|reference| reference.url.clone()),
-        cvss3: vuln
+        cvss3_vector: vuln
             .severity
             .iter()
             .find(|severity| severity.kind == "CVSS_V3")
@@ -465,8 +467,10 @@ pub fn targets(graph: &GraphStore, repository_id: &str) -> Result<Vec<Target>> {
 }
 
 /// Write one scan into `repository_id`, stamped `known_at`. The AFFECTED_BY
-/// and SCANNED_CLEAN edges of the project are replaced first, so a version the
-/// new scan no longer reports loses its edge. Advisory nodes are MERGEd and
+/// and SCANNED_CLEAN edges of the versions the scan finished are replaced
+/// first, so a version the new scan no longer reports loses its edge; a
+/// version whose answer was paged keeps the edges a finished scan wrote,
+/// because a truncated answer claims nothing. Advisory nodes are MERGEd and
 /// kept. Returns the job's result.
 pub fn write(
     graph: &GraphStore,
@@ -474,22 +478,36 @@ pub fn write(
     scan: &Scan,
     known_at: &str,
 ) -> Result<Value> {
-    let params = || store_graph::params(&json!({"repo": repository_id}));
+    // The keys the scan speaks for: hit or clean, never truncated.
+    let finished: BTreeSet<&str> = scan
+        .hits
+        .iter()
+        .map(|hit| hit.key.as_str())
+        .chain(scan.clean.iter().map(String::as_str))
+        .collect();
+    let keys = || {
+        store_graph::params(&json!({"repo": repository_id, "keys": finished
+            .iter().collect::<Vec<_>>()}))
+    };
     graph.transaction(|db| {
         store_graph::write(
             db,
-            "MATCH (:PackageVersion {repository_id: $repo})-[r:AFFECTED_BY]->() DELETE r",
-            params(),
+            "UNWIND $keys AS key \
+             MATCH (:PackageVersion {repository_id: $repo, purl_at_version: key})\
+             -[r:AFFECTED_BY]->() DELETE r",
+            keys(),
         )?;
         store_graph::write(
             db,
-            "MATCH (:PackageVersion {repository_id: $repo})-[r:SCANNED_CLEAN]->() DELETE r",
-            params(),
+            "UNWIND $keys AS key \
+             MATCH (:PackageVersion {repository_id: $repo, purl_at_version: key})\
+             -[r:SCANNED_CLEAN]->() DELETE r",
+            keys(),
         )?;
         store_graph::write(
             db,
             "MERGE (c:AdvisoryCorpus {repository_id: $repo, source: 'osv'})",
-            params(),
+            store_graph::params(&json!({"repo": repository_id})),
         )?;
         Ok(())
     })?;
@@ -508,7 +526,9 @@ pub fn write(
         .iter()
         .map(|hit| {
             json!({"key": hit.key, "osv_id": hit.osv_id, "known_at": known_at,
-                   "cvss3": scan.advisories.get(&hit.osv_id).and_then(|a| a.cvss3.clone())})
+                   "fixed_in": hit.fixed_in,
+                   "cvss3_vector": scan.advisories.get(&hit.osv_id)
+                       .and_then(|a| a.cvss3_vector.clone())})
         })
         .collect();
     let clean: Vec<Value> = scan
@@ -532,7 +552,8 @@ pub fn write(
          MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: row.key}) \
          MATCH (a:Advisory {repository_id: $repo, osv_id: row.osv_id}) \
          MERGE (pv)-[r:AFFECTED_BY {osv_id: row.osv_id}]->(a) \
-         SET r.source = 'osv', r.cvss3 = row.cvss3, r.known_at = row.known_at",
+         SET r.source = 'osv', r.cvss3_vector = row.cvss3_vector, \
+             r.fixed_in = row.fixed_in, r.known_at = row.known_at",
     )?;
     crate::supply_chain::batches(
         graph,

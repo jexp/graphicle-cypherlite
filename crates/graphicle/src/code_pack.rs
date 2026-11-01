@@ -354,10 +354,10 @@ impl Section {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
     /// Header, manifest, architecture, breadth (least relevant first), docs,
-    /// tests, call paths, focus (most relevant last).
+    /// tests, dependencies, call paths, focus (most relevant last).
     RelevantLast,
     /// Header, manifest, architecture, focus (most relevant first), call
-    /// paths, tests, docs, breadth.
+    /// paths, tests, dependencies, docs, breadth.
     RelevantFirst,
 }
 

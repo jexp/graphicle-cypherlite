@@ -317,7 +317,7 @@ are the ones `graphicle sync` or `graph_link` last recorded.
 | `recall_project` | Finds original source evidence and current reviewed memory for a question, within a token budget; an identifier, or a question that only asks where one is defined or used, gets its definitions and references from the code graph |
 | `read_project_source` | Reads a source by ID or path, continuing exactly where an excerpt stopped |
 | `pack` | Packs the project's code for a question into one block of text within a token budget (`budget`, default 32,000, at most 200,000): architecture, focus code, call paths, tests, dependencies, docs and a manifest ([packs](pack.md)) |
-| `deps_of` | Finds the packages a symbol's or a file's imports resolve to, with each locked version, what it depends on and its manifest requirements where deps.dev has them |
+| `deps_of` | Finds the packages a symbol's or a file's imports resolve to, with each locked version, what it depends on and its manifest requirements (a pinned fact first, else deps.dev) |
 | `vuln_impact` | Finds where a vulnerable package is used: for an advisory (its OSV or RustSec id) the locked versions it affects and the files that import them; for a package its advisories, or the clean scan that found none |
 | `license_of` | Finds the license of the package a symbol, a file or a package maps to, per locked version: a pinned fact first, else deps.dev |
 | `list_projects` | Lists the workspace's projects you can read, with the ids `repo` takes (workspace connections only) |

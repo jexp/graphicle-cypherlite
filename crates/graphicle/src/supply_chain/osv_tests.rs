@@ -180,7 +180,7 @@ async fn the_advisory_facts_come_from_the_detail() {
         Some("https://rustsec.org/advisories/RUSTSEC-2020-0071.html")
     );
     assert_eq!(
-        rustsec.cvss3.as_deref(),
+        rustsec.cvss3_vector.as_deref(),
         Some("CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
     );
     assert!(rustsec.aliases.contains(&"GHSA-wcg3-cvx6-7396".to_owned()));
@@ -204,13 +204,14 @@ async fn the_writer_stores_affected_by_with_provenance_and_the_clean_scan() {
     );
     assert_eq!(result["clean"], value!(1));
 
-    // AFFECTED_BY on the locked version, to each advisory, with its provenance.
+    // AFFECTED_BY on the locked version, to each advisory, with its provenance
+    // and the fixed version it names.
     let affected = rows(
         &graph,
         "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: 'pkg:cargo/time@0.2.22'})\
          -[r:AFFECTED_BY]->(a:Advisory {repository_id: $repo}) \
          RETURN a.osv_id AS osv_id, r.osv_id AS edge_osv_id, r.source AS source, \
-         r.cvss3 AS cvss3, r.known_at AS known_at",
+         r.cvss3_vector AS cvss3_vector, r.fixed_in AS fixed_in, r.known_at AS known_at",
     );
     assert_eq!(affected.len(), 2, "{affected:?}");
     let rustsec = affected
@@ -220,8 +221,9 @@ async fn the_writer_stores_affected_by_with_provenance_and_the_clean_scan() {
     assert_eq!(rustsec["edge_osv_id"], "RUSTSEC-2020-0071");
     assert_eq!(rustsec["source"], "osv");
     assert_eq!(rustsec["known_at"], KNOWN_AT);
+    assert_eq!(rustsec["fixed_in"], "0.2.23");
     assert_eq!(
-        rustsec["cvss3"],
+        rustsec["cvss3_vector"],
         "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
     );
 
@@ -308,6 +310,70 @@ async fn a_paged_answer_claims_no_clean_scan() {
     assert_eq!(scan.clean, [TIME_KEY]);
     let result = write(&graph, REPO, &scan, KNOWN_AT).unwrap();
     assert_eq!(result["truncated"], value!([SERDE_KEY]));
+}
+
+#[tokio::test]
+async fn a_truncated_rescan_keeps_the_evidence_of_the_versions_it_did_not_finish() {
+    let graph = graph_with_lock();
+    let store = TempDir::new().unwrap();
+    // A complete scan first: serde clean, time affected by both advisories.
+    let (complete, _transport) = client(&store, QUERYBATCH);
+    let first = scan(&complete, &lock_targets(&graph)).await.unwrap();
+    write(&graph, REPO, &first, KNOWN_AT).unwrap();
+
+    // A later, truncated scan: serde's answer is only the first page, so
+    // serde claims nothing — and the prior scan's evidence survives it.
+    let later = TempDir::new().unwrap();
+    let paged = r#"{"results": [{"vulns": [], "next_page_token": "page-2"}, {}]}"#;
+    let (paged_client, _transport) = client(&later, paged);
+    let second = scan(&paged_client, &lock_targets(&graph)).await.unwrap();
+    let result = write(&graph, REPO, &second, "2026-11-02T04:00:00Z").unwrap();
+    assert_eq!(result["truncated"], value!([SERDE_KEY]));
+
+    // serde's clean edge is the complete scan's, at its own as_of; time, a
+    // finished key, is rewritten — its advisories give way to the clean scan
+    // of the later answer.
+    assert_eq!(
+        rows(
+            &graph,
+            "MATCH (pv:PackageVersion {repository_id: $repo})-[r:SCANNED_CLEAN]->\
+             (:AdvisoryCorpus {repository_id: $repo}) \
+             RETURN pv.purl_at_version AS key, r.as_of AS as_of ORDER BY key"
+        ),
+        [
+            value!({"key": SERDE_KEY, "as_of": KNOWN_AT}),
+            value!({"key": TIME_KEY, "as_of": "2026-11-02T04:00:00Z"}),
+        ]
+    );
+    assert!(
+        rows(
+            &graph,
+            "MATCH (:PackageVersion {repository_id: $repo})-[r:AFFECTED_BY]->() \
+         RETURN r.osv_id AS osv_id"
+        )
+        .is_empty()
+    );
+
+    // A scan that finished nothing (every answer paged) erases no evidence
+    // either: both versions keep the edges the last finished scan wrote.
+    let none = Scan {
+        queried: 2,
+        truncated: vec![SERDE_KEY.to_owned(), TIME_KEY.to_owned()],
+        ..Scan::default()
+    };
+    write(&graph, REPO, &none, "2026-11-03T04:00:00Z").unwrap();
+    assert_eq!(
+        rows(
+            &graph,
+            "MATCH (pv:PackageVersion {repository_id: $repo})-[r:SCANNED_CLEAN]->\
+             (:AdvisoryCorpus {repository_id: $repo}) \
+             RETURN pv.purl_at_version AS key, r.as_of AS as_of ORDER BY key"
+        ),
+        [
+            value!({"key": SERDE_KEY, "as_of": KNOWN_AT}),
+            value!({"key": TIME_KEY, "as_of": "2026-11-02T04:00:00Z"}),
+        ]
+    );
 }
 
 #[tokio::test]

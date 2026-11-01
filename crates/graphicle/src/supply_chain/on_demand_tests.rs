@@ -47,7 +47,7 @@ const CHANGED_SERDE: &str = r#"{"versionKey": {"system": "CARGO", "name": "serde
 
 /// The project's lockfile, with `time`'s own dependencies locked: the
 /// manifest requirements join onto the `REQUIRES` edges these write.
-const LOCK_WITH_DEPS: &str = r#"version = 4
+pub(crate) const LOCK_WITH_DEPS: &str = r#"version = 4
 
 [[package]]
 name = "app"

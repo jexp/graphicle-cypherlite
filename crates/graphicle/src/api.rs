@@ -1831,7 +1831,7 @@ pub fn core_mcp_tools(learning: bool, work_state: bool) -> Vec<McpTool> {
     tools.push(McpTool::new(
         tool(
             "deps_of",
-            "Find the packages a symbol or a file's imports resolve to: the locked versions of each, what each version depends on, and its manifest requirements where deps.dev has them; cited by the importing file: path and line, as query_graph cites. Use it to see which crates a file uses before changing a dependency.",
+            "Find the packages a symbol or a file's imports resolve to: the locked versions of each, what each version depends on, and its manifest requirements (a pinned fact first, else deps.dev); cited by the importing file: path and line, as query_graph cites. Use it to see which crates a file uses before changing a dependency.",
             json!({"symbol":{"type":"string","description":"a symbol's stable_id or qualified name"},
             "file":{"type":"string","description":"a file's path in the project"},
             "repo":{"type":"string","description":REPO_DESCRIPTION}}),
