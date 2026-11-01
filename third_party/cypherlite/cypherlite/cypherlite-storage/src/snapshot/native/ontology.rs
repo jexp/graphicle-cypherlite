@@ -75,7 +75,7 @@ pub(super) fn sweep_ontology_orphans(target: &StoreTarget, manifest: &Manifest) 
 /// the object a plain file, never an alias.
 pub(super) fn validate_ontology_object(target: &StoreTarget, name: &str) -> Result<()> {
     if let Some(root) = &target.native_root {
-        validate_dir(root, ONTOLOGY_DIR, "ontology directory", false)
+        validate_dir(root, ONTOLOGY_DIR, "ontology directory", DirAdmit::Required)
             .map_err(|_| Error::storage(format!("invalid ontology path: {name}")))?;
         validate_native_plain_file(root, name, "ontology")?;
     }

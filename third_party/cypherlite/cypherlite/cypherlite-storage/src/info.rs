@@ -31,10 +31,18 @@ pub enum StoreLayout {
 pub enum StoreSnapshot {
     /// Parquet-codec store: the full selected manifest.
     Parquet(Manifest),
-    /// JSON-codec store: `manifest.json` holds only the codec envelope
-    /// (ADR-0050); counts and the catalog live in `graph.json`, which a
-    /// cold info read never parses.
-    Json { checkpoint_lsn: u64, commit_ts: u64 },
+    /// An envelope-only codec store: `manifest.json` holds only the
+    /// codec envelope — JSON (ADR-0050) at the store root, Markdown
+    /// (ADR-0406) in the `.cypherlite/` sidecar. Counts and the catalog
+    /// live where a cold info read never goes (`graph.json` for JSON,
+    /// the vault and sidecar engine state for Markdown); the codec
+    /// field says which.
+    Envelope {
+        /// The envelope-only codec this store records.
+        codec: SnapshotCodecKind,
+        checkpoint_lsn: u64,
+        commit_ts: u64,
+    },
     /// No snapshot yet: a fresh store before its first checkpoint has no
     /// `manifest.json`. This is a state to report, not an error — the typed
     /// signal callers match on instead of an error-message substring.
@@ -176,19 +184,43 @@ fn collect(target: &StoreTarget, layout: StoreLayout, total_bytes: u64) -> Resul
     })
 }
 
-/// The snapshot half of a cold read: the codec envelope decides whether
-/// `manifest.json` is a full Parquet manifest or a JSON-codec envelope
-/// (ADR-0165 Decision 5). No envelope at all is the fresh-store state:
-/// [`StoreSnapshot::None`], not an error.
+/// The snapshot half of a cold read, routed on the one typed
+/// classification: the markdown sidecar probe decides first (ADR-0406
+/// §5 — `resolve_codec` guarantees a sidecar never coexists with a root
+/// `manifest.json`), and its `Absent` verdict falls through to the root
+/// envelope read, whose codec says whether `manifest.json` is a full
+/// Parquet manifest or an envelope-only codec store (ADR-0165 Decision
+/// 5). No envelope at all is the fresh-store state:
+/// [`StoreSnapshot::None`], not an error. A root envelope naming the
+/// markdown codec is the never-written state open refuses, and the cold
+/// read refuses it with the same typed error instead of projecting an
+/// unopenable directory as a store.
 fn read_snapshot(target: &StoreTarget) -> Result<StoreSnapshot> {
+    // The codec's one typed sidecar reader owns the bound, the parse,
+    // and the codec verdict (ADR-0406 §5) — including the
+    // present-but-not-markdown refusal; this reader only projects the
+    // manifest into the envelope shape.
+    if let Some(manifest) = codec::markdown::read_manifest(target)? {
+        return Ok(StoreSnapshot::Envelope {
+            codec: SnapshotCodecKind::Markdown,
+            checkpoint_lsn: manifest.checkpoint_lsn,
+            commit_ts: manifest.commit_ts,
+        });
+    }
     let Some(envelope) = codec::read_envelope(target)? else {
         return Ok(StoreSnapshot::None);
     };
     match envelope.codec {
-        SnapshotCodecKind::Json => Ok(StoreSnapshot::Json {
+        SnapshotCodecKind::Json => Ok(StoreSnapshot::Envelope {
+            codec: envelope.codec,
             checkpoint_lsn: envelope.checkpoint_lsn,
             commit_ts: envelope.commit_ts,
         }),
+        // A root envelope naming markdown is normally refused inside
+        // `read_envelope` itself (the markdown manifest home is the
+        // `.cypherlite/` sidecar, ADR-0406 §3); the arm stays as the
+        // fail-closed belt if that invariant ever breaks.
+        SnapshotCodecKind::Markdown => Err(codec::root_envelope_names_markdown()),
         SnapshotCodecKind::Parquet => parquet_snapshot(target),
     }
 }

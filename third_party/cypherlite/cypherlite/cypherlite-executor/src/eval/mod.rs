@@ -38,7 +38,7 @@ pub(crate) use cypherlite_ir::{
     expr_vars, is_agg_expr, key_of, label_expr_vars, orient, var_key_side, var_prop,
 };
 
-pub(crate) use expr::binary;
+pub(crate) use expr::{binary, cmp_bool, ordering_operator};
 use expr::{eval_case, prop, reject_deleted_access, slice, subscript, unary};
 use function::function;
 pub(crate) use function::is_nondeterministic;
@@ -392,6 +392,13 @@ pub fn eval(
         }
         Expr::MapProjection { expr, items } => {
             let target = eval(graph, row, expr, params, cypher_version)?;
+            // A map projection over a null entity is null (CIP-284): the
+            // projection has no properties to project, and returning the
+            // `meta`-only map instead made `collect(n {.*, meta: …})` over
+            // an `OPTIONAL MATCH` miss collect a row instead of nothing.
+            if target.is_null() {
+                return Ok(Value::Null);
+            }
             let mut map = BTreeMap::new();
             for item in items {
                 match item {

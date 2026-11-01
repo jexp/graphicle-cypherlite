@@ -725,7 +725,9 @@ pub(crate) fn match_one_path(
         ..
     } = ctx;
     if match_mode == MatchMode::RepeatableElements || path.needs_gpm() {
-        return match_gpm_path(ctx, path, row, used, match_mode, reduce, keep_used);
+        return match_gpm_path(
+            ctx, path, row, used, match_mode, reduce, keep_used, residual,
+        );
     }
     let mut out = Vec::new();
     let mut sink = CollectSink {

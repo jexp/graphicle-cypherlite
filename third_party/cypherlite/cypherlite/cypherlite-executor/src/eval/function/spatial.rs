@@ -104,8 +104,11 @@ mod tests {
         assert_eq!((p.srid, p.x, p.y), (7203, 3.0, 4.0));
     }
 
+    /// A node value with no store entry and a non-negative id is a broken
+    /// payload, not an empty property map: `properties()` reports it as a
+    /// typed internal error instead of fabricating one.
     #[test]
-    fn point_on_a_missing_entity_errors_like_an_empty_map() {
+    fn point_on_a_missing_entity_is_an_internal_error() {
         let g = Graph::default();
         let graph = ExecGraph::read(&g);
         let missing = Value::from_node(cypherlite_core::Node {
@@ -117,7 +120,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("'x' and 'y', or 'latitude' and 'longitude'"),
+            err.contains("properties() node has no store entry"),
             "unexpected error: {err}"
         );
     }

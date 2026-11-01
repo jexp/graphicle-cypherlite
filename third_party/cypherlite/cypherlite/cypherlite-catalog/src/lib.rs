@@ -47,6 +47,16 @@ pub struct ConstraintDef {
     pub kind: String,
     #[serde(default)]
     pub property_type: Option<String>,
+    /// The label a `labelExistence`/`sourceLabel`/`targetLabel` constraint
+    /// requires to be present (CIP-177, CIP-266) — part of the constraint's
+    /// schema identity, the piece the theater's derived-constraint index
+    /// used to hold alone. `None` for every other kind. Rows written before
+    /// this field existed decode as `None` (their identity is unknown; the
+    /// catalog treats them with the pre-field kind-scoped equivalence
+    /// policy). `skip_serializing_if` keeps a non-enforced row's bytes
+    /// identical to the pre-field shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced_label: Option<String>,
 }
 
 /// Whether a constraint kind tag is backed by a range index — the single
@@ -68,22 +78,102 @@ impl ConstraintDef {
         constraint_kind_is_index_backed(&self.kind)
     }
 
-    /// The constraint-equivalence predicate: same entity kind
-    /// (node/relationship), label, property set, constraint kind, and
-    /// property type. The one place this five-field rule lives.
-    pub fn schema_equivalent(
+    /// The catalog definition a derived model constraint describes — the
+    /// one model→def crossing (its inverse is [`to_model`](Self::to_model)).
+    /// The caller passes the typed entity fact, so the relationship bit is
+    /// derived once here.
+    pub fn from_model(
+        constraint: &cypherlite_model::Constraint,
+        entity: cypherlite_model::EntityKind,
+    ) -> Self {
+        Self {
+            name: constraint.name.clone(),
+            relationship: entity.is_relationship(),
+            label: constraint.label.clone(),
+            properties: constraint.properties.clone(),
+            kind: constraint.constraint_type.as_str().to_string(),
+            property_type: constraint.property_type.clone(),
+            enforced_label: constraint.enforced_label.clone(),
+        }
+    }
+
+    /// The model record this definition describes — the def→model crossing,
+    /// taking the already-parsed kind. The definition owns its entity side,
+    /// so the record derives it here (one input per fact). The theater's
+    /// derived-constraint index uses it, so the statement keeps one
+    /// constraint shape (the def) and does not respell its fields.
+    pub fn to_model(
         &self,
-        relationship: bool,
-        label: &str,
-        properties: &[String],
-        kind: &str,
-        property_type: Option<&str>,
-    ) -> bool {
-        self.relationship == relationship
-            && self.label == label
-            && self.properties == properties
-            && self.kind == kind
-            && self.property_type.as_deref() == property_type
+        constraint_type: cypherlite_model::ConstraintType,
+    ) -> cypherlite_model::Constraint {
+        cypherlite_model::Constraint {
+            name: self.name.clone(),
+            label: self.label.clone(),
+            properties: self.properties.clone(),
+            constraint_type,
+            property_type: self.property_type.clone(),
+            entity_type: cypherlite_model::EntityKind::from_relationship_flag(self.relationship)
+                .display_name()
+                .into(),
+            enforced_label: self.enforced_label.clone(),
+        }
+    }
+
+    /// Whether `other` names the same subject and kind with different
+    /// options: the same entity side, label, property set and kind, but a
+    /// different property type (for the kinds that carry one). Distinct from
+    /// [`schema_equivalent`](Self::schema_equivalent), which also matches the
+    /// options. Two enforced-label rules with different labels are distinct
+    /// rules, not conflicts (CIP-266), so a differing enforced label takes
+    /// the pair out of this predicate.
+    pub fn conflicts_with(&self, other: &ConstraintDef) -> bool {
+        self.relationship == other.relationship
+            && self.label == other.label
+            && self.properties == other.properties
+            && self.kind == other.kind
+            && self.enforced_label == other.enforced_label
+            && self.property_type != other.property_type
+    }
+
+    /// The constraint's schema text — `kind node|relationship :Label(props)
+    /// [:: TYPE] [=> :EnforcedLabel]` — the one spelling the store
+    /// manifest's constraint line renders (the [`IndexDef::index_text`]
+    /// twin). Presentation sanitization stays with the caller.
+    pub fn schema_text(&self) -> String {
+        let target = if self.relationship {
+            "relationship"
+        } else {
+            "node"
+        };
+        let mut text = format!(
+            "{} {} :{}({})",
+            self.kind,
+            target,
+            self.label,
+            self.properties.join(", ")
+        );
+        if let Some(property_type) = &self.property_type {
+            text.push_str(" :: ");
+            text.push_str(property_type);
+        }
+        if let Some(enforced_label) = &self.enforced_label {
+            text.push_str(" => :");
+            text.push_str(enforced_label);
+        }
+        text
+    }
+
+    /// The constraint-equivalence predicate: same entity kind
+    /// (node/relationship), label, property set, constraint kind, property
+    /// type, and enforced label. The one place this six-field rule lives;
+    /// the constraint's own name is not part of it.
+    pub fn schema_equivalent(&self, other: &ConstraintDef) -> bool {
+        self.relationship == other.relationship
+            && self.label == other.label
+            && self.properties == other.properties
+            && self.kind == other.kind
+            && self.property_type == other.property_type
+            && self.enforced_label == other.enforced_label
     }
 }
 
@@ -158,6 +248,20 @@ impl Catalog {
     }
 
     pub fn insert_constraint(&mut self, def: ConstraintDef) -> Result<()> {
+        // The kind vocabulary is closed: every executor-authored definition
+        // spells its kind with `ConstraintType::as_str()`. An unknown tag is
+        // a corrupt durable row — reject it here rather than install a
+        // constraint no validator, index, or committed tuple map can
+        // maintain. The error text matches the validator's fail-closed
+        // `ConstraintCheck::new` reply.
+        let kind = match cypherlite_model::ConstraintType::from_str(&def.kind) {
+            Ok(kind) => kind,
+            Err(reason) => {
+                return Err(Error::semantic(
+                    cypherlite_model::ConstraintType::unknown_kind_message(&def.name, &reason),
+                ));
+            }
+        };
         // A constraint's subject is a graph-catalog fact in the namespace its
         // entity kind selects (ADR-0363 decision 5), recorded by a replaying
         // identical insert too so an older store still learns it. Monotone: a
@@ -173,27 +277,34 @@ impl Catalog {
                 def.name
             )));
         }
-        // A label/endpoint-label existence kind's identity includes its
-        // enforced label, which the catalog def does not carry (it lives
-        // in the theater's derived-constraint index): two same-label
-        // existence constraints with different enforced labels are two
-        // rules, not a duplicate (CIP-266's multi-parent
-        // `(:A => :B&C)` derives two). Every other kind compares as
-        // before.
-        let identity_includes_enforced_label =
-            cypherlite_model::ConstraintType::from_str(&def.kind)
-                .is_ok_and(|kind| kind.enforced_label_site().is_some());
-        if !identity_includes_enforced_label
-            && self.constraints.values().any(|existing| {
-                existing.relationship == def.relationship
-                    && existing.label == def.label
-                    && existing.properties == def.properties
-                    && existing.kind == def.kind
-            })
+        // The identity is the six-field schema rule. A row written before
+        // `enforced_label` existed decodes it as `None`; for an
+        // enforced-label kind that leaves the identity unknown, so such a
+        // row takes the pre-field kind-scoped policy (never declared
+        // equivalent) — a legacy multi-parent graph type's two same-schema
+        // existence constraints still load. Two current rows with different
+        // enforced labels are two rules, not a duplicate (CIP-266's
+        // multi-parent `(:A => :B&C)` derives two).
+        let legacy_identity = kind.is_enforced_label_kind() && def.enforced_label.is_none();
+        if !legacy_identity
+            && self
+                .constraints
+                .values()
+                .any(|existing| existing.schema_equivalent(&def))
         {
             return Err(Error::semantic(
                 "EquivalentSchemaRuleAlreadyExists: equivalent constraint exists",
             ));
+        }
+        // Same subject and kind with different options (a property-type
+        // constraint under another declared type) is a conflict, not a
+        // distinct rule.
+        if self
+            .constraints
+            .values()
+            .any(|existing| def.conflicts_with(existing))
+        {
+            return Err(Error::semantic("ConstraintConflict"));
         }
         self.record_schema_name(def.relationship, def.label.clone());
         self.constraints.insert(def.name.clone(), def);
@@ -209,6 +320,20 @@ impl Catalog {
 mod tests {
     use super::*;
 
+    /// The canonical constraint fixture: one name/label/property, with the
+    /// kind parameterized.
+    fn def_of(kind: &str) -> ConstraintDef {
+        ConstraintDef {
+            name: "c".into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec!["p".into()],
+            kind: kind.into(),
+            property_type: None,
+            enforced_label: None,
+        }
+    }
+
     #[test]
     fn records() {
         let mut c = Catalog::default();
@@ -220,39 +345,23 @@ mod tests {
 
     #[test]
     fn constraint_def_is_index_backed_parses_kind_at_str_boundary() {
-        let def = |kind: &str| ConstraintDef {
-            name: "c".into(),
-            relationship: false,
-            label: "L".into(),
-            properties: vec!["p".into()],
-            kind: kind.into(),
-            property_type: None,
-        };
-        assert!(def("unique").is_index_backed());
-        assert!(def("key").is_index_backed());
-        assert!(!def("exists").is_index_backed());
-        assert!(!def("propertyType").is_index_backed());
-        assert!(!def("labelExistence").is_index_backed());
-        assert!(!def("nodeLabelExistence").is_index_backed());
-        assert!(!def("sourceLabel").is_index_backed());
-        assert!(!def("sourceLabelExistence").is_index_backed());
-        assert!(!def("targetLabel").is_index_backed());
-        assert!(!def("targetLabelExistence").is_index_backed());
+        assert!(def_of("unique").is_index_backed());
+        assert!(def_of("key").is_index_backed());
+        assert!(!def_of("exists").is_index_backed());
+        assert!(!def_of("propertyType").is_index_backed());
+        assert!(!def_of("labelExistence").is_index_backed());
+        assert!(!def_of("nodeLabelExistence").is_index_backed());
+        assert!(!def_of("sourceLabel").is_index_backed());
+        assert!(!def_of("sourceLabelExistence").is_index_backed());
+        assert!(!def_of("targetLabel").is_index_backed());
+        assert!(!def_of("targetLabelExistence").is_index_backed());
         // An unparseable tag fails closed: not index-backed.
-        assert!(!def("not-a-kind").is_index_backed());
-        assert!(!def("").is_index_backed());
+        assert!(!def_of("not-a-kind").is_index_backed());
+        assert!(!def_of("").is_index_backed());
     }
 
     #[test]
     fn constraint_def_is_index_backed_delegates_to_the_free_fn() {
-        let def = |kind: &str| ConstraintDef {
-            name: "c".into(),
-            relationship: false,
-            label: "L".into(),
-            properties: vec!["p".into()],
-            kind: kind.into(),
-            property_type: None,
-        };
         for kind in [
             "unique",
             "key",
@@ -268,7 +377,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                def(kind).is_index_backed(),
+                def_of(kind).is_index_backed(),
                 constraint_kind_is_index_backed(kind),
                 "{kind}"
             );
@@ -276,37 +385,109 @@ mod tests {
     }
 
     #[test]
-    fn constraint_def_schema_equivalent_compares_all_five_fields() {
+    fn constraint_def_schema_equivalent_compares_all_six_fields() {
         let def = ConstraintDef {
             name: "c".into(),
             relationship: false,
             label: "L".into(),
             properties: vec!["p".into()],
-            kind: "unique".into(),
+            kind: "propertyType".into(),
             property_type: Some("STRING".into()),
+            enforced_label: None,
         };
         let props = vec!["p".to_string()];
-        assert!(def.schema_equivalent(false, "L", &props, "unique", Some("STRING")));
+        let probe = |relationship: bool,
+                     label: &str,
+                     props: &[String],
+                     kind: &str,
+                     ty: Option<&str>,
+                     enforced: Option<&str>| ConstraintDef {
+            name: "probe".into(),
+            relationship,
+            label: label.to_string(),
+            properties: props.to_vec(),
+            kind: kind.to_string(),
+            property_type: ty.map(str::to_owned),
+            enforced_label: enforced.map(str::to_owned),
+        };
+        assert!(def.schema_equivalent(&probe(
+            false,
+            "L",
+            &props,
+            "propertyType",
+            Some("STRING"),
+            None
+        )));
         // The constraint's own name is not part of the equivalence rule.
         assert!(ConstraintDef {
             name: "other".into(),
             ..def.clone()
         }
-        .schema_equivalent(false, "L", &props, "unique", Some("STRING")));
-        // Flip each of the five fields in turn: no longer equivalent.
-        assert!(!def.schema_equivalent(true, "L", &props, "unique", Some("STRING")));
-        assert!(!def.schema_equivalent(false, "M", &props, "unique", Some("STRING")));
-        assert!(!def.schema_equivalent(false, "L", &["q".to_string()], "unique", Some("STRING")));
-        assert!(!def.schema_equivalent(false, "L", &props, "key", Some("STRING")));
-        assert!(!def.schema_equivalent(false, "L", &props, "unique", None));
-        assert!(!def.schema_equivalent(false, "L", &props, "unique", Some("INTEGER")));
-        // `None` on the stored definition matches only a `None` query.
-        let untyped = ConstraintDef {
+        .schema_equivalent(&probe(
+            false,
+            "L",
+            &props,
+            "propertyType",
+            Some("STRING"),
+            None
+        )));
+        // Flip each of the six fields in turn: no longer equivalent.
+        assert!(!def.schema_equivalent(&probe(
+            true,
+            "L",
+            &props,
+            "propertyType",
+            Some("STRING"),
+            None
+        )));
+        assert!(!def.schema_equivalent(&probe(
+            false,
+            "M",
+            &props,
+            "propertyType",
+            Some("STRING"),
+            None
+        )));
+        assert!(!def.schema_equivalent(&probe(
+            false,
+            "L",
+            &["q".to_string()],
+            "propertyType",
+            Some("STRING"),
+            None
+        )));
+        assert!(!def.schema_equivalent(&probe(false, "L", &props, "unique", Some("STRING"), None)));
+        assert!(!def.schema_equivalent(&probe(false, "L", &props, "propertyType", None, None)));
+        assert!(!def.schema_equivalent(&probe(
+            false,
+            "L",
+            &props,
+            "propertyType",
+            Some("INTEGER"),
+            None
+        )));
+        assert!(!def.schema_equivalent(&probe(
+            false,
+            "L",
+            &props,
+            "propertyType",
+            Some("STRING"),
+            Some("Required")
+        )));
+        // An enforced-label identity is part of the rule: two existence
+        // constraints with different enforced labels differ.
+        let existence = |enforced: Option<&str>| ConstraintDef {
+            name: "e".into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec![],
+            kind: "nodeLabelExistence".into(),
             property_type: None,
-            ..def
+            enforced_label: enforced.map(str::to_owned),
         };
-        assert!(untyped.schema_equivalent(false, "L", &props, "unique", None));
-        assert!(!untyped.schema_equivalent(false, "L", &props, "unique", Some("STRING")));
+        assert!(existence(Some("A")).schema_equivalent(&existence(Some("A"))));
+        assert!(!existence(Some("A")).schema_equivalent(&existence(Some("B"))));
+        assert!(!existence(Some("A")).schema_equivalent(&existence(None)));
     }
 
     #[test]
@@ -342,6 +523,29 @@ mod tests {
         assert!(!c.drop_index("person_name"));
     }
 
+    /// The kind vocabulary is closed: an unknown tag is rejected loudly
+    /// (ADR-0439) instead of installing a constraint no validator, index, or
+    /// committed tuple map can maintain.
+    #[test]
+    fn insert_rejects_an_unknown_constraint_kind() {
+        let mut c = Catalog::default();
+        let def = ConstraintDef {
+            name: "c".into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec!["p".into()],
+            kind: "uniqueish".into(),
+            property_type: None,
+            enforced_label: None,
+        };
+        let error = c.insert_constraint(def).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "semantic error: ConstraintValidationFailed: `c` unknown constraint type \"uniqueish\""
+        );
+        assert!(c.constraints.is_empty());
+    }
+
     /// ADR-0363 decision 5: inserting a named schema object records its
     /// subject in the graph-catalog namespace the object's model selects — a
     /// node constraint's label or a relationship constraint's type — and a
@@ -356,6 +560,7 @@ mod tests {
             properties: vec!["p".into()],
             kind: "unique".into(),
             property_type: None,
+            enforced_label: None,
         };
 
         c.insert_index(IndexDef {
@@ -382,5 +587,80 @@ mod tests {
         c.insert_constraint(constraint("nc", false, "Other"))
             .unwrap_err();
         assert!(!c.labels.contains("Other"));
+    }
+
+    /// A same-subject, same-kind rule under a different property type is a
+    /// conflict, not a distinct rule; the same type under a new name is the
+    /// equivalent-schema reply.
+    #[test]
+    fn conflicting_property_types_are_a_conflict_not_a_distinct_rule() {
+        let mut c = Catalog::default();
+        let typed = |name: &str, ty: &str| ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec!["p".into()],
+            kind: "propertyType".into(),
+            property_type: Some(ty.into()),
+            enforced_label: None,
+        };
+        c.insert_constraint(typed("a", "INTEGER")).unwrap();
+        let error = c.insert_constraint(typed("b", "STRING")).unwrap_err();
+        assert_eq!(error.to_string(), "semantic error: ConstraintConflict");
+        let error = c.insert_constraint(typed("c", "INTEGER")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "semantic error: EquivalentSchemaRuleAlreadyExists: equivalent constraint exists"
+        );
+    }
+
+    /// CIP-266: a label-existence rule's identity includes its enforced
+    /// label, so a multi-parent element type's two rules on one label
+    /// coexist, while a repeat of the same rule does not.
+    #[test]
+    fn enforced_label_joins_the_constraint_identity() {
+        let mut c = Catalog::default();
+        let rule = |name: &str, enforced: &str| ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "P".into(),
+            properties: vec![],
+            kind: "nodeLabelExistence".into(),
+            property_type: None,
+            enforced_label: Some(enforced.into()),
+        };
+        c.insert_constraint(rule("q", "Q")).unwrap();
+        c.insert_constraint(rule("r", "R")).unwrap();
+        let error = c.insert_constraint(rule("q_again", "Q")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "semantic error: EquivalentSchemaRuleAlreadyExists: equivalent constraint exists"
+        );
+    }
+
+    /// A row written before `ConstraintDef` carried the enforced label
+    /// decodes it as `None`; its identity is unknown, so the pre-field
+    /// kind-scoped policy applies and legacy rows never block each other or
+    /// a current row. This keeps a legacy multi-parent graph type loadable.
+    #[test]
+    fn legacy_rows_without_the_enforced_label_stay_kind_scoped() {
+        let mut c = Catalog::default();
+        let legacy = |name: &str| ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "P".into(),
+            properties: vec![],
+            kind: "nodeLabelExistence".into(),
+            property_type: None,
+            enforced_label: None,
+        };
+        c.insert_constraint(legacy("a")).unwrap();
+        c.insert_constraint(legacy("b")).unwrap();
+        c.insert_constraint(ConstraintDef {
+            name: "current".into(),
+            enforced_label: Some("Q".into()),
+            ..legacy("probe")
+        })
+        .unwrap();
     }
 }

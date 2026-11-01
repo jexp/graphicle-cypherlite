@@ -11,9 +11,6 @@
 //! - [`search`]: the CIP-224 SEARCH-clause rules that don't fit a generic
 //!   scope tracker (binding-variable reference, SCORE conflicts, pattern
 //!   shape, per-index CIP-225/240 kind restrictions).
-//! - [`output_vars`]: the subquery output-variable analysis (what a
-//!   (sub)query's terminal projection exports), shared with
-//!   [`crate::call_scope`].
 //! - [`writes`]: CREATE/MERGE pattern legality (single relationship type,
 //!   direction, no variable length, no QPPs, parameter property maps,
 //!   CIP-156 dynamic label rules).
@@ -38,8 +35,10 @@
 //! This module's root holds the ADR-0257 nesting-depth guard
 //! ([`validate_nesting_depth`]), the nested-statement validation battery
 //! ([`validate_statement_tree`]), the CIP-150 preview-gate predicates, and
-//! the two canonical error constructors every pass shares
-//! ([`duplicate_variable`], [`duplicate_outer_variable`]). The generic AST
+//! the canonical error constructor every pass shares
+//! ([`duplicate_variable`]; the outer-scope collision constructor
+//! [`crate::call_scope::duplicate_outer_variable`] lives at the crate root
+//! beside its consumers). The generic AST
 //! helpers those passes build on — the collectors, the per-clause
 //! scope-introduction fold ([`crate::ast::collect::clause_introduced_names`]),
 //! the UNION-chain enumeration and the walker family — live in
@@ -53,7 +52,6 @@ mod dialect;
 mod expressions;
 mod functions;
 mod graph_type_gate;
-mod output_vars;
 mod scope;
 mod search;
 mod show;
@@ -82,26 +80,12 @@ pub use self::structure::{
 };
 pub use self::writes::validate_param_property_shorthand;
 
-pub(crate) use self::output_vars::compute_subquery_output_vars;
-
 /// The canonical "variable already declared" diagnostic: one construction
 /// site for every duplicate-binding and shadow check.
 pub(crate) fn duplicate_variable(name: &str) -> EngineError {
     EngineError::semantic(
         ErrorKind::VariableAlreadyBound,
         format!("variable '{name}' already declared"),
-    )
-}
-
-/// The one construction site for an outer-scope collision: a subquery
-/// output (or CALL export) re-declares a name the enclosing scope already
-/// binds. Neo4j's verbatim text names the offender (CIP-218 interactions
-/// [1]-[3]); every outer-scope guard routes through here so the diagnostic
-/// cannot drift into unnamed variants.
-pub(crate) fn duplicate_outer_variable(name: &str) -> EngineError {
-    EngineError::semantic(
-        ErrorKind::VariableAlreadyBound,
-        format!("Variable `{name}` already declared in outer scope"),
     )
 }
 

@@ -1,3 +1,4 @@
+use cypherlite_catalog::ConstraintDef;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
@@ -89,14 +90,15 @@ fn main() -> Result<()> {
     // its constraint, never by a speculative write to the shared theater.
     graph.apply_redo(
         vec![
-            RedoOp::CreateConstraint {
+            RedoOp::create_constraint(ConstraintDef {
                 name: "annotated".into(),
                 relationship: false,
                 label: "N".into(),
                 properties: vec![],
                 kind: "nodeLabelExistence".into(),
                 property_type: None,
-            },
+                enforced_label: None,
+            }),
             RedoOp::CatalogDerivedConstraint {
                 constraint: cypherlite_model::Constraint {
                     name: "annotated".into(),

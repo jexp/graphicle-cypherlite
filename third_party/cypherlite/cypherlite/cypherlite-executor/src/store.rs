@@ -2,11 +2,11 @@
 //! Public `Node` / `Relationship` maps are materialized at the API boundary.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use cypherlite_core::{Error, Node, NodeId, RelId, Relationship, Result, Value};
+use cypherlite_core::{Node, NodeId, RelId, Relationship, Result, Value};
 use cypherlite_ir::Direction;
 use dashmap::DashMap;
 
@@ -124,166 +124,10 @@ impl Interner {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct CompactProps {
-    keys: Vec<u32>,
-    vals: Vec<Value>,
-}
+mod compact_props;
 
-impl CompactProps {
-    pub(crate) fn from_map(interner: &Interner, map: BTreeMap<String, Value>) -> Self {
-        let mut keys = Vec::with_capacity(map.len());
-        let mut vals = Vec::with_capacity(map.len());
-        for (k, v) in map {
-            keys.push(interner.intern(&k));
-            vals.push(v);
-        }
-        let mut props = Self { keys, vals };
-        props.fit();
-        props
-    }
-
-    pub(crate) fn to_map(&self, interner: &Interner) -> BTreeMap<String, Value> {
-        let mut m = BTreeMap::new();
-        for (k, v) in self.keys.iter().zip(self.vals.iter()) {
-            m.insert(String::from(&*interner.get(*k)), v.clone());
-        }
-        m
-    }
-
-    pub(crate) fn get(&self, key: u32) -> Option<&Value> {
-        self.keys
-            .iter()
-            .position(|&k| k == key)
-            .map(|i| &self.vals[i])
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn key_capacity(&self) -> usize {
-        self.keys.capacity()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn val_capacity(&self) -> usize {
-        self.vals.capacity()
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, &Value)> {
-        self.keys.iter().copied().zip(self.vals.iter())
-    }
-
-    fn fit(&mut self) {
-        crate::memory::fit_reserved(&mut self.keys);
-        crate::memory::fit_reserved(&mut self.vals);
-    }
-
-    pub(crate) fn keys_as_strings(&self, interner: &Interner) -> Vec<String> {
-        self.keys
-            .iter()
-            .map(|k| String::from(&*interner.get(*k)))
-            .collect()
-    }
-
-    pub(crate) fn set(&mut self, key: u32, value: Value) {
-        if let Some(i) = self.keys.iter().position(|&k| k == key) {
-            self.vals[i] = value;
-        } else {
-            self.keys.push(key);
-            self.vals.push(value);
-            self.fit();
-        }
-    }
-
-    pub(crate) fn remove(&mut self, key: u32) {
-        if let Some(i) = self.keys.iter().position(|&k| k == key) {
-            self.keys.remove(i);
-            self.vals.remove(i);
-            self.fit();
-        }
-    }
-
-    /// Tagged JSON byte length of this map, borrowing each value.
-    pub(crate) fn tagged_json_len(&self, interner: &Interner) -> Result<u64> {
-        json_len(&BorrowedProps {
-            interner,
-            props: self,
-        })
-    }
-}
-
-struct ByteCount(u64);
-
-impl Write for ByteCount {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(buf.len() as u64)
-            .ok_or_else(|| std::io::Error::other("checkpoint byte count overflow"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn json_len(value: &impl serde::Serialize) -> Result<u64> {
-    let mut sink = ByteCount(0);
-    serde_json::to_writer(&mut sink, value).map_err(|e| Error::storage(e.to_string()))?;
-    Ok(sink.0)
-}
-
-fn add_bytes(sum: u64, extra: u64) -> Result<u64> {
-    sum.checked_add(extra)
-        .ok_or_else(|| Error::storage("checkpoint byte count overflow"))
-}
-
-/// Property map serialized in stored order. JSON object length does not
-/// depend on key order; values serialize through [`Value`]'s tagged form.
-struct BorrowedProps<'a> {
-    interner: &'a Interner,
-    props: &'a CompactProps,
-}
-
-impl serde::Serialize for BorrowedProps<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.props.keys.len()))?;
-        for (key, value) in self.props.iter() {
-            map.serialize_entry(self.interner.get(key).as_ref(), value)?;
-        }
-        map.end()
-    }
-}
-
-/// `{amount, id, ts}` in the same tagged JSON as a property map, without
-/// cloning the triple fields. Key order does not change the byte length.
-struct BorrowedTriple<'a> {
-    id: &'a str,
-    amount: &'a Value,
-    ts: i64,
-}
-
-impl serde::Serialize for BorrowedTriple<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(3))?;
-        map.serialize_entry("amount", self.amount)?;
-        map.serialize_entry("id", &cypherlite_core::tagged_str(self.id))?;
-        map.serialize_entry("ts", &Value::Int(self.ts))?;
-        map.end()
-    }
-}
+pub(crate) use self::compact_props::CompactProps;
+use self::compact_props::{add_bytes, json_len, BorrowedTriple};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LiveNode {
@@ -348,35 +192,194 @@ impl LiveNode {
     }
 }
 
-/// Common fraud/identity transfer payload. Any other shape uses `Other`.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum RelPayload {
-    Triple {
-        id: Arc<str>,
-        amount: Value,
-        ts: i64,
-    },
-    Other(CompactProps),
+/// A payload's property key ids with its own interner reads already done:
+/// `Triple` carries its three fixed names resolved once, `Other` carries its
+/// stored ids (which need no interner). A caller that probes another lock
+/// against these ids — the ADR-0439 constraint map's scope, held under its
+/// lock — builds this before taking that lock, so the probe never takes an
+/// interner shard guard.
+pub(crate) enum PayloadKeyIds<'a> {
+    Triple([Option<u32>; 3]),
+    Other(&'a CompactProps),
 }
 
-/// The triple-or-map choice without interned key ids.
+impl PayloadKeyIds<'_> {
+    /// Visit every property key id the payload carries, in payload order.
+    /// The one `Triple`/`Other` dispatch — [`any`](Self::any) derives from
+    /// it instead of repeating the match.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u32) -> ControlFlow<()>) -> ControlFlow<()> {
+        match self {
+            Self::Triple(ids) => {
+                for id in ids.iter().flatten() {
+                    f(*id)?;
+                }
+            }
+            Self::Other(props) => {
+                for (kid, _) in props.iter() {
+                    f(kid)?;
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Whether any of the payload's key ids satisfies `f`. Built on
+    /// [`Self::for_each`] so the Triple/Other walk stays single-sourced;
+    /// `ControlFlow` keeps the first-match short-circuit the create-seam hot
+    /// path wants.
+    pub(crate) fn any(&self, mut f: impl FnMut(u32) -> bool) -> bool {
+        self.for_each(|kid| {
+            if f(kid) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    }
+}
+
+/// One relationship payload: the `Triple` fast shape or a property map. `P`
+/// is the props representation — [`CompactProps`] for the live record,
+/// `BTreeMap<String, Value>` for the interner-free redo estimate — so the
+/// shape choice and every method over it are implemented once.
 ///
-/// `RelPayload::from_map` stores a `Triple` only when the map is created in
-/// this shape. `Other` never turns back into a `Triple`, so a later `SET`
-/// that happens to produce `{id, amount, ts}` still occupies property
-/// vectors. Accounting has to follow this form, not re-read the map.
+/// `from_map` stores a `Triple` only when the map is created in this shape.
+/// `Other` never turns back into a `Triple`, so a later `SET` that happens
+/// to produce `{id, amount, ts}` still occupies property vectors.
+/// Accounting has to follow this form, not re-read the map.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PayloadForm {
+pub(crate) enum Payload<P> {
     Triple {
         id: Arc<str>,
         amount: Value,
         ts: i64,
     },
-    Props(BTreeMap<String, Value>),
+    Other(P),
 }
 
-impl PayloadForm {
-    pub(crate) fn from_map(mut map: BTreeMap<String, Value>) -> Self {
+/// The props representation a [`Payload`] is generic over.
+pub(crate) trait PayloadProps: Sized {
+    fn from_map(interner: &Interner, map: BTreeMap<String, Value>) -> Self;
+    fn set(&mut self, interner: &Interner, key: &str, value: Value);
+    fn remove(&mut self, interner: &Interner, key: &str);
+    fn get(&self, interner: &Interner, key: &str) -> Option<Value>;
+    fn to_map(&self, interner: &Interner) -> BTreeMap<String, Value>;
+}
+
+impl PayloadProps for BTreeMap<String, Value> {
+    fn from_map(_interner: &Interner, map: BTreeMap<String, Value>) -> Self {
+        map
+    }
+
+    fn set(&mut self, _interner: &Interner, key: &str, value: Value) {
+        self.insert(key.to_string(), value);
+    }
+
+    fn remove(&mut self, _interner: &Interner, key: &str) {
+        BTreeMap::remove(self, key);
+    }
+
+    fn get(&self, _interner: &Interner, key: &str) -> Option<Value> {
+        BTreeMap::get(self, key).cloned()
+    }
+
+    fn to_map(&self, _interner: &Interner) -> BTreeMap<String, Value> {
+        self.clone()
+    }
+}
+
+impl PayloadProps for CompactProps {
+    fn from_map(interner: &Interner, map: BTreeMap<String, Value>) -> Self {
+        CompactProps::from_map(interner, map)
+    }
+
+    fn set(&mut self, interner: &Interner, key: &str, value: Value) {
+        self.set(interner.intern(key), value);
+    }
+
+    fn remove(&mut self, interner: &Interner, key: &str) {
+        // Read-only lookup: a miss means nothing to remove, never a new
+        // interned id.
+        if let Some(kid) = interner.get_id(key) {
+            self.remove(kid);
+        }
+    }
+
+    fn get(&self, interner: &Interner, key: &str) -> Option<Value> {
+        self.get(interner.get_id(key)?).cloned()
+    }
+
+    fn to_map(&self, interner: &Interner) -> BTreeMap<String, Value> {
+        CompactProps::to_map(self, interner)
+    }
+}
+
+/// The live counter's payload shape.
+pub(crate) type RelPayload = Payload<CompactProps>;
+/// The redo estimate's payload shape (no interned ids).
+pub(crate) type PayloadForm = Payload<BTreeMap<String, Value>>;
+
+/// What an in-place triple write does with `(key, value)`.
+enum TripleWrite<'a> {
+    /// Set the `id` field to this string.
+    Id(&'a str),
+    /// Set the `amount` field to this value.
+    Amount(&'a Value),
+    /// Set the `ts` field to this integer.
+    Ts(i64),
+    /// The pair does not fit the triple's shape: promote to a property map
+    /// and re-apply there.
+    Promote,
+}
+
+/// Apply an in-place triple write to its fields; `true` when the write does
+/// not fit the triple's shape and the caller must promote and re-dispatch.
+/// The one field-update spelling both payload shapes share.
+fn apply_triple_write(
+    id: &mut Arc<str>,
+    amount: &mut Value,
+    ts: &mut i64,
+    write: TripleWrite<'_>,
+) -> bool {
+    match write {
+        TripleWrite::Id(s) => *id = Arc::from(s),
+        TripleWrite::Amount(v) => *amount = v.clone(),
+        TripleWrite::Ts(i) => *ts = i,
+        TripleWrite::Promote => return true,
+    }
+    false
+}
+
+/// The one in-place-vs-promote decision both payload shapes consult: a write
+/// updates a triple field only when it names that field with its own type;
+/// every other write — and every removal — promotes.
+fn triple_write<'a>(key: &str, value: &'a Value) -> TripleWrite<'a> {
+    match (key, value) {
+        ("id", Value::String(s)) => TripleWrite::Id(s),
+        ("amount", Value::Int(_) | Value::Float(_)) => TripleWrite::Amount(value),
+        ("ts", Value::Int(i)) => TripleWrite::Ts(*i),
+        _ => TripleWrite::Promote,
+    }
+}
+
+/// The `Triple` payload's three fixed property names, in field order — the
+/// one spelling `keys`, `key_ids`, `for_each_key_value`, the promotes,
+/// `to_map`, and the borrowed serializer all consult.
+pub(crate) const TRIPLE_KEYS: [&str; 3] = ["amount", "id", "ts"];
+
+/// The three fixed properties as a map — the one conversion `to_map` and
+/// both promotes share.
+fn triple_map(id: Arc<str>, amount: Value, ts: i64) -> BTreeMap<String, Value> {
+    let mut map = BTreeMap::new();
+    map.insert(TRIPLE_KEYS[0].to_string(), amount);
+    map.insert(TRIPLE_KEYS[1].to_string(), Value::String(id));
+    map.insert(TRIPLE_KEYS[2].to_string(), Value::Int(ts));
+    map
+}
+
+impl<P: PayloadProps> Payload<P> {
+    pub(crate) fn from_map(interner: &Interner, mut map: BTreeMap<String, Value>) -> Self {
         if map.len() == 3
             && matches!(
                 (map.get("id"), map.get("amount"), map.get("ts")),
@@ -394,132 +397,64 @@ impl PayloadForm {
             let Value::Int(ts) = map.remove("ts").expect("ts checked") else {
                 unreachable!("ts checked as an int");
             };
-            return PayloadForm::Triple { id, amount, ts };
+            return Payload::Triple { id, amount, ts };
         }
-        PayloadForm::Props(map)
+        Payload::Other(P::from_map(interner, map))
     }
 
-    pub(crate) fn set(&mut self, key: &str, value: Value) {
-        if value.is_null() {
-            self.remove(key);
-            return;
-        }
-        match self {
-            PayloadForm::Triple { id, amount, ts } => match (key, &value) {
-                ("id", Value::String(s)) => *id = s.clone(),
-                ("amount", Value::Int(_) | Value::Float(_)) => *amount = value,
-                ("ts", Value::Int(i)) => *ts = *i,
-                _ => {
-                    self.promote();
-                    self.set(key, value);
-                }
-            },
-            PayloadForm::Props(props) => {
-                props.insert(key.to_string(), value);
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, key: &str) {
-        if matches!(self, PayloadForm::Triple { .. }) {
-            self.promote();
-        }
-        if let PayloadForm::Props(props) = self {
-            props.remove(key);
-        }
-    }
-
-    fn promote(&mut self) {
-        let PayloadForm::Triple { id, amount, ts } = self else {
-            return;
-        };
-        let mut props = BTreeMap::new();
-        props.insert("id".into(), Value::String(std::mem::take(id)));
-        props.insert("amount".into(), std::mem::replace(amount, Value::Null));
-        props.insert("ts".into(), Value::Int(*ts));
-        *self = PayloadForm::Props(props);
-    }
-}
-
-impl RelPayload {
-    pub(crate) fn from_map(interner: &Interner, map: BTreeMap<String, Value>) -> Self {
-        match PayloadForm::from_map(map) {
-            PayloadForm::Triple { id, amount, ts } => RelPayload::Triple { id, amount, ts },
-            PayloadForm::Props(map) => RelPayload::Other(CompactProps::from_map(interner, map)),
-        }
-    }
-
-    /// The storage choice the byte account has to follow. `Other` stays
-    /// `Props` even when its keys are `id`, `amount`, and `ts`.
-    pub(crate) fn form(&self, interner: &Interner) -> PayloadForm {
-        match self {
-            RelPayload::Triple { id, amount, ts } => PayloadForm::Triple {
-                id: id.clone(),
-                amount: amount.clone(),
-                ts: *ts,
-            },
-            RelPayload::Other(props) => PayloadForm::Props(props.to_map(interner)),
-        }
-    }
-
-    pub(crate) fn to_map(&self, interner: &Interner) -> BTreeMap<String, Value> {
-        match self {
-            RelPayload::Triple { id, amount, ts } => {
-                let mut m = BTreeMap::new();
-                m.insert("id".into(), Value::String(id.clone()));
-                m.insert("amount".into(), amount.clone());
-                m.insert("ts".into(), Value::Int(*ts));
-                m
-            }
-            RelPayload::Other(p) => p.to_map(interner),
-        }
-    }
-
-    fn promote(&mut self, interner: &Interner) {
-        let (id, amount, ts) = match self {
-            RelPayload::Triple { id, amount, ts } => (
-                std::mem::take(id),
-                std::mem::replace(amount, Value::Null),
-                *ts,
-            ),
-            RelPayload::Other(_) => return,
-        };
-        let mut m = BTreeMap::new();
-        m.insert("id".into(), Value::String(id));
-        m.insert("amount".into(), amount);
-        m.insert("ts".into(), Value::Int(ts));
-        *self = RelPayload::Other(CompactProps::from_map(interner, m));
-    }
-
-    /// Storage twin of [`PayloadForm::set`]. The redo estimate follows
-    /// `PayloadForm`; the live counter follows this payload. A change to
-    /// either match arm has to land in both.
     pub(crate) fn set(&mut self, interner: &Interner, key: &str, value: Value) {
         if value.is_null() {
             self.remove(interner, key);
             return;
         }
         match self {
-            RelPayload::Triple { id, amount, ts } => match (key, &value) {
-                ("id", Value::String(s)) => *id = s.clone(),
-                ("amount", Value::Int(_) | Value::Float(_)) => {
-                    *amount = value;
-                }
-                ("ts", Value::Int(i)) => *ts = *i,
-                _ => {
+            Payload::Triple { id, amount, ts } => {
+                if apply_triple_write(id, amount, ts, triple_write(key, &value)) {
                     self.promote(interner);
                     self.set(interner, key, value);
                 }
-            },
-            RelPayload::Other(p) => p.set(interner.intern(key), value),
+            }
+            Payload::Other(props) => props.set(interner, key, value),
+        }
+    }
+
+    /// Removal always promotes (the [`triple_write`] policy's `Promote`
+    /// arm).
+    pub(crate) fn remove(&mut self, interner: &Interner, key: &str) {
+        if matches!(self, Payload::Triple { .. }) {
+            self.promote(interner);
+        }
+        if let Payload::Other(props) = self {
+            props.remove(interner, key);
+        }
+    }
+
+    fn promote(&mut self, interner: &Interner) {
+        let Payload::Triple { id, amount, ts } = self else {
+            return;
+        };
+        *self = Payload::Other(P::from_map(
+            interner,
+            triple_map(
+                std::mem::take(id),
+                std::mem::replace(amount, Value::Null),
+                *ts,
+            ),
+        ));
+    }
+
+    pub(crate) fn to_map(&self, interner: &Interner) -> BTreeMap<String, Value> {
+        match self {
+            Payload::Triple { id, amount, ts } => triple_map(id.clone(), amount.clone(), *ts),
+            Payload::Other(props) => props.to_map(interner),
         }
     }
 
     pub(crate) fn ts(&self, interner: &Interner) -> Option<i64> {
         match self {
-            RelPayload::Triple { ts, .. } => Some(*ts),
-            RelPayload::Other(p) => match interner.get_id("ts").and_then(|k| p.get(k)) {
-                Some(Value::Int(i)) => Some(*i),
+            Payload::Triple { ts, .. } => Some(*ts),
+            Payload::Other(props) => match props.get(interner, "ts") {
+                Some(Value::Int(i)) => Some(i),
                 _ => None,
             },
         }
@@ -527,20 +462,47 @@ impl RelPayload {
 
     pub(crate) fn get(&self, interner: &Interner, key: &str) -> Option<Value> {
         match self {
-            RelPayload::Triple { id, amount, ts } => match key {
+            Payload::Triple { id, amount, ts } => match key {
                 "id" => Some(Value::String(id.clone())),
                 "amount" => Some(amount.clone()),
                 "ts" => Some(Value::Int(*ts)),
                 _ => None,
             },
-            RelPayload::Other(p) => p.get(interner.get_id(key)?).cloned(),
+            Payload::Other(props) => props.get(interner, key),
+        }
+    }
+}
+
+impl Payload<CompactProps> {
+    /// The storage choice the byte account has to follow. `Other` stays
+    /// `Other` even when its keys are `id`, `amount`, and `ts`.
+    pub(crate) fn form(&self, interner: &Interner) -> PayloadForm {
+        match self {
+            Payload::Triple { id, amount, ts } => Payload::Triple {
+                id: id.clone(),
+                amount: amount.clone(),
+                ts: *ts,
+            },
+            Payload::Other(props) => Payload::Other(props.to_map(interner)),
         }
     }
 
     pub(crate) fn keys(&self, interner: &Interner) -> Vec<String> {
         match self {
-            RelPayload::Triple { .. } => vec!["amount".into(), "id".into(), "ts".into()],
-            RelPayload::Other(p) => p.keys_as_strings(interner),
+            Payload::Triple { .. } => TRIPLE_KEYS.iter().map(|k| (*k).into()).collect(),
+            Payload::Other(props) => props.keys_as_strings(interner),
+        }
+    }
+
+    /// The property key ids only, with this payload's interner reads done
+    /// here and once. See [`PayloadKeyIds`] for the callers that must build
+    /// it before taking another lock.
+    pub(crate) fn key_ids(&self, interner: &Interner) -> PayloadKeyIds<'_> {
+        match self {
+            Payload::Triple { .. } => {
+                PayloadKeyIds::Triple(TRIPLE_KEYS.map(|key| interner.get_id(key)))
+            }
+            Payload::Other(props) => PayloadKeyIds::Other(props),
         }
     }
 
@@ -550,20 +512,24 @@ impl RelPayload {
     /// string de-interning or re-hashing.
     pub(crate) fn for_each_key_value(&self, interner: &Interner, mut f: impl FnMut(u32, &Value)) {
         match self {
-            RelPayload::Triple { id, amount, ts } => {
+            Payload::Triple { id, amount, ts } => {
+                // Only the two synthesized fields materialize; `amount` is
+                // lent by reference.
+                let id_value = Value::String(id.clone());
+                let ts_value = Value::Int(*ts);
                 let pairs = [
-                    ("amount", amount.clone()),
-                    ("id", Value::String(id.clone())),
-                    ("ts", Value::Int(*ts)),
+                    (TRIPLE_KEYS[0], amount),
+                    (TRIPLE_KEYS[1], &id_value),
+                    (TRIPLE_KEYS[2], &ts_value),
                 ];
                 for (k, v) in pairs {
                     if let Some(kid) = interner.get_id(k) {
-                        f(kid, &v);
+                        f(kid, v);
                     }
                 }
             }
-            RelPayload::Other(p) => {
-                for (k, v) in p.iter() {
+            Payload::Other(props) => {
+                for (k, v) in props.iter() {
                     f(k, v);
                 }
             }
@@ -572,21 +538,12 @@ impl RelPayload {
 
     pub(crate) fn tagged_json_len(&self, interner: &Interner) -> Result<u64> {
         match self {
-            RelPayload::Triple { id, amount, ts } => json_len(&BorrowedTriple {
+            Payload::Triple { id, amount, ts } => json_len(&BorrowedTriple {
                 id,
                 amount,
                 ts: *ts,
             }),
-            RelPayload::Other(props) => props.tagged_json_len(interner),
-        }
-    }
-
-    pub(crate) fn remove(&mut self, interner: &Interner, key: &str) {
-        if matches!(self, RelPayload::Triple { .. }) {
-            self.promote(interner);
-        }
-        if let RelPayload::Other(p) = self {
-            p.remove(interner.intern(key));
+            Payload::Other(props) => props.tagged_json_len(interner),
         }
     }
 }

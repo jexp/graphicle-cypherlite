@@ -143,14 +143,16 @@ pub static BUILTIN_PROCEDURE_SIGNATURES: &[ProcSignature] = &[
     // inferred by scanning stored entities (ADR-0112's rule). Listed by
     // `SHOW PROCEDURES` exactly like its `db.schema.*` siblings.
     // LABS-389 (CIP-277 compat smoke): the call shape with an options
-    // map is accepted, not failed -- the visualization's own output is
-    // parameter-free (the stored entities are the whole truth,
-    // ADR-0112), so the map is accepted and ignored. Neo4j parity
-    // keeps the zero-arg call the documented form.
+    // map is accepted, not failed. A **null** map selects nothing at all
+    // (Neo4j yields zero rows rather than the whole stored schema); a
+    // non-null map's contents are ignored -- the visualization's own
+    // output is parameter-free (the stored entities are the whole truth,
+    // ADR-0112). A missing argument keeps the whole-schema output, and
+    // Neo4j parity keeps the zero-arg call the documented form.
     ProcSignature::read("db.schema.visualization")
         .works_on_system()
         .described("Visualizes the schema of the data based on available statistics.")
-        .args(&[ProcArgMeta::with_default("options", "Accepted for call-shape compatibility; ignored.", "MAP", "{}")])
+        .args(&[ProcArgMeta::with_default("options", "A null map selects nothing; a non-null map's contents are ignored.", "MAP", "{}")])
         .returns(&[
             ProcArgMeta::described("nodes", "One virtual node per stored label.", "LIST<NODE>"),
             ProcArgMeta::described("relationships", "One virtual relationship per distinct (startLabel, relType, endLabel) triple.", "LIST<RELATIONSHIP>"),

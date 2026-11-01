@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 use cypherlite_core::{Error, Result, Value};
 use cypherlite_error::EngineError;
+use cypherlite_model::identifier::quote_identifier_always;
 use cypherlite_parser::type_normalize::{type_expr_to_canon, CanonKind, CanonType};
 use cypherlite_parser::{Expr, FunctionCallExpr, LiteralValue, MapPair, PredefinedKind, TypeExpr};
 use serde::{Deserialize, Serialize};
@@ -271,7 +272,7 @@ impl DefaultValue {
             Self::Map(pairs) => {
                 let mut entries: Vec<String> = pairs
                     .iter()
-                    .map(|(k, v)| format!("`{}`: {}", k.replace('`', "``"), v.render()))
+                    .map(|(k, v)| format!("{}: {}", quote_identifier_always(k), v.render()))
                     .collect();
                 entries.sort();
                 format!("{{{}}}", entries.join(", "))
@@ -374,6 +375,13 @@ mod tests {
         assert_eq!(default_of("true").render(), "true");
         assert_eq!(default_of("6.66").render(), "6.66");
         assert_eq!(default_of("['a', 'b']").render(), "['a', 'b']");
+    }
+
+    #[test]
+    fn map_keys_render_through_the_shared_identifier_quoting() {
+        // The map-key render is `quote_identifier_always`'s spelling: the key is
+        // backticked and every embedded backtick doubled.
+        assert_eq!(default_of("{`we``ird`: 1}").render(), "{`we``ird`: 1}");
     }
 
     #[test]

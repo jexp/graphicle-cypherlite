@@ -4,6 +4,7 @@
 //! including the `CypherValue` enum that replaces Go's `interface{}`.
 
 pub mod canonical_key;
+pub mod identifier;
 pub mod schema;
 pub mod serde_value;
 pub mod value;

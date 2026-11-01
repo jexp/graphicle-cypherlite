@@ -165,6 +165,7 @@ fn unsupported_snapshot_without_wal_never_creates_wal_dir() {
         native_root: Some(root.clone()),
         wal_native: Some(wal.clone()),
         codec: SnapshotCodecKind::Json,
+        codec_config: None,
     };
     let err = open_store(&target).err().expect("gated open must fail");
     assert!(matches!(err, Error::Storage(_)), "{err}");

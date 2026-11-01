@@ -5,36 +5,33 @@
 //! the [`string`] submodule (ADR-0175).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use cypherlite_core::{Error, Result, Value};
 
 use crate::eval::numeric::float_to_i64;
 use crate::overlay::ExecGraph;
 
-use super::super::temporal::temporal_full_seconds;
-use super::coerce_scalar_to_string;
 use string::{float_from_string, integer_from_string, IntegerString};
 
 mod string;
 
-pub(super) fn bi_tostring(_graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> Result<Value> {
-    to_string_value(vals.first())
-}
-
-pub(super) fn bi_tostring_full(
+pub(super) fn bi_tostring(
     _graph: &ExecGraph<'_>,
     _n: &str,
     vals: Vec<Value>,
+    cypher_version: Option<u32>,
 ) -> Result<Value> {
-    to_string_full(vals.first())
+    to_string_value(vals.first(), cypher_version)
 }
 
 pub(super) fn bi_tostringornull(
     _graph: &ExecGraph<'_>,
     _n: &str,
     vals: Vec<Value>,
+    cypher_version: Option<u32>,
 ) -> Result<Value> {
-    Ok(to_string_value(vals.first()).unwrap_or(Value::Null))
+    Ok(to_string_value(vals.first(), cypher_version).unwrap_or(Value::Null))
 }
 pub(super) fn bi_toint(_graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> Result<Value> {
     to_integer_value(vals.first())
@@ -198,53 +195,67 @@ fn list_tostring_accepted(xs: &[Value]) -> bool {
     xs.iter().any(|v| type_class(v) != first)
 }
 
-/// Shared body of `toString()`/`toStringOrNull()`: convert an optional value
-/// to its string form. Null and absent input yield `Value::Null`; only a
-/// non-convertible *type* (a homogeneous list) errors, which the `OrNull`
-/// variant maps to null.
-fn to_string_value(v: Option<&Value>) -> Result<Value> {
+/// Shared body of `toString()`/`toStringOrNull()`: convert an optional
+/// value to its string form. Null and absent input yield `Value::Null`;
+/// only a non-convertible *type* errors, which the `OrNull` variant maps to
+/// null. `cypher_version` selects the dialect: CIP-271 (containers render
+/// in display form) is Cypher-25-only, while an explicit `CYPHER 5`
+/// preamble keeps the pre-CIP-271 contract (CIP-150) in which every
+/// container is non-stringifiable.
+fn to_string_value(v: Option<&Value>, cypher_version: Option<u32>) -> Result<Value> {
+    let Some(v) = v else {
+        return Ok(Value::Null);
+    };
+    // The one type error this function raises: `toString()` reports it,
+    // `toStringOrNull()` maps it to null.
+    let type_error = || Error::ty("InvalidArgumentValue: toString()");
+    let cypher5 = cypher_version == Some(5);
+    // The routing match is exhaustive over `Value`: a new variant fails
+    // compilation here instead of being deferred to a renderer's `Option`.
     match v {
-        Some(Value::Null) | None => Ok(Value::Null),
-        Some(v) => match v {
-            // CIP-271: toString() renders maps, heterogeneous lists,
-            // and graph values in display form. A homogeneous list
-            // (every non-null element of one type class, numbers one
-            // class) is still a type error — that emulates Neo4j's
-            // static LIST<ANY>-only acceptance dynamically (verified
-            // 2026.09.0: [1,'a'] ok; [1,2] / ['a','b'] / [1,2.0] /
-            // [[1]] reject; any list containing null ok).
-            // The result is the `to_display_string()` form except for
-            // two cases: the homogeneous-list type error, and a Vector,
-            // which renders in its literal form. `to_string_full`
-            // overrides the temporal rendering on top of this body. A
-            // STRING is returned as the same shared payload rather than a
-            // copy.
-            Value::List(xs) if list_tostring_accepted(xs) => {
-                Ok(Value::String(v.to_display_string().into()))
-            }
-            // A byte array is a homogeneous LIST<INTEGER> (ADR-0327).
-            Value::List(_) | Value::Bytes(_) => Err(Error::ty("InvalidArgumentValue: toString()")),
-            // Maps and graph values render in display form (CIP-271).
-            Value::Map(_) | Value::Node(_) | Value::Relationship(_) | Value::Path(_) => {
-                Ok(Value::String(v.to_display_string().into()))
-            }
-            // Every scalar, STRING included, goes through the coercion
-            // helper shared with CIP-261; anything it declines (a Vector)
-            // falls back to its literal form.
-            _ => Ok(Value::String(
-                coerce_scalar_to_string(v).unwrap_or_else(|| v.to_cypher_literal().into()),
-            )),
-        },
-    }
-}
-
-/// `toString()` with full temporal rendering: a temporal renders with
-/// full-precision seconds; every other value goes through
-/// [`to_string_value`] unchanged.
-fn to_string_full(v: Option<&Value>) -> Result<Value> {
-    match v {
-        Some(Value::Temporal(t)) => Ok(Value::String(temporal_full_seconds(t).into())),
-        _ => to_string_value(v),
+        Value::Null => Ok(Value::Null),
+        // A byte array is a homogeneous LIST<INTEGER> (ADR-0327) and is
+        // rejected in every dialect.
+        Value::Bytes(_) => Err(type_error()),
+        // The CYPHER-5 dialect rejects every container and graph value —
+        // one guard arm, so the dialect rule has one spelling.
+        Value::List(_)
+        | Value::Map(_)
+        | Value::Node(_)
+        | Value::Relationship(_)
+        | Value::Path(_)
+            if cypher5 =>
+        {
+            Err(type_error())
+        }
+        // CIP-271: a list is accepted when it is empty, contains a null
+        // (ANY), or holds elements of more than one type class — numbers
+        // counting as a single class (verified 2026.09.0: [1,'a'] ok;
+        // [1,2] / ['a','b'] / [1,2.0] / [[1]] reject; any list containing
+        // null ok).
+        Value::List(xs) if list_tostring_accepted(xs) => {
+            Ok(Value::String(v.to_display_string().into()))
+        }
+        Value::List(_) => Err(type_error()),
+        // Maps and graph values render in display form (CIP-271) — a
+        // temporal nested in either renders at full precision (ADR-0448),
+        // the same policy as the top-level scalar below.
+        Value::Map(_) | Value::Node(_) | Value::Relationship(_) | Value::Path(_) => {
+            Ok(Value::String(v.to_display_string().into()))
+        }
+        // A Vector renders in its literal form — the one scalar outside
+        // the shared renderer's acceptance set. Every dialect renders it.
+        Value::Vector { .. } => Ok(Value::String(v.to_cypher_literal().into())),
+        // A STRING passes through as the same shared payload (no copy).
+        Value::String(s) => Ok(Value::String(Arc::clone(s))),
+        // Every other scalar renders through the one display policy
+        // (temporals at full precision, ADR-0448).
+        Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Temporal(_)
+        | Value::Point(_)
+        | Value::Uuid(_) => Ok(Value::String(super::render_accepted_scalar(v))),
     }
 }
 

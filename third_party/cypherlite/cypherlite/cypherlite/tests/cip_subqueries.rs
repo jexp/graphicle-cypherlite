@@ -366,3 +366,130 @@ fn count_subquery_in_a_sink_projected_where_runs() {
         .unwrap();
     assert_eq!(result.rows.len(), 4);
 }
+
+/// An expression subquery imports the enclosing scope implicitly, and an
+/// imported name stays a grouping key of the body's aggregating `WITH`:
+/// `WITH COUNT(*) AS agg` over an emptied input therefore yields no row,
+/// not the identity row, so the `RETURN agg + g` result is empty
+/// (`Collect/Count/ExistsExpression` "Should not use outer scope variables
+/// as grouping variables in aggregations dependency").
+#[test]
+fn expression_subquery_import_is_a_grouping_key_of_an_aggregating_with() {
+    let mut connection = connection();
+    let result = connection
+        .query(
+            "WITH 1 AS g, 2 AS h \
+             RETURN COLLECT { \
+                 UNWIND [1,2,3] AS x \
+                 WITH * WHERE x < 0 \
+                 WITH COUNT(*) AS agg \
+                 RETURN agg + g \
+             } AS x",
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::List(Vec::new().into())]]);
+
+    let result = connection
+        .query(
+            "WITH 1 AS g, 2 AS h \
+             RETURN COUNT { \
+                 UNWIND [1,2,3] AS x \
+                 WITH * WHERE x < 0 \
+                 WITH COUNT(*) AS agg \
+                 RETURN agg + g \
+             } AS x",
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
+
+    let result = connection
+        .query(
+            "WITH 1 AS g, 2 AS h \
+             RETURN EXISTS { \
+                 UNWIND [1,2,3] AS x \
+                 WITH * WHERE x < 0 \
+                 WITH COUNT(*) AS agg \
+                 RETURN agg + g \
+             } AS x",
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Bool(false)]]);
+}
+
+/// A `CALL` subquery's explicit import is a live scope, not a `WITH` item:
+/// the same emptied-input aggregation keeps its identity row, so `x + c`
+/// answers `x` (`SubqueryAcceptance` "Non-grouping aggregation with empty
+/// driving table should output a single row").
+#[test]
+fn call_subquery_import_keeps_the_non_grouping_identity_row() {
+    let mut connection = connection();
+    let result = connection
+        .query(
+            "UNWIND [0, 1, 2] AS x \
+             CALL(x) { \
+                 UNWIND range(1, 3) AS i \
+                 WITH i WHERE i < 0 \
+                 WITH count(*) AS c \
+                 RETURN x + c AS result \
+             } \
+             RETURN x, result",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int(0), Value::Int(0)],
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+        ]
+    );
+}
+
+/// Rule 10's promotion policy, pinned (LABS-518): a name bundled into a
+/// larger WITH item list alongside a `*` is NOT promoted to star-visible,
+/// so a correlated `CALL (x) { WITH x, * RETURN * }` finds no star-visible
+/// variable and fails `NoVariablesInScope`. (Pre-change, the promotion
+/// made the body re-export `x`, which Rule 9 then rejected as an
+/// outer-scope collision — both reject the shape, this pins which error
+/// owns it now.)
+#[test]
+fn rule10_star_bundling_disqualifies_promotion() {
+    let mut connection = connection();
+    let err = connection
+        .query("WITH 1 AS x CALL (x) { WITH x, * RETURN * } RETURN x")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("RETURN * is not allowed when there are no variables in scope"),
+        "{err}"
+    );
+}
+
+/// A conditional NEXT stage's branch bodies see the prior stage's exports
+/// (CIP-213 carry), pinned (LABS-518): the predicates were always checked
+/// against `imported ∪ carry`, and the bodies now get the same visibility.
+#[test]
+fn conditional_next_stage_bodies_see_prior_stage_exports() {
+    let mut connection = connection();
+    let result = connection
+        .query(
+            "CALL () { \
+                 RETURN 1 AS a \
+                 NEXT WHEN a > 0 THEN RETURN a + 1 AS b ELSE RETURN 0 AS b \
+             } \
+             RETURN b",
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int(2)]]);
+
+    let result = connection
+        .query(
+            "CALL () { \
+                 RETURN 1 AS a \
+                 NEXT WHEN a > 5 THEN RETURN a + 1 AS b ELSE RETURN 0 AS b \
+             } \
+             RETURN b",
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
+}

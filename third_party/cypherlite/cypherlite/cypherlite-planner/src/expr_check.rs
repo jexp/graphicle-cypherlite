@@ -13,9 +13,10 @@ use cypherlite_ir::{BinaryOp, Clause, Expr, MapProjectionItem, UnaryOp};
 
 use crate::binding::{Binding, Env};
 use crate::names::query_output_names_with_seed;
+use crate::names::query_with_persistent_imports;
 use crate::pattern::{check_path_exprs, check_pattern_pred_vars};
 use crate::use_target::graph_call_text;
-use crate::validate::{clause_is_write, query_with_persistent_imports, validate_part_with_env};
+use crate::validate::{clause_is_write, validate_part_with_env};
 
 pub(crate) fn check_expr(
     env: &Env,
@@ -229,7 +230,7 @@ fn expr_contains_rand(expr: &Expr) -> bool {
 
 /// The known-function check the binder applies to lowered IR. Delegates to
 /// the single registry owned by `cypherlite-front` (`KNOWN_FUNCTIONS` plus
-/// the unadvertised lowered-internal names such as `tostring_full`), so a
+/// the unadvertised lowered-internal names such as `string.interp`), so a
 /// function advertised by `SHOW FUNCTIONS` can no longer be rejected here
 /// (and vice versa).
 fn is_known_function(name: &str) -> bool {

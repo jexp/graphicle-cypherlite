@@ -69,6 +69,21 @@ impl Srid {
         matches!(self, Srid::Wgs84_3D | Srid::Cartesian3D)
     }
 
+    /// The four CRS names Neo4j's `point()` accepts, case-insensitively:
+    /// `crs` is the name spelling of the same four-code domain.
+    fn from_name(name: &str) -> Result<Srid> {
+        match name.to_ascii_lowercase().as_str() {
+            "wgs-84" => Ok(Srid::Wgs84_2D),
+            "wgs-84-3d" => Ok(Srid::Wgs84_3D),
+            "cartesian" => Ok(Srid::Cartesian2D),
+            "cartesian-3d" => Ok(Srid::Cartesian3D),
+            _ => Err(Error::ty(format!(
+                "InvalidArgumentValue: point() unknown crs '{name}': expected one of \
+                 'wgs-84', 'wgs-84-3d', 'cartesian', 'cartesian-3d'"
+            ))),
+        }
+    }
+
     /// The srid Neo4j picks when the map has no `srid` key.
     fn default(family: Family, has_z: bool) -> Srid {
         match (family, has_z) {
@@ -92,7 +107,8 @@ impl Srid {
 
 /// Neo4j-verified construction rules: cartesian iff both `x` and `y` are
 /// present, else geographic iff both `latitude` and `longitude` are present,
-/// else an error. Extra properties are ignored.
+/// else an error. `crs` names the CRS (the name spelling of `srid`); other
+/// extra properties are ignored.
 fn point_from_map(map: &BTreeMap<String, Value>) -> Result<Value> {
     let family = if map.contains_key("x") && map.contains_key("y") {
         Family::Cartesian
@@ -136,32 +152,57 @@ fn point_from_map(map: &BTreeMap<String, Value>) -> Result<Value> {
     }))
 }
 
-/// Resolve the map's `srid` key: absent picks the family/dimension default;
-/// a present value must be an integer from the four-code domain, matching
-/// the coordinate dimension (3D srid iff `z` is present), and geographic
-/// coordinates reject cartesian srids.
+/// Resolve the map's CRS specification: `srid` is the code spelling and
+/// `crs` the name spelling of the same four-code domain; both may be
+/// present when they agree. Absent picks the family/dimension default; a
+/// present value must match the coordinate dimension (3D srid iff `z` is
+/// present), and geographic coordinates reject cartesian srids.
 fn resolve_srid(map: &BTreeMap<String, Value>, family: Family, z: Option<f64>) -> Result<Srid> {
-    match map.get("srid") {
-        None => Ok(Srid::default(family, z.is_some())),
-        Some(Value::Int(i)) => {
-            let srid = Srid::from_i64(*i)?;
-            if srid.is_3d() != z.is_some() {
-                return Err(Error::ty(format!(
-                    "InvalidArgumentValue: point() srid {} does not match the coordinate dimension",
-                    srid.code()
-                )));
-            }
-            if family == Family::Geographic && srid.family() == Family::Cartesian {
-                return Err(Error::ty(
-                    "InvalidArgumentValue: point() geographic coordinates require srid 4326 or 4979",
-                ));
-            }
-            Ok(srid)
+    let crs_name = match map.get("crs") {
+        None => None,
+        Some(Value::String(name)) => Some(&**name),
+        Some(_) => {
+            return Err(Error::invalid_argument_type(
+                "point() 'crs' must be a string",
+            ))
         }
-        Some(_) => Err(Error::invalid_argument_type(
-            "point() 'srid' must be an integer",
-        )),
+    };
+    let named = crs_name.map(Srid::from_name).transpose()?;
+    let srid = match (map.get("srid"), named) {
+        (None, None) => return Ok(Srid::default(family, z.is_some())),
+        (None, Some(srid)) => srid,
+        (Some(Value::Int(i)), named) => {
+            let srid = Srid::from_i64(*i)?;
+            if let Some(named) = named {
+                if named != srid {
+                    // A named SRID can only come from a `crs` string.
+                    let name = crs_name.expect("`named` is Some only for a `crs` string");
+                    return Err(Error::ty(format!(
+                        "InvalidArgumentValue: point() crs '{name}' conflicts with srid {}",
+                        srid.code()
+                    )));
+                }
+            }
+            srid
+        }
+        (Some(_), _) => {
+            return Err(Error::invalid_argument_type(
+                "point() 'srid' must be an integer",
+            ))
+        }
+    };
+    if srid.is_3d() != z.is_some() {
+        return Err(Error::ty(format!(
+            "InvalidArgumentValue: point() srid {} does not match the coordinate dimension",
+            srid.code()
+        )));
     }
+    if family == Family::Geographic && srid.family() == Family::Cartesian {
+        return Err(Error::ty(
+            "InvalidArgumentValue: point() geographic coordinates require srid 4326 or 4979",
+        ));
+    }
+    Ok(srid)
 }
 
 /// A coordinate key that may be absent; present values must be finite
@@ -583,6 +624,94 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(srid, 4326);
+    }
+
+    /// A `crs` string is the name spelling of an `srid`: it selects the
+    /// same four-code domain, case-insensitively, while the coordinate keys
+    /// keep deciding the family (`{x, y, crs: 'WGS-84'}` is the harness's
+    /// 4326 row in `Spatial` `[1]`).
+    #[test]
+    fn crs_names_resolve_to_their_srids() {
+        let (srid, x, y, z) = srid_xyz(
+            &point(&[
+                ("x", Value::Float(2.3)),
+                ("y", Value::Float(4.5)),
+                ("crs", Value::String("WGS-84".into())),
+            ])
+            .unwrap(),
+        );
+        assert_eq!((srid, x, y, z), (4326, 2.3, 4.5, None));
+        // Lowercase spelling (the harness's `TernaryComparison` shape).
+        let (srid, ..) = srid_xyz(
+            &point(&[
+                ("x", Value::Int(1)),
+                ("y", Value::Int(2)),
+                ("crs", Value::String("wgs-84".into())),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(srid, 4326);
+        // Cartesian names keep the default cartesian srid.
+        let (srid, ..) = srid_xyz(
+            &point(&[
+                ("x", Value::Float(2.3)),
+                ("y", Value::Float(4.5)),
+                ("crs", Value::String("cartesian".into())),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(srid, 7203);
+        // 3D names carry the 3D srids and are dimension-checked.
+        let (srid, .., z) = srid_xyz(
+            &point(&[
+                ("x", Value::Int(1)),
+                ("y", Value::Int(2)),
+                ("z", Value::Int(3)),
+                ("crs", Value::String("WGS-84-3D".into())),
+            ])
+            .unwrap(),
+        );
+        assert_eq!((srid, z), (4979, Some(3.0)));
+        assert!(point(&[
+            ("x", Value::Int(1)),
+            ("y", Value::Int(2)),
+            ("crs", Value::String("WGS-84-3D".into())),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn crs_must_be_a_known_string_and_agree_with_srid() {
+        for bad in [Value::Int(4326), Value::Float(4326.0)] {
+            assert!(point(&[("x", Value::Int(1)), ("y", Value::Int(2)), ("crs", bad),]).is_err());
+        }
+        let err = point(&[
+            ("x", Value::Int(1)),
+            ("y", Value::Int(2)),
+            ("crs", Value::String("geo".into())),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown crs"), "unexpected error: {err}");
+        // Both spellings may be present when they name the same srid.
+        let (srid, ..) = srid_xyz(
+            &point(&[
+                ("x", Value::Int(1)),
+                ("y", Value::Int(2)),
+                ("crs", Value::String("cartesian".into())),
+                ("srid", Value::Int(7203)),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(srid, 7203);
+        // A conflicting pair is an error.
+        assert!(point(&[
+            ("x", Value::Int(1)),
+            ("y", Value::Int(2)),
+            ("crs", Value::String("cartesian".into())),
+            ("srid", Value::Int(4326)),
+        ])
+        .is_err());
     }
 
     #[test]

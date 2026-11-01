@@ -1,3 +1,11 @@
+//! Index/residual equivalence, all domains: an answer served from a
+//! property index must agree with the answer the same predicate gives on
+//! the unindexed residual — for every value domain, not just numerics.
+//! The sections below pin one domain each; a new domain's index/residual
+//! divergence pin belongs here rather than in a domain-specific file.
+//!
+//! ## Int/Float numerics (first section)
+//!
 //! Property-index keys share the normalized numeric equivalence of
 //! `GroupKey` (memdb-merge node 37): a stored `Int(1)` and a stored
 //! `Float(1.0)` occupy one index bucket, so an equality seek for `1.0`
@@ -11,6 +19,15 @@
 //! `WHERE` residual, a pattern post-filter, `IN`, MERGE, DISTINCT, and an
 //! index seek can never disagree — not even past `2^53`, where the old
 //! `(i as f64) == f` cast rounded away low bits.
+//!
+//! ## Temporal (zoned `Time`)
+//!
+//! A range seek's key order is coarser than `Temporal::compare` for zoned
+//! `Time` (the key carries the instant, the predicate breaks ties on the
+//! offset, ADR-0446), so a strict boundary seek must still scan its
+//! key-tie group; `strict_temporal_range_seek_matches_the_residual` pins
+//! that agreement. F-3-5 proposed moving this pin to a temporal-specific
+//! file; the all-domain charter here subsumes that finding, so it stays.
 
 mod common;
 
@@ -259,4 +276,37 @@ fn vector_equality_and_distinct_share_the_elementwise_exact_rule() {
         )
         .unwrap();
     assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+}
+
+/// The temporal half of the same rule: a range seek's key order is coarser
+/// than `Temporal::compare` for zoned `Time` (the key carries the instant,
+/// the predicate breaks ties on the offset, ADR-0446), so a strict `>` seek
+/// must still scan the key-tie group. `12:00+01:00` and `11:00Z` are the
+/// same instant but compare as greater and equal respectively, so the
+/// indexed answer must match the residual one exactly.
+#[test]
+fn strict_temporal_range_seek_matches_the_residual() {
+    // One setup, one query, one expectation: the indexed seek and the
+    // unindexed residual must agree.
+    for with_index in [true, false] {
+        let mut c = connection();
+        if with_index {
+            setup_with_index(&mut c);
+        }
+        c.query("CREATE (n:N {x: time('12:00+01:00')})").unwrap();
+        c.query("CREATE (n:N {x: time('11:00Z')})").unwrap();
+        let rows = c
+            .query("MATCH (n:N) WHERE n.x > time('11:00Z') RETURN n.x AS x")
+            .unwrap()
+            .rows;
+        // One row, and it is the tie-broken greater time (12:00+01:00), not
+        // the equal-instant 11:00Z the old exclusive boundary would have
+        // kept alone.
+        assert_eq!(rows.len(), 1, "with_index={with_index}");
+        assert!(
+            rows[0][0].to_cypher_literal().contains("12:00"),
+            "with_index={with_index}: got {}",
+            rows[0][0].to_cypher_literal()
+        );
+    }
 }

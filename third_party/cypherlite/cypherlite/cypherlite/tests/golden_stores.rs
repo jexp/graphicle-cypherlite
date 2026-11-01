@@ -22,6 +22,7 @@ use cypherlite::{Connection, Database, OpenOptions, Value};
 use cypherlite_storage::{
     is_bundle_path, read_to_vec, SnapshotCodecKind, Vfs, LOCK_MARKER, MAGIC, ROOT_ROLE, WAL_ROLE,
 };
+use cypherlite_test_support::vfs_walk::walk_vfs;
 
 use common::store_vfs;
 
@@ -253,42 +254,43 @@ fn run_golden(store: &GoldenStore) {
     let vfs = store_vfs(&working);
     let manifest = read_to_vec(&*vfs, "manifest.json").unwrap();
     let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    // LABS-132: no ontology anywhere in a re-checkpointed v0.8.0 store —
+    // no `ontology_path` in the manifest, whichever codec wrote it (and,
+    // for the JSON codec, no `ontology` field in graph.json below).
+    assert!(
+        manifest.get("ontology_path").is_none(),
+        "v0.8.0 manifest carries no ontology_path: {manifest}"
+    );
     // ADR-0116 §8: the checkpoint image no longer carries the fixture's
     // `analytics`/`staging` theater rows -- only the fixed namespaces.
     let theater = match store.codec {
         SnapshotCodecKind::Parquet => {
             assert_eq!(manifest["format_version"], 3);
-            // LABS-132: no ontology anywhere in a re-checkpointed v0.8.0
-            // store — no `ontology_path` in the manifest.
-            assert!(
-                manifest.get("ontology_path").is_none(),
-                "v0.8.0 manifest carries no ontology_path: {manifest}"
-            );
             manifest["theater"].clone()
         }
         SnapshotCodecKind::Json => {
             let graph = read_to_vec(&*vfs, "graph.json").unwrap();
             let graph: serde_json::Value = serde_json::from_slice(&graph).unwrap();
             assert_eq!(graph["value_encoding"], 2);
-            // LABS-132: no ontology anywhere — no `ontology_path` in the
-            // manifest, no `ontology` field in graph.json.
-            assert!(
-                manifest.get("ontology_path").is_none(),
-                "v0.8.0 manifest carries no ontology_path: {manifest}"
-            );
             assert!(
                 graph.get("ontology").is_none(),
                 "v0.8.0 graph.json carries no ontology field: {graph}"
             );
             graph["theater"].clone()
         }
+        // A v0.8.0 golden fixture cannot exist for a codec that postdates
+        // it: the markdown codec (ADR-0406) is new, so the versioned store
+        // fixtures only ever enumerate Parquet and JSON.
+        SnapshotCodecKind::Markdown => unreachable!(
+            "no versioned markdown golden store can exist; fixtures are Parquet/JSON only"
+        ),
     };
     // And no `ontology/` document objects in the store (the prefix family
-    // exists only when a v4 manifest published one, ADR-0120 §5).
+    // exists only when a v4 manifest published one, ADR-0120 §5). The
+    // absent case is spelled explicitly, so a listing failure fails the
+    // assert instead of folding into the absent verdict.
     assert!(
-        vfs.list_dir("ontology")
-            .map(|n| n.is_empty())
-            .unwrap_or(true),
+        !vfs.exists("ontology").unwrap() || vfs.list_dir("ontology").unwrap().is_empty(),
         "{} holds ontology/ objects",
         store.subpath
     );
@@ -532,13 +534,17 @@ fn collect_tmp_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `(virtual path, bytes)` of every entry in a working copy, read through
 /// the store's VFS so Native directories and `.cl` bundles enumerate the
-/// same way. The database must be closed (a bundle VFS locks the host
-/// file).
+/// same way (the shared test-support walk). The database must be closed
+/// (a bundle VFS locks the host file).
 fn store_file_bytes(working: &Path) -> BTreeMap<String, Vec<u8>> {
     let vfs = store_vfs(working);
-    let mut files = BTreeMap::new();
-    collect_file_bytes(&*vfs, "", &mut files);
-    files
+    walk_vfs(&*vfs, "")
+        .into_iter()
+        .map(|path| {
+            let bytes = read_to_vec(&*vfs, &path).unwrap();
+            (path, bytes)
+        })
+        .collect()
 }
 
 /// LABS-132: re-checkpointing a v0.8.0 store is byte-stable. Reopen,
@@ -580,21 +586,6 @@ fn assert_recheckpoint_byte_stable(working: &Path, store: &GoldenStore) {
                 "re-checkpointing {} changed {name}",
                 store.subpath
             );
-        }
-    }
-}
-
-fn collect_file_bytes(vfs: &dyn Vfs, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
-    for name in vfs.list_dir(prefix).unwrap() {
-        let path = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        if vfs.metadata(&path).unwrap().is_dir {
-            collect_file_bytes(vfs, &path, out);
-        } else {
-            out.insert(path.clone(), read_to_vec(vfs, &path).unwrap());
         }
     }
 }

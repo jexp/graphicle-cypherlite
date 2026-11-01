@@ -3,8 +3,9 @@
 //! falls back to. Relationship expansion lives in `expand`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
-use cypherlite_core::{NodeId, RelId, Result, Value};
+use cypherlite_core::{Node, NodeId, RelId, Result, Value};
 use cypherlite_ir::{BinaryOp, Expr, NodePattern, RelPattern};
 
 use crate::eval::{eval, expr_vars, label_expr_matches, Row};
@@ -373,6 +374,23 @@ pub(crate) fn node_ok(
     params: &BTreeMap<String, Value>,
     cypher_version: Option<u32>,
 ) -> Result<bool> {
+    // Cypher keeps a deleted-but-bound entity addressable for the rest of
+    // the query: when the row already binds this candidate's variable to
+    // the node a DELETE removed, the checks below read that binding's
+    // tombstone (`refresh_rows` writes it: the same id, no labels, no
+    // properties) instead of the store, which no longer has the node. So
+    // `MATCH (u) DELETE u WITH u MATCH (u)` still matches, while a labelled
+    // re-match fails like it does against the tombstone's empty label set.
+    // Nothing else may see a deleted node — a pattern over an unbound
+    // variable still matches nothing.
+    let snapshot: Option<Arc<Node>> =
+        np.variable
+            .as_ref()
+            .and_then(|v| row.get(v))
+            .and_then(|value| match value {
+                Value::Node(n) if n.id == id && graph.is_deleted_node(id) => Some(Arc::clone(n)),
+                _ => None,
+            });
     // One visibility read per path, and label checks without
     // materializing the label list (LABS-347, stellar F-1-17/F-1-36).
     match &np.label_expr {
@@ -386,13 +404,19 @@ pub(crate) fn node_ok(
         // builds `And([])`), so the guard needs no labels cross-check —
         // the same single criterion `label_index_seekable` uses.
         Some(expr) if expr.is_static_conjunction() => {
-            // `node_has_label` answers `None` for an invisible node —
-            // which fails the check exactly like an absent label.
-            if !np
-                .labels
-                .iter()
-                .all(|l| matches!(graph.node_has_label(id, l), Some(true)))
-            {
+            let labels_ok = match &snapshot {
+                Some(node) => np
+                    .labels
+                    .iter()
+                    .all(|want| node.labels.iter().any(|have| have == want)),
+                // `node_has_label` answers `None` for an invisible node —
+                // which fails the check exactly like an absent label.
+                None => np
+                    .labels
+                    .iter()
+                    .all(|l| matches!(graph.node_has_label(id, l), Some(true))),
+            };
+            if !labels_ok {
                 return Ok(false);
             }
         }
@@ -400,8 +424,12 @@ pub(crate) fn node_ok(
         // strings; `node_labels` returning None is this path's
         // visibility read (invisible nodes have no labels).
         Some(expr) => {
-            let Some(labels) = graph.node_labels(id) else {
-                return Ok(false);
+            let labels = match &snapshot {
+                Some(node) => (*node.labels).clone(),
+                None => match graph.node_labels(id) {
+                    Some(labels) => labels,
+                    None => return Ok(false),
+                },
             };
             if !label_expr_matches(graph, row, params, expr, &labels, false, cypher_version)? {
                 return Ok(false);
@@ -409,7 +437,7 @@ pub(crate) fn node_ok(
         }
         // No label expression at all: bare visibility.
         None => {
-            if !graph.node_exists(id) {
+            if snapshot.is_none() && !graph.node_exists(id) {
                 return Ok(false);
             }
         }
@@ -421,7 +449,11 @@ pub(crate) fn node_ok(
             // lookup per (candidate, key) — the same count any wrapper
             // of it pays — and the scratch (uncommitted) map it reads is
             // string-keyed by construction.
-            match graph.node_prop(id, &k) {
+            let have = match &snapshot {
+                Some(node) => node.properties.get(&k).cloned(),
+                None => graph.node_prop(id, &k),
+            };
+            match have {
                 Some(have) if have.eq_non_null(&v) => {}
                 _ => return Ok(false),
             }

@@ -7,12 +7,16 @@
 
 #[cfg(feature = "bolt")]
 pub mod bolt;
+#[cfg(feature = "envelope")]
+pub mod envelope;
 pub mod git;
 #[cfg(any(feature = "wire", feature = "loopback"))]
 pub mod loopback;
 #[cfg(feature = "nested_eval")]
 pub mod nested_eval;
 pub mod sampling;
+#[cfg(feature = "vfs_walk")]
+pub mod vfs_walk;
 
 /// The stack size of the big-stack test worker: 64 MiB, mirroring the
 /// per-query worker stack the engine provisions (ADR-0259). The ADR-0257

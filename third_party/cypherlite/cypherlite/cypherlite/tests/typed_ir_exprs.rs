@@ -133,4 +133,18 @@ fn map_projection_is_typed_and_checks_its_variables() {
         err.contains("UndefinedVariable: `nosuchvar`"),
         "map projection variable: {err}"
     );
+
+    // A projection over a null entity is null — not a map of the literal
+    // entries — so `collect` over an `OPTIONAL MATCH` miss collects nothing.
+    let result = connection
+        .query(
+            "OPTIONAL MATCH (n:Missing)-->(m) \
+             RETURN n { .*, meta: {prop: 42} } AS projected, \
+                    collect(n { .*, m, meta: {prop: 42} }) AS collected",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Null, Value::List(Vec::new().into())]]
+    );
 }

@@ -99,9 +99,61 @@ pub(crate) fn is_property_value(value: &Value) -> bool {
                 | Value::String(_)
                 | Value::Temporal(_)
                 | Value::Point(_)
+                // CIP-246: a UUID is a storable property type, so it is a
+                // property value -- alone and as a list element.
+                | Value::Uuid(_)
         )
     }
     scalar(value)
         || matches!(value, Value::Vector { .. })
         || matches!(value, Value::List(xs) if xs.iter().all(scalar))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: u128 = 0xf066_ecfc_5151_4121_8a36_b35e_00d7_2918;
+
+    // CIP-246: a UUID is a storable property type, so `IS :: ANY PROPERTY
+    // VALUE` holds for it alone and as a list element, and the plain type
+    // arms keep their answers.
+    #[test]
+    fn uuid_is_a_property_value() {
+        let u = Value::Uuid(UUID);
+        let list = Value::List(vec![u.clone()].into());
+        let any_property_value = TypeExpr::PropertyValue { not_null: true };
+        assert!(value_matches_type(&u, &any_property_value));
+        assert!(value_matches_type(&list, &any_property_value));
+        assert!(value_matches_type(
+            &Value::Null,
+            &TypeExpr::PropertyValue { not_null: false }
+        ));
+        assert!(!value_matches_type(&Value::Null, &any_property_value));
+        // A UUID is still not a STRING / INTEGER, and a nested list is still
+        // not a property value.
+        assert!(!value_matches_type(
+            &u,
+            &TypeExpr::Predefined {
+                kind: PredefinedType::String,
+                not_null: false,
+            }
+        ));
+        assert!(!value_matches_type(
+            &Value::List(vec![list].into()),
+            &any_property_value
+        ));
+    }
+
+    // ADR-0327: a byte array is a sequence value, not a property value --
+    // the UUID addition must not widen the set that far.
+    #[test]
+    fn bytes_stay_out_of_the_property_value_set() {
+        let bytes = Value::Bytes(vec![1u8, 2].into());
+        assert!(!is_property_value(&bytes));
+        assert!(!value_matches_type(
+            &bytes,
+            &TypeExpr::PropertyValue { not_null: true }
+        ));
+    }
 }

@@ -23,6 +23,8 @@ pub use native_ownership::{take_writer_lease, WriterLease};
 #[doc(hidden)]
 pub use native_ownership::{LOCK_MARKER, ROOT_ROLE, WAL_ROLE, WRITER_LEASE};
 
+pub use codec::markdown::recorded_body_properties;
+pub use codec::markdown::MarkdownBodyProperties;
 pub use codec::SnapshotCodecKind;
 pub use cypherlite_core::{cypher_to_value, value_to_cypher};
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,7 +42,8 @@ pub use open::{open_store_readonly_with_ontology, open_store_with_ontology};
 pub use snapshot::native::{window_width, DEFAULT_SHARD_TARGET_BYTES};
 pub use snapshot::ShardPart;
 pub use vfs::{
-    atomic_write, is_bundle_path, read_to_vec, MemoryVfs, Vfs, VfsFile, VfsMeta, VfsOpen,
+    atomic_write, is_bundle_path, read_to_vec, MemoryVfs, Vfs, VfsEntryKind, VfsFile, VfsMeta,
+    VfsOpen,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use vfs::{BundleVfs, NativeVfs};
@@ -50,66 +53,90 @@ pub use wal::{
     commit_payload_reservation_bytes, AppendCommitStats, Wal, WalCatchUp, WalPreflight, WalRecord,
 };
 
-// Reset inspects the caller's final named component before canonicalization;
-// ordinary open is still allowed to resolve supported aliases.
-#[cfg(not(target_arch = "wasm32"))]
-fn reset_request_path(path: &Path) -> PathBuf {
-    path.components().collect()
+/// Codec-specific open-time configuration, one generic slot on
+/// [`StoreTarget`] (ADR-0460): resolved alongside the codec at open and
+/// spent by that codec's load and checkpoint only — `None`, the
+/// default, is the recorded/sidecar state every codec falls back to.
+/// One variant per codec that grows open-time knobs; the next codec
+/// extends this enum, never the target's field list.
+#[derive(Clone, Debug)]
+pub enum CodecOpenConfig {
+    /// The markdown vault's explicit body-property configuration
+    /// (ADR-0460); the sidecar manifest's recorded one governs when
+    /// absent.
+    MarkdownBodies(codec::markdown::MarkdownBodyProperties),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn reject_reset_alias(path: &Path) -> Result<()> {
-    let path = reset_request_path(path);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if !vfs::native::plain_entry(&meta) => Err(Error::storage(format!(
-            "reset refuses database URI alias {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+/// The set-but-ignored error for a codec-specific configuration on a
+/// store that does not open as its codec — the one spelling every
+/// refusal site in this crate raises, keyed on the configuration's own
+/// identity ([`CodecOpenConfig::describe`]). The `named` evidence names
+/// a codec when a refusal site actually derived one (the request at the
+/// pre-lease refusal, the resolved codec at the installer); `None`
+/// states the fact it can prove: the store does not open as the
+/// configuration's codec.
+pub(crate) fn codec_config_mismatch_error(
+    config: &CodecOpenConfig,
+    named: Option<SnapshotCodecKind>,
+) -> Error {
+    let what = config.describe();
+    let required = config.required_codec();
+    match named {
+        Some(codec) => Error::semantic(format!(
+            "{what} are set but the store's snapshot codec is {codec}, not {required}; \
+             the configuration would be ignored"
+        )),
+        None => Error::semantic(format!(
+            "{what} are set but the store does not open as a {required} vault (no snapshot \
+             codec was requested and the directory carries no {required} sidecar); the \
+             configuration would be ignored"
+        )),
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn verify_reset_identity(
-    requested: &Path,
-    target: &Path,
-    expected: cypherlite_core::file_identity::FileIdentity,
-) -> Result<()> {
-    let requested = reset_request_path(requested);
-    reject_reset_alias(&requested)?;
-    let current = std::fs::symlink_metadata(&requested).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::storage(format!(
-                "reset database URI identity changed: {}",
-                requested.display()
-            ))
-        } else {
-            e.into()
+impl CodecOpenConfig {
+    /// The codec this configuration requires — the one fact every
+    /// refusal site consults, owned by the enum instead of hand-spelled
+    /// at each consumer.
+    pub(crate) fn required_codec(&self) -> SnapshotCodecKind {
+        match self {
+            CodecOpenConfig::MarkdownBodies(_) => SnapshotCodecKind::Markdown,
         }
-    })?;
-    let target_meta = std::fs::symlink_metadata(target).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::storage(format!(
-                "reset target identity changed: {}",
-                target.display()
-            ))
-        } else {
-            e.into()
-        }
-    })?;
-    if cypherlite_core::file_identity::of_path(&requested)? != expected
-        || cypherlite_core::file_identity::of_path(target)? != expected
-        || !vfs::native::plain_entry(&current)
-        || !vfs::native::plain_entry(&target_meta)
-    {
-        return Err(Error::storage(format!(
-            "reset database URI identity changed: {}",
-            requested.display()
-        )));
     }
-    Ok(())
+
+    /// The configuration's own validity — the payload's validation,
+    /// owned by the enum so every install-or-refuse boundary runs it.
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            CodecOpenConfig::MarkdownBodies(bodies) => bodies.validate(),
+        }
+    }
+
+    /// The configuration's own name in refusal messages — the variant
+    /// owns its identity; no refusal site hardcodes it.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self {
+            CodecOpenConfig::MarkdownBodies(_) => "markdown body properties",
+        }
+    }
+
+    /// The one install-or-refuse sequence every boundary runs: the
+    /// configuration's own validation, then the codec match against
+    /// `opening` — the codec this open resolves. `named` is the codec
+    /// the refusal may cite (the explicit request at the pre-lease
+    /// refusal, the resolved codec at the installer); `None` when no
+    /// codec was derived.
+    pub(crate) fn ensure_matches(
+        &self,
+        opening: SnapshotCodecKind,
+        named: Option<SnapshotCodecKind>,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.required_codec() != opening {
+            return Err(codec_config_mismatch_error(self, named));
+        }
+        Ok(())
+    }
 }
 
 /// Parquet snapshot + WAL on a [`Vfs`] (ADR-0072). `:memory:` is `MemoryVfs`.
@@ -121,6 +148,9 @@ pub struct StoreTarget {
     native_root: Option<PathBuf>,
     wal_native: Option<PathBuf>,
     pub(crate) codec: SnapshotCodecKind,
+    /// The resolved codec-specific open-time configuration
+    /// ([`CodecOpenConfig`]), spent by the matching codec only.
+    pub(crate) codec_config: Option<CodecOpenConfig>,
 }
 
 /// Message prefix of the [`Error::Storage`] an exclusive destination create
@@ -202,6 +232,26 @@ pub fn parse_uri_with_options(
     parse_uri_opening(uri, wal_dir, requested, false)
 }
 
+/// [`parse_uri_opening`] plus a codec-specific open-time configuration
+/// ([`CodecOpenConfig`], ADR-0460). The configuration installs — or is
+/// refused — **before the native lease materializes any state**, so a
+/// failed open on a fresh path leaves nothing behind; the markdown
+/// vault's body-property configuration is the one cargo today.
+pub fn parse_uri_opening_with_config(
+    uri: &str,
+    wal_dir: Option<PathBuf>,
+    requested: Option<SnapshotCodecKind>,
+    read_only: bool,
+    config: Option<CodecOpenConfig>,
+) -> Result<StoreTarget> {
+    let mode = if read_only {
+        OpenMode::ReadOnly
+    } else {
+        OpenMode::OpenOrCreate
+    };
+    parse_uri_inner(uri, wal_dir, requested, mode, config)
+}
+
 /// [`parse_uri_with_options`] plus a read-only open (ADR-0136).
 ///
 /// `read_only` does not create a missing store and takes shared locks on an
@@ -212,12 +262,7 @@ pub fn parse_uri_opening(
     requested: Option<SnapshotCodecKind>,
     read_only: bool,
 ) -> Result<StoreTarget> {
-    let mode = if read_only {
-        OpenMode::ReadOnly
-    } else {
-        OpenMode::OpenOrCreate
-    };
-    parse_uri_inner(uri, wal_dir, requested, mode)
+    parse_uri_opening_with_config(uri, wal_dir, requested, read_only, None)
 }
 
 /// [`parse_uri_with_options`] whose destination is created exclusively
@@ -233,7 +278,20 @@ pub fn parse_uri_creating(
     wal_dir: Option<PathBuf>,
     requested: Option<SnapshotCodecKind>,
 ) -> Result<StoreTarget> {
-    parse_uri_inner(uri, wal_dir, requested, OpenMode::CreateExclusive)
+    parse_uri_creating_with_config(uri, wal_dir, requested, None)
+}
+
+/// [`parse_uri_creating`] plus a codec-specific open-time configuration
+/// ([`CodecOpenConfig`]): installed — or refused — before the
+/// destination's lease or bundle create, so a refused configuration
+/// never created the destination it would have been ignored on.
+pub fn parse_uri_creating_with_config(
+    uri: &str,
+    wal_dir: Option<PathBuf>,
+    requested: Option<SnapshotCodecKind>,
+    config: Option<CodecOpenConfig>,
+) -> Result<StoreTarget> {
+    parse_uri_inner(uri, wal_dir, requested, OpenMode::CreateExclusive, config)
 }
 
 fn parse_uri_inner(
@@ -241,15 +299,29 @@ fn parse_uri_inner(
     wal_dir: Option<PathBuf>,
     requested: Option<SnapshotCodecKind>,
     mode: OpenMode,
+    config: Option<CodecOpenConfig>,
 ) -> Result<StoreTarget> {
     if is_memory_uri(uri) {
-        return memory_store_with_codec(requested.unwrap_or_default());
+        // No lease to protect; the installer's own refusal covers a
+        // mismatched configuration.
+        let store = memory_store_with_codec(requested.unwrap_or_default())?;
+        return install_config(store, config);
     }
     if let Some(codec) = requested {
         codec::check_available(codec)?;
     }
     reject_remote_scheme(uri)?;
-    parse_filesystem_uri(uri, wal_dir, requested, mode)
+    parse_filesystem_uri(uri, wal_dir, requested, mode, config)
+}
+
+/// The post-construction install half of the config threading: the
+/// [`StoreTarget::with_codec_config`] validator (a mismatch is already
+/// impossible where the pre-lease refusal ran).
+fn install_config(store: StoreTarget, config: Option<CodecOpenConfig>) -> Result<StoreTarget> {
+    match config {
+        Some(config) => store.with_codec_config(config),
+        None => Ok(store),
+    }
 }
 
 // wasm32 has no filesystem access; only `:memory:` opens.
@@ -262,6 +334,7 @@ fn parse_filesystem_uri(
     _wal_dir: Option<PathBuf>,
     _requested: Option<SnapshotCodecKind>,
     _mode: OpenMode,
+    _config: Option<CodecOpenConfig>,
 ) -> Result<StoreTarget> {
     Err(Error::storage(WASM_FS_UNAVAILABLE))
 }
@@ -272,6 +345,7 @@ fn parse_filesystem_uri(
     wal_dir: Option<PathBuf>,
     requested: Option<SnapshotCodecKind>,
     mode: OpenMode,
+    config: Option<CodecOpenConfig>,
 ) -> Result<StoreTarget> {
     let path = PathBuf::from(filesystem_uri_path(uri));
     if is_bundle_path(&path) {
@@ -279,6 +353,27 @@ fn parse_filesystem_uri(
             return Err(Error::storage(
                 "wal_dir is not supported for .cl single-file databases (ADR-0074)",
             ));
+        }
+        // A bundle this open will create resolves the requested codec or
+        // the build default, so a markdown-only codec configuration is
+        // decidable — and refused — before the create materializes the
+        // bundle, the same pre-create contract the native arm's
+        // pre-lease refusal below upholds. An existing bundle keeps the
+        // post-resolution install: its store, not this decision, names
+        // the codec.
+        let creates_bundle = match mode {
+            OpenMode::CreateExclusive => true,
+            OpenMode::OpenOrCreate => !path.exists(),
+            OpenMode::ReadOnly => false,
+        };
+        if creates_bundle {
+            if let Some(config) = &config {
+                refuse_codec_config_mismatch(
+                    config,
+                    markdown_wal_hint(&path, requested),
+                    requested,
+                )?;
+            }
         }
         let bundle = match mode {
             OpenMode::OpenOrCreate => BundleVfs::open_or_create(&path)?,
@@ -288,9 +383,51 @@ fn parse_filesystem_uri(
         let vfs: Arc<dyn Vfs> = Arc::new(bundle);
         let mut target = on_vfs(vfs, SnapshotCodecKind::Parquet);
         target.codec = codec::resolve_codec(&target, requested)?;
-        return Ok(target);
+        // No native lease behind a bundle; the installer's own refusal
+        // covers a mismatched configuration (a created-exclusive bundle
+        // is removed by the publish path's cleanup).
+        return install_config(target, config);
     }
-    let wal_path = wal_dir.unwrap_or_else(|| path.join("wal"));
+    // A markdown store's engine state lives under `.cypherlite/`
+    // (ADR-0406 §3), so its default WAL is `<vault>/.cypherlite/wal`.
+    // The codec is probed from the requested kind or the sidecar
+    // manifest before the lease; `resolve_codec` below stays
+    // authoritative for conflicts.
+    // An explicit markdown request must not create engine state (the
+    // lease below materializes a WAL directory and its role marker —
+    // the default under `.cypherlite/`, or a caller-supplied `wal_dir`)
+    // inside a directory that already carries a classic codec's root
+    // evidence — refuse before the lease, whichever WAL directory the
+    // open would use; `resolve_codec` below stays authoritative for
+    // every other conflict shape. A sidecar-driven hint is never
+    // refused here: the sidecar probe already classified the directory
+    // fail-closed.
+    // One hint decision, derived once: the codec whose default-WAL
+    // layout this open takes and whose verdict the codec-config refusal
+    // below consults. The markdown-over-classic evidence refusal keeps
+    // its own gate — it refuses only an *explicit* markdown request
+    // over classic evidence, a narrower fact than the hint. The bundle
+    // create-check above reads the hint through the same fn.
+    // `resolve_codec` after the lease stays authoritative for every
+    // other conflict shape.
+    let hint = markdown_wal_hint(&path, requested);
+    if requested == Some(SnapshotCodecKind::Markdown) {
+        refuse_markdown_over_classic_evidence(&path)?;
+    }
+    // The codec-specific open-time configuration installs — or is
+    // refused — before the lease below materializes a WAL directory and
+    // its role marker, so a refused open on a fresh path leaves nothing
+    // behind (the fail-before-lease contract the CSV and memory-limit
+    // knobs established).
+    if let Some(config) = &config {
+        refuse_codec_config_mismatch(config, hint, requested)?;
+    }
+    let wal_path = match wal_dir {
+        Some(dir) => dir,
+        // The hint codec's `wal_dir` owns the directory layout for both
+        // arms (ADR-0406 §3).
+        None => path.join(hint.wal_dir()),
+    };
     let (dir, wal, lease) = match mode {
         OpenMode::OpenOrCreate => native_ownership::lease(&path, &wal_path)?,
         OpenMode::ReadOnly => native_ownership::lease_readonly(&path, &wal_path)?,
@@ -307,10 +444,65 @@ fn parse_filesystem_uri(
         native_root: Some(dir),
         wal_native: Some(wal),
         codec: SnapshotCodecKind::Parquet,
+        codec_config: None,
     };
     target.codec = codec::resolve_codec(&target, requested)?;
-    Ok(target)
+    install_config(target, config)
 }
+
+/// The pre-materialization half of the codec-config threading: refuse a
+/// configuration whose codec does not match the codec this open will
+/// resolve, judged on the caller's derived [`markdown_wal_hint`] verdict
+/// — never a re-probe. The error names the codec only where it was
+/// actually derived (an explicit request); with none requested it states
+/// the fact it can prove: the store does not open as a markdown vault.
+/// Never refuses a sidecar-classified markdown directory.
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_codec_config_mismatch(
+    config: &CodecOpenConfig,
+    hint: SnapshotCodecKind,
+    requested: Option<SnapshotCodecKind>,
+) -> Result<()> {
+    // The one install-or-refuse sequence, with the hint as the codec
+    // this open resolves and the request as the namable evidence.
+    config.ensure_matches(hint, requested)
+}
+/// The codec whose default-WAL layout the directory at `path` takes,
+/// for the pre-lease default-WAL routing: [`SnapshotCodecKind::Markdown`]
+/// when the open is markdown — requested, or an engine-written sidecar
+/// says so — otherwise [`SnapshotCodecKind::Json`], standing for the
+/// classic codecs' shared `wal/` layout (`wal_dir` maps both to the same
+/// directory, and Json is the no-evidence default). A folder of markdown
+/// files alone is not a store until it is opened as one. (The reset
+/// guard is the probe's other consumer, through
+/// `codec::markdown::refuse_reset` → `probe_path`, manifest.rs.)
+#[cfg(not(target_arch = "wasm32"))]
+fn markdown_wal_hint(path: &Path, requested: Option<SnapshotCodecKind>) -> SnapshotCodecKind {
+    // The sidecar classification — including the present-but-unparseable
+    // fail-closed verdict — is the codec's one typed probe.
+    if requested == Some(SnapshotCodecKind::Markdown) || codec::markdown::probe_path(path) {
+        SnapshotCodecKind::Markdown
+    } else {
+        SnapshotCodecKind::Json
+    }
+}
+
+/// The explicit-markdown pre-lease guard: the directory carries a
+/// classic codec's root-level store evidence (`graph.json`, a Parquet
+/// object family), so routing the default WAL into `.cypherlite/` and
+/// leasing it would write engine state into another codec's store
+/// before `resolve_codec` could refuse the mismatched request.
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_markdown_over_classic_evidence(path: &Path) -> Result<()> {
+    if crate::snapshot::has_classic_store_evidence_at(path) {
+        return Err(Error::storage(
+            "mixed snapshot codecs: the directory carries snapshot-file evidence; an \
+             explicit markdown open would create WAL engine state inside it",
+        ));
+    }
+    Ok(())
+}
+
 pub fn memory_store() -> StoreTarget {
     memory_target(SnapshotCodecKind::default())
 }
@@ -344,6 +536,7 @@ fn on_vfs(vfs: Arc<dyn Vfs>, codec: SnapshotCodecKind) -> StoreTarget {
         native_root: None,
         wal_native: None,
         codec,
+        codec_config: None,
     }
 }
 
@@ -387,6 +580,28 @@ impl StoreTarget {
         Ok(on_vfs(vfs, codec))
     }
 
+    /// Install codec-specific open-time configuration
+    /// ([`CodecOpenConfig`]). The one installer every codec knob passes
+    /// through: the variant's own validation runs here, and a
+    /// configuration whose codec does not match the store's is refused —
+    /// a set-but-ignored knob is an error, never a silent no-op.
+    pub fn with_codec_config(mut self, config: CodecOpenConfig) -> Result<Self> {
+        config.ensure_matches(self.codec, Some(self.codec))?;
+        self.codec_config = Some(config);
+        Ok(self)
+    }
+
+    /// The markdown vault's explicit body-property configuration when
+    /// this open carried one (ADR-0460) — the markdown codec's load and
+    /// checkpoint read it here; `None` lets the sidecar manifest's
+    /// recorded configuration govern.
+    pub(crate) fn markdown_bodies(&self) -> Option<&codec::markdown::MarkdownBodyProperties> {
+        match &self.codec_config {
+            Some(CodecOpenConfig::MarkdownBodies(bodies)) => Some(bodies),
+            None => None,
+        }
+    }
+
     /// In-process WAL (`:memory:`). No timed checkpoint (ADR-0041).
     pub fn wal_is_memory(&self) -> bool {
         !self.wal_vfs.durable()
@@ -410,6 +625,12 @@ impl StoreTarget {
 
     pub(crate) fn wal_vfs(&self) -> (Arc<dyn Vfs>, &str) {
         (Arc::clone(&self.wal_vfs), self.wal_prefix.as_str())
+    }
+
+    /// The directory holding engine state (CDC slots) — the codec's
+    /// one typed layout fact ([`SnapshotCodecKind::engine_dir`]).
+    pub fn engine_dir(&self) -> Option<&'static str> {
+        self.codec.engine_dir()
     }
 
     pub fn snapshot_codec(&self) -> SnapshotCodecKind {
@@ -521,15 +742,18 @@ fn reset_filesystem_uri(_uri: &str, _wal_override: Option<&Path>) -> Result<()> 
 #[cfg(not(target_arch = "wasm32"))]
 fn reset_filesystem_uri(uri: &str, wal_override: Option<&Path>) -> Result<()> {
     let path = Path::new(filesystem_uri_path(uri));
+    // A markdown store's root is a hand-authorable vault; the codec
+    // refuses to reset it rather than deleting it (ADR-0406 §6).
+    codec::markdown::refuse_reset(path)?;
     if is_bundle_path(path) {
-        reject_reset_alias(path)?;
+        native_ownership::reject_reset_alias(path)?;
         match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
             Ok(_) => (),
         }
         let (locked_path, lease) = BundleVfs::lock_host(path, vfs::HostAdmit::Exclusive)?;
-        verify_reset_identity(
+        native_ownership::verify_reset_identity(
             path,
             &locked_path,
             cypherlite_core::file_identity::of_file(&lease)?,
@@ -579,6 +803,9 @@ pub fn checkpoint_at(
         SnapshotCodecKind::Json => {
             codec::json::dump(target, graph, checkpoint_lsn, snapshot_ts, ontology)
         }
+        SnapshotCodecKind::Markdown => {
+            codec::markdown::checkpoint_at(target, graph, checkpoint_lsn, snapshot_ts, ontology)
+        }
     }
 }
 
@@ -596,6 +823,7 @@ pub fn snapshot_data_bytes(target: &StoreTarget) -> Result<u64> {
     match target.codec {
         SnapshotCodecKind::Parquet => snapshot::snapshot_data_bytes(target),
         SnapshotCodecKind::Json => codec::json::snapshot_data_bytes(target),
+        SnapshotCodecKind::Markdown => codec::markdown::snapshot_data_bytes(target),
     }
 }
 

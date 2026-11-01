@@ -28,14 +28,43 @@ use std::collections::HashSet;
 
 use cypherlite_error::{EngineError, ErrorKind};
 use cypherlite_parser::{
-    CallScope, CallSubqueryClause, Clause, Expr, PatternPath, ReturnItem, Statement,
+    CallScope, CallSubqueryClause, Clause, ConditionalClause, Expr, PatternPath, ReturnClause,
+    ReturnItem, Statement, WithClause,
 };
 
 use crate::ast::collect::{
     check_expr_vars_defined, clause_introduced_names, effective_name, pattern_vars,
     projected_names, search_score_var, union_chain,
 };
-use crate::validate::{compute_subquery_output_vars, duplicate_outer_variable};
+// The lenient naked-CALL fallback consults the output-vars family at
+// the crate root (its other consumer is `validate::scope`, importing
+// downward) — no upward edge into `validate` remains.
+use crate::output_vars::compute_subquery_output_vars;
+
+/// The one construction site for an outer-scope collision: a subquery
+/// output (or CALL export) re-declares a name the enclosing scope already
+/// binds. Neo4j's verbatim text names the offender (CIP-218 interactions
+/// [1]-[3]); every outer-scope guard routes through here so the diagnostic
+/// cannot drift into unnamed variants. Lives at the crate root (its
+/// consumers are this module and `validate::scope`, which imports
+/// downward from here).
+pub(crate) fn duplicate_outer_variable(name: &str) -> EngineError {
+    EngineError::semantic(
+        ErrorKind::VariableAlreadyBound,
+        format!("Variable `{name}` already declared in outer scope"),
+    )
+}
+
+/// The colliding export reported when a Rule 9 / 3.3(f) check fires: the
+/// lexicographically smallest colliding name, not whichever a hash
+/// iteration yields first — the rejection set is unchanged, the error
+/// text is run-to-run deterministic.
+fn smallest_collision<'a>(
+    exports: &'a HashSet<String>,
+    outer: &HashSet<String>,
+) -> Option<&'a String> {
+    exports.iter().filter(|n| outer.contains(*n)).min()
+}
 
 /// Resolves a `CALL (...)` clause's scope against `outer_scope` (the set of
 /// variables bound in the enclosing query immediately before this CALL),
@@ -130,40 +159,40 @@ fn bind_pattern_vars_checked(
     Ok(())
 }
 
-/// Walks one branch (`clauses`; callers handle `.union` chains themselves)
-/// of a scope-clause CALL subquery body. Invokes `sink` for every
-/// `Clause::Return`/`Clause::Finish` encountered with `(clause_index,
-/// exported_names, star_exclusion_set, has_star)`. When `strict`, also
-/// enforces Rule 4/5 (undefined variable references), Rule 8 (shadowing),
-/// and Rule 10's `NoVariablesInScope`.
-pub(crate) fn walk_branch(
-    clauses: &[Clause],
-    imported: &HashSet<String>,
-    strict: bool,
-    sink: &mut dyn FnMut(usize, HashSet<String>, HashSet<String>, bool) -> Result<(), EngineError>,
-) -> Result<(), EngineError> {
-    walk_branch_seeded(clauses, imported, &HashSet::new(), strict, sink)
+/// The branch-seeding policy, the one spelling: a branch body's initial
+/// scope is `imported ∪ carry` — the names an earlier NEXT stage declared
+/// ride along as reference-visibility on top of the imported set (see
+/// [`walk_branch_seeded`]'s doc for the CIP-213 semantics of `carry`).
+fn branch_seed(imported: &HashSet<String>, carry: &HashSet<String>) -> HashSet<String> {
+    imported.union(carry).cloned().collect()
 }
 
-/// Like `walk_branch`, but seeds `local_scope` with `carry` in addition to
-/// `imported` -- used by CIP-213's NEXT-chain handling, where a later
-/// stage's clauses must see whatever an earlier stage in the *same* body
-/// declared (its own bound/projected names), without those carried names
-/// being treated as CIP-141 "imported from the outer scope" for Rule 8
-/// shadow-checking or CIP-218 Rule 10 star-exclusion purposes -- only
-/// genuine `imported` names get that treatment; `carry` is purely
-/// reference-visibility.
+/// Walks one branch (`clauses`; callers handle `.union` chains themselves)
+/// of a scope-clause CALL subquery body, seeding `local_scope` from
+/// `imported` (plus `carry` when the caller has one). Invokes `sink` for
+/// every `Clause::Return`/`Clause::Finish` encountered with the exported
+/// name set that clause produces. When `strict`, also enforces Rule 4/5
+/// (undefined variable references), Rule 8 (shadowing), and Rule 10's
+/// `NoVariablesInScope`.
+///
+/// `carry` seeds extra reference-visible names beyond `imported` -- used
+/// by CIP-213's NEXT-chain handling, where a later stage's clauses must
+/// see whatever an earlier stage in the *same* body declared (its own
+/// bound/projected names), without those carried names being treated as
+/// CIP-141 "imported from the outer scope" for Rule 8 shadow-checking or
+/// CIP-218 Rule 10 star-exclusion purposes -- only genuine `imported`
+/// names get that treatment; `carry` is purely reference-visibility.
 fn walk_branch_seeded(
     clauses: &[Clause],
     imported: &HashSet<String>,
     carry: &HashSet<String>,
     strict: bool,
-    sink: &mut dyn FnMut(usize, HashSet<String>, HashSet<String>, bool) -> Result<(), EngineError>,
+    sink: &mut dyn FnMut(HashSet<String>) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
-    let mut local_scope: HashSet<String> = imported.union(carry).cloned().collect();
+    let mut local_scope: HashSet<String> = branch_seed(imported, carry);
     let mut excluded: HashSet<String> = imported.clone();
 
-    for (idx, clause) in clauses.iter().enumerate() {
+    for clause in clauses.iter() {
         match clause {
             Clause::Match(mc) => {
                 bind_pattern_vars_checked(&mc.pattern, imported, &mut local_scope, strict)?;
@@ -200,152 +229,227 @@ fn walk_branch_seeded(
                     check_expr_vars_defined(&uc.graph_expr, &local_scope)?;
                 }
             }
-            // A SHOW clause is a fresh row source (like MATCH with no prior
-            // clauses), not a variable *reference* -- it introduces its
-            // YIELD'd (or, bare/`YIELD *`, its full catalog's) column names
-            // into scope for a later clause in this same scope-clause body
-            // to reference, e.g. `CALL () { SHOW FUNCTIONS YIELD name ...
-            // RETURN collect(name) }`.
-            // The row-producing catalog commands (SHOW … and
-            // TERMINATE TRANSACTIONS), through the one catalog
-            // classification: each introduces its effective output
-            // columns into scope exactly like the enumerated arms did —
-            // never a second clause-by-clause spelling here.
+            // The row-producing catalog commands (e.g. a SHOW clause, a
+            // fresh row source like MATCH with no prior clauses) put
+            // their effective output columns — YIELD'd, or the full
+            // catalog's under a bare `YIELD *` — into scope for a later
+            // clause in this same scope-clause body to reference, e.g.
+            // `CALL () { SHOW FUNCTIONS YIELD name ...
+            // RETURN collect(name) }`: one guard, the same catalog
+            // classification the other scope walkers use.
             c if crate::show_columns::catalog_produces_rows(c) => {
                 for v in crate::show_columns::catalog_output_columns(c) {
                     check_and_insert(&v, imported, &mut local_scope, strict)?;
                 }
             }
             Clause::With(wc) => {
-                if strict {
-                    for item in &wc.items {
-                        if !item.all {
-                            check_expr_vars_defined(&item.expr, &local_scope)?;
-                        }
-                    }
-                    if let Some(w) = &wc.where_expr {
-                        check_expr_vars_defined(w, &local_scope)?;
-                    }
-                }
-
-                let non_star: Vec<&ReturnItem> = wc.items.iter().filter(|i| !i.all).collect();
-
-                // Rule 8: a non-pass-through item whose output name equals
-                // an imported name is a forbidden redeclaration.
-                for item in &non_star {
-                    if let Some(name) = effective_name(item) {
-                        if imported.contains(&name) {
-                            // Pass-through: a bare `WITH a` or a redundant
-                            // self-alias `WITH a AS a` of an imported name
-                            // is not a redeclaration.
-                            let is_pass_through = matches!(&item.expr, Expr::Variable(v) if v == &name)
-                                && item.alias.as_deref().is_none_or(|a| a == name);
-                            if !is_pass_through && strict {
-                                return Err(shadow_error(&name));
-                            }
-                        }
-                    }
-                }
-
-                // Rule 10 promotion: only when this WITH consists *solely*
-                // of bare pass-throughs of currently-excluded names (see
-                // module doc) do those names become star-visible.
-                if !non_star.is_empty()
-                    && non_star.iter().all(|item| {
-                        item.alias.is_none()
-                            && matches!(&item.expr, Expr::Variable(v) if excluded.contains(v))
-                    })
-                {
-                    for item in &non_star {
-                        if let Expr::Variable(v) = &item.expr {
-                            excluded.remove(v);
-                        }
-                    }
-                }
-
-                let mut new_scope = HashSet::new();
-                for item in &wc.items {
-                    if item.all {
-                        new_scope.extend(local_scope.iter().cloned());
-                    } else if let Some(name) = effective_name(item) {
-                        new_scope.insert(name);
-                    }
-                }
-                new_scope.extend(imported.iter().cloned()); // Rule 7 stickiness
-                local_scope = new_scope;
+                apply_with_to_scope(wc, imported, &mut excluded, &mut local_scope, strict)?;
             }
             Clause::CallSubquery(inner) => {
                 let inner_exports = resolve_nested_call(inner, &local_scope, strict)?;
                 local_scope.extend(inner_exports);
             }
             Clause::Return(rc) => {
-                let mut exported = HashSet::new();
-                let mut has_star = false;
-                for item in &rc.items {
-                    if item.all {
-                        has_star = true;
-                        for n in &local_scope {
-                            if !excluded.contains(n) {
-                                exported.insert(n.clone());
-                            }
-                        }
-                    } else if let Some(name) = effective_name(item) {
-                        if strict {
-                            check_expr_vars_defined(&item.expr, &local_scope)?;
-                        }
-                        exported.insert(name);
-                    }
-                }
-                if strict && has_star && exported.is_empty() {
-                    return Err(EngineError::semantic(
-                        ErrorKind::NoVariablesInScope,
-                        "RETURN * is not allowed when there are no variables in scope",
-                    ));
-                }
-                sink(idx, exported, excluded.clone(), has_star)?;
+                let exported = return_exports(rc, &local_scope, &excluded, strict)?;
+                sink(exported)?;
             }
             Clause::Finish => {
-                sink(idx, HashSet::new(), HashSet::new(), false)?;
+                sink(HashSet::new())?;
             }
-            // CIP-135: a `WHEN/ELSE` conditional clause is always the sole
-            // element of the clause list it appears in (see
-            // `ConditionalClause`'s doc comment), so `local_scope ==
-            // imported` here -- no earlier clause in this body could have
-            // bound anything. Each branch body (and the ELSE body, plus
-            // each one's own UNION chain) is walked as an independent
-            // scope-clause body sharing the same `imported` set, and every
-            // `Return`/`Finish` it finds is forwarded to this clause's own
-            // `sink` under this Conditional clause's `idx` -- Rule 9/10
-            // (enforced on the lowered IR by the planner's
-            // `validate_conditional_returns`) guarantees every branch
-            // reports the same exported names, so the resulting
-            // union-of-exports is exactly that one shared set.
+            // CIP-135: [`walk_conditional_bodies`] owns the arm's policy
+            // (including the sole-element invariant the grammar gives it).
             Clause::Conditional(cc) => {
-                if strict {
-                    for branch in &cc.branches {
-                        check_expr_vars_defined(&branch.predicate, &local_scope)?;
-                    }
-                }
-                let mut bodies: Vec<&Statement> = cc.branches.iter().map(|b| &b.body).collect();
-                if let Some(else_body) = &cc.else_body {
-                    bodies.push(else_body);
-                }
-                for body in bodies {
-                    let mut cur = Some(body);
-                    while let Some(s) = cur {
-                        walk_branch(
-                            &s.clauses,
-                            imported,
-                            strict,
-                            &mut |_, exp, excl, has_star| sink(idx, exp, excl, has_star),
-                        )?;
-                        cur = s.union.as_deref().map(|u| &u.statement);
-                    }
-                }
+                walk_conditional_bodies(cc, imported, carry, strict, &mut *sink)?;
             }
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// The CIP-135 Conditional arm's policy, one sibling helper beside
+/// [`apply_with_to_scope`]/[`return_exports`] so the walker stays a
+/// clause dispatch: a `WHEN/ELSE` clause is always the sole element of
+/// the clause list it appears in (see `ConditionalClause`'s doc
+/// comment), so nothing beyond the seeded `imported ∪ carry` could have
+/// been bound where it stands — the seed is derived here, once, and the
+/// predicates are checked against exactly the visibility each branch
+/// body is then walked with (`imported` for the Rule 8/10 policy sets,
+/// `carry` for reference-visibility). Rule 9/10 (enforced on the
+/// lowered IR by the planner's `validate_conditional_returns`)
+/// guarantees every branch reports the same exported names, so the
+/// resulting union-of-exports is exactly that one shared set.
+fn walk_conditional_bodies(
+    cc: &ConditionalClause,
+    imported: &HashSet<String>,
+    carry: &HashSet<String>,
+    strict: bool,
+    sink: &mut dyn FnMut(HashSet<String>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let seed = branch_seed(imported, carry);
+    if strict {
+        for branch in &cc.branches {
+            check_expr_vars_defined(&branch.predicate, &seed)?;
+        }
+    }
+    // Every branch body, plus the ELSE body, each with its own UNION chain.
+    let bodies = cc
+        .branches
+        .iter()
+        .map(|b| &b.body)
+        .chain(cc.else_body.iter());
+    for body in bodies {
+        for s in union_chain(body) {
+            walk_branch_seeded(&s.clauses, imported, carry, strict, &mut *sink)?;
+        }
+    }
+    Ok(())
+}
+
+/// The alias policy a pass-through check runs under: Rule 10's star
+/// promotion accepts bare pass-throughs only, Rule 8's redeclaration
+/// check also accepts the redundant self-alias — the module's subtlest
+/// invariant, named at the type level so each rule's call site states
+/// its own policy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AliasPolicy {
+    /// `WITH a` — no alias.
+    BareOnly,
+    /// `WITH a` or the redundant self-alias `WITH a AS a`.
+    AllowSelfAlias,
+}
+
+/// One WITH item's pass-through variable under `policy`: the item's
+/// variable under its own output name when the item is a pass-through
+/// the policy accepts, `None` otherwise.
+fn pass_through_var(item: &ReturnItem, policy: AliasPolicy) -> Option<&str> {
+    let Expr::Variable(v) = &item.expr else {
+        return None;
+    };
+    match item.alias.as_deref() {
+        None => Some(v),
+        Some(a) if policy == AliasPolicy::AllowSelfAlias && a == v.as_str() => Some(v),
+        _ => None,
+    }
+}
+
+/// The RETURN arm's export computation, one sibling helper beside
+/// [`apply_with_to_scope`] so the walker stays a clause dispatch: the
+/// exported names (star expansion minus the still-excluded names, plus
+/// every item's effective name) — the strict star-with-empty-scope
+/// rejection included, so the arm is the helper call plus the sink.
+fn return_exports(
+    rc: &ReturnClause,
+    local_scope: &HashSet<String>,
+    excluded: &HashSet<String>,
+    strict: bool,
+) -> Result<HashSet<String>, EngineError> {
+    if strict {
+        check_non_star_items_defined(&rc.items, local_scope)?;
+    }
+    // The star-visible bound is the incoming scope minus the still-
+    // excluded names; the exported set is then the canonical
+    // [`projected_names`] projection over that bound (a `*` passes the
+    // bound through, every other item contributes its effective name).
+    // The bound matters only for a `*` item, so a star-less RETURN
+    // passes an empty bound and skips the filtered clone.
+    let has_star = rc.items.iter().any(|i| i.all);
+    let bound = if has_star {
+        local_scope
+            .iter()
+            .filter(|n| !excluded.contains(*n))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let exported = projected_names(&rc.items, &bound);
+    if strict && has_star && exported.is_empty() {
+        return Err(EngineError::semantic(
+            ErrorKind::NoVariablesInScope,
+            "RETURN * is not allowed when there are no variables in scope",
+        ));
+    }
+    Ok(exported)
+}
+
+/// Rule 1's strict pre-check over a projection item list, the one
+/// spelling both projection arms share: every non-star item's
+/// expression must reference only visible names.
+fn check_non_star_items_defined(
+    items: &[ReturnItem],
+    scope: &HashSet<String>,
+) -> Result<(), EngineError> {
+    for item in items {
+        if !item.all {
+            check_expr_vars_defined(&item.expr, scope)?;
+        }
+    }
+    Ok(())
+}
+
+/// The WITH arm's four named policies, one sibling helper so the
+/// walker stays a clause dispatch (LABS-518): the strict pre-check
+/// (Rule 1 — every referenced name visible), the Rule 8
+/// imported-name-redeclaration check, the Rule 10 star-exclusion
+/// promotion, and the Rule 7 scope rebuild over [`projected_names`].
+fn apply_with_to_scope(
+    wc: &WithClause,
+    imported: &HashSet<String>,
+    excluded: &mut HashSet<String>,
+    local_scope: &mut HashSet<String>,
+    strict: bool,
+) -> Result<(), EngineError> {
+    // Rule 1 (strict pre-check) and Rule 8 (the redeclaration check)
+    // share one gate: both are strict-only policies, spelled one way.
+    if strict {
+        check_non_star_items_defined(&wc.items, local_scope)?;
+        if let Some(w) = &wc.where_expr {
+            check_expr_vars_defined(w, local_scope)?;
+        }
+
+        // Rule 8: a non-pass-through item whose output name equals
+        // an imported name is a forbidden redeclaration — a bare
+        // `WITH a` or a redundant self-alias `WITH a AS a` of an
+        // imported name is not one.
+        for item in wc.items.iter().filter(|i| !i.all) {
+            if let Some(name) = effective_name(item) {
+                if imported.contains(&name)
+                    && pass_through_var(item, AliasPolicy::AllowSelfAlias).is_none()
+                {
+                    return Err(shadow_error(&name));
+                }
+            }
+        }
+    }
+
+    // Rule 10 promotion: only when this WITH consists *solely*
+    // of bare pass-throughs of currently-excluded names (see
+    // module doc) do those names become star-visible. The
+    // classification is collected once — every item a bare
+    // pass-through (the length equality subsumes the star scan: a
+    // `*` item classifies to None) and every one currently
+    // excluded — so bundling with a `*` or any other item kind
+    // disqualifies promotion exactly as computed expressions and
+    // fresh bindings do.
+    let promotions: Vec<&str> = wc
+        .items
+        .iter()
+        .filter_map(|i| pass_through_var(i, AliasPolicy::BareOnly))
+        .collect();
+    if promotions.len() == wc.items.len() && promotions.iter().all(|v| excluded.contains(*v)) {
+        for v in promotions {
+            excluded.remove(v);
+        }
+    }
+
+    // The star projection is [`projected_names`] (a `*` item
+    // passes the incoming local scope through, every other
+    // item contributes its effective name) plus the Rule 7
+    // stickiness: the imported names stay referenceable.
+    let mut new_scope = projected_names(&wc.items, local_scope);
+    new_scope.extend(imported.iter().cloned()); // Rule 7 stickiness
+    *local_scope = new_scope;
     Ok(())
 }
 
@@ -379,14 +483,9 @@ fn resolve_nested_call(
 /// chain) exported names for a scope-clause body, enforcing Rule 9 (no
 /// exported name may collide with `outer_scope`) when `strict`.
 ///
-/// CIP-213: each branch may itself be a NEXT chain (`s.next`); every stage
-/// is still walked (so Rule 4/5/8/10 are checked throughout, and Rule 3 --
-/// imported names visible in every statement of the chain -- holds via
-/// `carry` always including `imported`), but only the *final* stage's own
-/// Return/Finish is a real export: an earlier stage's projection is
-/// consumed by the following NEXT stage, not exposed to the enclosing
-/// scope, mirroring `Engine::execute_call_scope_stage`'s identical runtime
-/// handoff.
+/// CIP-213: each branch may itself be a NEXT chain (`s.next`) —
+/// [`stage_exports`] walks it — mirroring
+/// `Engine::execute_call_scope_stage`'s identical runtime handoff.
 fn branch_exports_with_union(
     stmt: &Statement,
     imported: &HashSet<String>,
@@ -395,47 +494,51 @@ fn branch_exports_with_union(
 ) -> Result<HashSet<String>, EngineError> {
     let mut exported = HashSet::new();
     for s in union_chain(stmt) {
-        let mut stage = s;
-        let mut carry: HashSet<String> = HashSet::new();
-        loop {
-            let is_final_stage = stage.next.is_none();
-            let mut stage_export: HashSet<String> = HashSet::new();
-            let mut stage_returned = false;
-            walk_branch_seeded(
-                &stage.clauses,
-                imported,
-                &carry,
-                strict,
-                &mut |_, exp, _, _| {
-                    stage_export = exp;
-                    stage_returned = true;
-                    Ok(())
-                },
-            )?;
-            if is_final_stage {
-                if strict {
-                    for n in &stage_export {
-                        if outer_scope.contains(n) {
-                            return Err(duplicate_outer_variable(n));
-                        }
-                    }
-                }
-                exported.extend(stage_export);
-            } else {
-                carry = if stage_returned {
-                    stage_export
-                } else {
-                    HashSet::new()
-                };
-                carry.extend(imported.iter().cloned());
-            }
-            match &stage.next {
-                Some(next_stmt) => stage = next_stmt,
-                None => break,
-            }
-        }
+        exported.extend(stage_exports(
+            s,
+            imported,
+            &HashSet::new(),
+            strict,
+            outer_scope,
+        )?);
     }
     Ok(exported)
+}
+
+/// One NEXT chain's export, stage by stage: walk this stage (so Rule
+/// 4/5/8/10 are checked throughout), then either hand its projection to
+/// the following stage as `carry` — an earlier stage's export is consumed
+/// by the next stage, not exposed to the enclosing scope — or, for the
+/// final stage, check Rule 9 and return its exports. Rule 3 (imported
+/// names visible in every statement of the chain) holds via
+/// [`walk_branch_seeded`] seeding `local_scope` from
+/// `imported.union(carry)` — the one owner of that invariant.
+fn stage_exports(
+    stage: &Statement,
+    imported: &HashSet<String>,
+    carry: &HashSet<String>,
+    strict: bool,
+    outer_scope: &HashSet<String>,
+) -> Result<HashSet<String>, EngineError> {
+    // The sink collects the stage's export set; a stage whose walk never
+    // fires a Return/Finish leaves it empty, which is already the
+    // intended carry for the next stage.
+    let mut stage_export: HashSet<String> = HashSet::new();
+    walk_branch_seeded(&stage.clauses, imported, carry, strict, &mut |exports| {
+        stage_export = exports;
+        Ok(())
+    })?;
+    match &stage.next {
+        Some(next) => stage_exports(next, imported, &stage_export, strict, outer_scope),
+        None => {
+            if strict {
+                if let Some(n) = smallest_collision(&stage_export, outer_scope) {
+                    return Err(duplicate_outer_variable(n));
+                }
+            }
+            Ok(stage_export)
+        }
+    }
 }
 
 /// Strict, top-level entry point (CIP-141/CIP-218 Rules 1/4/5/8/9/10):
@@ -480,10 +583,7 @@ fn walk_top_level(stmt: &Statement, base_scope: HashSet<String>) -> Result<(), E
                         // collision is rejected; whole-row visibility of the
                         // outer scope inside the body is unchanged.
                         let exports = call_subquery_exports(csq, &scope);
-                        let mut collisions: Vec<&String> =
-                            exports.iter().filter(|n| scope.contains(*n)).collect();
-                        collisions.sort();
-                        if let Some(name) = collisions.first() {
+                        if let Some(name) = smallest_collision(&exports, &scope) {
                             return Err(duplicate_outer_variable(name));
                         }
                         // Also make its exported variables visible to

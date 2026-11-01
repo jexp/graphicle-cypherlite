@@ -84,13 +84,15 @@ fn json_codec_store_is_envelope_only() {
     checkpoint_with_lsn(&target, &g, wal.lsn, None).unwrap();
     let info = store_info(&db).unwrap();
     assert_eq!(info.layout, StoreLayout::NativeDir);
-    let StoreSnapshot::Json {
+    let StoreSnapshot::Envelope {
+        codec,
         checkpoint_lsn,
         commit_ts,
     } = &info.snapshot
     else {
         panic!("expected a JSON envelope, got {:?}", info.snapshot);
     };
+    assert_eq!(*codec, SnapshotCodecKind::Json);
     assert_eq!(*checkpoint_lsn, 1);
     assert_eq!(*commit_ts, g.commit_ts());
 }
@@ -193,6 +195,30 @@ fn store_info_beside_a_checkpointing_writer_never_panics() {
         writer_result.unwrap();
         reader_result.unwrap();
     }
+}
+
+/// A root `manifest.json` naming the markdown codec is a never-written
+/// state (the markdown manifest home is the `.cypherlite/` sidecar,
+/// ADR-0406 §3): the cold read refuses it with the same typed error
+/// open's `resolve_codec` head guard returns, instead of projecting an
+/// unopenable directory as an envelope-only store.
+#[test]
+fn root_manifest_naming_the_markdown_codec_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    std::fs::create_dir(&db).unwrap();
+    std::fs::write(
+        db.join("manifest.json"),
+        br#"{"codec":"markdown","checkpoint_lsn":0,"commit_ts":0}"#,
+    )
+    .unwrap();
+    let err = store_info(&db).unwrap_err();
+    assert!(
+        matches!(&err, Error::Storage(m) if m.contains(
+            "a root manifest.json names the markdown codec"
+        )),
+        "{err}"
+    );
 }
 
 #[test]

@@ -30,9 +30,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the details and [AGENTS.md](AGENTS.md
 
 The install script downloads the release binary for your platform (macOS and
 Linux, amd64 and arm64), authenticates the release's `SHA256SUMS` manifest
-against its OpenSSH SSHSIG signature using the stock `ssh-keygen` binary, checks
-the binary against that verified manifest, and installs it to
-`$HOME/.local/bin`:
+against its OpenSSH SSHSIG signature using the stock `ssh-keygen` binary,
+checks that the manifest's signed version header names the release it
+resolved (ADR-0457), checks the binary against that verified manifest, and
+installs it to `$HOME/.local/bin`:
 
 ```bash
 curl -sSfL https://neo4j-labs.github.io/cypherlite/install.sh | GITHUB_TOKEN=$(gh auth token) bash
@@ -75,8 +76,9 @@ cargo build --release
 
 An installed binary self-updates from GitHub releases. It authenticates the
 release's `SHA256SUMS` signature against the public key pinned in the binary
-**before** trusting any checksum, then verifies the download against the
-verified manifest:
+**before** trusting any checksum, requires the manifest's signed version
+header to name the release it was asked to install (ADR-0457), then verifies
+the download against the verified manifest:
 
 ```bash
 cypherlite upgrade          # download, verify, and replace (alias: update)
@@ -122,7 +124,7 @@ cypherlite clone --help
 ```
 $ cypherlite query --database ./friends
 
-CypherLite v0.13.0
+CypherLite v0.14.0
 Type .help for help, .exit to quit.
 
 cypher> CREATE (alice:Person {name: 'Alice', age: 30});

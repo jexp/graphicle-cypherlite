@@ -74,6 +74,54 @@ fn to_boolean_or_null_and_to_string_or_null_match_neo4j() {
     assert!(matches!(call("toStringOrNull", mixed), Value::String(_)));
 }
 
+// CIP-271 is Cypher-25-only: under an explicit `CYPHER 5` preamble the
+// pre-CIP-271 contract holds — `toString()` raises on containers and graph
+// values, and `toStringOrNull()` returns null for them.
+#[test]
+fn tostring_container_semantics_follow_the_cypher5_dialect() {
+    let g = Graph::default();
+    let graph = ExecGraph::read(&g);
+    let row = Row::new();
+    let params = BTreeMap::new();
+    let call = |name: &str, arg: Expr, version: Option<u32>| {
+        function(&graph, &row, &params, name, false, &[arg], version)
+    };
+    let mixed = Expr::List(vec![Expr::Int(1), Expr::String("a".into())]);
+    let homogeneous = Expr::List(vec![Expr::Int(1), Expr::Int(2)]);
+    let map = Expr::Map(vec![("a".into(), Expr::Int(1))]);
+
+    // Cypher 25 (the default): containers render in display form; a
+    // homogeneous list errors and `OrNull` maps that to null.
+    assert_eq!(
+        call("toString", mixed.clone(), None).unwrap(),
+        Value::String("[1, a]".into())
+    );
+    assert_eq!(
+        call("toStringOrNull", map.clone(), None).unwrap(),
+        Value::String("{a: 1}".into())
+    );
+    assert!(call("toString", homogeneous.clone(), None).is_err());
+    assert_eq!(
+        call("toStringOrNull", homogeneous, None).unwrap(),
+        Value::Null
+    );
+
+    // CYPHER 5: every container is non-stringifiable for both spellings.
+    assert!(call("toString", mixed.clone(), Some(5)).is_err());
+    assert!(call("toString", map.clone(), Some(5)).is_err());
+    assert_eq!(
+        call("toStringOrNull", mixed.clone(), Some(5)).unwrap(),
+        Value::Null
+    );
+    assert_eq!(call("toStringOrNull", map, Some(5)).unwrap(), Value::Null);
+
+    // Scalars are unaffected in either dialect.
+    assert_eq!(
+        call("toString", Expr::Int(7), Some(5)).unwrap(),
+        Value::String("7".into())
+    );
+}
+
 #[test]
 fn to_integer_or_null_and_to_float_or_null_match_neo4j() {
     let g = Graph::default();
@@ -669,4 +717,24 @@ fn conversions_match_adr_0175_list_elements_and_string_forms() {
         ("toInteger('')", NULL),
         ("toFloat('')", NULL),
     ]);
+}
+
+// ADR-0448: the rendering policy is a property of the value — one
+// full-precision rendering, through the value layer's display policy,
+// whether the temporal is top-level, nested in a map, or built by any
+// spelling. Top-level and nested are both pinned so the two paths
+// cannot drift apart again.
+#[test]
+fn to_string_renders_temporals_at_full_precision() {
+    let t = cypherlite_core::temporal::datetime_from_epoch(1_709_164_800, 0).unwrap();
+    let full = t.full_seconds_string();
+    assert_eq!(
+        to_string_value(Some(&Value::Temporal(t.clone())), None),
+        Ok(Value::String(full.clone().into()))
+    );
+    let nested = Value::Map(BTreeMap::from([("at".to_string(), Value::Temporal(t))]).into());
+    assert_eq!(
+        to_string_value(Some(&nested), None),
+        Ok(Value::String(format!("{{at: {full}}}").into()))
+    );
 }

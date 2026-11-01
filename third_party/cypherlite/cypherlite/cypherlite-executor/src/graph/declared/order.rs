@@ -9,6 +9,7 @@ use cypherlite_core::{NodeId, Temporal, Value};
 use cypherlite_ir::BinaryOp;
 use cypherlite_model::canonical_key::f64_exact_i64;
 
+use crate::eval;
 use crate::group_key::GroupKey;
 
 use super::DrainState;
@@ -120,8 +121,9 @@ pub(crate) struct RangeIndex {
     /// Order keys this node was posted under, so a drain removes it without
     /// scanning every key in the index.
     pub(super) by_node: HashMap<NodeId, RevKeys<OrderKey>>,
-    /// Equality postings for values that have no [`OrderKey`] (lists, maps,
-    /// points, uuids, and temporals outside the order window).
+    /// Equality postings for values whose [`OrderKey`] cannot answer `=`
+    /// (lists, maps, points, uuids, temporals outside the order window, and
+    /// every zoned datetime — see [`order_key_finer_than_equality`]).
     eq_only: HashMap<GroupKey, Postings>,
     eq_by_node: HashMap<NodeId, RevKeys<GroupKey>>,
     /// Nodes whose temporal value does not fit an `OrderKey`. A comparison
@@ -390,17 +392,23 @@ where
 }
 
 pub(super) fn insert_order(st: &mut RangeIndex, value: &Value, id: NodeId) {
-    if let Some(k) = order_key(value) {
+    let ordered = order_key(value);
+    if let Some(k) = &ordered {
         remember(&mut st.by_node, id, k.clone());
-        st.order.entry(k).or_insert(Postings::One(id)).insert(id);
-        return;
-    }
-    if unorderable_temporal(value) {
+        st.order
+            .entry(k.clone())
+            .or_insert(Postings::One(id))
+            .insert(id);
+    } else if unorderable_temporal(value) {
         st.unbounded.insert(id);
     }
-    if let Some(gk) = GroupKey::for_property_index(value) {
-        remember(&mut st.eq_by_node, id, gk.clone());
-        st.eq_only.entry(gk).or_insert(Postings::One(id)).insert(id);
+    // A value with an order key only needs the `eq_only` copy when its order
+    // key is not a coarsening of `=` (see [`order_key_finer_than_equality`]).
+    if ordered.is_none() || order_key_finer_than_equality(value) {
+        if let Some(gk) = GroupKey::for_property_index(value) {
+            remember(&mut st.eq_by_node, id, gk.clone());
+            st.eq_only.entry(gk).or_insert(Postings::One(id)).insert(id);
+        }
     }
 }
 
@@ -427,12 +435,24 @@ pub(super) fn equality_count(st: &RangeIndex, value: &Value) -> usize {
     equality_postings(st, value).map(Postings::len).unwrap_or(0)
 }
 
+/// Whether the value's order key is **not** a coarsening of Cypher `=`, so
+/// an equality probe cannot read the `order` map for it. A zoned `DateTime`
+/// orders by its UTC instant but is `=` by its local wall clock and zone
+/// identity (`Temporal::datetime_eq_identity`, ADR-0446): the two halves of a
+/// DST fall-back overlap order apart yet are equal, so an instant-keyed
+/// bucket would miss the equal partner and an indexed seek (or `MERGE`
+/// through the backing index) would disagree with a scan.
+fn order_key_finer_than_equality(value: &Value) -> bool {
+    matches!(value, Value::Temporal(Temporal::DateTime { .. }))
+}
+
 fn equality_postings<'a>(st: &'a RangeIndex, value: &Value) -> Option<&'a Postings> {
-    if let Some(k) = order_key(value) {
-        return st.order.get(&k);
+    if !order_key_finer_than_equality(value) {
+        if let Some(k) = order_key(value) {
+            return st.order.get(&k);
+        }
     }
-    let gk = GroupKey::for_property_index(value)?;
-    st.eq_only.get(&gk)
+    st.eq_only.get(&GroupKey::for_property_index(value)?)
 }
 
 pub(super) fn collect_range(
@@ -455,33 +475,34 @@ pub(super) fn numeric_cross_start(bound: f64, greater: bool) -> OrderKey {
     OrderKey::Float(ord_f64(if edge.is_finite() { edge } else { bound }))
 }
 
-/// Superset of values on the far side of a numeric bound, covering both
-/// ints and floats. Residual comparison drops the extra ids.
-pub(super) fn numeric_ids(
+/// Superset of values on the far side of a bound, covering both ints and
+/// floats and, for a zoned temporal, its key-tie group. Residual comparison
+/// drops the extra ids.
+pub(super) fn range_ids(
     order: &BTreeMap<OrderKey, Postings>,
     op: BinaryOp,
     bound: &Value,
 ) -> HashSet<NodeId> {
     let mut out = HashSet::new();
-    visit_numeric_postings(order, op, bound, |ids| ids.extend_into(&mut out));
+    visit_range_postings(order, op, bound, |ids| ids.extend_into(&mut out));
     out
 }
 
-/// Upper bound on [`numeric_ids`], summed from posting lengths. A node posted
+/// Upper bound on [`range_ids`], summed from posting lengths. A node posted
 /// under more than one visited key is counted once per key. No id set is built.
-pub(super) fn numeric_count(
+pub(super) fn range_count(
     order: &BTreeMap<OrderKey, Postings>,
     op: BinaryOp,
     bound: &Value,
 ) -> usize {
     let mut count = 0usize;
-    visit_numeric_postings(order, op, bound, |ids| {
+    visit_range_postings(order, op, bound, |ids| {
         count = count.saturating_add(ids.len());
     });
     count
 }
 
-fn visit_numeric_postings(
+fn visit_range_postings(
     order: &BTreeMap<OrderKey, Postings>,
     op: BinaryOp,
     bound: &Value,
@@ -490,28 +511,50 @@ fn visit_numeric_postings(
     let Some(key) = order_key(bound) else {
         return;
     };
-    let (greater, inclusive) = match op {
-        BinaryOp::Gt => (true, false),
-        BinaryOp::Gte => (true, true),
-        BinaryOp::Lt => (false, false),
-        BinaryOp::Lte => (false, true),
+    // A zoned `Time`/`DateTime` bound's key order is coarser than the
+    // predicate's ordering: the key carries the instant (or UTC nanos) alone,
+    // while `Temporal::compare` breaks the tie on the Time offset and the
+    // DateTime zone region (ADR-0446). A key-tie group can therefore still
+    // hold values the strict predicate accepts, so for those two kinds the
+    // boundary is scanned inclusively and `cmp_holds` rejects the rest. Every
+    // other kind's key order is its predicate's order, and keeps the exact
+    // exclusive boundary.
+    let coarse_key = matches!(
+        bound,
+        Value::Temporal(Temporal::Time { .. } | Temporal::DateTime { .. })
+    );
+    let (greater, start, end) = match (op, coarse_key) {
+        (BinaryOp::Gt, false) => (
+            true,
+            Bound::Excluded(key.clone()),
+            Bound::Excluded(variant_upper(&key)),
+        ),
+        (BinaryOp::Gt, true) => (
+            true,
+            Bound::Included(key.clone()),
+            Bound::Excluded(variant_upper(&key)),
+        ),
+        (BinaryOp::Gte, _) => (
+            true,
+            Bound::Included(key.clone()),
+            Bound::Excluded(variant_upper(&key)),
+        ),
+        (BinaryOp::Lt, false) => (
+            false,
+            Bound::Included(variant_lower(&key)),
+            Bound::Excluded(key.clone()),
+        ),
+        (BinaryOp::Lt, true) => (
+            false,
+            Bound::Included(variant_lower(&key)),
+            Bound::Included(key.clone()),
+        ),
+        (BinaryOp::Lte, _) => (
+            false,
+            Bound::Included(variant_lower(&key)),
+            Bound::Included(key.clone()),
+        ),
         _ => return,
-    };
-    let start = if greater {
-        if inclusive {
-            Bound::Included(key.clone())
-        } else {
-            Bound::Excluded(key.clone())
-        }
-    } else {
-        Bound::Included(variant_lower(&key))
-    };
-    let end = if greater {
-        Bound::Excluded(variant_upper(&key))
-    } else if inclusive {
-        Bound::Included(key.clone())
-    } else {
-        Bound::Excluded(key.clone())
     };
     let mut scan = |start, end| {
         for (_, ids) in order.range((start, end)) {
@@ -564,16 +607,17 @@ pub(super) fn prefix_ids(order: &BTreeMap<OrderKey, Postings>, prefix: &str) -> 
 }
 
 pub(super) fn cmp_holds(v: &Value, op: BinaryOp, bound: &Value) -> bool {
-    let Some(ord) = v.compare(bound) else {
+    // The predicate side comes from the ordering-operator table the expression
+    // evaluator uses, and the value side from its `cmp_bool`, so an indexed
+    // range predicate can never answer differently from a residual one
+    // (`duration(...) <= duration(...)` holds without being orderable).
+    let Some((equality_allowed, pred)) = eval::ordering_operator(op) else {
         return false;
     };
-    match op {
-        BinaryOp::Lt => ord.is_lt(),
-        BinaryOp::Gt => ord.is_gt(),
-        BinaryOp::Lte => ord.is_le(),
-        BinaryOp::Gte => ord.is_ge(),
-        _ => false,
-    }
+    matches!(
+        eval::cmp_bool(v, bound, equality_allowed, pred),
+        Value::Bool(true)
+    )
 }
 
 #[cfg(test)]
@@ -610,15 +654,58 @@ mod tests {
 
         // Float bound: the int side of the cross scan runs up to the Float
         // variant lower bound and never reaches the String variant.
-        let gt = numeric_ids(&st.order, BinaryOp::Gt, &Value::Float(2.5));
+        let gt = range_ids(&st.order, BinaryOp::Gt, &Value::Float(2.5));
         assert!(gt.is_superset(&HashSet::from([2, 5])));
         assert!(!gt.contains(&6));
         assert!(!gt.contains(&7));
 
         // Int bound, other direction: the float side runs from the Float
         // variant lower bound and never reaches the String variant.
-        let lt = numeric_ids(&st.order, BinaryOp::Lt, &Value::Int(3));
+        let lt = range_ids(&st.order, BinaryOp::Lt, &Value::Int(3));
         assert_eq!(lt, HashSet::from([1, 3, 4, 7]));
+    }
+
+    #[test]
+    fn strict_temporal_seek_includes_the_key_tie_group() {
+        // `12:00+01:00` and `11:00Z` share the order key (the same instant)
+        // but not the predicate's ordering: `Temporal::compare` breaks the
+        // tie on the offset, so the wall clock 12:00 is strictly greater
+        // than 11:00. A strict `>` seek must still collect it — the
+        // boundary is inclusive and `cmp_holds` rejects what it should.
+        let mut st = RangeIndex::default();
+        let plus_one = Value::Temporal(Temporal::Time {
+            time: chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            offset: 3600,
+        });
+        let zulu = Value::Temporal(Temporal::Time {
+            time: chrono::NaiveTime::from_hms_opt(11, 0, 0).unwrap(),
+            offset: 0,
+        });
+        insert_order(&mut st, &plus_one, 10);
+        insert_order(&mut st, &zulu, 11);
+        assert_eq!(
+            order_key(&plus_one),
+            order_key(&zulu),
+            "one key, two orders"
+        );
+        // The key scan is a superset (it carries the tie group, bound
+        // included); the production pipeline filters it through the
+        // evaluator predicate, and that is what must answer exactly.
+        let scanned = range_ids(&st.order, BinaryOp::Gt, &zulu);
+        assert!(
+            scanned.contains(&10),
+            "the tie-broken greater value is scanned"
+        );
+        assert!(
+            scanned.contains(&11),
+            "the bound's own key group is scanned too"
+        );
+        let kept: HashSet<NodeId> = [(10, plus_one.clone()), (11, zulu.clone())]
+            .into_iter()
+            .filter(|(_, v)| cmp_holds(v, BinaryOp::Gt, &zulu))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(kept, HashSet::from([10]));
     }
 
     #[test]
@@ -681,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_count_sums_posting_lengths() {
+    fn range_count_sums_posting_lengths() {
         let mut st = RangeIndex::default();
         insert_order(&mut st, &Value::Int(50), 1);
         for id in [2, 3, 4] {
@@ -691,7 +778,7 @@ mod tests {
             insert_order(&mut st, &Value::Int(250), id);
         }
         let bound = Value::Int(100);
-        let count = numeric_count(&st.order, BinaryOp::Gt, &bound);
+        let count = range_count(&st.order, BinaryOp::Gt, &bound);
         let summed: usize = st
             .order
             .range((
@@ -702,7 +789,55 @@ mod tests {
             .sum();
         assert_eq!(count, 5);
         assert_eq!(count, summed);
-        assert_eq!(numeric_ids(&st.order, BinaryOp::Gt, &bound).len(), count);
+        assert_eq!(range_ids(&st.order, BinaryOp::Gt, &bound).len(), count);
         assert_eq!(equality_count(&st, &Value::Int(150)), 3);
+    }
+
+    #[test]
+    fn out_of_window_datetime_is_not_an_order_key() {
+        let far = chrono::NaiveDate::from_ymd_opt(9999, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let value = Value::Temporal(Temporal::LocalDateTime(far));
+        let mut st = RangeIndex::default();
+        insert_order(&mut st, &value, 7);
+        assert!(st.order.is_empty());
+        assert!(st.unbounded.contains(&7));
+        order_remove_node(&mut st, 7);
+        assert!(st.unbounded.is_empty());
+    }
+
+    /// ADR-0446: the range index posts a zoned datetime under its *order* key
+    /// (instant) and under its *equality* key (local wall clock + zone), and
+    /// the equality probe reads the latter — so it finds the DST fall-back
+    /// overlap's other half, which a scan answers by equality too.
+    #[test]
+    fn zoned_datetime_equality_bucket_ignores_the_instant() {
+        let local = chrono::NaiveDate::from_ymd_opt(2025, 10, 26)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        // hours is the offset east of UTC; the UTC instant and the stored
+        // offset both derive from it, so no incoherent half is expressible.
+        let half = |hours: i64| {
+            Value::Temporal(Temporal::DateTime {
+                utc: local - chrono::Duration::hours(hours),
+                offset: (hours * 3600) as i32,
+                zone: Some("Europe/Stockholm".into()),
+            })
+        };
+        let first = half(2);
+        let second = half(1);
+        let mut st = RangeIndex::default();
+        insert_order(&mut st, &first, 1);
+        assert_eq!(equality_ids(&st, &second), HashSet::from([1]));
+        // A different zone identity never joins the bucket.
+        let other_zone = Value::Temporal(Temporal::DateTime {
+            utc: local - chrono::Duration::hours(1),
+            offset: 3600,
+            zone: Some("Europe/Berlin".into()),
+        });
+        assert!(equality_ids(&st, &other_zone).is_empty());
     }
 }

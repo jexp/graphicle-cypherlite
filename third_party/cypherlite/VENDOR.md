@@ -2,8 +2,8 @@
 
 This directory is a vendored snapshot of the CypherLite repository
 (https://github.com/neo4j-labs/cypherlite — a Neo4j Labs project, access
-restricted), taken at commit `221329d5269f8e5dcc17a092ca39d2c4716d51e1`
-(v0.13.0 + 51 commits, 2026-10-29). It is the engine Graphicle embeds as
+restricted), taken at commit `d089addf8fab6caf686f37d32092780703da264d`
+(v0.14.0 + 33 commits, 2026-11-01). It is the engine Graphicle embeds as
 its graph store — see `crates/graphicle/src/store_graph.rs` and
 `cypherlite-migration.md` in the Graphicle repository.
 
@@ -11,7 +11,7 @@ its graph store — see `crates/graphicle/src/store_graph.rs` and
 
 - `cypherlite/` — the engine crate group in full: the `cypherlite` facade
   plus model, parser, error, splitter, core, catalog, ir, front, planner,
-  executor, ontology and storage.
+  executor, ontology, markdown and storage.
 - `testing/cypherlite-test-support/` — the shared test helpers the engine
   crates dev-depend on.
 - The workspace manifest, the lock, the toolchain pin, the README, the

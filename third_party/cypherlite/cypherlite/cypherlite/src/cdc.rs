@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 
 const SLOTS_FILE: &str = "cdc/slots.json";
 
+/// The slots file inside the store VFS: under the engine's hidden
+/// directory for a markdown vault (ADR-0406 §3), at the root otherwise.
+fn slots_file(engine_dir: Option<&str>) -> String {
+    match engine_dir {
+        None => SLOTS_FILE.to_string(),
+        Some(dir) => format!("{dir}/{SLOTS_FILE}"),
+    }
+}
+
 /// A WAL consumer that holds recycle until it acks (ADR-0045).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CdcSlot {
@@ -29,20 +38,21 @@ pub(crate) struct CdcState {
     apply_only: bool,
     slots: BTreeMap<String, CdcSlot>,
     vfs: Arc<dyn Vfs>,
+    slots_file: String,
 }
 
 impl CdcState {
-    pub(crate) fn load(vfs: Arc<dyn Vfs>) -> Result<Self> {
-        if !vfs.exists(SLOTS_FILE)? {
-            return Ok(Self {
-                apply_only: false,
-                slots: BTreeMap::new(),
-                vfs,
-            });
-        }
-        let bytes = read_to_vec(&*vfs, SLOTS_FILE)?;
-        let file: CdcFile =
-            serde_json::from_slice(&bytes).map_err(|e| Error::storage(e.to_string()))?;
+    pub(crate) fn load(vfs: Arc<dyn Vfs>, engine_dir: Option<&str>) -> Result<Self> {
+        let slots_file = slots_file(engine_dir);
+        // A missing slots file is the never-configured default: the same
+        // `CdcFile` a present file with all-absent fields would decode to
+        // (`Default`'s fields match the serde defaults), built once.
+        let file = if vfs.exists(&slots_file)? {
+            let bytes = read_to_vec(&*vfs, &slots_file)?;
+            serde_json::from_slice(&bytes).map_err(|e| Error::storage(e.to_string()))?
+        } else {
+            CdcFile::default()
+        };
         let mut slots = BTreeMap::new();
         for s in file.slots {
             slots.insert(s.name.clone(), s);
@@ -51,6 +61,7 @@ impl CdcState {
             apply_only: file.apply_only,
             slots,
             vfs,
+            slots_file,
         })
     }
 
@@ -60,7 +71,7 @@ impl CdcState {
             slots: self.slots.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| Error::storage(e.to_string()))?;
-        atomic_write(&*self.vfs, SLOTS_FILE, &bytes)
+        atomic_write(&*self.vfs, &self.slots_file, &bytes)
     }
 
     pub(crate) fn apply_only(&self) -> bool {

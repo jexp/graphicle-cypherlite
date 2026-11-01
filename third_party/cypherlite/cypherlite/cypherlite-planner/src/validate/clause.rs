@@ -19,10 +19,11 @@ use crate::pattern::{
     element_has_qpp,
 };
 
+use crate::names::query_with_persistent_imports;
+
 use super::{
     check_remove_item, check_set_item, query_contains_in_transactions,
-    query_with_persistent_imports, validate_conditional_returns, validate_part_with_env,
-    validate_scoped_return_star,
+    validate_conditional_returns, validate_part_with_env, validate_scoped_return_star,
 };
 
 pub(super) fn check_catalog_clause(

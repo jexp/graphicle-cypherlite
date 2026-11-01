@@ -338,6 +338,32 @@ pub fn spawn_single_response_capturing(
     spawn_scripted_responses_capturing(status_line, vec![body])
 }
 
+/// Like [`spawn_single_response_capturing`], but the body is raw bytes —
+/// the binary fixture a suite serves verbatim (an extension tarball,
+/// ADR-0431): the response carries the exact bytes and their length, so
+/// no string conversion can corrupt them in transit. One body, one
+/// connection; the join value is the captured request head. Serves
+/// through the same [`serve_connection`] the scripted fixtures do, with
+/// the binary body's octet-stream content type — the one fixed-response
+/// dance, not a second copy of it.
+pub fn spawn_single_response_bytes_capturing(
+    status_line: &'static str,
+    body: Vec<u8>,
+) -> (CapturingFixture, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let thread = std::thread::spawn(move || {
+        let Some(stream) = accept_one(&listener) else {
+            return Vec::new();
+        };
+        serve_connection(&stream, status_line, "application/octet-stream", &body)
+            .map(|served| vec![served.head])
+            .unwrap_or_default()
+    });
+    (CapturingFixture { thread }, port)
+}
+
 /// Serve one fixed raw HTTP response per request on loopback, running until
 /// the returned [`CaptureSink`] is stopped or dropped. Unlike the scripted
 /// spawns, the server has no fixed request count: it records every request
@@ -359,7 +385,12 @@ pub fn spawn_capture_server(
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Some(served) = serve_connection(&stream, status_line, &body) {
+                        if let Some(served) = serve_connection(
+                            &stream,
+                            status_line,
+                            JSON_CONTENT_TYPE,
+                            body.as_bytes(),
+                        ) {
                             bodies.lock().expect("bodies").push(served.body);
                         }
                     }
@@ -465,7 +496,8 @@ struct ServedRequest {
 /// mid-request, so a test that never connects cannot hang the server thread.
 fn serve_one(listener: &TcpListener, status_line: &str, body: &str) -> Option<String> {
     let stream = accept_one(listener)?;
-    serve_connection(&stream, status_line, body).map(|served| served.head)
+    serve_connection(&stream, status_line, JSON_CONTENT_TYPE, body.as_bytes())
+        .map(|served| served.head)
 }
 
 /// [`serve_one`]'s whole-request twin: the captured `(head, body)` pair, for
@@ -476,7 +508,8 @@ fn serve_one_full(
     body: &str,
 ) -> Option<(String, String)> {
     let stream = accept_one(listener)?;
-    serve_connection(&stream, status_line, body).map(|served| (served.head, served.body))
+    serve_connection(&stream, status_line, JSON_CONTENT_TYPE, body.as_bytes())
+        .map(|served| (served.head, served.body))
 }
 
 /// Serve one already-accepted connection: force the socket back to blocking
@@ -484,7 +517,19 @@ fn serve_one_full(
 /// flag, and `set_read_timeout` does not make a nonblocking socket block),
 /// read the request, write the response, and return the captured head and
 /// body. `None` when the peer hung up mid-request.
-fn serve_connection(stream: &TcpStream, status_line: &str, body: &str) -> Option<ServedRequest> {
+///
+/// The one fixed-response writer every fixture spawn shares — the scripted
+/// string fixtures (JSON content type, the body's UTF-8 bytes) and the
+/// binary fixture (octet-stream, the body served verbatim, no string
+/// conversion in transit) — so the response shape cannot drift between
+/// them: `content_type` names the response's media type and `body` is the
+/// exact bytes written after the head, their length declared.
+fn serve_connection(
+    stream: &TcpStream,
+    status_line: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Option<ServedRequest> {
     stream
         .set_nonblocking(false)
         .expect("blocking accepted socket");
@@ -495,12 +540,13 @@ fn serve_connection(stream: &TcpStream, status_line: &str, body: &str) -> Option
         .set_write_timeout(Some(Duration::from_secs(10)))
         .expect("set write timeout");
     let served = read_request(stream)?;
-    let resp = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let head = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );
     let mut write_half = stream;
-    let _ = write_half.write_all(resp.as_bytes());
+    let _ = write_half.write_all(head.as_bytes());
+    let _ = write_half.write_all(body);
     Some(served)
 }
 
@@ -550,6 +596,74 @@ fn read_request(stream: &TcpStream) -> Option<ServedRequest> {
         head,
         body: String::from_utf8_lossy(&request_body).into_owned(),
     })
+}
+
+/// Wait for the server to drop a connection whose request phase the caller
+/// left incomplete (the slowloris/trickle probe), returning how long the
+/// drop took. `settle` bounds the wait: a connection still open then panics,
+/// so a server that never applies its deadline fails the test.
+///
+/// The caller has already written its surface-specific incomplete prefix
+/// (and, for the trickling form, calls [`assert_dropped_while_trickling`]
+/// instead); this helper owns the read side only. Both the Query API and MCP
+/// admission tests call it so the probe's read loop (timeout handling,
+/// reset-vs-EOF, settle bound) is stated once; the callers keep their own
+/// deadline-window assertions and messages.
+pub fn assert_dropped_by_deadline(stream: &mut TcpStream, settle: Duration) -> Duration {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("arm the probe's read timeout");
+    let started = Instant::now();
+    let mut buf = [0u8; 64];
+    loop {
+        match stream.read(&mut buf) {
+            // EOF: the server closed the connection.
+            Ok(0) => return started.elapsed(),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if started.elapsed() > settle {
+                    panic!(
+                        "the connection was still open after {settle:?}; the admission deadline did not drop it"
+                    );
+                }
+            }
+            // A reset also means the server dropped us.
+            Err(_) => return started.elapsed(),
+        }
+    }
+}
+
+/// The trickle gap: each byte arrives well inside any surface's per-read
+/// timeout, so only an absolute deadline can drop the connection.
+const TRICKLE_GAP: Duration = Duration::from_millis(50);
+/// The trickle length: 1.5 s of activity, enough to outlive the short test
+/// deadlines while staying inside the default settle bound.
+const TRICKLE_BYTES: usize = 30;
+
+/// Drive the slowloris probe end to end: `stream` has already written its
+/// surface-specific incomplete request prefix; this spawns a writer clone
+/// that trickles one byte every [`TRICKLE_GAP`], waits for the server to
+/// drop the connection ([`assert_dropped_by_deadline`]), joins the writer,
+/// and returns the elapsed drop time. The caller keeps its own deadline
+/// window assertions and messages.
+pub fn assert_dropped_while_trickling(stream: &mut TcpStream, settle: Duration) -> Duration {
+    let mut writer = stream.try_clone().expect("clone the trickle writer");
+    let trickle = std::thread::spawn(move || {
+        for _ in 0..TRICKLE_BYTES {
+            if writer.write_all(b"a").is_err() {
+                return;
+            }
+            std::thread::sleep(TRICKLE_GAP);
+        }
+    });
+    let elapsed = assert_dropped_by_deadline(stream, settle);
+    trickle.join().expect("the trickle writer panicked");
+    elapsed
 }
 
 #[cfg(test)]
@@ -712,5 +826,32 @@ mod tests {
             );
             assert!(head.ends_with("\r\n\r\n"), "{head:?}");
         }
+    }
+
+    /// The binary fixture's response shape: the octet-stream content type,
+    /// the body's exact length declared, and the bytes themselves arriving
+    /// verbatim (bytes that are not UTF-8, so any string conversion would
+    /// corrupt them) — the generalization [`serve_connection`] gives the
+    /// bytes fixture, pinned as the tarball-serving contract it is.
+    #[test]
+    fn bytes_fixture_serves_the_exact_bytes_as_octet_stream() {
+        const REQUEST: &[u8] = b"GET /greet-1.2.3.tar.gz HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        let body: Vec<u8> = vec![0x1f, 0x8b, 0x00, 0xff, 0x8b, 0x1f];
+        let (fixture, port) = spawn_single_response_bytes_capturing("200 OK", body.clone());
+        let (status, raw) = exchange_bytes(port, REQUEST);
+        assert_eq!(status, 200);
+        let (head, served_body) = split_response(&raw);
+        assert_eq!(
+            header_value(head, "content-type"),
+            Some("application/octet-stream"),
+            "the binary fixture's content type: {head:?}"
+        );
+        assert_eq!(header_value(head, "content-length"), Some("6"));
+        assert_eq!(
+            served_body,
+            &body[..],
+            "the body bytes must arrive verbatim"
+        );
+        assert_eq!(fixture.join().len(), 1, "one connection, one head");
     }
 }

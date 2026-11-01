@@ -6,8 +6,10 @@
 //! texts, the error-text extractor, the `db.ontology.*` document helpers
 //! (`set_doc`/`get_doc`), the WAL segment-magic readers, the WAL frame
 //! encoder, the crash-seeded store fixtures
-//! (`store_vfs`/`active_segment`/`seed_store`), and the ADR-0120 checkpoint
-//! format-marker assertion, plus the `ontology` preview opt-in
+//! (`store_vfs`/`active_segment`/`seed_store`), the deterministic
+//! test-store open policy (`opts`), and the ADR-0120 checkpoint
+//! format-marker assertion (`assert_checkpoint_format` plus its
+//! `ExpectedOntology`), plus the `ontology` preview opt-in
 //! (`preview_ontology`, ADR-0378).
 //!
 //! Each including test crate uses a different subset of these helpers, so
@@ -67,6 +69,19 @@ pub fn connection() -> cypherlite::Connection {
         .unwrap()
         .connect()
         .unwrap()
+}
+
+/// A fresh connection whose store carries one `IS UNIQUE` constraint:
+/// `CREATE CONSTRAINT <constraint> FOR (n:<label>) REQUIRE n.<prop> IS UNIQUE`
+/// — the shared scaffold `temporal_identity_split.rs` and
+/// `constraint_numeric_equivalence.rs` each hand-rolled (F-4-18).
+pub fn unique_constrained(constraint: &str, label: &str, prop: &str) -> cypherlite::Connection {
+    let mut c = connection();
+    c.query(&format!(
+        "CREATE CONSTRAINT {constraint} FOR (n:{label}) REQUIRE n.{prop} IS UNIQUE"
+    ))
+    .unwrap();
+    c
 }
 
 /// One `:Person` and one `:City` — the two-label store the notification
@@ -157,6 +172,13 @@ pub fn string(value: &str) -> cypherlite::Value {
     cypherlite::Value::String(value.into())
 }
 
+/// A `Value::List` of `Value::String` — the one canonical spelling of a
+/// list-of-strings expectation (the hoisted twin of `uuid_label_predicates`'
+/// `labels` and `schema_procedures`' `strings`; F-1-53).
+pub fn strings(values: &[&str]) -> cypherlite::Value {
+    list(values.iter().map(|value| string(value)).collect())
+}
+
 /// Runs `query`, which must succeed.
 pub fn run(connection: &mut cypherlite::Connection, query: &str) -> cypherlite::QueryResult {
     connection
@@ -179,6 +201,40 @@ pub fn scalar_one(connection: &mut cypherlite::Connection, query: &str) -> cyphe
     let mut rs = rows(connection, query);
     assert_eq!(rs.len(), 1, "{query}: expected a single row");
     rs.remove(0).remove(0)
+}
+
+/// Every column of the exactly-one row (the all-columns twin of
+/// `scalar_one`) — the shared extractor the comparison and temporal test
+/// files had each copied (F-1-11, F-1-12 and F-1-50).
+pub fn row(connection: &mut cypherlite::Connection, query: &str) -> Vec<cypherlite::Value> {
+    let mut rows = rows(connection, query);
+    assert_eq!(rows.len(), 1, "{query}: expected one row");
+    rows.remove(0)
+}
+
+/// Run one comparison-case table: each tuple is `(a, b, eq, lt, gt,
+/// distinct)`, and the one query shape asserts all four answers at once
+/// (hoisted from `comparison_semantics.rs`; F-1-54).
+pub fn assert_comparison_cases(
+    c: &mut cypherlite::Connection,
+    cases: &[(&str, &str, bool, bool, bool, i64)],
+) {
+    for &(a, b, eq, lt, gt, distinct) in cases {
+        let query = format!(
+            "WITH {a} AS a, {b} AS b UNWIND [a, b] AS x \
+             RETURN a = b AS eq, a < b AS lt, a > b AS gt, count(DISTINCT x) AS dc"
+        );
+        assert_eq!(
+            row(c, &query),
+            vec![
+                cypherlite::Value::Bool(eq),
+                cypherlite::Value::Bool(lt),
+                cypherlite::Value::Bool(gt),
+                cypherlite::Value::Int(distinct)
+            ],
+            "{a} vs {b}"
+        );
+    }
 }
 
 /// The error text of a `unique` or `key` violation of constraint `name`
@@ -248,9 +304,14 @@ pub fn get_doc(conn: &mut cypherlite::Connection, cypher: &str) -> cypherlite::V
 }
 
 /// `(segment name, magic)` of every WAL segment under `dir`, sorted by
-/// name — the last entry is the active segment.
-pub fn segment_magics(dir: &std::path::Path) -> Vec<(String, [u8; 8])> {
-    let mut segments: Vec<(String, [u8; 8])> = std::fs::read_dir(dir.join("wal"))
+/// name — the last entry is the active segment. The per-codec WAL
+/// directory comes from [`cypherlite_storage::SnapshotCodecKind::wal_dir`]
+/// (ADR-0406 §3 for the markdown store).
+pub fn segment_magics(
+    dir: &std::path::Path,
+    codec: cypherlite_storage::SnapshotCodecKind,
+) -> Vec<(String, [u8; 8])> {
+    let mut segments: Vec<(String, [u8; 8])> = std::fs::read_dir(dir.join(codec.wal_dir()))
         .unwrap()
         .filter_map(|entry| {
             let path = entry.unwrap().path();
@@ -268,8 +329,8 @@ pub fn segment_magics(dir: &std::path::Path) -> Vec<(String, [u8; 8])> {
 }
 
 /// Just the magics of [`segment_magics`], in segment-name order.
-pub fn magics(dir: &std::path::Path) -> Vec<[u8; 8]> {
-    segment_magics(dir)
+pub fn magics(dir: &std::path::Path, codec: cypherlite_storage::SnapshotCodecKind) -> Vec<[u8; 8]> {
+    segment_magics(dir, codec)
         .into_iter()
         .map(|(_, magic)| magic)
         .collect()
@@ -300,22 +361,42 @@ pub fn active_segment(vfs: &dyn cypherlite_storage::Vfs) -> String {
     format!("wal/{}", segments.last().expect("a WAL segment must exist"))
 }
 
+/// The deterministic-test-store open policy: zero checkpoint interval
+/// (every durability boundary is an explicit `db.checkpoint()`, the timer
+/// never fires on its own) plus the chosen snapshot codec — the shared
+/// fixture the integration tests open stores with, so no test re-spells
+/// the `OpenOptions` record.
+pub fn opts(codec: cypherlite_storage::SnapshotCodecKind) -> cypherlite::OpenOptions {
+    cypherlite::OpenOptions {
+        checkpoint_interval: Some(std::time::Duration::ZERO),
+        snapshot_codec: Some(codec),
+        ..cypherlite::OpenOptions::default()
+    }
+}
+
 /// Create a store through the public `Database` API under `codec`, commit
 /// once, checkpoint, commit again, then close with
 /// `leak_without_checkpoint` (a crash after the WAL fsync) so the last
 /// commit lives only in the active WAL segment.
 pub fn seed_store(root: &std::path::Path, codec: cypherlite_storage::SnapshotCodecKind) {
-    let db = cypherlite::Database::open_with(
-        root.to_str().unwrap(),
-        cypherlite::OpenOptions {
-            checkpoint_interval: Some(std::time::Duration::ZERO),
-            snapshot_codec: Some(codec),
-            ..cypherlite::OpenOptions::default()
-        },
-    )
-    .unwrap();
+    seed_store_with(root, codec, &[]);
+}
+
+/// [`seed_store`] plus `pre_checkpoint` statements applied before the
+/// checkpoint — the parametrized fixture the constraint-replay seeding
+/// shares, where the DDL must live in the checkpoint and the appended WAL
+/// tail carries only the duplicate writes.
+pub fn seed_store_with(
+    root: &std::path::Path,
+    codec: cypherlite_storage::SnapshotCodecKind,
+    pre_checkpoint: &[&str],
+) {
+    let db = cypherlite::Database::open_with(root.to_str().unwrap(), opts(codec)).unwrap();
     let mut conn = db.connect().unwrap();
     conn.query("CREATE (:T {name: 'checkpointed'})").unwrap();
+    for statement in pre_checkpoint {
+        run(&mut conn, statement);
+    }
     db.checkpoint().unwrap();
     conn.query("CREATE (:T {name: 'tailed'})").unwrap();
     drop(conn);
@@ -349,46 +430,106 @@ pub fn ontology_set_frame(lsn: u64, commit_ts: u64, spec: &str) -> Vec<u8> {
     wal_frame(payload.as_bytes())
 }
 
+/// What a checkpoint's ontology publication must look like — the one
+/// typed expectation [`assert_checkpoint_format`] asserts on, so every
+/// shape asserts something (no held-but-unchecked hole).
+pub enum ExpectedOntology {
+    /// The plain format: the codec's ontology field is absent.
+    Absent,
+    /// The ontology is held: the codec's ontology field is present (a
+    /// Parquet manifest publishes by reference — `ontology_path`,
+    /// ADR-0120 §5 — so presence is the most it can assert).
+    Held,
+    /// The ontology is held and published verbatim: the field's value is
+    /// exactly `document`.
+    Document(&'static str),
+}
+
 /// Assert the ADR-0120 §4/§8 checkpoint format markers of a Native store
-/// directory, per snapshot codec — the Parquet-`format_version` vs
-/// JSON-`value_encoding` duality of the published ontology. While the
-/// ontology is held (`held`) a Parquet manifest carries `format_version` 4
-/// and a JSON `graph.json` carries `value_encoding` 3, publishing the
-/// document verbatim into its `ontology` field (`document` asserts the
-/// published bytes when given). In the plain format (`!held`) the manifest
-/// is `format_version` 3 and `graph.json` is `value_encoding` 2, and no
-/// ontology is published anywhere — no `ontology_path` in the manifest, no
-/// `ontology` field in `graph.json`.
+/// directory, per snapshot codec, against one typed ontology expectation.
+/// The ontology state is the format-marker state: the plain format
+/// ([`ExpectedOntology::Absent`]) is a Parquet `format_version` 3 / a JSON
+/// `value_encoding` 2 with no ontology published anywhere, and a held
+/// ontology is `format_version` 4 / `value_encoding` 3. Each codec arm
+/// asserts on one typed read of its own checkpoint image
+/// (`SnapshotCodecKind::checkpoint_image`): the Parquet manifest's
+/// `ontology_path` (by reference, ADR-0120 §5), the JSON `graph.json`'s
+/// inline `ontology` field, and the markdown sidecar manifest
+/// (ADR-0406 §3), whose envelope names the codec and whose inline
+/// ontology follows the JSON codec's rules.
 pub fn assert_checkpoint_format(
     dir: &std::path::Path,
     codec: cypherlite_storage::SnapshotCodecKind,
-    held: bool,
-    document: Option<&str>,
+    expected: ExpectedOntology,
 ) {
+    // One typed read of the checkpoint image, shared by every arm below.
+    let image: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(codec.checkpoint_image())).unwrap())
+            .unwrap();
+    // The ontology state is the format-marker state (ADR-0120 §4/§8).
+    let held = !matches!(expected, ExpectedOntology::Absent);
     match codec {
         cypherlite_storage::SnapshotCodecKind::Parquet => {
-            let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-            let manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            assert_eq!(manifest["format_version"], if held { 4 } else { 3 });
-            if !held {
-                assert!(
-                    !raw.contains("ontology_path"),
-                    "the v3 manifest carries no ontology_path: {manifest}"
-                );
-            }
+            assert_eq!(image["format_version"], if held { 4 } else { 3 });
+            // A Parquet manifest publishes the ontology by reference
+            // (`ontology_path`), never verbatim — the document
+            // expectation collapses to presence.
+            let expected = match expected {
+                ExpectedOntology::Document(_) => ExpectedOntology::Held,
+                other => other,
+            };
+            assert_ontology(
+                &image,
+                "ontology_path",
+                expected,
+                "the plain manifest carries no ontology_path",
+            );
         }
         cypherlite_storage::SnapshotCodecKind::Json => {
-            let graph: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(dir.join("graph.json")).unwrap()).unwrap();
-            assert_eq!(graph["value_encoding"], if held { 3 } else { 2 });
-            if !held {
-                assert!(
-                    graph.get("ontology").is_none(),
-                    "graph.json carries no ontology field: {graph}"
-                );
-            } else if let Some(document) = document {
-                assert_eq!(graph["ontology"], document);
-            }
+            assert_eq!(image["value_encoding"], if held { 3 } else { 2 });
+            assert_ontology(
+                &image,
+                "ontology",
+                expected,
+                "graph.json carries no ontology field",
+            );
+        }
+        cypherlite_storage::SnapshotCodecKind::Markdown => {
+            assert_eq!(image["codec"], "markdown");
+            assert_ontology(
+                &image,
+                "ontology",
+                expected,
+                "the sidecar manifest carries no ontology field",
+            );
+        }
+    }
+}
+
+/// The ontology-publication rule every codec arm of
+/// [`assert_checkpoint_format`] shares, on the codec's own field name:
+/// absent, present, or the published document verbatim.
+fn assert_ontology(
+    envelope: &serde_json::Value,
+    field: &str,
+    expected: ExpectedOntology,
+    absent_message: &str,
+) {
+    match expected {
+        ExpectedOntology::Absent => {
+            assert!(
+                envelope.get(field).is_none(),
+                "{absent_message}: {envelope}"
+            );
+        }
+        ExpectedOntology::Held => {
+            assert!(
+                envelope.get(field).is_some(),
+                "the checkpoint publishes its ontology through `{field}`: {envelope}"
+            );
+        }
+        ExpectedOntology::Document(document) => {
+            assert_eq!(envelope[field], document);
         }
     }
 }

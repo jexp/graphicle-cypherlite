@@ -5,7 +5,8 @@ use std::cell::Cell;
 use std::path::Path;
 
 use cypherlite_storage::{
-    checkpoint_at, init_empty_wal, parse_uri_creating, SnapshotCodecKind, DESTINATION_EXISTS,
+    checkpoint_at, init_empty_wal, parse_uri_creating_with_config, SnapshotCodecKind,
+    DESTINATION_EXISTS,
 };
 
 use crate::{Database, Error, Result};
@@ -83,26 +84,29 @@ fn plant_destination(dest: &Path, shape: PlantShape) {
 
 /// Publish the cut a read-only open of `source_db` loaded into a new store
 /// at `dest` (`.cl` file or native directory). The destination checkpoint is
-/// written in `to_snapshot_format`, falling back to the source's codec when
-/// `None` (ADR-0163); a requested codec this build does not include fails
-/// inside `parse_uri_creating` before the destination exists. The
+/// written in `codec` — resolved once by the caller (`Database::clone`: the
+/// requested override, else the source's codec, ADR-0163); a codec this
+/// build does not include fails inside the create, before the destination
+/// exists. The
 /// destination must not exist; a failure after it is created removes it.
 /// `verb` ("clone") names the operation in error messages.
 pub(crate) fn publish_into(
     dest: &str,
     source_db: &Database,
     verb: &'static str,
-    to_snapshot_format: Option<SnapshotCodecKind>,
+    codec: SnapshotCodecKind,
+    codec_config: Option<cypherlite_storage::CodecOpenConfig>,
 ) -> Result<()> {
     let dest_path = uri_path(dest);
     reject_destination(dest_path, verb)?;
     if let Some(shape) = take_plant_destination() {
         plant_destination(dest_path, shape);
     }
-    let codec = to_snapshot_format.unwrap_or_else(|| source_db.inner.store.snapshot_codec());
     // Create-exclusive (ADR-0161): a destination that appears between the
-    // pre-check and the create is refused, never adopted.
-    let dest_store = match parse_uri_creating(dest, None, Some(codec)) {
+    // pre-check and the create is refused, never adopted. The
+    // codec-specific configuration rides the create — a mismatched one
+    // is refused before the destination's lease or bundle create.
+    let dest_store = match parse_uri_creating_with_config(dest, None, Some(codec), codec_config) {
         Ok(store) => store,
         // The exclusive create made nothing, so there is nothing to remove:
         // the pre-existing destination must survive untouched.

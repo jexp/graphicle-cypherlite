@@ -737,23 +737,6 @@ fn clause_node(clause: &Clause, stats: &dyn PlanStats) -> ClauseNode {
             ClauseNode::new("Foreach", variable.clone(), Vec::new())
         }
         Clause::Use { .. } => ClauseNode::new("Use", String::new(), Vec::new()),
-        Clause::CreateConstraint {
-            name,
-            label,
-            properties,
-            kind,
-            ..
-        } => {
-            let name = name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
-            ClauseNode::new(
-                "CreateConstraint",
-                format!("{name} FOR :{label}({}) ({kind})", properties.join(", ")),
-                Vec::new(),
-            )
-        }
-        Clause::DropConstraint { name, .. } => {
-            ClauseNode::new("DropConstraint", name.clone(), Vec::new())
-        }
         // Catalog commands reuse the planner's canonical clause keyword
         // (the same name the old rendering showed), never a Debug dump.
         Clause::Catalog(command) => ClauseNode::new(

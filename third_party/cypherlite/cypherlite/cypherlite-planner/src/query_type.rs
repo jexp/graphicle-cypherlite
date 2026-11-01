@@ -217,6 +217,10 @@ mod tests {
             "DROP INDEX i",
             "CREATE CONSTRAINT c FOR (n:N) REQUIRE n.id IS UNIQUE",
             "DROP CONSTRAINT c",
+            // Graph-type DDL is catalog schema, not a data write (ADR-0447):
+            // a read tool refuses it, the DDL tool admits it.
+            "CREATE GRAPH TYPE g { (:A => {id :: INTEGER IS KEY}) }",
+            "ALTER CURRENT GRAPH TYPE SET GRAPH TYPE g",
         ] {
             assert_eq!(type_of(cypher), QueryType::Schema, "{cypher}");
         }

@@ -1,103 +1,91 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-use cypherlite_core::file_identity::{self, nofollow};
+use cypherlite_core::file_identity::nofollow;
 use cypherlite_core::{Error, Result};
-use fs4::FileExt;
 
 use super::{Vfs, VfsFile, VfsMeta, VfsOpen};
 
-pub struct NativeVfs {
-    root: PathBuf,
-    _lease: Option<Arc<NativeLease>>,
-}
+pub(crate) mod lease;
 
-/// Keep both identities alive for every cloned Native VFS and WAL handle.
+/// The one classification of a native entry's on-disk shape — the
+/// plain file / plain directory / symlink-or-reparse / other fact
+/// every native guard consults, matched as a typed kind instead of
+/// re-composed per-site boolean conjuncts (lstat semantics: the entry's
+/// own shape, never its target's).
 ///
-/// Writable opens also hold the exclusive `.cypherlite.writer` lease
-/// (ADR-0136), the same [`crate::WriterLease`] a later `promote` takes.
-/// Read-only opens leave `writer` empty. `Database::open` moves it onto
-/// the engine handle so `demote` can drop it without closing the store.
-pub(crate) struct NativeLease {
-    writer: Mutex<Option<crate::WriterLease>>,
-    pub(crate) _root: File,
-    pub(crate) _wal: Option<File>,
+/// Distinct from [`crate::vfs::VfsEntryKind`], the virtual-namespace
+/// shape [`VfsMeta`] reports: this one classifies host `fs::Metadata`.
+/// The two vocabularies stay aligned — each `Other` shape the native
+/// classifier keeps is reported through [`VfsEntryKind::Other`], never
+/// collapsed into the symlink refusal kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeEntryKind {
+    /// A plain directory: a directory that is not itself a symlink,
+    /// junction, or other reparse point.
+    Dir,
+    /// A plain regular file.
+    File,
+    /// A symlink, junction, or other reparse point.
+    Alias,
+    /// Any other entry shape (FIFO, socket, device): never admitted
+    /// where a plain file or directory shape is required.
+    Other,
 }
 
-impl NativeLease {
-    pub(crate) fn new(root: File, wal: Option<File>, writer: Option<crate::WriterLease>) -> Self {
-        Self {
-            writer: Mutex::new(writer),
-            _root: root,
-            _wal: wal,
-        }
-    }
-
-    /// Hand the writer lease to the caller once. A second call is `None`.
-    pub(crate) fn take_writer(&self) -> Option<crate::WriterLease> {
-        self.writer
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .take()
+/// Classify `meta`'s entry shape — the one classifier; [`plain_entry`]
+/// and every native guard derive from it, never a second spelling.
+pub(crate) fn native_entry_kind(meta: &fs::Metadata) -> NativeEntryKind {
+    if is_alias(meta) {
+        NativeEntryKind::Alias
+    } else if meta.is_dir() {
+        NativeEntryKind::Dir
+    } else if meta.is_file() {
+        NativeEntryKind::File
+    } else {
+        NativeEntryKind::Other
     }
 }
+/// The Windows `FILE_ATTRIBUTE_REPARSE_POINT` bit (symlinks, junctions,
+/// and other reparse indirections) — the one spelling of the alias bit
+/// both the classifier and the ownership scan consult.
+#[cfg(windows)]
+pub(crate) const REPARSE_POINT: u32 = 0x0400;
 
-// Temporary preflight locks need the same explicit unlock as long-lived
-// leases: closing a descriptor alone can delay immediate reacquisition on macOS.
-pub(crate) struct PreflightLease(File);
-
-impl std::ops::Deref for PreflightLease {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.0
-    }
-}
-
-impl Drop for PreflightLease {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
-impl Drop for NativeLease {
-    fn drop(&mut self) {
-        // An explicit unlock finishes the ownership handoff before the last
-        // lease returns from Drop. On macOS, closing the descriptor alone can
-        // leave a concurrent immediate reopen seeing EWOULDBLOCK briefly.
-        // Release the writer lease first so a waiting writer can proceed once
-        // the shared identity locks drop.
-        drop(
-            self.writer
-                .get_mut()
-                .unwrap_or_else(|err| err.into_inner())
-                .take(),
-        );
-        for file in [self._wal.as_ref(), Some(&self._root)]
-            .into_iter()
-            .flatten()
-        {
-            let _ = FileExt::unlock(file);
-        }
-    }
-}
-
-fn regular_handle(file: &File, path: &Path) -> Result<()> {
-    let meta = file.metadata()?;
-    let kind = meta.file_type();
+/// Whether `meta` names a symlink or Windows reparse point — the alias
+/// half of [`native_entry_kind`]'s classification, spelled once.
+fn is_alias(meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
-    let reparse_point = {
+    {
         use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & 0x0400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
-    };
+        meta.file_type().is_symlink() || meta.file_attributes() & REPARSE_POINT != 0
+    }
     #[cfg(not(windows))]
-    let reparse_point = false;
-    if !kind.is_file() || kind.is_symlink() || reparse_point {
+    meta.file_type().is_symlink()
+}
+
+/// Whether `meta` is a plain entry — a regular file or directory that is
+/// not itself a symlink/junction/reparse point (or any other non-plain
+/// shape). Derived from [`native_entry_kind`].
+pub(crate) fn plain_entry(meta: &fs::Metadata) -> bool {
+    !matches!(
+        native_entry_kind(meta),
+        NativeEntryKind::Alias | NativeEntryKind::Other
+    )
+}
+
+/// Refuse an open handle whose entry is not a plain regular file: the
+/// one regular-file check over an open handle, expressed through the
+/// [`native_entry_kind`] classifier (symlink, directory, reparse point,
+/// and any other shape all refuse identically).
+pub(crate) fn regular_handle(file: &File, path: &Path) -> Result<()> {
+    let meta = file.metadata()?;
+    if native_entry_kind(&meta) != NativeEntryKind::File {
         return Err(Error::storage(format!(
             "{} is not a regular file (symlinks refused)",
             path.display()
@@ -106,28 +94,9 @@ fn regular_handle(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn plain_entry(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        !meta.file_type().is_symlink() && meta.file_attributes() & 0x0400 == 0
-    }
-    #[cfg(not(windows))]
-    {
-        !meta.file_type().is_symlink()
-    }
-}
-
-/// How [`NativeVfs::open_regular_file`] admits the destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OpenAdmit {
-    /// Open an existing regular file; never create.
-    Existing,
-    /// Create when missing; adopt the existing file otherwise.
-    OpenOrCreate,
-    /// Create exclusively (ADR-0161): an existing entry fails with a
-    /// destination-already-exists storage error instead of being adopted.
-    CreateExclusive,
+pub struct NativeVfs {
+    root: PathBuf,
+    _lease: Option<Arc<lease::NativeLease>>,
 }
 
 impl NativeVfs {
@@ -138,242 +107,20 @@ impl NativeVfs {
         }
     }
 
-    pub(crate) fn with_lease(root: PathBuf, lease: Arc<NativeLease>) -> Self {
+    pub(crate) fn with_lease(root: PathBuf, lease: Arc<lease::NativeLease>) -> Self {
         Self {
             root,
             _lease: Some(lease),
         }
     }
 
-    pub(crate) fn lock_directory(path: &Path) -> Result<(PathBuf, File)> {
-        Self::lock_directory_mode(path, true)
-    }
-
-    /// Shared identity lock for a live opener (ADR-0136). Still creates a
-    /// missing marker so a writable open can adopt the directory. Reset and
-    /// adoption stay on [`Self::lock_directory`], which takes `LOCK_EX`.
-    pub(crate) fn lock_directory_shared(path: &Path) -> Result<(PathBuf, File)> {
-        Self::lock_directory_mode(path, false)
-    }
-
-    fn lock_directory_mode(path: &Path, exclusive: bool) -> Result<(PathBuf, File)> {
-        Self::create_private_dir_all(path)?;
-        let path = fs::canonicalize(path)?;
-        if !fs::metadata(&path)?.is_dir() {
-            return Err(Error::storage(format!(
-                "{} is not a directory",
-                path.display()
-            )));
-        }
-        let marker = path.join(crate::native_ownership::LOCK_MARKER);
-        let file = Self::lock_file(&marker, OpenAdmit::OpenOrCreate, exclusive)?;
-        Ok((path, file))
-    }
-
-    /// Shared lock on an existing marker, opened read-only. Does not create
-    /// the file (ADR-0136).
-    pub(crate) fn lock_existing_shared_readonly(path: &Path) -> Result<File> {
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        nofollow(&mut opts);
-        let file = Self::open_checked_existing(path, &opts)?;
-        map_lock_result(FileExt::try_lock_shared(&file), path)?;
-        Ok(file)
-    }
-
-    /// A reset may rename a parent just as an opener creates its own marker.
-    /// Refuse a handle that no longer names the path we intend to open.
-    pub(crate) fn check_identity(file: &File, path: &Path) -> Result<()> {
-        let current = fs::symlink_metadata(path)?;
-        if file_identity::of_file(file)? != file_identity::of_path(path)?
-            || !plain_entry(&current)
-            || !current.is_file()
-        {
-            return Err(Error::storage(format!(
-                "storage identity changed while opening {}",
-                path.display()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Open an existing regular file without truncation or exclusively create it.
-    /// Canonicalize supported aliases first; never open a symlink as the final
-    /// lock target. The returned file itself owns the OS lock.
-    /// Exclusive lock used by bundle preflight tests. Live opens go through
-    /// [`Self::lock_directory`] / [`Self::lock_directory_shared`].
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn lock_regular_file(path: &Path) -> Result<File> {
-        Self::lock_file(path, OpenAdmit::OpenOrCreate, true)
-    }
-
-    /// Shared so role preflight does not contend with live openers, which
-    /// all hold the identity marker shared (ADR-0136). Reset and adoption
-    /// take their exclusive lease afterwards.
-    pub(crate) fn lock_existing_regular_file(path: &Path) -> Result<PreflightLease> {
-        Ok(PreflightLease(Self::lock_file(
-            path,
-            OpenAdmit::Existing,
-            false,
-        )?))
-    }
-
-    /// Exclusive lock on `.cypherlite.writer` (ADR-0136). Creates the file
-    /// when it is missing. Callers hold the shared identity lock already.
-    pub(crate) fn lock_writer_lease(dir: &Path) -> Result<File> {
-        Self::lock_file(
-            &dir.join(crate::native_ownership::WRITER_LEASE),
-            OpenAdmit::OpenOrCreate,
-            true,
-        )
-    }
-
-    fn lock_file(path: &Path, admit: OpenAdmit, exclusive: bool) -> Result<File> {
-        let file = Self::open_regular_file(path, admit)?;
-        let locked = if exclusive {
-            FileExt::try_lock_exclusive(&file)
-        } else {
-            FileExt::try_lock_shared(&file)
-        };
-        if let Err(e) = map_lock_result(locked, path) {
-            let _ = FileExt::unlock(&file);
-            return Err(e);
-        }
-        Ok(file)
-    }
-
-    /// Write `bytes` while `file` holds `LOCK_SH` (ADR-0136).
-    ///
-    /// A Windows shared `LockFileEx` rejects `WriteFile` on every handle,
-    /// including the owner. The write takes a brief exclusive lock and then
-    /// restores the shared one. Unix `flock` lets the owner write under
-    /// `LOCK_SH`.
-    pub(crate) fn write_under_shared_lock(file: &File, path: &Path, bytes: &[u8]) -> Result<()> {
-        #[cfg(windows)]
-        {
-            FileExt::unlock(file)?;
-            if let Err(e) = map_lock_result(FileExt::try_lock_exclusive(file), path) {
-                let _ = FileExt::try_lock_shared(file);
-                return Err(e);
-            }
-            let wrote = (&*file).write_all(bytes).and_then(|_| file.sync_all());
-            let _ = FileExt::unlock(file);
-            map_lock_result(FileExt::try_lock_shared(file), path)?;
-            // The exclusive upgrade unlocked the marker. A reset can rename
-            // the directory in that window; refuse the lease if the handle
-            // no longer names `path`.
-            Self::check_identity(file, path)?;
-            wrote?;
-            return Ok(());
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = path;
-            (&*file).write_all(bytes)?;
-            file.sync_all()?;
-            Ok(())
-        }
-    }
-
-    pub(crate) fn read_locked_marker(file: &File, path: &Path) -> Result<Vec<u8>> {
-        Self::check_identity(file, path)?;
-        let mut handle = file;
-        handle.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        handle.take(128).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    /// Open or create `path` as a regular file under `admit`. The
-    /// created-vs-adopted distinction lives in this one open primitive:
-    /// every caller shares the same `OpenOptions` (read+write, nofollow,
-    /// 0600) and the same `AlreadyExists` dispatch instead of carrying a
-    /// parallel copy (ADR-0161). The returned file itself owns any OS lock
-    /// the caller takes on it.
-    pub(crate) fn open_regular_file(path: &Path, admit: OpenAdmit) -> Result<File> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        nofollow(&mut opts);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let file = match admit {
-            OpenAdmit::Existing => Self::open_existing_regular(path)?,
-            OpenAdmit::OpenOrCreate => match opts.open(path) {
-                Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Self::open_existing_regular(path)?
-                }
-                Err(e) => return Err(e.into()),
-            },
-            // An exclusive create adopts nothing: any `create_new` failure
-            // is arbitrated by `symlink_metadata` — if ANYTHING occupies the
-            // path (file, directory, or symlink, dangling included; a symlink
-            // raced into the create window is one `nofollow`+`create_new`
-            // never follows), the refusal is destination-already-exists.
-            // Only a genuinely absent path propagates the original I/O error
-            // (permissions, a `NotADirectory` parent, …). Matching on
-            // `ErrorKind` alone is not portable: Windows fails `create_new`
-            // over a directory with `AccessDenied`, not `IsADirectory`, and a
-            // generic I/O error here would let publish cleanup
-            // `remove_dir_all` a directory this run never created (ADR-0161).
-            OpenAdmit::CreateExclusive => match opts.open(path) {
-                Ok(file) => file,
-                Err(e) => {
-                    if fs::symlink_metadata(path).is_ok() {
-                        return Err(crate::destination_exists(path));
-                    }
-                    return Err(e.into());
-                }
-            },
-        };
-        regular_handle(&file, path)?;
-        Ok(file)
-    }
-
-    fn open_existing_regular(path: &Path) -> Result<File> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-        nofollow(&mut opts);
-        Self::open_checked_existing(path, &opts)
-    }
-
-    /// Open an existing regular file after refusing a final-component
-    /// symlink by pre-checking its metadata.
-    pub(crate) fn open_checked_existing(path: &Path, opts: &OpenOptions) -> Result<File> {
-        Self::open_checked_existing_inner(path, opts, || {})
-    }
-
-    // The callback is a deterministic test seam between inspection and open.
-    // Kernel no-follow and post-open handle validation, not the precheck,
-    // enforce the identity actually opened.
-    fn open_checked_existing_inner(
-        path: &Path,
-        opts: &OpenOptions,
-        before_open: impl FnOnce(),
-    ) -> Result<File> {
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.file_type().is_file() {
-            return Err(Error::storage(format!(
-                "{} is not a regular file (symlinks refused)",
-                path.display()
-            )));
-        }
-        before_open();
-        let file = opts.open(path)?;
-        regular_handle(&file, path)?;
-        Ok(file)
-    }
-
-    /// Test-only variant of [`Self::open_checked_existing`] that runs
-    /// `before_open` after the metadata inspection and before the open, so a
-    /// test can race a symlink swap deterministically.
-    #[cfg(test)]
-    pub(crate) fn open_checked_existing_with<F: FnOnce()>(
-        path: &Path,
-        opts: &OpenOptions,
-        before_open: F,
-    ) -> Result<File> {
-        Self::open_checked_existing_inner(path, opts, before_open)
+    /// Create `dir` (and missing ancestors) after refusing a symlinked
+    /// directory anywhere below the store root — the one write-surface
+    /// preparation shared by `create_dir_all`, atomic parent creation,
+    /// `open`-with-create, and `rename`.
+    fn create_dir_below_root(&self, dir: &Path) -> Result<()> {
+        self.refuse_symlinked_below_root(dir)?;
+        Self::create_private_dir_all(dir)
     }
 
     pub(crate) fn create_private_dir_all(path: &Path) -> Result<()> {
@@ -385,6 +132,47 @@ impl NativeVfs {
         }
         #[cfg(not(unix))]
         fs::create_dir_all(path)?;
+        Ok(())
+    }
+
+    /// Refuse a `path` whose existing directory chain below this VFS's
+    /// root runs through a symlink/junction/reparse point, before
+    /// anything is created beneath it — the write-surface twin of
+    /// `validate_dir`'s read-side refusal. Ancestors at or above the
+    /// store root are the operator's own filesystem and are not policed
+    /// here.
+    fn refuse_symlinked_below_root(&self, path: &Path) -> Result<()> {
+        if path == self.root || !path.starts_with(&self.root) {
+            return Ok(());
+        }
+        // `path` is a proper component-descendant of the store root (the
+        // guard above refused everything else, and callers pass `resolve`
+        // output, which rejects `..`), so the ancestor walk below runs
+        // strictly between `path` and the root and always terminates at
+        // the root — it never runs off the top of the tree.
+        let mut cursor = path
+            .parent()
+            .expect("a path below the store root has a parent")
+            .to_path_buf();
+        while cursor != self.root {
+            match fs::symlink_metadata(&cursor) {
+                Ok(meta) if matches!(native_entry_kind(&meta), NativeEntryKind::Dir) => {}
+                Ok(_) => {
+                    return Err(Error::storage(format!(
+                        "{} is not a regular directory (symlinks refused)",
+                        cursor.display()
+                    )))
+                }
+                // A missing ancestor is about to be created; ancestors
+                // above it still need the check, so keep walking up.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            cursor = cursor
+                .parent()
+                .expect("an ancestor below the store root has a parent")
+                .to_path_buf();
+        }
         Ok(())
     }
 
@@ -480,19 +268,31 @@ impl NativeVfs {
         Self::create_private_dir_all(path)?;
         Ok(())
     }
-}
 
-/// Map a `try_lock_*`/`unlock` outcome to a typed result: success passes
-/// through and lock contention becomes [`Error::Locked`]; every other I/O
-/// failure is returned unchanged. Shared by the Native and `.cl` bundle hosts,
-/// both of which take an OS exclusive lock on the same marker file.
-pub(crate) fn map_lock_result(result: std::io::Result<()>, path: &Path) -> Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == fs4::lock_contended_error().raw_os_error() => {
-            Err(Error::Locked(path.display().to_string()))
+    /// The create-or-existing arm of [`Vfs::open`]: an existing final
+    /// component must be a regular file — a symlink or directory is refused
+    /// before it can be truncated or appended through — a missing file is
+    /// created exclusively, and an entry raced into the create window is
+    /// adopted only after the same regular-file recheck.
+    fn open_create_or_existing(p: &Path, o: &mut OpenOptions) -> Result<File> {
+        // An existing entry of any non-regular shape (symlink, directory,
+        // FIFO) is refused by the one canonical check inside
+        // `open_checked_existing`, which every existing-open path shares.
+        match fs::symlink_metadata(p) {
+            Ok(_) => Self::open_checked_existing(p, o),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                o.create_new(true);
+                match o.open(p) {
+                    Ok(file) => Ok(file),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        o.create_new(false);
+                        Self::open_checked_existing(p, o)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(e) => Err(e.into()),
         }
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -506,12 +306,15 @@ impl Vfs for NativeVfs {
     }
 
     fn create_dir_all(&self, path: &str) -> Result<()> {
-        Self::create_private_dir_all(&self.resolve(path)?)?;
-        Ok(())
+        let dir = self.resolve(path)?;
+        self.create_dir_below_root(&dir)
     }
 
     fn create_dir_all_for_atomic(&self, path: &str) -> Result<()> {
+        // The same below-root refusal as create_dir_below_root; the
+        // creation itself is the durable per-component host form.
         let dir = self.resolve(path)?;
+        self.refuse_symlinked_below_root(&dir)?;
         #[cfg(unix)]
         return Self::create_dir_all_for_atomic_host(&dir);
         #[cfg(not(unix))]
@@ -539,10 +342,27 @@ impl Vfs for NativeVfs {
     }
 
     fn metadata(&self, path: &str) -> Result<VfsMeta> {
-        let meta = fs::metadata(self.resolve(path)?)?;
-        Ok(VfsMeta {
-            len: meta.len(),
-            is_dir: meta.is_dir(),
+        // lstat semantics: an entry reports its own shape, never its
+        // target's — symlinked files are refused at open, and a walker
+        // must not classify (let alone recurse into or write through) a
+        // symlinked directory as a directory.
+        let meta = fs::symlink_metadata(self.resolve(path)?)?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64);
+        Ok(match native_entry_kind(&meta) {
+            NativeEntryKind::Dir => VfsMeta::dir(),
+            NativeEntryKind::File => VfsMeta::file(meta.len(), mtime),
+            // Each non-plain shape reports its own variant — the shape the
+            // classifier actually decided, never a collapse: aliases under
+            // the symlink refusal kind, any other shape (FIFO, socket,
+            // device) under the other kind. Both carry the entry's own
+            // length, and every consumer refuses both before any read,
+            // write, or delete through them.
+            NativeEntryKind::Alias => VfsMeta::symlink(meta.len()),
+            NativeEntryKind::Other => VfsMeta::other(meta.len()),
         })
     }
 
@@ -550,7 +370,7 @@ impl Vfs for NativeVfs {
         let p = self.resolve(path)?;
         if opts.create || opts.create_new {
             if let Some(parent) = p.parent() {
-                Self::create_private_dir_all(parent)?;
+                self.create_dir_below_root(parent)?;
             }
         }
         let mut o = OpenOptions::new();
@@ -566,27 +386,7 @@ impl Vfs for NativeVfs {
         // An existing final-component symlink must never be truncated or
         // appended through. A missing file is created exclusively.
         let file = if opts.create && !opts.create_new {
-            match fs::symlink_metadata(&p) {
-                Ok(meta) if !meta.file_type().is_file() => {
-                    return Err(Error::storage(format!(
-                        "{} is not a regular file (symlinks refused)",
-                        p.display()
-                    )));
-                }
-                Ok(_) => Self::open_checked_existing(&p, &o)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    o.create_new(true);
-                    match o.open(&p) {
-                        Ok(file) => file,
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            o.create_new(false);
-                            Self::open_checked_existing(&p, &o)?
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
+            Self::open_create_or_existing(&p, &mut o)?
         } else if opts.create_new {
             o.open(&p)?
         } else {
@@ -636,11 +436,28 @@ impl Vfs for NativeVfs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
+        // The source is confirmed before the destination's parent is
+        // created, so a missing source leaves no new empty directory.
+        // `metadata` (stat) keeps `Path::exists`'s follow-symlink
+        // semantics — a dangling symlink still reads as not-found — while
+        // an unstatable source (EACCES on the parent, …) propagates
+        // instead of folding into the not-found refusal.
+        let source = self.resolve(from)?;
+        match fs::metadata(&source) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::io(format!(
+                    "rename source not found: {}",
+                    source.display()
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let dest = self.resolve(to)?;
         if let Some(parent) = dest.parent() {
-            Self::create_private_dir_all(parent)?;
+            self.create_dir_below_root(parent)?;
         }
-        fs::rename(self.resolve(from)?, dest)?;
+        fs::rename(source, dest)?;
         Ok(())
     }
 
@@ -661,7 +478,7 @@ struct NativeFile {
     file: File,
     // A caller can retain a writable file after dropping its StoreTarget/VFS.
     // Keep both root and WAL locks until this last mutable handle is gone.
-    _lease: Option<Arc<NativeLease>>,
+    _lease: Option<Arc<lease::NativeLease>>,
 }
 
 impl VfsFile for NativeFile {
@@ -699,61 +516,9 @@ impl VfsFile for NativeFile {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-
-    #[test]
-    fn checked_existing_refuses_symlink_swapped_after_inspection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lock");
-        let victim = dir.path().join("victim");
-        fs::write(&path, b"original").unwrap();
-        fs::write(&victim, b"keep").unwrap();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        nofollow(&mut options);
-        assert!(NativeVfs::open_checked_existing_with(&path, &options, || {
-            fs::remove_file(&path).unwrap();
-            symlink(&victim, &path).unwrap();
-        })
-        .is_err());
-        assert_eq!(fs::read(&victim).unwrap(), b"keep");
-
-        let vfs = NativeVfs::new(dir.path());
-        assert!(vfs.open("lock", VfsOpen::create_truncate()).is_err());
-        assert_eq!(fs::read(victim).unwrap(), b"keep");
-    }
-}
+#[path = "native/tests_unix.rs"]
+mod tests;
 
 #[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    #[test]
-    fn checked_existing_refuses_swapped_reparse_point() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lock");
-        let victim = dir.path().join("victim");
-        fs::write(&path, b"original").unwrap();
-        fs::write(&victim, b"keep").unwrap();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        nofollow(&mut options);
-        let mut symlink_supported = true;
-        let result = NativeVfs::open_checked_existing_with(&path, &options, || {
-            fs::remove_file(&path).unwrap();
-            if let Err(e) = std::os::windows::fs::symlink_file(&victim, &path) {
-                // Some Windows runners do not grant the symlink privilege.
-                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
-                symlink_supported = false;
-            }
-        });
-        if symlink_supported {
-            assert!(result.is_err());
-            let vfs = NativeVfs::new(dir.path());
-            assert!(vfs.open("lock", VfsOpen::create_truncate()).is_err());
-        }
-        assert_eq!(fs::read(victim).unwrap(), b"keep");
-    }
-}
+#[path = "native/tests_windows.rs"]
+mod windows_tests;

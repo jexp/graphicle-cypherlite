@@ -4,8 +4,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use cypherlite_core::{CancelToken, Error, QueryClockGuard, Result, Value};
-use cypherlite_ir::{Clause, LabelExpr};
-use cypherlite_planner::{clause_mutates_store, plan_any_clause, LogicalPlan};
+use cypherlite_ir::{Clause, LabelExpr, Query};
+use cypherlite_planner::{
+    clause_mutates_store, clause_projects_rows, plan_any_clause, LogicalPlan,
+};
 
 use crate::ctx::{PlanMetricsSink, PlanMetricsSite};
 
@@ -569,26 +571,49 @@ pub(crate) fn execute_plan_read_seeded(
 /// `TERMINATE TRANSACTIONS`) keep their row semantics: they seed the next
 /// stage from their projected rows, never with a unit row.
 fn parts_have_unit_output<'p>(mut parts: impl Iterator<Item = &'p [Clause]>) -> bool {
-    parts.all(|part| match part.last() {
-        Some(
-            Clause::Finish
-            | Clause::Create { .. }
-            | Clause::Merge { .. }
-            | Clause::Delete { .. }
-            | Clause::Set { .. }
-            | Clause::Remove { .. }
-            | Clause::Foreach { .. }
-            | Clause::CallSubquery { .. }
-            | Clause::CreateIndex { .. }
-            | Clause::DropIndex { .. }
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. },
-        ) => true,
-        Some(Clause::Catalog(command)) => {
-            !cypherlite_front::show_columns::catalog_produces_rows(command)
-        }
-        _ => false,
-    })
+    parts.all(|part| part.last().is_some_and(unit_output_clause))
+}
+
+/// Whether the clause concluding a part makes that part unit output: an
+/// empty result still seeds the next `NEXT` stage with one row (ADR-0287).
+/// [`clause_projects_rows`] decides it, plus the two arms this seeding
+/// policy adds over that classification:
+///
+/// - `CALL { … }` is a data write in the ADR-0287 vocabulary, even though
+///   its merged rows are a statement result of their own.
+/// - a `WHEN`/`ELSE` conditional whose branch bodies are all write-only
+///   projects no rows (the per-row driver spills none), so the stage is
+///   write-shaped for seeding.
+fn unit_output_clause(clause: &Clause) -> bool {
+    if !clause_projects_rows(clause) {
+        return true;
+    }
+    matches!(clause, Clause::CallSubquery { .. })
+        || matches!(
+            clause,
+            Clause::Conditional { branches, else_query }
+                if !call::conditional_produces_rows(branches, else_query.as_deref())
+        )
+}
+
+/// Whether a part (one UNION arm) projects statement rows of its own — the
+/// one classification over the concluding-clause vocabulary, read by the
+/// `CALL { … }` merge policy and by a conditional branch body's
+/// row-lessness (and, through [`unit_output_clause`], by the NEXT-stage
+/// seeding policy).
+pub(crate) fn part_projects_rows(clauses: &[Clause]) -> bool {
+    clauses.last().is_none_or(clause_projects_rows)
+}
+
+/// The final stage of a query's NEXT chain: a `Query`'s stages are the same
+/// trailing-clause shape a `LogicalPlan`'s parts are, so every
+/// trailing-clause classification reads the last one.
+pub(crate) fn final_stage(query: &Query) -> &Query {
+    let mut tail = query;
+    while let Some(next) = tail.next.as_deref() {
+        tail = next;
+    }
+    tail
 }
 
 pub(crate) fn fold_parts(
@@ -671,6 +696,8 @@ pub(crate) fn union_merge(
 
 #[cfg(test)]
 mod aggregate_tests;
+#[cfg(test)]
+mod conditional_tests;
 mod count_stats;
 #[cfg(test)]
 mod count_stats_tests;

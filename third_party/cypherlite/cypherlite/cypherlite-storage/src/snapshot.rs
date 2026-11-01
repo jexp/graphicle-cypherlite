@@ -21,7 +21,10 @@ pub(crate) use unavailable::{
     checkpoint_at, load_with_checkpoint_lsn, snapshot_data_bytes, sweep_orphans,
 };
 
-const MAX_JSON_OBJECT: u64 = 16 * 1024 * 1024; // ADR-0086, per metadata object
+// ADR-0086, per metadata object. The one home of the bound: the markdown
+// codec's sidecar manifest (`.cypherlite/manifest.json`) is a metadata
+// object too and spells its ceiling through this constant.
+pub(crate) const MAX_JSON_OBJECT: u64 = 16 * 1024 * 1024;
 
 /// The manifest object name: the one size-bounded JSON metadata object the
 /// generic object helpers special-case. Read, write, and accounting paths
@@ -52,13 +55,20 @@ pub(crate) fn is_ontology_object_name(name: &str) -> bool {
 /// What one snapshot load decodes, named instead of positional (ADR-0120,
 /// ADR-0127 Decision 2): the graph, the checkpoint LSN (0 when the store
 /// has no manifest yet), the ontology document the snapshot carries
-/// (`None` when the store holds none), and the version marker the codec
-/// loader classified. Both codecs and the no-parquet stub return it.
+/// (`None` when the store holds none), the version marker the codec
+/// loader classified, and the open-time action the load deferred. Both
+/// codecs and the no-parquet stub return it.
 pub(crate) struct LoadedSnapshot {
     pub(crate) graph: Graph,
     pub(crate) checkpoint_lsn: u64,
     pub(crate) ontology: Option<String>,
     pub(crate) marker: crate::version::SnapshotMarker,
+    /// The open-time action the codec's load deferred (ADR-0406 §5):
+    /// computed from what the load picked up, but only the writable
+    /// open — after the dirty-WAL guard proved no WAL deltas pending —
+    /// may run it; a read-only open never does. `None` for every codec
+    /// that defers nothing and every unchanged store.
+    pub(crate) deferred: Option<DeferredOpenAction>,
 }
 
 impl LoadedSnapshot {
@@ -73,7 +83,45 @@ impl LoadedSnapshot {
             checkpoint_lsn,
             ontology: None,
             marker: crate::version::SnapshotMarker::Current,
+            deferred: None,
         }
+    }
+}
+
+/// One codec-owned open-time step over the opened store — the payload
+/// a [`DeferredOpenAction`] carries.
+type DeferredStep = Box<dyn FnOnce(&StoreTarget) -> Result<()>>;
+
+/// A codec load's deferred open-time action, carried codec-neutrally:
+/// the codec that defers one (only the markdown codec today,
+/// ADR-0406 §5's edit-while-closed re-baseline) owns the action's
+/// meaning and constructs it; the open path runs it without naming a
+/// codec, so this contract and the classic codecs' loaders never
+/// reference a codec module's types.
+pub(crate) struct DeferredOpenAction {
+    run: DeferredStep,
+}
+
+impl DeferredOpenAction {
+    /// Wrap one codec-owned open-time action; the writable open's
+    /// post-guard step runs it exactly once.
+    pub(crate) fn new(run: impl FnOnce(&StoreTarget) -> Result<()> + 'static) -> Self {
+        Self { run: Box::new(run) }
+    }
+
+    /// Run the action against the opened store.
+    pub(crate) fn run(self, target: &StoreTarget) -> Result<()> {
+        (self.run)(target)
+    }
+}
+
+/// The load-tail commit-timestamp floor, the one home of the policy
+/// every codec's load applies: a snapshot that loaded rows but
+/// recorded no commit timestamp gets 1, so the first in-session write
+/// timestamps above the snapshot it replays.
+pub(crate) fn ensure_commit_ts(graph: &Graph, loaded: usize) {
+    if graph.commit_ts() == 0 && loaded > 0 {
+        graph.set_commit_ts(1);
     }
 }
 
@@ -312,6 +360,34 @@ pub(crate) fn object_exists(target: &StoreTarget, name: &str) -> Result<bool> {
         .map_err(|e| Error::storage(e.to_string()))
 }
 
+/// The Parquet object families' path-level evidence — the path-level
+/// twin of [`has_parquet_store_files`]: a retired pre-shard monolith
+/// object, or a shard directory. Kept its own named probe so the
+/// family's existence vocabulary stays separate from the envelope and
+/// `graph.json` evidence beside it, like the VFS-level resolver's.
+#[cfg(not(target_arch = "wasm32"))]
+fn has_parquet_store_files_at(path: &std::path::Path) -> bool {
+    Kind::ALL
+        .into_iter()
+        .any(|kind| path.join(kind.legacy_names()[0]).exists() || path.join(kind.dir()).is_dir())
+}
+
+/// The path-level shape of the classic-codec evidence checks — the
+/// JSON codec's `graph.json`, a root envelope naming a classic codec
+/// (an envelope-only store, via
+/// [`root_envelope_names_classic`](crate::codec::root_envelope_names_classic)),
+/// and [`has_parquet_store_files_at`]'s Parquet object families — the
+/// same evidence vocabulary `resolve_codec` consults, probed before any
+/// VFS or lease exists, so an explicit markdown request cannot create
+/// WAL engine state inside a snapshot-file store before the codec
+/// resolver refuses it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn has_classic_store_evidence_at(path: &std::path::Path) -> bool {
+    path.join(crate::codec::json::GRAPH_JSON).exists()
+        || crate::codec::root_envelope_names_classic(path)
+        || has_parquet_store_files_at(path)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn has_parquet_store_files(target: &StoreTarget) -> Result<bool> {
     for kind in Kind::ALL {
@@ -322,19 +398,17 @@ pub(crate) fn has_parquet_store_files(target: &StoreTarget) -> Result<bool> {
     for kind in Kind::ALL {
         match target.vfs.metadata(kind.dir()) {
             Ok(meta) => {
-                if meta.is_dir {
+                if meta.is_dir() {
                     return Ok(true);
                 }
             }
             // Absent is not a Parquet store; a metadata failure on an
-            // object that does exist surfaces instead of reading as absent.
+            // object that does exist surfaces verbatim instead of reading
+            // as absent — probed through the one exists-probe policy
+            // ([`object_exists`]), like the legacy-name probes above.
             Err(e) => {
-                if target
-                    .vfs
-                    .exists(kind.dir())
-                    .map_err(|e| Error::storage(e.to_string()))?
-                {
-                    return Err(Error::storage(e.to_string()));
+                if object_exists(target, kind.dir())? {
+                    return Err(e);
                 }
             }
         }

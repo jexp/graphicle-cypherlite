@@ -2,7 +2,7 @@
 //! rules checked against the binding environment before a plan is built.
 
 use cypherlite_core::{Error, Result};
-use cypherlite_ir::{Clause, Expr, Projection, Query, SingleQuery};
+use cypherlite_ir::{Clause, Expr, Query, SingleQuery};
 
 use crate::binding::Env;
 use crate::expr_check::check_expr;
@@ -11,11 +11,7 @@ use crate::names::query_output_names;
 pub(crate) fn is_schema_clause(c: &Clause) -> bool {
     matches!(
         c,
-        Clause::CreateIndex { .. }
-            | Clause::DropIndex { .. }
-            | Clause::ShowIndexes
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. }
+        Clause::CreateIndex { .. } | Clause::DropIndex { .. } | Clause::ShowIndexes
     )
 }
 
@@ -70,7 +66,6 @@ pub(crate) fn validate_part_with_env(
             }
             Clause::Foreach { .. } => check_foreach_clause(&mut env, is_write_procedure, c)?,
             Clause::Use { .. } => check_use_clause(&mut env, is_write_procedure, seen_write, c)?,
-            Clause::CreateConstraint { .. } | Clause::DropConstraint { .. } => {}
         }
         seen_write |= clause_is_write(c, is_write_procedure)
             && !matches!(
@@ -82,44 +77,6 @@ pub(crate) fn validate_part_with_env(
             );
     }
     Ok(())
-}
-
-/// Push a synthetic bare-variable `Projection` for each imported name the
-/// item list does not already project. Shared by
-/// [`query_with_persistent_imports`]'s WITH-item and terminal-RETURN walks.
-fn push_missing_imports(items: &mut Vec<Projection>, imported: &[String]) {
-    for name in imported {
-        if !items
-            .iter()
-            .any(|item| matches!(&item.expr, Expr::Variable(variable) if variable == name))
-        {
-            items.push(Projection {
-                expr: Expr::Variable(name.clone()),
-                alias: None,
-                source_text: None,
-            });
-        }
-    }
-}
-
-pub(crate) fn query_with_persistent_imports(query: &Query, imported: &[String]) -> Query {
-    let mut query = query.clone();
-    for part in &mut query.parts {
-        for clause in &mut part.clauses {
-            if let Clause::With { items, .. } = clause {
-                push_missing_imports(items, imported);
-            }
-        }
-        if query.next.is_some() {
-            if let Some(Clause::Return { items, .. }) = part.clauses.last_mut() {
-                push_missing_imports(items, imported);
-            }
-        }
-    }
-    if let Some(next) = &mut query.next {
-        **next = query_with_persistent_imports(next, imported);
-    }
-    query
 }
 
 fn validate_scoped_return_star(query: &Query, imported: &[String]) -> Result<()> {

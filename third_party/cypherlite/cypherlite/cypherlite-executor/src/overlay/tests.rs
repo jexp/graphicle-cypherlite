@@ -378,14 +378,15 @@ fn catalog_positions_and_validation_cursor_follow_the_redo_log() {
     let scratch = write_scratch(&g);
     let view = ExecGraph::write(&g, &scratch);
     let constraint = |name: &str| {
-        view.create_named_constraint(
-            name.into(),
-            false,
-            "P".into(),
-            vec!["id".into()],
-            "unique".into(),
-            None,
-        )
+        view.create_named_constraint(cypherlite_catalog::ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "P".into(),
+            properties: vec!["id".into()],
+            kind: "unique".into(),
+            property_type: None,
+            enforced_label: None,
+        })
         .unwrap()
     };
     view.create_node(vec!["P".into()], BTreeMap::new()).unwrap();

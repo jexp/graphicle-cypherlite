@@ -1,4 +1,6 @@
-//! Git fixture repositories for the CLI's `lab git-to-graph` tests
+//! Git fixture repositories for the git-to-graph importer's tests (the
+//! `cypherlite-git-to-graph` crate's reader and plan suites, and the CLI
+//! e2e that drives the installed child)
 //! (ADR-0376).
 //!
 //! Every repository this module creates runs git with an empty
@@ -266,7 +268,8 @@ pub fn history_fixture() -> (tempfile::TempDir, Repo) {
 /// still on disk with text content, one file deleted in history, and one
 /// visible untracked file on disk.
 ///
-/// Importing DIR with both `lab` actions, in either order, must leave exactly
+/// Importing DIR with both first-party importers (`run fs-to-graph` and
+/// `run git-to-graph`), in either order, must leave exactly
 /// four `:File` nodes: the two tracked files (content, incoming `TOUCHED`),
 /// the deleted-in-history file (git-only, no content) and the untracked file
 /// (fs-only, no `TOUCHED`).

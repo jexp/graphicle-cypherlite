@@ -94,7 +94,12 @@ pub(crate) fn function(
         }
         return Err(Error::semantic(format!("unknown function {n}()")));
     };
-    (builtin.implementation)(graph, n.as_str(), vals)
+    match builtin.implementation {
+        BuiltinImplementation::Plain(implementation) => implementation(graph, n.as_str(), vals),
+        BuiltinImplementation::Versioned(implementation) => {
+            implementation(graph, n.as_str(), vals, cypher_version)
+        }
+    }
 }
 
 /// Whether a builtin samples the clock or entropy on each call, so two
@@ -115,6 +120,19 @@ pub(crate) fn is_nondeterministic(name: &str) -> bool {
 /// `.statement` / `.transaction` suffix rewrite happens once, before lookup.
 type Builtin = fn(&ExecGraph<'_>, &str, Vec<Value>) -> Result<Value>;
 
+/// A builtin implementation that also receives the statement's Cypher
+/// version. The `toString` family is the only dialect-sensitive vocabulary
+/// (CIP-271 is Cypher-25-only), so only its rows take this form.
+type VersionedBuiltin = fn(&ExecGraph<'_>, &str, Vec<Value>, Option<u32>) -> Result<Value>;
+
+/// The implementation shape a builtin row carries: the plain form for every
+/// dialect-independent name, the versioned form for the `toString` family.
+#[derive(Clone, Copy)]
+enum BuiltinImplementation {
+    Plain(Builtin),
+    Versioned(VersionedBuiltin),
+}
+
 /// One builtin row: implementation plus its per-call determinism
 /// classification (LABS-198: the shared `CALL { }` fast path refuses any
 /// body calling a nondeterministic builtin, since it would sample once
@@ -122,7 +140,7 @@ type Builtin = fn(&ExecGraph<'_>, &str, Vec<Value>) -> Result<Value>;
 /// forces the decision where the implementation is registered.
 struct BuiltinRow {
     name: &'static str,
-    implementation: Builtin,
+    implementation: BuiltinImplementation,
     nondeterministic: bool,
 }
 
@@ -137,7 +155,21 @@ const TEMPORAL_ACCESS_MODE_BASES: &[&str] =
 const fn row(name: &'static str, implementation: Builtin, nondeterministic: bool) -> BuiltinRow {
     BuiltinRow {
         name,
-        implementation,
+        implementation: BuiltinImplementation::Plain(implementation),
+        nondeterministic,
+    }
+}
+
+/// Row constructor for a dialect-sensitive builtin: dispatch hands it the
+/// statement's Cypher version.
+const fn versioned_row(
+    name: &'static str,
+    implementation: VersionedBuiltin,
+    nondeterministic: bool,
+) -> BuiltinRow {
+    BuiltinRow {
+        name,
+        implementation: BuiltinImplementation::Versioned(implementation),
         nondeterministic,
     }
 }
@@ -274,9 +306,8 @@ const BUILTINS: &[BuiltinRow] = &[
     row("tointegerlist", convert::bi_tointegerlist, false),
     row("tointegerornull", convert::bi_tointegerornull, false),
     row("tolower", string::bi_lower, false),
-    row("tostring", convert::bi_tostring, false),
-    row("tostring_full", convert::bi_tostring_full, false),
-    row("tostringornull", convert::bi_tostringornull, false),
+    versioned_row("tostring", convert::bi_tostring, false),
+    versioned_row("tostringornull", convert::bi_tostringornull, false),
     row("toupper", string::bi_upper, false),
     row("trim", string::bi_trim, false),
     row("trim_leading", string::bi_trim_leading, false),
@@ -340,44 +371,53 @@ fn lookup_builtin(name: &str) -> Option<&'static BuiltinRow> {
         .map(|i| &BUILTINS[i])
 }
 
-/// The scalar half of the `toString` coercion, shared by CIP-271
-/// `toString()` and CIP-261 `string.interp`: every scalar goes through here.
-/// Appends `v`'s display form to `out` and returns `true`, or returns
-/// `false` (leaving `out` untouched) for the container/graph values each
-/// caller handles on its own (a list/map/node/relationship/path, or a
-/// `Vector`, which the two callers render differently). Temporals render as
-/// their bare ISO string unless the caller overrides them.
-fn write_scalar(out: &mut String, v: &Value) -> bool {
-    use std::fmt::Write as _;
+/// The accepted scalar set's rendering, stated once: a STRING passes
+/// through as the same shared payload (no copy); every other accepted
+/// scalar renders through [`Value::to_display_string`] (the one display
+/// policy, temporals at full precision per ADR-0448). Both
+/// [`render_scalar`] and `toString`'s exhaustive scalar tail call this,
+/// so the rendering policy has one spelling; each caller still spells the
+/// ACCEPTANCE set itself, because that is what makes a new `Value`
+/// variant fail compilation at every routing site.
+pub(crate) fn render_accepted_scalar(v: &Value) -> Arc<str> {
     match v {
-        Value::String(s) => out.push_str(s),
-        Value::Int(i) => {
-            let _ = write!(out, "{i}");
-        }
-        Value::Float(_) => out.push_str(&v.to_cypher_literal()),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Temporal(t) => out.push_str(&t.iso_string()),
-        Value::Point(_) => out.push_str(&v.to_display_string()),
-        // CIP-246: bare canonical string (verified on 2026.09.0).
-        Value::Uuid(u) => out.push_str(&cypherlite_core::uuid_hyphenated(*u)),
-        _ => return false,
+        // A STRING passes through as the same shared payload (no copy).
+        Value::String(s) => Arc::clone(s),
+        // Every other caller-verified accepted scalar renders through the
+        // one display policy (temporals at full precision, ADR-0448).
+        _ => v.to_display_string().into(),
     }
-    true
 }
 
-/// [`write_scalar`] as a value: a STRING passes through as the same shared
-/// payload (no copy); any other coercible scalar renders into a new one.
-fn coerce_scalar_to_string(v: &Value) -> Option<Arc<str>> {
-    if let Value::String(s) = v {
-        return Some(Arc::clone(s));
+fn render_scalar(v: &Value) -> Option<Arc<str>> {
+    match v {
+        // A STRING passes through as the same shared payload (no copy).
+        Value::String(_)
+        // Every other accepted scalar renders through the one display
+        // policy (temporals at full precision, ADR-0448).
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Temporal(_)
+        | Value::Point(_)
+        | Value::Uuid(_) => Some(render_accepted_scalar(v)),
+        // The declined vocabulary, spelled: the containers and graph
+        // values each caller routes on its own, and the Vector the two
+        // toString paths render differently.
+        Value::Null
+        | Value::Bytes(_)
+        | Value::List(_)
+        | Value::Map(_)
+        | Value::Node(_)
+        | Value::Relationship(_)
+        | Value::Path(_)
+        | Value::Vector { .. } => None,
     }
-    let mut rendered = String::new();
-    write_scalar(&mut rendered, v).then(|| rendered.into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::convert::{bi_tostring, bi_tostring_full, bi_tostringornull};
+    use super::convert::{bi_tostring, bi_tostringornull};
     use super::string::bi_string_interp;
     use super::*;
     use crate::graph::Graph;
@@ -398,18 +438,12 @@ mod tests {
         let input = Value::String(Arc::clone(&payload));
         let shared = |out: Value| matches!(out, Value::String(s) if Arc::ptr_eq(&s, &payload));
 
-        assert!(Arc::ptr_eq(
-            &coerce_scalar_to_string(&input).unwrap(),
-            &payload
+        assert!(Arc::ptr_eq(&render_scalar(&input).unwrap(), &payload));
+        assert!(shared(
+            bi_tostring(&graph, "toString", vec![input.clone()], None).unwrap()
         ));
         assert!(shared(
-            bi_tostring(&graph, "toString", vec![input.clone()]).unwrap()
-        ));
-        assert!(shared(
-            bi_tostringornull(&graph, "toStringOrNull", vec![input.clone()]).unwrap()
-        ));
-        assert!(shared(
-            bi_tostring_full(&graph, "tostring_full", vec![input.clone()]).unwrap()
+            bi_tostringornull(&graph, "toStringOrNull", vec![input.clone()], None).unwrap()
         ));
         assert!(shared(
             bi_string_interp(&graph, "string.interp", vec![input.clone()]).unwrap()

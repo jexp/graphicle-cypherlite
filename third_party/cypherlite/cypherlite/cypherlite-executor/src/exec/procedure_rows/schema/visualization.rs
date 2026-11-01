@@ -32,7 +32,17 @@ use crate::redo::split_legacy_property_encoding;
 /// relType, endLabel). The empty graph yields zero rows. Each virtual
 /// node's `indexes`/`constraints` lists are populated from the catalog at
 /// call time (ADR-0166).
-pub(crate) fn schema_visualization_rows(graph: &ExecGraph<'_>) -> Vec<BTreeMap<String, Value>> {
+///
+/// `options` is the call's optional options map. A **null** map selects
+/// nothing at all (Neo4j yields zero rows rather than the whole stored
+/// schema); a missing argument keeps the documented whole-schema output.
+pub(crate) fn schema_visualization_rows(
+    graph: &ExecGraph<'_>,
+    options: Option<&Value>,
+) -> Vec<BTreeMap<String, Value>> {
+    if options.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let mut labels = BTreeSet::new();
     for id in graph.all_node_ids() {
         labels.extend(graph.node_labels(id).unwrap_or_default());
@@ -244,9 +254,29 @@ fn neo4j_space_constraint_type_name(kind: ConstraintType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_helpers::{map, rows, string};
+    use super::super::super::test_helpers::{map, rows, rows_with_args, string};
     use super::*;
     use crate::graph::Graph;
+
+    /// A null `options` map selects nothing at all — zero rows rather than
+    /// the whole stored schema. The rule lives in the builtin's own row
+    /// production, so it holds without any special case in the generic CALL
+    /// loop.
+    #[test]
+    fn null_options_select_no_rows() {
+        let graph = Graph::default();
+        graph
+            .create_node(vec!["Person".into()], map(&[("name", string("Alice"))]))
+            .unwrap();
+        let nullable = map(&[("options", Value::Null)]);
+        assert!(rows_with_args(&graph, "db.schema.visualization", None, &nullable).is_empty());
+        // A non-null options map keeps the whole-schema output.
+        let present = map(&[("options", Value::Map(BTreeMap::new().into()))]);
+        assert_eq!(
+            rows_with_args(&graph, "db.schema.visualization", None, &present).len(),
+            1
+        );
+    }
 
     #[test]
     fn schema_visualization_builds_one_virtual_node_per_label_and_rel_per_triple() {
@@ -369,6 +399,7 @@ mod tests {
                 properties: vec!["id".into()],
                 kind: "unique".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
         // The backing index CREATE CONSTRAINT installs for
@@ -389,6 +420,7 @@ mod tests {
                 properties: vec!["name".into()],
                 kind: "exists".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
         graph
@@ -452,6 +484,7 @@ mod tests {
                 properties: vec!["id".into()],
                 kind: "unique".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
         // The backing index CREATE CONSTRAINT installs alongside, named
@@ -506,6 +539,7 @@ mod tests {
                 properties: vec!["id".into()],
                 kind: "unique".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
 
@@ -554,6 +588,7 @@ mod tests {
                 properties: vec!["amount".into()],
                 kind: "exists".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
 

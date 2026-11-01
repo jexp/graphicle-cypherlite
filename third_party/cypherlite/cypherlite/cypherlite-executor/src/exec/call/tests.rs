@@ -337,7 +337,7 @@ mod shared_subquery {
         let Some(plan) = plan else {
             panic!("fixture must admit the fast path: {cypher}");
         };
-        import_invariant_body(&body, &plan.check)
+        import_invariant_body(&body, &plan.check())
     }
 
     #[test]
@@ -558,5 +558,50 @@ fn transaction_error_message_keeps_the_legacy_text_of_adr_0307_variants() {
             cypherlite_core::ArithmeticFailure::DivisionByZero
         )),
         "/ by zero"
+    );
+}
+
+/// An aggregating `WITH` inside a per-row `CALL (vars) { … }` body keeps
+/// its empty-group identity row, and an imported variable the body reads
+/// *after* the aggregation stays visible: an import is never a grouping
+/// key of a body `WITH`, so a preceding clause that empties the input
+/// still yields `count(*) = 0` and the concluding `RETURN` can add the
+/// import to it.
+#[test]
+fn subquery_aggregation_over_an_emptied_input_keeps_the_identity_row() {
+    let graph = Graph::default();
+    let view = ExecGraph::read(&graph);
+    let emptied_by_unwind = exec_cypher_on(
+        &view,
+        "UNWIND [0, 1] AS x CALL (x) { UNWIND [] AS i WITH count(*) AS c RETURN c } \
+         RETURN x, c ORDER BY x",
+    );
+    assert_eq!(
+        emptied_by_unwind.columns,
+        vec!["x".to_string(), "c".to_string()]
+    );
+    assert_eq!(
+        emptied_by_unwind.rows,
+        vec![
+            vec![Value::Int(0), Value::Int(0)],
+            vec![Value::Int(1), Value::Int(0)],
+        ]
+    );
+    // The emptying clause is the filter here (`WHERE i < 0`), and the
+    // imported `x` is read only after the aggregation.
+    let emptied_by_filter = exec_cypher_on(
+        &view,
+        "UNWIND [0, 1, 2] AS x \
+         CALL (x) { UNWIND range(1, 3) AS i WITH i WHERE i < 0 WITH count(*) AS c \
+                    RETURN x + c AS result } \
+         RETURN x, result ORDER BY x",
+    );
+    assert_eq!(
+        emptied_by_filter.rows,
+        vec![
+            vec![Value::Int(0), Value::Int(0)],
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+        ]
     );
 }

@@ -212,9 +212,7 @@ pub fn walk_clauses_with_roles<'a>(
             | Clause::CreateIndex { .. }
             | Clause::DropIndex { .. }
             | Clause::ShowIndexes
-            | Clause::Finish
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. } => {}
+            | Clause::Finish => {}
         }
     }
 }

@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 # Vendored snapshot (see VENDOR.md): only the engine crates and the shared
-# test-support crate are included; surfaces/, clients/, docs/ and the other
-# testing/ crates are not part of this copy.
+# test-support crate are included; surfaces/, clients/, docs/, extensions/
+# and the other testing/ crates are not part of this copy.
 members = ["cypherlite/*", "testing/cypherlite-test-support"]
 # Deliberately outside the default set (plain `cargo build` / `cargo test`
 # skips them): surfaces/cypherlite-python is a pyo3 cdylib linked through
@@ -21,20 +21,23 @@ default-members = [
     "cypherlite/cypherlite-planner",
     "cypherlite/cypherlite-executor",
     "cypherlite/cypherlite-ontology",
+    "cypherlite/cypherlite-markdown",
     "cypherlite/cypherlite-storage",
     "cypherlite/cypherlite",
     "testing/cypherlite-test-support",
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 repository = "https://github.com/neo4j-labs/cypherlite"
 rust-version = "1.88"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # CypherLite crates
 cypherlite-model = { path = "cypherlite/cypherlite-model" }
+cypherlite-markdown = { path = "cypherlite/cypherlite-markdown" }
 cypherlite-parser = { path = "cypherlite/cypherlite-parser" }
 cypherlite-error = { path = "cypherlite/cypherlite-error" }
 cypherlite-formatter = { path = "surfaces/cypherlite-formatter" }
@@ -60,6 +63,17 @@ cypherlite-mcp = { path = "surfaces/cypherlite-mcp" }
 cypherlite-serve = { path = "surfaces/cypherlite-serve" }
 cypherlite-datasets = { path = "testing/cypherlite-datasets" }
 cypherlite-test-support = { path = "testing/cypherlite-test-support" }
+# First-party extension crates (ADR-0431 §11): the wire kit both wire sides
+# link, and the importer children. The CLI host consumes the wire kit; the
+# importer children link it and nothing else beyond the engine's leaf
+# crates — they carry no `Database` (ADR-0430 §6).
+cypherlite-wire = { path = "extensions/cypherlite-wire" }
+cypherlite-fs-to-graph = { path = "extensions/cypherlite-fs-to-graph" }
+cypherlite-git-to-graph = { path = "extensions/cypherlite-git-to-graph" }
+
+# Property-testing harness (ADR-0268): dev-only, never compiled into the
+# library or the released artifact; one version workspace-wide.
+proptest = "1.11"
 
 # Data types
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde", "wasmbind"] }

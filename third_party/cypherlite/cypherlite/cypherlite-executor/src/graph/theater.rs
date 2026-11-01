@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use cypherlite_catalog::{ConstraintDef, IndexDef};
+use cypherlite_catalog::{Catalog, ConstraintDef, IndexDef};
 use cypherlite_core::{Error, Namespace, Result, Value};
 use serde::{Deserialize, Serialize};
 
@@ -338,8 +338,10 @@ impl Graph {
     /// Validate a typed checkpoint image against its named catalog before
     /// installing it; a missing enforced label must never relax a constraint.
     #[doc(hidden)]
+    /// Validate then install a typed theater image.
     pub fn restore_checkpoint_theater(&self, image: CheckpointTheater) -> Result<()> {
-        self.restore_checkpoint_theater_image(image, true)
+        self.validate_checkpoint_theater_image(&image)?;
+        self.install_checkpoint_theater_image(image)
     }
 
     /// CIP-176 spec string for the JSON snapshot codec (ADR-0050). A
@@ -386,7 +388,7 @@ impl Graph {
     #[doc(hidden)]
     pub fn checkpoint_theater_for_write(&self) -> Result<CheckpointTheater> {
         let image = self.checkpoint_theater();
-        self.validate_checkpoint_theater_image(&image, true)?;
+        self.validate_checkpoint_theater_image(&image)?;
         Ok(image)
     }
 
@@ -412,12 +414,9 @@ impl Graph {
         }
     }
 
-    fn restore_checkpoint_theater_image(
-        &self,
-        image: CheckpointTheater,
-        require_complete: bool,
-    ) -> Result<()> {
-        self.validate_checkpoint_theater_image(&image, require_complete)?;
+    /// Install an already-validated theater image (the typed image's checks,
+    /// or the legacy path's per-entry checks).
+    fn install_checkpoint_theater_image(&self, image: CheckpointTheater) -> Result<()> {
         *self.legacy_unenforced.lock().unwrap() = image
             .legacy_unknown_constraints
             .iter()
@@ -448,17 +447,18 @@ impl Graph {
         Ok(())
     }
 
-    fn validate_checkpoint_theater_image(
-        &self,
-        image: &CheckpointTheater,
-        require_complete: bool,
-    ) -> Result<()> {
+    fn validate_checkpoint_theater_image(&self, image: &CheckpointTheater) -> Result<()> {
         let catalog = self.catalog.lock().unwrap();
-        if !image.legacy_unknown_constraints.is_empty() && !require_complete {
-            return Err(Error::storage(
-                "legacy checkpoint theater cannot carry unknown markers",
-            ));
-        }
+        Self::validate_legacy_unknown(image, &catalog)?;
+        Self::validate_enforced_label_completeness(image, &catalog)?;
+        Self::validate_graph_type_derivation(image)?;
+        Self::validate_derived_identity(image, &catalog)?;
+        Self::validate_index_details(image, &catalog)
+    }
+
+    /// Legacy-unknown markers name rows the catalog still carries and the
+    /// derived index does not shadow.
+    fn validate_legacy_unknown(image: &CheckpointTheater, catalog: &Catalog) -> Result<()> {
         for (name, def) in &image.legacy_unknown_constraints {
             if name != &def.name
                 || !requires_enforced_label(def)
@@ -470,29 +470,39 @@ impl Graph {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Every enforced-label constraint has a matching derived record or a
+    /// recorded legacy marker; a complete image may not leave one dangling.
+    fn validate_enforced_label_completeness(
+        image: &CheckpointTheater,
+        catalog: &Catalog,
+    ) -> Result<()> {
         for def in catalog
             .constraints
             .values()
             .filter(|d| requires_enforced_label(d))
         {
-            if !image
-                .data
-                .derived_constraints
-                .get(&def.name)
-                .is_some_and(|c| matching_enforced_label(def, c))
-            {
-                if image.legacy_unknown_constraints.get(&def.name) == Some(def)
-                    && !image.data.derived_constraints.contains_key(&def.name)
-                {
-                    continue;
-                }
-                if require_complete {
+            // One probe, flat arms: a matching derived record, or a recorded
+            // legacy marker for an absent record; anything else is a missing
+            // match.
+            match image.data.derived_constraints.get(&def.name) {
+                Some(constraint) if matching_enforced_label(def, constraint) => {}
+                None if image.legacy_unknown_constraints.get(&def.name) == Some(def) => {}
+                _ => {
                     return Err(Error::storage(
                         "checkpoint named label constraint is missing matching enforced label",
-                    ));
+                    ))
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The persisted graph type derives exactly the constraints the theater
+    /// lists.
+    fn validate_graph_type_derivation(image: &CheckpointTheater) -> Result<()> {
         for expected in
             crate::graph_type::derive_constraints(&image.data.current_graph_type.to_body())
                 .map_err(crate::graph_type::persisted_derive_error)?
@@ -503,16 +513,28 @@ impl Graph {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Every derived record's key, kind, entity side, and enforced label are
+    /// coherent with the catalog.
+    fn validate_derived_identity(image: &CheckpointTheater, catalog: &Catalog) -> Result<()> {
         for (name, constraint) in &image.data.derived_constraints {
-            if name != &constraint.name
-                || (constraint.entity_type != "NODE" && constraint.entity_type != "RELATIONSHIP")
-            {
-                return Err(Error::storage(
-                    "invalid checkpoint derived constraint identity",
-                ));
-            }
+            // One typed boundary for both identity facts: the entry's key is
+            // its record's name, and `entity_type` is one of the two rendered
+            // kinds. Any other spelling is corruption — the same
+            // model classifier the WAL preflight uses.
+            let kind = match constraint.entity_kind() {
+                Ok(kind) if name == &constraint.name => kind,
+                _ => {
+                    return Err(Error::storage(
+                        "invalid checkpoint derived constraint identity",
+                    ))
+                }
+            };
             let label_kind = constraint.constraint_type.is_enforced_label_kind();
-            let relationship = constraint.entity_type == "RELATIONSHIP";
+            let has_label = super::has_enforced_label(constraint);
+            let relationship = kind.is_relationship();
             let wrong_entity = constraint
                 .constraint_type
                 .enforced_label_site()
@@ -522,12 +544,7 @@ impl Graph {
                     "checkpoint enforced-label entity type mismatch",
                 ));
             }
-            if label_kind
-                && constraint
-                    .enforced_label
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-            {
+            if label_kind && !has_label {
                 return Err(Error::storage(
                     "checkpoint constraint is missing its enforced label",
                 ));
@@ -535,27 +552,28 @@ impl Graph {
             if constraint.enforced_label.is_some() {
                 let matches = catalog.constraints.values().any(|def| {
                     (def.name == *name || !catalog.constraints.contains_key(name))
-                        && def.label == constraint.label
-                        && def.relationship == relationship
-                        && def.properties == constraint.properties
-                        && def.kind == constraint.constraint_type.as_str()
-                        && def.property_type == constraint.property_type
+                        && matching_enforced_label(def, constraint)
                 });
-                if !matches || !label_kind {
+                if !matches || !has_label {
                     return Err(Error::storage(
                         "invalid checkpoint enforced-label constraint",
                     ));
                 }
             }
         }
-        drop(catalog);
+        Ok(())
+    }
+
+    /// Every index detail/option names a live index (the same
+    /// `(image, &Catalog)` shape as its four siblings).
+    fn validate_index_details(image: &CheckpointTheater, catalog: &Catalog) -> Result<()> {
         for name in image
             .data
             .index_details
             .keys()
             .chain(image.data.index_options.keys())
         {
-            if self.named_index(name).is_none() {
+            if !catalog.indexes.contains_key(name) {
                 return Err(Error::storage("checkpoint index detail has no named index"));
             }
         }
@@ -571,14 +589,37 @@ impl Graph {
     ) -> Result<()> {
         let mut image = self.checkpoint_theater();
         for constraint in constraints {
+            // Legacy GraphData may omit the theater entirely: validate the
+            // supplied entries one by one (typed identity plus a matching
+            // catalog definition) instead of imposing the typed image's
+            // completeness guarantee.
+            self.validate_legacy_enforced_entry(&constraint)?;
             image
                 .data
                 .derived_constraints
                 .insert(constraint.name.clone(), constraint);
         }
-        // Legacy GraphData may omit theater entirely; validate supplied entries
-        // without imposing the completeness guarantee of a typed image.
-        self.restore_checkpoint_theater_image(image, false)
+        self.install_checkpoint_theater_image(image)
+    }
+
+    /// The legacy entry gate: a typed entity kind, an enforced-label kind,
+    /// a non-empty label, and a catalog definition it matches.
+    fn validate_legacy_enforced_entry(
+        &self,
+        constraint: &cypherlite_model::Constraint,
+    ) -> Result<()> {
+        constraint.entity_kind().map_err(Error::storage)?;
+        let catalog = self.catalog.lock().unwrap();
+        let matches = catalog
+            .constraints
+            .values()
+            .any(|def| matching_enforced_label(def, constraint));
+        if !super::has_enforced_label(constraint) || !matches {
+            return Err(Error::storage(
+                "invalid checkpoint enforced-label constraint",
+            ));
+        }
+        Ok(())
     }
 }
 

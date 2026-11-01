@@ -11,6 +11,7 @@ use crate::redo::{self, PullKind, RedoOp};
 use crate::store::{Interner, LiveNode, LiveRel, TypedAdj};
 
 use adjacency::{adj_insert, adj_reposition};
+use constraint_keys::ConstraintKeyIndex;
 use degree_stats::CountDelta;
 
 // The count-only reader's probe shape (LABS-370 round 3, F-1-5): re-exported
@@ -20,11 +21,15 @@ pub(crate) use degree_stats::CountProbe;
 mod adjacency;
 mod apply_redo;
 mod conflict;
+pub(crate) mod constraint_keys;
 mod declared;
 mod degree_stats;
 mod degree_stats_estimate;
 mod degree_stats_incident;
+mod entity_mutation;
 mod index;
+mod index_lookup;
+mod index_postings;
 mod label_mutation;
 mod label_probe;
 mod query_stats;
@@ -65,12 +70,27 @@ fn visible_version<Live>(vers: &[Ver<Live>], ts: u64) -> Option<&Ver<Live>> {
 /// maintained-statistics paths run inside the write window, where a rel
 /// created earlier in the same batch is invisible at `commit_ts` and one
 /// deleted in the batch keeps a live-looking pre-delete version. The
-/// `xmax == 0` convention is the one `live_label_ids` and the rebuild's
-/// live-rel scan use. (The other historical inline spellings of this
-/// walk — the delete paths, the rebuild scan — fold onto this helper as
-/// night-shift backlog work, not in this fix's scope.)
+/// `xmax == 0` convention is the one every live-version reader in the graph
+/// module uses (`live_label_ids`, the rebuild's live-rel scan, and the
+/// constraint_keys family's snapshots and backfills).
 fn live_version<Live>(vers: &[Ver<Live>]) -> Option<&Ver<Live>> {
     vers.iter().rev().find(|v| v.xmax == 0)
+}
+
+impl Graph {
+    /// A node's current live labels in the interned domain (u32 ids) —
+    /// the histogram's key domain, read through [`live_version`] rather than
+    /// a snapshot-visible one: the histogram is maintained at create time,
+    /// inside the writing transaction, where the just-created node is not yet
+    /// visible at `commit_ts` (the bug the first version of this read had —
+    /// every bump looped over zero labels). The `xmax == 0` convention
+    /// matches the rebuild's live-rel scan.
+    pub(in crate::graph) fn live_label_ids(&self, node: NodeId) -> Vec<u32> {
+        self.nodes
+            .get(&node)
+            .and_then(|vers| live_version(vers.as_slice()).map(|v| v.live.labels.clone()))
+            .unwrap_or_default()
+    }
 }
 
 pub use theater::{CheckpointTheater, DatabaseEntry, SchemaSnapshot};
@@ -128,6 +148,13 @@ pub(crate) fn delete_connected_node_error() -> cypherlite_core::Error {
     cypherlite_core::Error::execution(
         "DeleteConnectedNode: Cannot delete node with relationships unless DETACH",
     )
+}
+
+/// The one typed reply for a relationship whose endpoint is not a live node:
+/// the create path's semantic error, shared by the overlay's create, the
+/// primitive's endpoint validation, and the redo preflight.
+pub(crate) fn missing_rel_endpoint_error() -> cypherlite_core::Error {
+    cypherlite_core::Error::semantic("cannot create relationship on missing node")
 }
 
 /// Allocate the next exhaustible id from `counter`, mapping exhaustion to the
@@ -264,6 +291,16 @@ pub struct Graph {
     /// drained on zero, charged to `used_bytes` per entry like the pair
     /// counts (graph/degree_stats.rs owns the bump discipline).
     label_counts: Mutex<HashMap<u32, u64>>,
+    /// ADR-0439: the maintained, single-version per-constraint committed
+    /// tuple map (`unique`/`key` constraints, node and relationship). Unlike
+    /// the lazily built postings in [`Indexes`], this map is eagerly current;
+    /// `graph/constraint_keys/mod.rs` owns its charge family and
+    /// backfill/rebuild lifecycle; `simulation.rs` owns the op classification
+    /// and the entity simulation; `seams.rs` the `apply_redo` maintenance;
+    /// `ddl.rs` the batch DDL accumulator; `admission.rs` the commit-time
+    /// admission probe; `estimate.rs` the entry-growth estimate (one-way: the
+    /// admission and estimate sides import the map's vocabulary).
+    constraint_keys: Mutex<ConstraintKeyIndex>,
     interner: Interner,
     catalog: Mutex<Catalog>,
     pub(crate) theater: Mutex<TheaterData>,
@@ -308,6 +345,7 @@ impl Default for Graph {
             degree_histograms: Mutex::new(HashMap::new()),
             pair_counts: Mutex::new(HashMap::new()),
             label_counts: Mutex::new(HashMap::new()),
+            constraint_keys: Mutex::new(ConstraintKeyIndex::default()),
             interner,
             catalog: Mutex::new(Catalog::default()),
             theater: Mutex::new(TheaterData::default()),
@@ -385,6 +423,16 @@ fn matching_enforced_label(def: &ConstraintDef, c: &cypherlite_model::Constraint
         && c.constraint_type
             .enforced_label_site()
             .is_some_and(|site| site.is_relationship() == def.relationship)
+        && c.enforced_label
+            .as_deref()
+            .is_some_and(|label| !label.is_empty())
+}
+
+/// Whether a derived record names an enforced label at all: its kind
+/// requires one and the label is present and non-empty. The per-entry core
+/// both checkpoint gates share (each keeps its own error mapping).
+fn has_enforced_label(c: &cypherlite_model::Constraint) -> bool {
+    c.constraint_type.is_enforced_label_kind()
         && c.enforced_label
             .as_deref()
             .is_some_and(|label| !label.is_empty())
@@ -476,6 +524,10 @@ impl Graph {
         // (the #398 lesson). The term lives with the family
         // (graph/degree_stats.rs).
         n = n.saturating_add(self.degree_stats_structure_bytes());
+        // ADR-0439: the committed constraint-key map is retained structure
+        // too; it carries the bytes each entry was charged, so the recount
+        // and the incremental charge cannot drift.
+        n = n.saturating_add(self.constraint_keys_structure_bytes());
         n
     }
 
@@ -491,9 +543,23 @@ impl Graph {
     /// record until GC, so it adds nothing. A copy-on-write set adds the
     /// new version.
     pub fn estimate_redo_delta(&self, ops: &[RedoOp]) -> i64 {
+        self.estimate_redo_delta_with_constraint_growth(ops, None)
+    }
+
+    /// [`Graph::estimate_redo_delta`] with the constraint-key entry-growth
+    /// term optionally supplied by the caller. The group-commit admission
+    /// loop classifies each slot once and passes the delta its walk produced,
+    /// so the slot's ops are not re-classified here (ADR-0439).
+    #[doc(hidden)]
+    pub fn estimate_redo_delta_with_constraint_growth(
+        &self,
+        ops: &[RedoOp],
+        constraint_growth: Option<i64>,
+    ) -> i64 {
         let before = self.index_charge();
         let after = self.charge_after_ops(ops);
         let mut delta = crate::memory::estimate_redo_delta(
+            &self.interner,
             ops,
             |id| self.node(id),
             |id| self.rel_form(id),
@@ -508,6 +574,13 @@ impl Graph {
         // rejected at admission, not after its entries land past the cap
         // (graph/degree_stats.rs owns the term).
         delta += self.estimate_stats_entry_growth(ops);
+        // ADR-0439: a constrained write's new entries are committed
+        // structure too — refused at admission, never after they land. The
+        // group path supplies the delta its admission walk already computed.
+        delta += match constraint_growth {
+            Some(growth) => growth,
+            None => self.estimate_constraint_key_entry_growth(ops),
+        };
         if before.as_ref() != &after {
             for entry in self.nodes.iter() {
                 let id = *entry.key();
@@ -1023,150 +1096,6 @@ impl Graph {
         }
     }
 
-    pub fn create_node(
-        &self,
-        labels: Vec<String>,
-        properties: BTreeMap<String, Value>,
-    ) -> Result<NodeId> {
-        let id = self.alloc_node_id()?;
-        self.install_node(id, labels, properties)?;
-        Ok(id)
-    }
-
-    fn install_node(
-        &self,
-        id: NodeId,
-        labels: Vec<String>,
-        properties: BTreeMap<String, Value>,
-    ) -> Result<()> {
-        let next = checked_persisted_id(id, "node")?;
-        self.next_node_id.fetch_max(next, Ordering::Relaxed);
-        self.catalog
-            .lock()
-            .unwrap()
-            .record_labels(labels.iter().cloned());
-        self.bump_stats(|s| {
-            s.nodes_created += 1;
-            s.labels_added += labels.len() as i64;
-            s.properties_set += properties.len() as i64;
-        });
-        if self.recording() {
-            self.push_redo(RedoOp::create_node(
-                id,
-                std::sync::Arc::new(labels.clone()),
-                properties.clone(),
-            ));
-        }
-        let xmin = self.xmin_for_install();
-        let live = LiveNode::from_parts(&self.interner, labels, properties);
-        let charge =
-            crate::memory::live_node_account_live(&live, &self.interner, &self.index_charge());
-        // LABS-370 (v1 follow-up): the exact label counts follow every
-        // create, before the version owns the live set.
-        self.bump_label_counts(&live.labels, CountDelta::Add);
-        {
-            let mut vers = self.nodes.entry(id).or_default();
-            vers.push(NodeVer {
-                xmin,
-                xmax: 0,
-                live,
-            });
-            crate::memory::fit_reserved(&mut vers);
-        }
-        self.index_add(id);
-        self.mark_node_dirty(id);
-        // ADR-0063: lazy string postings — just dirty-mark built pairs, and
-        // only after the version is installed (apply-before-dirty ordering).
-        if let Some(vers) = self.nodes.get(&id) {
-            if let Some(v) = vers.last() {
-                self.string_dirty_mark_node(&v.live, id);
-            }
-        }
-        self.charge(charge as i64 + crate::memory::node_chain_bytes(1) as i64);
-        Ok(())
-    }
-
-    pub fn create_rel(
-        &self,
-        start: NodeId,
-        end: NodeId,
-        rel_type: String,
-        properties: BTreeMap<String, Value>,
-    ) -> Result<RelId> {
-        self.validate_rel_endpoints(start, end)?;
-        let id = self.alloc_rel_id()?;
-        self.install_rel(id, start, end, rel_type, properties)?;
-        Ok(id)
-    }
-
-    fn validate_rel_endpoints(&self, start: NodeId, end: NodeId) -> Result<()> {
-        checked_persisted_id(start, "relationship start")?;
-        checked_persisted_id(end, "relationship end")?;
-        // Endpoint existence without materializing the endpoint nodes.
-        let ts_now = self.read_ts();
-        if !self.node_visible_at(start, ts_now) || !self.node_visible_at(end, ts_now) {
-            return Err(cypherlite_core::Error::semantic(
-                "cannot create relationship on missing node",
-            ));
-        }
-        Ok(())
-    }
-
-    fn install_rel(
-        &self,
-        id: RelId,
-        start: NodeId,
-        end: NodeId,
-        rel_type: String,
-        properties: BTreeMap<String, Value>,
-    ) -> Result<()> {
-        let next = checked_persisted_id(id, "relationship")?;
-        self.validate_rel_endpoints(start, end)?;
-        self.next_rel_id.fetch_max(next, Ordering::Relaxed);
-        self.catalog
-            .lock()
-            .unwrap()
-            .record_rel_type(rel_type.clone());
-        self.bump_stats(|s| {
-            s.relationships_created += 1;
-            s.properties_set += properties.len() as i64;
-        });
-        if self.recording() {
-            let op = RedoOp::create_rel(id, start, end, rel_type.clone(), properties.clone());
-            self.push_redo(op);
-        }
-        let xmin = self.xmin_for_install();
-        let live = LiveRel::from_parts(&self.interner, start, end, &rel_type, properties);
-        let charge = crate::memory::live_rel_account_live(&live);
-        let ts = live.payload.ts(&self.interner);
-        let out_before = adj_floor(&self.out_adj, start);
-        let in_before = adj_floor(&self.in_adj, end);
-        let degree_before = self.out_chunk_len(start, live.type_id);
-        adj_insert(&self.out_adj, start, live.type_id, id, ts);
-        adj_insert(&self.in_adj, end, live.type_id, id, ts);
-        self.bump_rel_type(live.type_id, CountDelta::Add);
-        self.bump_degree_histograms(start, live.type_id, degree_before);
-        self.bump_pair_counts(start, live.type_id, end, CountDelta::Add);
-        let adj = adj_floor(&self.out_adj, start) as i64 - out_before as i64
-            + adj_floor(&self.in_adj, end) as i64
-            - in_before as i64;
-        {
-            let mut vers = self.rels.entry(id).or_default();
-            vers.push(RelVer {
-                xmin,
-                xmax: 0,
-                live,
-            });
-            crate::memory::fit_reserved(&mut vers);
-        }
-        self.mark_rel_dirty(id);
-        // ADR-0185: lazy relationship postings — dirty-mark built pairs, and
-        // only after the version is installed (apply-before-dirty ordering).
-        self.rel_index_add(id);
-        self.charge(charge as i64 + crate::memory::rel_chain_bytes(1) as i64 + adj);
-        Ok(())
-    }
-
     pub fn named_indexes(&self) -> Vec<IndexDef> {
         self.catalog
             .lock()
@@ -1222,6 +1151,12 @@ impl Graph {
             .collect()
     }
 
+    /// Install one catalog constraint row. Restore paths only: this mutates
+    /// the catalog WITHOUT the maintained constraint-key map (ADR-0439), so
+    /// the caller must finish with `rebuild_indexes` / `finish_restore`,
+    /// which builds the map from the catalog ∪ the theater's derived set.
+    /// Calling it on a live graph would leave a uniqueness constraint the
+    /// admission probe cannot see.
     pub fn install_named_constraint(&self, def: ConstraintDef) -> Result<()> {
         self.catalog.lock().unwrap().insert_constraint(def)
     }
@@ -1255,189 +1190,6 @@ impl Graph {
         self.rel(id)
             .map(Value::from_relationship)
             .unwrap_or(Value::Null)
-    }
-
-    fn cow_node(&self, id: NodeId) -> Option<LiveNode> {
-        cow(&self.write_ts, &self.nodes, id)
-    }
-
-    fn put_node(&self, id: NodeId, live: LiveNode) {
-        if let Some(mut vers) = self.nodes.get_mut(&id) {
-            if let Some(last) = vers.last_mut() {
-                last.live = live;
-            }
-        }
-    }
-
-    fn cow_rel(&self, id: RelId) -> Option<LiveRel> {
-        cow(&self.write_ts, &self.rels, id)
-    }
-
-    fn put_rel(&self, id: RelId, live: LiveRel) {
-        if let Some(mut vers) = self.rels.get_mut(&id) {
-            if let Some(last) = vers.last_mut() {
-                last.live = live;
-            }
-        }
-    }
-
-    pub fn set_property_node(&self, id: NodeId, key: &str, value: Value) {
-        let before = self.node(id);
-        let before_len = self.node_chain_len(id);
-        let mut op = None;
-        let mut props_set = 0i64;
-        if let Some(mut n) = self.cow_node(id) {
-            let kid = self.interner.intern(key);
-            if value.is_null() {
-                n.props.remove(kid);
-                op = Some(RedoOp::remove_node_prop(id, key.to_string()));
-            } else {
-                n.props.set(kid, value.clone());
-                props_set = 1;
-                op = Some(RedoOp::set_node_prop(id, key.to_string(), value.clone()));
-            }
-            self.put_node(id, n);
-        }
-        self.bump_stats(|s| s.properties_set += props_set);
-        if let Some(op) = op {
-            self.push_redo(op);
-            self.mark_node_dirty(id);
-        }
-        // Dirty-mark only after the new version is installed — the ADR-0185
-        // invariant: `index_add` marks every (label, key) pair the installed
-        // version carries; a removal leaves stale postings, which the
-        // residual re-verification filters.
-        self.index_add(id);
-        self.charge_node_after_edit(id, before.as_ref(), before_len);
-    }
-
-    pub fn set_property_rel(&self, id: RelId, key: &str, value: Value) {
-        let before_bytes = self.visible_rel_account(id);
-        let before_len = self.rel_chain_len(id);
-        let mut op = None;
-        let mut props_set = 0i64;
-        if let Some(mut r) = self.cow_rel(id) {
-            let old_ts = r.payload.ts(&self.interner);
-            let start = r.start;
-            let end = r.end;
-            let type_id = r.type_id;
-            if value.is_null() {
-                r.payload.remove(&self.interner, key);
-                op = Some(RedoOp::remove_rel_prop(id, key.to_string()));
-            } else {
-                r.payload.set(&self.interner, key, value.clone());
-                props_set = 1;
-                op = Some(RedoOp::set_rel_prop(id, key.to_string(), value.clone()));
-            }
-            let new_ts = r.payload.ts(&self.interner);
-            self.put_rel(id, r);
-            if old_ts != new_ts {
-                adj_reposition(&self.out_adj, start, type_id, id, new_ts);
-                adj_reposition(&self.in_adj, end, type_id, id, new_ts);
-            }
-            // Dirty-mark only after the new version is installed — the
-            // ADR-0185 invariant: `rel_index_add` reads the installed
-            // version's own type and keys; a removal's key is gone from the
-            // payload, and its stale postings are filtered by the residual
-            // re-verification.
-            self.rel_index_add(id);
-        }
-        self.bump_stats(|s| s.properties_set += props_set);
-        if let Some(op) = op {
-            self.push_redo(op);
-            self.mark_rel_dirty(id);
-        }
-        self.charge_rel_after_edit(id, before_bytes, before_len);
-    }
-
-    pub fn merge_properties_node(&self, id: NodeId, map: &BTreeMap<String, Value>) {
-        for (k, v) in map {
-            self.set_property_node(id, k, v.clone());
-        }
-    }
-
-    /// Tombstone timestamp for a delete: the write ts while in a write,
-    /// else the commit ts clamped to ≥ 1 so the tombstone is never the
-    /// "no tombstone" sentinel 0. Both MVCC delete paths share this rule.
-    fn tombstone_ts(&self) -> u64 {
-        if self.in_write.load(Ordering::Acquire) {
-            self.write_ts.load(Ordering::Acquire)
-        } else {
-            self.commit_ts().max(1)
-        }
-    }
-
-    /// A node's current live labels in the interned domain (u32 ids) —
-    /// the histogram's key domain, read from the live version (xmax == 0)
-    /// rather than a snapshot-visible one: the histogram is maintained at
-    /// create time, inside the writing transaction, where the just-created
-    /// node is not yet visible at `commit_ts` (the bug the first version
-    /// of this read had — every bump looped over zero labels). The
-    /// `xmax == 0` convention matches the rebuild's live-rel scan.
-    fn live_label_ids(&self, node: NodeId) -> Vec<u32> {
-        self.nodes
-            .get(&node)
-            .and_then(|vers| {
-                vers.iter()
-                    .rev()
-                    .find(|v| v.xmax == 0)
-                    .map(|v| v.live.labels.clone())
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn delete_rel(&self, id: RelId) {
-        let ts = self.tombstone_ts();
-        let mut found = false;
-        if let Some(mut vers) = self.rels.get_mut(&id) {
-            if let Some(v) = vers.iter_mut().rev().find(|v| v.xmax == 0) {
-                let type_id = v.live.type_id;
-                let (start, end) = (v.live.start, v.live.end);
-                v.xmax = ts;
-                self.bump_rel_type(type_id, CountDelta::Remove);
-                // LABS-370: the pair counts are exact (the counting
-                // operator answers from them), so a delete leaves its
-                // (start-label, type, end-label) triples — the mirror of
-                // the create-path bump.
-                self.bump_pair_counts(start, type_id, end, CountDelta::Remove);
-                found = true;
-            }
-        }
-        if found {
-            self.bump_stats(|s| s.relationships_deleted += 1);
-            self.push_redo(RedoOp::delete_rel(id));
-            self.mark_rel_dirty(id);
-        }
-    }
-
-    pub fn delete_node(&self, id: NodeId, detach: bool) -> Result<()> {
-        // The canonical incident scan: visibility-filtered at the read
-        // timestamp and self-loop-deduplicated (graph/adjacency.rs).
-        let incident = self.neighbors(id, cypherlite_ir::Direction::Both);
-        if !detach && !incident.is_empty() {
-            return Err(delete_connected_node_error());
-        }
-        for rid in incident {
-            self.delete_rel(rid);
-        }
-        let ts = self.tombstone_ts();
-        let mut found = false;
-        if let Some(mut vers) = self.nodes.get_mut(&id) {
-            if let Some(v) = vers.iter_mut().rev().find(|v| v.xmax == 0) {
-                v.xmax = ts;
-                // LABS-370 (v1 follow-up): the exact label counts follow
-                // every delete — the label index keeps the tombstoned id
-                // until GC, this map does not.
-                self.bump_label_counts(&v.live.labels, CountDelta::Remove);
-                found = true;
-            }
-        }
-        if found {
-            self.bump_stats(|s| s.nodes_deleted += 1);
-            self.push_redo(RedoOp::delete_node(id));
-            self.mark_node_dirty(id);
-        }
-        Ok(())
     }
 
     pub fn pull_identity_get(&self, source: &str, kind: PullKind, remote_id: &str) -> Option<i64> {

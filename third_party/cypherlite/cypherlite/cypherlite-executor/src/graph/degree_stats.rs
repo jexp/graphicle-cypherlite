@@ -341,6 +341,19 @@ impl Graph {
         }
     }
 
+    /// Every per-label statistics change one label-set mutation makes: the
+    /// degree re/unbucket, the incident pair counts, and the exact label
+    /// counts. `delta` selects the direction — the one entry point both
+    /// label seams call.
+    pub(super) fn apply_label_delta_stats(&self, node: NodeId, labels: &[u32], delta: CountDelta) {
+        match delta {
+            CountDelta::Add => self.rebucket_added_labels(node, labels),
+            CountDelta::Remove => self.unbucket_removed_labels(node, labels),
+        }
+        self.apply_incident_pair_counts(node, labels, delta);
+        self.bump_label_counts(labels, delta);
+    }
+
     /// LABS-370 (v1 follow-up): bump the exact per-label live node counts —
     /// the same seams the pair counts ride (create, delete, label add and
     /// remove, and the rebuild's wholesale fold), the same
@@ -359,6 +372,23 @@ impl Graph {
             }
         }
         self.charge(charge);
+    }
+
+    /// Rebuild the exact per-label live counts wholesale from the live graph
+    /// — abort and restore recompute them (the abort's install-time bumps die
+    /// with the reverted versions). The count map's one rebuild home, called
+    /// from `rebuild_indexes` like `rebuild_constraint_keys`.
+    pub(super) fn rebuild_label_counts(&self) {
+        let ts = self.commit_ts();
+        let mut counts: HashMap<u32, u64> = HashMap::new();
+        for id in self.all_node_ids_at(ts) {
+            if let Some(n) = self.node_at(id, ts) {
+                for label in n.labels.iter() {
+                    *counts.entry(self.interner.intern(label)).or_insert(0) += 1;
+                }
+            }
+        }
+        *self.label_counts.lock().unwrap() = counts;
     }
 
     /// LABS-370: the exact count of rels between a (start-label,

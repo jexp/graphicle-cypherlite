@@ -9,7 +9,7 @@ use cypherlite_core::{Error, Result, Value};
 use cypherlite_error::{ErrorKind, COUNT_UNION_MIX_MESSAGE, COUNT_UNION_OMITTED_MESSAGE};
 use cypherlite_ir::{Clause, MatchMode, Query};
 
-use super::call::{execute_query_seeded, query_with_persistent_imports};
+use super::call::execute_query_seeded;
 use super::dispatch::run_nested_clauses;
 use super::exists_probe;
 use super::mutates_store;
@@ -33,8 +33,9 @@ fn nested_row_count(rows: &[Row], last: &Option<QueryResult>) -> usize {
 
 /// The one nested-body preparation the three expression-subquery engines
 /// share: strip the enclosing clause engine's internal columns off the
-/// seed row, import the remaining names, rewrite the body with persistent
-/// imports, and build the nested statement context — a fresh context
+/// seed row (the body's importing scope), rewrite the body so those
+/// imports persist through its `WITH`s, and build the nested statement
+/// context — a fresh context
 /// per ADR-0344 phase 2 (no statement text: a `SHOW TRANSACTIONS` buried
 /// in an expression subquery reports an empty `currentQuery`; the
 /// version inherited from the enclosing statement per CIP-150 unless
@@ -48,14 +49,23 @@ fn nested_row_count(rows: &[Row], last: &Option<QueryResult>) -> usize {
 /// row, not the caller's: a `__`-prefixed column left on it would be
 /// imported as a persistent binding and read by the body's projection as
 /// its own state (`nested_seed_row`).
+///
+/// An expression subquery imports the enclosing scope implicitly, and the
+/// persistent-import rewrite is what keeps an imported name a grouping key
+/// of an aggregating `WITH` (`Collect/Count/ExistsExpression` "Should not
+/// use outer scope variables as grouping variables in aggregations
+/// dependency": an emptied input must yield no rows, not the identity
+/// row). A `CALL` subquery's explicit import is a different contract —
+/// `call` carries it as a live scope, not as `WITH` items — so this
+/// rewrite stays on the expression-subquery path only.
 fn nested_body(
     query: &Query,
     outer: &Row,
     cypher_version: Option<u32>,
 ) -> (Query, QueryCtx<'static>, Row) {
     let seed = nested_seed_row(outer);
-    let imported = seed.keys().cloned().collect();
-    let query = query_with_persistent_imports(query, &imported);
+    let imported: Vec<String> = seed.keys().cloned().collect();
+    let query = cypherlite_planner::query_with_persistent_imports(query, &imported);
     let qctx = QueryCtx::new(query.cypher_version.or(cypher_version), "");
     (query, qctx, seed)
 }
@@ -187,7 +197,7 @@ pub(crate) fn eval_count_query(
         for part in &query.parts {
             // ADR-0395: the omitted-RETURN path runs the clause engine
             // directly — one pass per part per outer row (the RETURN path
-            // below ticks inside `execute_query_seeded`).
+            // below ticks inside its seeded statement entry).
             let (rows, last) =
                 run_nested_clauses(graph, &part.clauses, params, vec![seed.clone()], qctx)?;
             count += nested_row_count(&rows, &last) as i64;

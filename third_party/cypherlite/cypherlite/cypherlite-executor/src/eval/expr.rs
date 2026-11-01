@@ -1,6 +1,7 @@
 //! Scalar expression operators: unary/binary ops, property access,
 //! subscript/slice, and CASE.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -112,10 +113,15 @@ pub(crate) fn binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
             Value::Bool(b) => Value::Bool(!b),
             other => other,
         },
-        BinaryOp::Lt => vector_cmp_or(l, r, false, |o| o.is_lt()),
-        BinaryOp::Gt => vector_cmp_or(l, r, false, |o| o.is_gt()),
-        BinaryOp::Lte => vector_cmp_or(l, r, true, |o| !o.is_gt()),
-        BinaryOp::Gte => vector_cmp_or(l, r, true, |o| !o.is_lt()),
+        // The four ordering operators, from the one (equality-tolerant,
+        // predicate) table the index range filter also reads. Vectors have no
+        // ordering arm in `Value::compare`, so `<=`/`>=` keep working for
+        // equal vectors through the equality fallback.
+        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Lte | BinaryOp::Gte => {
+            let (equality_allowed, pred) =
+                ordering_operator(op).expect("`op` matched one of the four ordering operators");
+            cmp_bool(&l, &r, equality_allowed, pred)
+        }
         BinaryOp::And => match (bool_or_null(&l, "AND")?, bool_or_null(&r, "AND")?) {
             (Some(false), _) | (_, Some(false)) => Value::Bool(false),
             (Some(true), Some(true)) => Value::Bool(true),
@@ -152,13 +158,42 @@ pub(crate) fn binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
     })
 }
 
-pub(crate) fn regex_is_match(text: &str, pattern: &str) -> std::result::Result<bool, ()> {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(text))
-        .map_err(|_| ())
+pub(crate) fn regex_is_match(text: &str, pattern: &str) -> std::result::Result<bool, regex::Error> {
+    // `=~` is a whole-string match (Neo4j's `Pattern.matches`), not a
+    // substring search: `'21_val' =~ '1_.*'` is false. The non-capturing
+    // group keeps an alternation (`a|b`) inside the anchors.
+    regex::Regex::new(&format!("^(?:{pattern})$")).map(|re| re.is_match(text))
 }
 
-pub(crate) fn cmp_bool(l: Value, r: Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> Value {
+/// One ordering operator: whether an incomparable-but-equal pair satisfies it
+/// (the `<=`/`>=` disjunct `a = b`), and the predicate over `Value::compare`.
+pub(crate) type OrderingOperator = (bool, fn(Ordering) -> bool);
+
+/// The four ordering operators' [`OrderingOperator`]s: `<=`/`>=` also hold
+/// when the operands are equal, which is what makes them true for values
+/// `Value::compare` cannot order (durations, UUIDs, points) where `<`/`>` are
+/// null. The shared table keeps `binary`'s evaluation and the index range
+/// filter (`graph::declared::order::cmp_holds`) on one definition; `None` for
+/// every other operator.
+pub(crate) fn ordering_operator(op: BinaryOp) -> Option<OrderingOperator> {
+    Some(match op {
+        BinaryOp::Lt => (false, Ordering::is_lt),
+        BinaryOp::Gt => (false, Ordering::is_gt),
+        BinaryOp::Lte => (true, Ordering::is_le),
+        BinaryOp::Gte => (true, Ordering::is_ge),
+        _ => return None,
+    })
+}
+
+/// Borrows both operands: the indexed range filter calls this per posting
+/// (`cmp_holds`), where a by-value signature would heap-clone a non-Arc
+/// `Value::Temporal` on every check.
+pub(crate) fn cmp_bool(
+    l: &Value,
+    r: &Value,
+    equality_allowed: bool,
+    pred: impl Fn(std::cmp::Ordering) -> bool,
+) -> Value {
     let ln = l.as_number();
     let rn = r.as_number();
     if ln.is_some_and(|f| f.is_nan()) || rn.is_some_and(|f| f.is_nan()) {
@@ -168,26 +203,16 @@ pub(crate) fn cmp_bool(l: Value, r: Value, pred: impl Fn(std::cmp::Ordering) -> 
             Value::Null
         };
     }
-    match l.compare(&r) {
+    match l.compare(r) {
         Some(o) => Value::Bool(pred(o)),
+        // Incomparable: null, unless the equality-tolerant operator's other
+        // disjunct (`a = b`) holds.
+        None if equality_allowed => match l.cypher_eq(r) {
+            Value::Bool(true) => Value::Bool(true),
+            _ => Value::Null,
+        },
         None => Value::Null,
     }
-}
-
-pub(crate) fn vector_cmp_or(
-    l: Value,
-    r: Value,
-    equality_allowed: bool,
-    pred: impl Fn(std::cmp::Ordering) -> bool,
-) -> Value {
-    if matches!(l, Value::Vector { .. }) || matches!(r, Value::Vector { .. }) {
-        return if equality_allowed && l.eq_non_null(&r) {
-            Value::Bool(true)
-        } else {
-            Value::Null
-        };
-    }
-    cmp_bool(l, r, pred)
 }
 
 pub(crate) fn add(l: Value, r: Value) -> Result<Value> {
@@ -638,5 +663,59 @@ mod tests {
             slice(&int(5), Some(s("x")), None).unwrap_err().to_string(),
             ty_err("slice needs a list")
         );
+    }
+
+    // `=~` is a whole-string match, not a substring search.
+    #[test]
+    fn regex_anchors_at_both_ends() {
+        assert!(!regex_is_match("21_val", "1_.*").unwrap());
+        assert!(regex_is_match("1_val", "1_.*").unwrap());
+        // An alternation stays inside the anchors.
+        assert!(!regex_is_match("ab", "a|b").unwrap());
+        assert!(regex_is_match("a", "a|b").unwrap());
+        assert!(regex_is_match("", "x*").unwrap());
+        assert!(regex_is_match("x1_val", ".*1_.*").unwrap());
+        assert!(regex_is_match("abc", "abc").unwrap());
+        assert!(regex_is_match("abc", "b").is_ok_and(|m| !m));
+        assert!(regex_is_match("abc", "[").is_err());
+    }
+
+    fn duration(months: i64, days: i64) -> Value {
+        Value::Temporal(cypherlite_core::Temporal::Duration {
+            months,
+            days,
+            nanos: 0,
+        })
+    }
+
+    fn cmp(op: BinaryOp, l: Value, r: Value) -> Value {
+        binary(op, l, r).unwrap()
+    }
+
+    // Durations have `=` but no ordering: `<`/`>` are null, `<=`/`>=` still
+    // hold for equal values (TCK TernaryComparisonAcceptance).
+    #[test]
+    fn equal_durations_satisfy_the_equality_tolerant_operators() {
+        let d = duration(0, 1);
+        assert_eq!(cmp(BinaryOp::Lt, d.clone(), d.clone()), Value::Null);
+        assert_eq!(cmp(BinaryOp::Gt, d.clone(), d.clone()), Value::Null);
+        assert_eq!(cmp(BinaryOp::Lte, d.clone(), d.clone()), Value::Bool(true));
+        assert_eq!(cmp(BinaryOp::Gte, d.clone(), d.clone()), Value::Bool(true));
+        // Different durations are incomparable in every direction.
+        let other = duration(0, 2);
+        for op in [BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Lte, BinaryOp::Gte] {
+            assert_eq!(cmp(op, d.clone(), other.clone()), Value::Null);
+        }
+    }
+
+    // UUIDs have `=` but no ordering either.
+    #[test]
+    fn equal_uuids_satisfy_the_equality_tolerant_operators() {
+        let a = Value::Uuid(1);
+        let b = Value::Uuid(2);
+        assert_eq!(cmp(BinaryOp::Gt, a.clone(), b.clone()), Value::Null);
+        assert_eq!(cmp(BinaryOp::Lt, b.clone(), a.clone()), Value::Null);
+        assert_eq!(cmp(BinaryOp::Gte, a.clone(), a.clone()), Value::Bool(true));
+        assert_eq!(cmp(BinaryOp::Lte, a.clone(), a.clone()), Value::Bool(true));
     }
 }

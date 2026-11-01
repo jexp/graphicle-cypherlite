@@ -1,8 +1,9 @@
 //! A store opened from a checkpoint plus a WAL tail has the adjacency of
 //! the graph that wrote it: the checkpoint load builds adjacency once and
-//! the replayed tail keeps it current. Checked for every compiled snapshot
-//! codec, through the read-write open and the read-only open a follower
-//! reloads through.
+//! the replayed tail keeps it current. Checked for the root-layout
+//! snapshot codecs (Parquet, JSON) through the read-write open and the
+//! read-only open a follower reloads through — the markdown codec is
+//! excluded below for its own id-assignment reason.
 
 use std::collections::BTreeMap;
 
@@ -66,9 +67,27 @@ fn hop_holders(g: &Graph, rel: RelId) -> [Vec<NodeId>; 2] {
     [held(Graph::degree_out), held(Graph::degree_in)]
 }
 
+/// Whether a checkpoint reload through this codec preserves the
+/// writer's raw node/rel ids — the property this adjacency test needs,
+/// derived from the typed layout fact (`engine_dir`): the codecs whose
+/// engine state lives at the store root replay over their own ids,
+/// while the markdown vault assigns node ids in vault-path order
+/// (ADR-0406 §2), so its WAL tail would reference the writer's raw ids,
+/// which no vault reload preserves. Adjacency across a markdown
+/// checkpoint is covered by the codec roundtrip tests and the Odyssey
+/// e2e. Never a variant-name comparison a future sidecar codec would
+/// silently drift past.
+fn reload_preserves_raw_ids(codec: SnapshotCodecKind) -> bool {
+    codec.engine_dir().is_none()
+}
+
 #[test]
 fn opened_store_has_the_adjacency_of_the_graph_that_wrote_it() {
-    for &codec in SnapshotCodecKind::compiled() {
+    for codec in SnapshotCodecKind::compiled()
+        .iter()
+        .copied()
+        .filter(|codec| reload_preserves_raw_ids(*codec))
+    {
         let store = memory_store_with_codec(codec).unwrap();
         let mut wal = Wal::open(store.vfs(), "wal", 0).unwrap();
         let writer = Graph::default();

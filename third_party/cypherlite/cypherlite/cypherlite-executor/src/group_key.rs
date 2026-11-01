@@ -1,16 +1,18 @@
 //! Canonical equivalence key for `DISTINCT`, `GROUP BY`, `UNION`
 //! deduplication, aggregate `DISTINCT` (`count(DISTINCT x)`, ...),
-//! `coll.distinct`, and the property index (`graph.rs::prop_index`).
+//! `coll.distinct`, and (in its equality reading) the property index, the
+//! uniqueness probe and `MERGE`/`MATCH` equality buckets.
 //!
 //! Cypher's *equivalence* relation is deliberately **not** the same relation
 //! as `=` equality (see `Value::eq_non_null` / `Value::cypher_eq`): `null` is
 //! reflexive here (`null ≡ null`) while `null = null` is `null`, and every
 //! NaN is its own equivalence class while `NaN = NaN` is false. This module is
-//! the executor's single source of truth for that relation: one typed
-//! [`GroupKey`] keys the five dedup/grouping sites plus the property index,
-//! so `RETURN DISTINCT`, `GROUP BY`, `UNION`, `count(DISTINCT ...)`,
-//! `coll.distinct(...)`, and an indexed `{prop: value}` seek can never
-//! disagree -- the divergence the old `Value::to_cypher_literal()` string
+//! the executor's single source of truth for both relations: one typed
+//! [`GroupKey`] keys the five dedup/grouping sites, and its equality reading
+//! keys every equality bucket, so `RETURN DISTINCT`, `GROUP BY`, `UNION`,
+//! `count(DISTINCT ...)`, `coll.distinct(...)`, an indexed `{prop: value}`
+//! seek, a uniqueness constraint and `MERGE` derive their verdicts from one
+//! normalization -- the divergence the old `Value::to_cypher_literal()` string
 //! keys had (they rendered `Int(1)` as `"1"` and `Float(1.0)` as `"1.0"`,
 //! splitting groups and missing index seeks, while rendering every NaN as
 //! `"NaN"`, merging groups).
@@ -33,12 +35,22 @@
 //!   (`'a,b' ≢ ['a','b']`).
 //! * nodes/relationships compare by element id; two structurally identical
 //!   nodes with different ids stay distinct. Paths key on their node/rel ids.
-//! * temporal instants key by instant, mirroring `Temporal::compare`
-//!   (`time('12:00+01:00') ≡ time('13:00+02:00')`; a zoned DateTime keys on
-//!   its UTC instant, ignoring the zone name).
+//! * temporals key on their value identity, not on a bare instant:
+//!   `time('12:00+01:00') ≢ time('13:00+02:00')` (same instant, different
+//!   local time/offset) while `time('12:00Z') ≡ time('12:00+00:00')`, and a
+//!   zoned DateTime keys on its UTC instant **plus** its [`ZoneId`], so the
+//!   two halves of a DST fall-back overlap stay distinct even though `=`
+//!   holds between them.
 //! * the **first-seen** occurrence's representation is what a dedup caller
 //!   emits -- the key only decides set membership (`[1, 1.0]` → `1`;
 //!   `[1.0, 1]` → `1.0`; `RETURN 1 UNION RETURN 1.0` → a single row `1`).
+//!
+//! The tree is built for one of **two relations** ([`KeyRelation`]): the
+//! equivalence relation above, and the `=`-coarsening relation every
+//! equality *bucket* needs (`a = b` must imply one bucket). They coincide
+//! everywhere except the zoned DateTime — where the spec's equivalence is
+//! deliberately finer than `=`, exactly for the DST-overlap pair above. A
+//! key for one relation must never be compared with a key for the other.
 //!
 //! The key is a fully-owned, normalized tree (`Norm`) whose `Hash`/`Eq` are
 //! derived, so the two can never fall out of sync -- the classic hazard of a
@@ -49,6 +61,7 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
+use cypherlite_core::temporal::ZoneId;
 use cypherlite_core::{Temporal, Value, VectorCoordKind};
 use cypherlite_model::canonical_key::f64_exact_i64;
 
@@ -98,10 +111,30 @@ fn norm_f64(f: f64) -> NormNum {
     }
 }
 
-/// Normalized temporal, mirroring `Temporal::compare` (which is what
-/// `Value::eq_non_null` uses): `Time` is normalized to nanos-since-midnight
-/// UTC so equivalent instants with different offsets share a key, and
-/// `DateTime` keys on its UTC instant, ignoring the zone name.
+/// Which of the two value-identity relations a [`Norm`] tree encodes. They
+/// are the same tree everywhere except the zoned `DateTime`, where the
+/// spec's relations genuinely diverge (ADR-0446).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyRelation {
+    /// The `DISTINCT`/grouping relation: a zoned `DateTime` keys on its UTC
+    /// instant plus [`ZoneId`], so the two halves of a DST fall-back overlap
+    /// stay apart although `=` holds between them.
+    Equivalence,
+    /// A coarsening of `=`, for the buckets an equality relation addresses
+    /// (`a = b` must imply one key): a zoned `DateTime` keys on
+    /// [`Temporal::datetime_eq_identity`], the local wall clock plus
+    /// [`ZoneId`] that `Temporal::equals` itself compares, so the DST
+    /// overlap's halves share one bucket.
+    Equality,
+}
+
+/// Normalized temporal. `Time` keys on its (UTC nanos-of-day, offset) pair —
+/// `Temporal::equals`'s local-time-and-offset identity — and the zone half
+/// of a `DateTime` is [`ZoneId`] in both relations, keeping a named zone
+/// apart from the offset it denotes while `Z` shares `+00:00`'s key. The
+/// relation decides the other `DateTime` half: the instant
+/// ([`KeyRelation::Equivalence`]) or the local wall clock
+/// ([`KeyRelation::Equality`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NormTemporal {
     Date(NaiveDate),
@@ -111,8 +144,11 @@ enum NormTemporal {
         day: u32,
     },
     LocalTime(NaiveTime),
-    /// Nanoseconds since midnight UTC (`local time - offset`).
-    Time(i64),
+    Time {
+        /// Nanoseconds since midnight UTC (`local time - offset`).
+        utc_nanos: i64,
+        offset: i32,
+    },
     LocalDateTime(NaiveDateTime),
     CivilDateTime {
         year: i64,
@@ -120,8 +156,16 @@ enum NormTemporal {
         day: u32,
         time: NaiveTime,
     },
-    /// UTC instant (matches `Temporal::compare`, which ignores zone/offset).
-    DateTime(NaiveDateTime),
+    /// [`KeyRelation::Equivalence`]'s zoned datetime: UTC instant plus zone.
+    DateTime {
+        utc: NaiveDateTime,
+        zone: ZoneId,
+    },
+    /// [`KeyRelation::Equality`]'s zoned datetime: local wall clock plus zone.
+    DateTimeEq {
+        local: NaiveDateTime,
+        zone: ZoneId,
+    },
     Duration {
         months: i64,
         days: i64,
@@ -135,7 +179,7 @@ fn time_to_nanos(t: NaiveTime) -> i64 {
     t.num_seconds_from_midnight() as i64 * 1_000_000_000 + t.nanosecond() as i64
 }
 
-fn norm_temporal(t: &Temporal) -> NormTemporal {
+fn norm_temporal(t: &Temporal, relation: KeyRelation) -> NormTemporal {
     match t {
         Temporal::Date(d) => NormTemporal::Date(*d),
         Temporal::CivilDate { year, month, day } => NormTemporal::CivilDate {
@@ -144,9 +188,10 @@ fn norm_temporal(t: &Temporal) -> NormTemporal {
             day: *day,
         },
         Temporal::LocalTime(tm) => NormTemporal::LocalTime(*tm),
-        Temporal::Time { time, offset } => {
-            NormTemporal::Time(time_to_nanos(*time) - i64::from(*offset) * 1_000_000_000)
-        }
+        Temporal::Time { time, offset } => NormTemporal::Time {
+            utc_nanos: time_to_nanos(*time) - i64::from(*offset) * 1_000_000_000,
+            offset: *offset,
+        },
         Temporal::LocalDateTime(dt) => NormTemporal::LocalDateTime(*dt),
         Temporal::CivilDateTime {
             year,
@@ -159,7 +204,18 @@ fn norm_temporal(t: &Temporal) -> NormTemporal {
             day: *day,
             time: *time,
         },
-        Temporal::DateTime { utc, .. } => NormTemporal::DateTime(*utc),
+        Temporal::DateTime { utc, offset, zone } => match relation {
+            KeyRelation::Equivalence => NormTemporal::DateTime {
+                utc: *utc,
+                zone: ZoneId::of(zone.as_deref(), *offset),
+            },
+            KeyRelation::Equality => {
+                let (local, zone) = t
+                    .datetime_eq_identity()
+                    .expect("the DateTime arm has a datetime_eq_identity");
+                NormTemporal::DateTimeEq { local, zone }
+            }
+        },
         Temporal::Duration {
             months,
             days,
@@ -204,7 +260,7 @@ enum Norm {
     },
 }
 
-fn norm(v: &Value) -> Norm {
+fn norm(v: &Value, relation: KeyRelation) -> Norm {
     match v {
         Value::Null => Norm::Null,
         Value::Bool(b) => Norm::Bool(*b),
@@ -213,10 +269,12 @@ fn norm(v: &Value) -> Norm {
         Value::String(s) => Norm::Str(s.clone()),
         Value::Bytes(b) => Norm::Bytes(b.clone()),
         Value::Uuid(u) => Norm::Uuid(*u),
-        Value::List(items) => Norm::List(items.iter().map(norm).collect()),
+        Value::List(items) => Norm::List(items.iter().map(|v| norm(v, relation)).collect()),
         Value::Map(m) => {
-            let mut entries: Vec<(String, Norm)> =
-                m.iter().map(|(k, val)| (k.clone(), norm(val))).collect();
+            let mut entries: Vec<(String, Norm)> = m
+                .iter()
+                .map(|(k, val)| (k.clone(), norm(val, relation)))
+                .collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Norm::Map(entries)
         }
@@ -226,7 +284,7 @@ fn norm(v: &Value) -> Norm {
             p.nodes.iter().map(|n| Norm::Node(n.id)).collect(),
             p.rels.iter().map(|r| Norm::Rel(r.id)).collect(),
         ),
-        Value::Temporal(t) => Norm::Temporal(norm_temporal(t)),
+        Value::Temporal(t) => Norm::Temporal(norm_temporal(t, relation)),
         Value::Point(p) => {
             let mut coords = vec![norm_f64(p.x), norm_f64(p.y)];
             if let Some(z) = p.z {
@@ -245,21 +303,22 @@ fn norm(v: &Value) -> Norm {
             // `vector([1], ...)` ≡ `vector([1.0], ...)` — the same
             // elementwise-exact rule `eq_non_null` applies.
             coord: *coord,
-            values: values.iter().map(norm).collect(),
+            values: values.iter().map(|v| norm(v, relation)).collect(),
         },
     }
 }
 
 /// A canonical equivalence key for a single `Value`, per the module-level
-/// contract. `Hash + Eq` implement Cypher's equivalence relation, which is
-/// distinct from `=` equality.
+/// contract. `Hash + Eq` implement the relation its constructor names:
+/// [`GroupKey::new`] is Cypher's *equivalence* relation (distinct from `=`),
+/// [`GroupKey::for_property_index`] a coarsening of `=`.
 ///
-/// The encoding is **injective** over the equivalence classes: two values map
-/// to equal keys **iff** they are Cypher-equivalent (with the deliberate NaN
-/// exception, where every occurrence is its own class). This is precisely the
-/// property the old `to_cypher_literal`-string key lacked -- there
-/// `Int(1)`/`Float(1.0)` collided-wrong-way while `"1,2"`/`[1,2]` and
-/// quote-bearing strings aliased.
+/// Under [`GroupKey::new`] the encoding is **injective** over the equivalence
+/// classes: two values map to equal keys **iff** they are Cypher-equivalent
+/// (with the deliberate NaN exception, where every occurrence is its own
+/// class). This is precisely the property the old `to_cypher_literal`-string
+/// key lacked -- there `Int(1)`/`Float(1.0)` collided-wrong-way while
+/// `"1,2"`/`[1,2]` and quote-bearing strings aliased.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GroupKey(Norm);
 
@@ -269,20 +328,22 @@ impl GroupKey {
     /// two separately-built keys over NaN-containing values never compare
     /// equal.
     pub(crate) fn new(value: &Value) -> Self {
-        GroupKey(norm(value))
+        GroupKey(norm(value, KeyRelation::Equivalence))
     }
 
-    /// Key for the property index: the same normalized equivalence as
-    /// [`GroupKey::new`], except that a value containing a NaN anywhere is
-    /// unindexable (`None`). A NaN never satisfies an equality seek
-    /// (`NaN = NaN` is false), so indexing it could only create a bucket no
-    /// seek key can ever address -- and, because every NaN key claims a
-    /// fresh nonce, one the GC drop path could never recompute to remove.
+    /// Key for the property index — the equality buckets of an indexed seek,
+    /// the uniqueness probe and the scan re-check: the [`KeyRelation::Equality`]
+    /// normalization, a coarsening of `Value::eq_non_null` (`a = b` implies one
+    /// key), except that a value containing a NaN anywhere is unindexable
+    /// (`None`). A NaN never satisfies an equality seek (`NaN = NaN` is false),
+    /// so indexing it could only create a bucket no seek key can ever address
+    /// -- and, because every NaN key claims a fresh nonce, one the GC drop path
+    /// could never recompute to remove.
     pub(crate) fn for_property_index(value: &Value) -> Option<Self> {
         if value_has_nan(value) {
             return None;
         }
-        Some(GroupKey::new(value))
+        Some(GroupKey(norm(value, KeyRelation::Equality)))
     }
 
     /// Estimated heap footprint of the key, for the ADR-0042 logical index
@@ -506,9 +567,9 @@ mod tests {
     }
 
     #[test]
-    fn time_keys_by_instant_ignoring_offset() {
-        // Matches `Temporal::compare` / `eq_non_null`: 12:00+01:00 and
-        // 13:00+02:00 denote the same instant.
+    fn time_keys_by_local_time_and_offset() {
+        // `Temporal::equals`: 12:00+01:00 and 13:00+02:00 share an instant
+        // but are different times, so they key apart.
         let a = Temporal::Time {
             time: NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
             offset: 3600,
@@ -517,15 +578,15 @@ mod tests {
             time: NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
             offset: 7200,
         };
-        assert_eq!(
+        assert_ne!(
             key(Value::Temporal(a.clone())),
             key(Value::Temporal(b.clone()))
         );
-        assert_eq!(a.compare(&b), Some(std::cmp::Ordering::Equal));
+        assert_ne!(a.compare(&b), Some(std::cmp::Ordering::Equal));
     }
 
     #[test]
-    fn datetime_keys_by_utc_instant_ignoring_zone() {
+    fn datetime_keys_by_instant_and_zone_identity() {
         let utc = NaiveDate::from_ymd_opt(2026, 1, 1)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -540,7 +601,75 @@ mod tests {
             offset: 0,
             zone: Some("Europe/Stockholm".to_string()),
         };
-        assert_eq!(key(Value::Temporal(a)), key(Value::Temporal(b)));
+        // A named zone is never the offset it denotes.
+        assert_ne!(key(Value::Temporal(a)), key(Value::Temporal(b)));
+    }
+
+    #[test]
+    fn datetime_dst_overlap_halves_key_apart_but_stay_equal() {
+        // 02:30+02:00 and 02:30+01:00 on the fall-back day: equal local
+        // date-time and zone, different offsets/instants. `=` holds,
+        // `count(DISTINCT ...)` keeps both (TCK TemporalCompare).
+        let local = NaiveDate::from_ymd_opt(2025, 10, 26)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        let first = Temporal::DateTime {
+            utc: local - chrono::Duration::hours(2),
+            offset: 7200,
+            zone: Some("Europe/Stockholm".to_string()),
+        };
+        let second = Temporal::DateTime {
+            utc: local - chrono::Duration::hours(1),
+            offset: 3600,
+            zone: Some("Europe/Stockholm".to_string()),
+        };
+        assert!(first.equals(&second));
+        assert_eq!(first.compare(&second), Some(std::cmp::Ordering::Less));
+        let first = Value::Temporal(first);
+        let second = Value::Temporal(second);
+        assert_ne!(key(first.clone()), key(second.clone()));
+        // The equality reading is a coarsening of `=`: the pair shares one
+        // bucket, so an indexed seek, a uniqueness probe and MERGE see the
+        // relation `=` sees.
+        assert_eq!(
+            GroupKey::for_property_index(&first),
+            GroupKey::for_property_index(&second)
+        );
+    }
+
+    #[test]
+    fn property_index_key_coarsens_equality_across_temporal_kinds() {
+        // Times the two relations agree on: equal times share the bucket,
+        // the same instant in a different offset does not.
+        let time = |h, m, offset| {
+            Value::Temporal(Temporal::Time {
+                time: NaiveTime::from_hms_opt(h, m, 0).unwrap(),
+                offset,
+            })
+        };
+        // The concrete bucket: UTC nanos of day plus the offset.
+        assert_eq!(
+            GroupKey::for_property_index(&time(12, 0, 0)),
+            Some(GroupKey(Norm::Temporal(NormTemporal::Time {
+                utc_nanos: 12 * 3_600 * 1_000_000_000,
+                offset: 0,
+            })))
+        );
+        assert_ne!(
+            GroupKey::for_property_index(&time(12, 0, 0)),
+            GroupKey::for_property_index(&time(12, 0, 3600))
+        );
+        // A local date-time is the same value in both readings.
+        let local = NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let value = Value::Temporal(Temporal::LocalDateTime(local));
+        assert_eq!(
+            key(value.clone()),
+            GroupKey::for_property_index(&value).unwrap()
+        );
     }
 
     #[test]
@@ -621,7 +750,8 @@ mod tests {
             GroupKey::for_property_index(&Value::Float(-0.0)),
             GroupKey::for_property_index(&Value::Int(0))
         );
-        // ... and it matches the grouping key for NaN-free values.
+        // ... and for every non-datetime value it shares the grouping key's
+        // tree: the two relations differ only on a zoned DateTime.
         assert_eq!(
             GroupKey::for_property_index(&Value::Float(1.0)),
             Some(GroupKey::new(&Value::Int(1)))

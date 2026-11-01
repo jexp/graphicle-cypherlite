@@ -2,6 +2,7 @@ use super::super::*;
 use super::harness::checkpoint_at;
 use super::harness::*;
 use crate::memory_store;
+use cypherlite_catalog::ConstraintDef;
 use cypherlite_executor::{Graph, RedoOp};
 
 #[test]
@@ -11,14 +12,15 @@ fn parquet_checkpoint_theater_rejects_corrupt_payload_and_accepts_legacy_absence
     graph
         .apply_redo(
             vec![
-                RedoOp::CreateConstraint {
+                RedoOp::create_constraint(ConstraintDef {
                     name: "rule".into(),
                     relationship: false,
                     label: "Person".into(),
                     properties: vec![],
                     kind: "nodeLabelExistence".into(),
                     property_type: None,
-                },
+                    enforced_label: None,
+                }),
                 RedoOp::CatalogDerivedConstraint {
                     constraint: cypherlite_model::Constraint {
                         name: "rule".into(),
@@ -30,14 +32,15 @@ fn parquet_checkpoint_theater_rejects_corrupt_payload_and_accepts_legacy_absence
                         enforced_label: Some("Verified".into()),
                     },
                 },
-                RedoOp::CreateConstraint {
+                RedoOp::create_constraint(ConstraintDef {
                     name: "source_rule".into(),
                     relationship: true,
                     label: "KNOWS".into(),
                     properties: vec![],
                     kind: "sourceLabelExistence".into(),
                     property_type: None,
-                },
+                    enforced_label: None,
+                }),
                 RedoOp::CatalogDerivedConstraint {
                     constraint: cypherlite_model::Constraint {
                         name: "source_rule".into(),

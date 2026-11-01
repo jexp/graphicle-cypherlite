@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use cypherlite_core::{parse_memory_limit, PreviewFeatures};
+use cypherlite_core::{
+    parse_memory_limit, parse_positive_memory_limit, require_positive_memory_limit, PreviewFeatures,
+};
 use cypherlite_storage::SnapshotCodecKind;
 
 use crate::{OpenOptions, Result, DEFAULT_CHECKPOINT_INTERVAL_SECS};
@@ -30,6 +32,56 @@ pub(crate) fn resolve_snapshot_codec(opts: &OpenOptions) -> Result<Option<Snapsh
         Some(s) => Ok(Some(s.parse()?)),
         None => Ok(None),
     }
+}
+
+/// The markdown vault's body-property configuration (ADR-0460): the
+/// `OpenOptions` value wins, else `CYPHERLITE_MARKDOWN_BODY_PROPERTIES`
+/// parses with the flag's grammar — a bad value fails open with the
+/// same error the flag's parse gives; unset or blank is `None`, the
+/// sidecar manifest's recorded configuration.
+pub(crate) fn resolve_markdown_bodies(
+    opts: &OpenOptions,
+) -> Result<Option<cypherlite_storage::MarkdownBodyProperties>> {
+    if let Some(bodies) = &opts.markdown_body_properties {
+        return Ok(Some(bodies.clone()));
+    }
+    markdown_bodies_from_setting(std::env::var("CYPHERLITE_MARKDOWN_BODY_PROPERTIES"))
+}
+
+/// The one environment-value triage the variable-backed resolvers
+/// share: unset, blank, and whitespace are `None`; a value that is not
+/// valid UTF-8 fails open naming the variable — an invalid value is
+/// never silently ignored, the preview-feature contract
+/// ([`preview_features_from_setting`]). Pure in the raw result, so
+/// tests never touch the process environment.
+fn present_env_value(
+    name: &'static str,
+    raw: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
+    match raw {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(crate::Error::semantic(format!(
+            "invalid {name}: value is not valid UTF-8"
+        ))),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+    }
+}
+
+/// The markdown vault's body-property configuration from an already-read
+/// `CYPHERLITE_MARKDOWN_BODY_PROPERTIES` value. Unset, blank, and
+/// whitespace are `None` (the sidecar manifest's recorded configuration
+/// governs); a present value parses with the flag's grammar. Pure in the
+/// raw result, so tests never touch the process environment.
+fn markdown_bodies_from_setting(
+    raw: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<cypherlite_storage::MarkdownBodyProperties>> {
+    let Some(spec) = present_env_value("CYPHERLITE_MARKDOWN_BODY_PROPERTIES", raw)? else {
+        return Ok(None);
+    };
+    Ok(Some(cypherlite_storage::MarkdownBodyProperties::parse(
+        &spec,
+    )?))
 }
 
 /// Bytes from an already-read `CYPHERLITE_LOGICAL_GRAPH_SIZE_LIMIT` value.
@@ -110,70 +162,50 @@ pub(crate) fn resolve_bulk_batch_limits() -> Result<(u64, u64)> {
     Ok((threshold, budget))
 }
 
-fn token_admission_enabled(opts: &OpenOptions) -> Result<bool> {
-    token_admission_from_setting(
-        opts.token_admission,
-        env_setting("CYPHERLITE_TOKEN_ADMISSION").as_deref(),
-    )
-}
-
-/// `--token-admission` turns admission on. `CYPHERLITE_TOKEN_ADMISSION=0`
-/// turns it off, including when the flag is set. `=1` turns it on. Unset
-/// follows the flag.
-fn token_admission_from_setting(flag: bool, raw: Option<&str>) -> Result<bool> {
-    match raw.map(str::trim) {
-        Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        None => Ok(flag),
-        Some(other) => Err(crate::Error::semantic(format!(
-            "invalid CYPHERLITE_TOKEN_ADMISSION '{other}'"
-        ))),
+/// A concurrent logical-workspace pool from an already-read
+/// `CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT` value (ADR-0452).
+///
+/// Unset, blank, and whitespace leave admission off (`Ok(None)`). A
+/// present value uses [`cypherlite_core::parse_positive_memory_limit`],
+/// the same `SIZE` grammar as the live-graph cap. `0`, a bad SIZE, and a
+/// value that is not valid UTF-8 fail open naming the variable. This
+/// takes the [`std::env::var`] result so a present-but-unusable value is
+/// never treated as unset. Pure in that result, so tests never touch the
+/// process environment.
+pub fn workspace_limit_from_setting(
+    raw: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<u64>> {
+    match present_env_value("CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT", raw)? {
+        Some(raw) => {
+            parse_positive_memory_limit("CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT", &raw)
+                .map(Some)
+        }
+        None => Ok(None),
     }
 }
 
-fn positive_token_limit(name: &str, option: Option<u64>) -> Result<u64> {
-    let value = match option {
-        Some(value) => value,
-        None => match env_setting(name) {
-            Some(raw) => raw
-                .parse::<u64>()
-                .map_err(|_| crate::Error::semantic(format!("invalid {name} '{raw}'")))?,
-            None => {
-                return Err(crate::Error::semantic(format!(
-                    "{name} is required when token admission is enabled"
-                )))
-            }
-        },
-    };
-    if value == 0 {
-        return Err(crate::Error::semantic(format!(
-            "{name} must be positive when token admission is enabled"
-        )));
-    }
-    Ok(value)
-}
-
-/// Token admission limits. Off ignores the pool. On, the concurrent peak
-/// cap is positive or open fails.
+/// Token admission limits (ADR-0452). A positive concurrent
+/// logical-workspace limit turns the pool on. Unset leaves it off. The
+/// engine does not invent a default capacity.
 pub(crate) fn resolve_token_limits(opts: &OpenOptions) -> Result<crate::token_budget::TokenLimits> {
     reject_renamed_env(
         "CYPHERLITE_CONCURRENT_PEAK_TOKEN_LIMIT",
         "CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT",
     )?;
-    let enabled = token_admission_enabled(opts)?;
-    if !enabled {
-        return Ok(crate::token_budget::TokenLimits {
-            enabled: false,
-            capacity: 0,
-        });
-    }
-    Ok(crate::token_budget::TokenLimits {
-        enabled: true,
-        capacity: positive_token_limit(
+    reject_renamed_env(
+        "CYPHERLITE_TOKEN_ADMISSION",
+        "CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT",
+    )?;
+    let capacity = match opts.concurrent_logical_workspace_limit {
+        Some(n) => Some(require_positive_memory_limit(
+            "concurrent_logical_workspace_limit",
+            n,
+        )?),
+        None => workspace_limit_from_setting(std::env::var(
             "CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT",
-            opts.concurrent_logical_workspace_limit,
-        )?,
-    })
+        ))?,
+    };
+    Ok(crate::token_budget::TokenLimits { capacity })
 }
 
 /// The preview-feature opt-in from an already-read `CYPHERLITE_PREVIEW`
@@ -187,12 +219,11 @@ pub(crate) fn resolve_token_limits(opts: &OpenOptions) -> Result<crate::token_bu
 pub(crate) fn preview_features_from_setting(
     raw: std::result::Result<String, std::env::VarError>,
 ) -> Result<PreviewFeatures> {
-    match raw {
-        Ok(value) => PreviewFeatures::parse(&value),
-        Err(std::env::VarError::NotPresent) => PreviewFeatures::parse(""),
-        Err(std::env::VarError::NotUnicode(_)) => Err(crate::Error::semantic(
-            "invalid CYPHERLITE_PREVIEW value: not valid UTF-8",
-        )),
+    match present_env_value("CYPHERLITE_PREVIEW", raw)? {
+        Some(value) => PreviewFeatures::parse(&value),
+        // Unset and blank both enable nothing — `parse("")` is
+        // `PreviewFeatures::none()`.
+        None => Ok(PreviewFeatures::none()),
     }
 }
 
@@ -260,6 +291,44 @@ mod tests {
     }
 
     #[test]
+    fn markdown_bodies_setting_parses_unset_and_fails_open() {
+        // The env contract of the sibling resolvers: unset/blank is None
+        // (the sidecar governs), a good spec parses with the flag
+        // grammar, a bad spec is its parse error, and non-UTF-8 fails
+        // open naming the variable.
+        assert_eq!(
+            markdown_bodies_from_setting(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert_eq!(
+            markdown_bodies_from_setting(Ok(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            markdown_bodies_from_setting(Ok("   ".to_string())).unwrap(),
+            None
+        );
+        let config = markdown_bodies_from_setting(Ok("summary,notes".to_string()))
+            .unwrap()
+            .expect("a good spec parses");
+        assert_eq!(config.default, vec!["summary", "notes"]);
+        let bad = markdown_bodies_from_setting(Ok("summary,,notes".to_string())).unwrap_err();
+        assert!(
+            bad.to_string().contains("an entry names no property"),
+            "{bad}"
+        );
+        let utf8 = markdown_bodies_from_setting(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("not utf-8"),
+        )))
+        .unwrap_err();
+        assert!(
+            utf8.to_string()
+                .contains("CYPHERLITE_MARKDOWN_BODY_PROPERTIES: value is not valid UTF-8"),
+            "{utf8}"
+        );
+    }
+
+    #[test]
     fn bad_bulk_batch_setting_fails_open() {
         let err =
             positive_u64_setting("CYPHERLITE_BULK_BATCH_THRESHOLD", Some("1tb"), 7).unwrap_err();
@@ -312,16 +381,78 @@ mod tests {
     }
 
     #[test]
-    fn token_admission_zero_turns_it_off() {
-        assert!(!token_admission_from_setting(true, Some("0")).unwrap());
-        assert!(token_admission_from_setting(false, Some("1")).unwrap());
-        assert!(!token_admission_from_setting(false, None).unwrap());
-        assert!(token_admission_from_setting(true, None).unwrap());
-        let err = token_admission_from_setting(false, Some("off")).unwrap_err();
+    fn workspace_limit_setting_enables_only_when_positive() {
+        assert_eq!(
+            workspace_limit_from_setting(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert_eq!(
+            workspace_limit_from_setting(Ok(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            workspace_limit_from_setting(Ok("   ".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            workspace_limit_from_setting(Ok("4096".into())).unwrap(),
+            Some(4096)
+        );
+        assert_eq!(
+            workspace_limit_from_setting(Ok("2mib".into())).unwrap(),
+            Some(2 * 1024 * 1024)
+        );
+        let zero = workspace_limit_from_setting(Ok("0".into())).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("invalid CYPHERLITE_TOKEN_ADMISSION 'off'"),
-            "{err}"
+            zero.to_string().contains(
+                "invalid CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT: must be positive"
+            ),
+            "{zero}"
+        );
+        let bad = workspace_limit_from_setting(Ok("1tb".into())).unwrap_err();
+        assert!(
+            bad.to_string()
+                .contains("invalid CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT:"),
+            "{bad}"
+        );
+        let utf8 = workspace_limit_from_setting(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("not utf-8"),
+        )))
+        .unwrap_err();
+        assert!(
+            utf8.to_string().contains(
+                "invalid CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT: value is not valid UTF-8"
+            ),
+            "{utf8}"
+        );
+        let ignored = renamed_env_error(
+            "CYPHERLITE_TOKEN_ADMISSION",
+            "CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT",
+            Ok("1".into()),
+        )
+        .unwrap_err();
+        assert!(
+            ignored
+                .to_string()
+                .contains("CYPHERLITE_TOKEN_ADMISSION is set but ignored"),
+            "{ignored}"
+        );
+        let on = resolve_token_limits(&OpenOptions {
+            concurrent_logical_workspace_limit: Some(8192),
+            ..OpenOptions::default()
+        })
+        .unwrap();
+        assert_eq!(on.capacity, Some(8192));
+        let zero_option = resolve_token_limits(&OpenOptions {
+            concurrent_logical_workspace_limit: Some(0),
+            ..OpenOptions::default()
+        })
+        .unwrap_err();
+        assert!(
+            zero_option
+                .to_string()
+                .contains("invalid concurrent_logical_workspace_limit: must be positive"),
+            "{zero_option}"
         );
     }
 }

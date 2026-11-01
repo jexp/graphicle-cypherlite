@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use cypherlite_parser::token::quote_identifier_always;
+use cypherlite_model::identifier::quote_identifier_always;
 
 use cypherlite_error::{EngineError, ErrorKind};
 use cypherlite_model::{Constraint, ConstraintType, EntityKind};

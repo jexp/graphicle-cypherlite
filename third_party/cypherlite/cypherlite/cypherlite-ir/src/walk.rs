@@ -469,9 +469,7 @@ fn exists_outer_vars(query: &Query, out: &mut HashSet<String>) {
                 | Clause::CallSubquery { .. }
                 | Clause::Conditional { .. }
                 | Clause::Foreach { .. }
-                | Clause::Use { .. }
-                | Clause::CreateConstraint { .. }
-                | Clause::DropConstraint { .. } => {}
+                | Clause::Use { .. } => {}
             }
         }
     }

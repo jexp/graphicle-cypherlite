@@ -68,10 +68,10 @@ fn planner_accepts_every_advertised_nullary_function() {
 
 #[test]
 fn binder_accepts_lowered_internal_names() {
-    // `toString` over a GQL temporal constructor lowers to the internal
-    // `tostring_full`; the binder must accept the lowered spelling even
+    // The CIP-261 interpolated string literal lowers to the internal
+    // `string.interp`; the binder must accept the lowered spelling even
     // though users cannot write it.
-    planned("RETURN toString(local_time('12:00')) AS t").unwrap();
+    planned("RETURN s'x{1}' AS t").unwrap();
 }
 
 #[test]

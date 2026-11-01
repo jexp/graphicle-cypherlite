@@ -23,6 +23,11 @@ pub(super) struct Shape<'p> {
 /// The one guard: the selectors, match and path modes, and pattern shape of
 /// ADR-0186's Decision, an empty incoming used-relationship set, and row
 /// bindings the search can honor. `None` keeps the pattern on GPM.
+///
+/// A path-level `WHERE` no longer sends the pattern to GPM: the route
+/// applies it *during* the search (see [`super::path_filter`]), so a
+/// shortest path that violates the predicate no longer hides the longer
+/// shortest path that satisfies it.
 pub(super) fn route_shape<'p>(
     path: &'p PathPattern,
     match_mode: MatchMode,
@@ -31,7 +36,6 @@ pub(super) fn route_shape<'p>(
 ) -> Option<Shape<'p>> {
     if match_mode != MatchMode::DifferentRelationships
         || !used.is_empty()
-        || path.where_clause.is_some()
         || !matches!(path.mode, None | Some(PathMode::Walk | PathMode::Trail))
     {
         return None;

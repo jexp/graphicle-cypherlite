@@ -30,18 +30,8 @@ fn logical_graph_size_limit_rejects_growing_writes_reads_ok() {
     let db = Database::open_with(
         ":memory:",
         OpenOptions {
-            wal_dir: None,
-            checkpoint_interval: None,
-            durability_mode: Default::default(),
             logical_graph_size_limit: Some(1),
-            snapshot_codec: None,
-            load_csv_dir: None,
-            load_csv_max_bytes: None,
-            mode: crate::OpenMode::Writable,
-
-            token_admission: false,
-            concurrent_logical_workspace_limit: None,
-            follow_gap: Default::default(),
+            ..OpenOptions::default()
         },
     )
     .unwrap();
@@ -78,18 +68,8 @@ fn logical_graph_size_limit_delete_then_create_recovers_with(
     let db = Database::open_with(
         ":memory:",
         OpenOptions {
-            wal_dir: None,
-            checkpoint_interval: None,
-            durability_mode: Default::default(),
             logical_graph_size_limit: Some(limit_bytes),
-            snapshot_codec: None,
-            load_csv_dir: None,
-            load_csv_max_bytes: None,
-            mode: crate::OpenMode::Writable,
-
-            token_admission: false,
-            concurrent_logical_workspace_limit: None,
-            follow_gap: Default::default(),
+            ..OpenOptions::default()
         },
     )
     .unwrap();
@@ -166,18 +146,8 @@ fn logical_graph_size_limit_concurrent_reserve() {
         Database::open_with(
             ":memory:",
             OpenOptions {
-                wal_dir: None,
-                checkpoint_interval: None,
-                durability_mode: Default::default(),
                 logical_graph_size_limit: Some(limit),
-                snapshot_codec: None,
-                load_csv_dir: None,
-                load_csv_max_bytes: None,
-                mode: crate::OpenMode::Writable,
-
-                token_admission: false,
-                concurrent_logical_workspace_limit: None,
-                follow_gap: Default::default(),
+                ..OpenOptions::default()
             },
         )
         .unwrap(),
@@ -215,18 +185,9 @@ fn logical_graph_size_limit_open_over_limit_replay_then_reject() {
     let db = Database::open_with(
         path,
         OpenOptions {
-            wal_dir: None,
             checkpoint_interval: Some(Duration::ZERO),
-            durability_mode: Default::default(),
             logical_graph_size_limit: Some(1),
-            snapshot_codec: None,
-            load_csv_dir: None,
-            load_csv_max_bytes: None,
-            mode: crate::OpenMode::Writable,
-
-            token_admission: false,
-            concurrent_logical_workspace_limit: None,
-            follow_gap: Default::default(),
+            ..OpenOptions::default()
         },
     )
     .unwrap();
@@ -245,18 +206,8 @@ fn logical_graph_size_limit_zero_is_unlimited() {
     let db = Database::open_with(
         ":memory:",
         OpenOptions {
-            wal_dir: None,
-            checkpoint_interval: None,
-            durability_mode: Default::default(),
             logical_graph_size_limit: Some(0),
-            snapshot_codec: None,
-            load_csv_dir: None,
-            load_csv_max_bytes: None,
-            mode: crate::OpenMode::Writable,
-
-            token_admission: false,
-            concurrent_logical_workspace_limit: None,
-            follow_gap: Default::default(),
+            ..OpenOptions::default()
         },
     )
     .unwrap();
@@ -278,17 +229,8 @@ fn logical_graph_size_limit_rejects_stats_entry_growth_pre_commit() {
         Database::open_with(
             ":memory:",
             OpenOptions {
-                wal_dir: None,
-                checkpoint_interval: None,
-                durability_mode: Default::default(),
                 logical_graph_size_limit: Some(limit),
-                snapshot_codec: None,
-                load_csv_dir: None,
-                load_csv_max_bytes: None,
-                mode: crate::OpenMode::Writable,
-                token_admission: false,
-                concurrent_logical_workspace_limit: None,
-                follow_gap: Default::default(),
+                ..OpenOptions::default()
             },
         )
         .unwrap()

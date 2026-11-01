@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Bind OpenCypher AST to a logical plan"
+license.workspace = true
 
 [dependencies]
 cypherlite-parser = { workspace = true }

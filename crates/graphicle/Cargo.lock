@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-catalog"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-model",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -786,14 +786,14 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-error"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-parser",
 ]
 
 [[package]]
 name = "cypherlite-executor"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "cypherlite-catalog",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-front"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-error",
@@ -829,15 +829,24 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-ir"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
 ]
 
 [[package]]
+name = "cypherlite-markdown"
+version = "0.14.0"
+dependencies = [
+ "cypherlite-core",
+ "saphyr-parser",
+ "serde_json",
+]
+
+[[package]]
 name = "cypherlite-model"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -847,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-ontology"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-core",
  "cypherlite-parser",
@@ -861,14 +870,14 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-parser"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-model",
 ]
 
 [[package]]
 name = "cypherlite-planner"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cypherlite-catalog",
  "cypherlite-core",
@@ -879,16 +888,17 @@ dependencies = [
 
 [[package]]
 name = "cypherlite-splitter"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "cypherlite-storage"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "crc32fast",
  "cypherlite-catalog",
  "cypherlite-core",
  "cypherlite-executor",
+ "cypherlite-markdown",
  "cypherlite-model",
  "fs4",
  "getrandom 0.2.17",

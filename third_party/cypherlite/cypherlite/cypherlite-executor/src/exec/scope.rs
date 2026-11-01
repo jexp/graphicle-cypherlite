@@ -17,12 +17,6 @@ pub(crate) fn is_internal_column(name: &str) -> bool {
     name.starts_with("__")
 }
 
-/// The parked sort-key column of ORDER BY item `index` — one spelling for
-/// the sink writer (`SinkProjection::new`) and the reader (`parked_keys`).
-pub(crate) fn parked_key_name(index: usize) -> String {
-    format!("__ord{index}")
-}
-
 /// One projection's (`RETURN` / `WITH`) borrowed field bundle, so helpers
 /// over a projection read named fields instead of positional parameters
 /// (three of which are the identical `&Option<Expr>`). `where_clause` is
@@ -139,13 +133,11 @@ pub(crate) fn has_star_item(items: &[Projection]) -> bool {
 
 /// The `__` namespace reservation (OPLANE_REQ-00328162): no user-authored
 /// output name (alias) may fall in the internal `__` namespace on an
-/// optimized path. The one site where such an alias can collide with
-/// engine-internal state is the match sink, whose `SinkProjection` parks
-/// its `__ord*` sort keys on the row — the sink declines a colliding alias
-/// and the ordinary projection (which parks nothing) keeps the user column.
-/// The aggregate folds synthesize no internal row names (their state lives
-/// in group tables, caches, and slot vectors), but decline all the same so
-/// every optimized path answers a user `__`-alias identically.
+/// optimized path. The match sink and the aggregate folds are those paths —
+/// each declines a colliding alias so the ordinary projection, which treats
+/// every name as a user column, answers it. Parked `ORDER BY` keys are not a
+/// reason to decline: their prefix is chosen to miss every result column
+/// (`super::project::OrderKeys`).
 pub(crate) fn projection_collides_with_internal_names(items: &[Projection]) -> bool {
     items
         .iter()
@@ -227,6 +219,27 @@ pub(crate) fn nested_seed_row(row: &Row) -> Row {
     seed
 }
 
+/// Re-attach the importing-subquery scope bindings a `WITH` projection
+/// dropped: a binding already present in the row is the body's own value
+/// and wins. The keep-visible half of the importing-subquery scope policy
+/// (the seed half is [`nested_seed_row`]), shared by the `WITH` arm and the
+/// `CALL { … }` NEXT-stage recursion. See `run_nested_clauses_scoped`.
+pub(crate) fn carry_scope_bindings(rows: &mut [Row], scope: &Row) {
+    for row in rows {
+        for (name, value) in scope {
+            row.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
+/// Fold a write clause's effects back into the rows that drove it: a bound
+/// entity the write updated is re-read from the store, and one the write
+/// deleted becomes an **empty tombstone** — the same id, no labels, no
+/// properties (CIP-202 `[21]`-`[24]`: a returned deleted node renders `()`).
+/// The tombstone keeps the identity a later pattern needs: the clause
+/// engine still matches a deleted-but-bound variable through it
+/// (`node_ok`'s snapshot path), while a fresh scan of the store finds
+/// nothing. A deleted entity is never refetched.
 pub(crate) fn refresh_rows(graph: &ExecGraph<'_>, rows: &mut [Row]) {
     for row in rows {
         let keys: Vec<_> = row.keys().cloned().collect();
@@ -250,6 +263,11 @@ pub(crate) fn refresh_rows(graph: &ExecGraph<'_>, rows: &mut [Row]) {
                     if let Some(fresh) = graph.rel(r.id) {
                         row.insert(k, Value::from_relationship(fresh));
                     } else if graph.is_deleted_rel(r.id) {
+                        // Same tombstone contract as the node arm above: the
+                        // identity survives (id, endpoints, type — what a
+                        // later pattern matches on), the properties do not,
+                        // so a deleted-but-bound `r {.*}` renders `{}`
+                        // instead of the pre-delete map.
                         row.insert(
                             k,
                             Value::from_relationship(cypherlite_core::Relationship {

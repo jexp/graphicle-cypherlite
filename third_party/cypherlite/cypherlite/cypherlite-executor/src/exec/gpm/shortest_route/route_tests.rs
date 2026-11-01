@@ -269,3 +269,120 @@ fn forced_gpm_switch_bypasses_the_route() {
     assert_eq!(counts, Counts::default());
     assert_eq!(route, sorted(forced));
 }
+
+/// A `WHERE` on a `shortestPath` pattern selects the shortest path that
+/// **satisfies** it. The 0→4→3 shortcut is the shortest path through the
+/// graph, but the predicate excludes node 4, so the route must answer the
+/// longer 0→1→2→3 path instead of zero rows.
+#[test]
+fn where_predicate_selects_the_shortest_satisfying_path() {
+    let g = shortcut();
+    let q = "MATCH p = shortestPath((a {id: 0})-[*]->(b {id: 3})) \
+             WHERE NONE(n IN nodes(p) WHERE n.id = 4) \
+             RETURN [n IN nodes(p) | n.id]";
+    assert_eq!(on_route(&g, q), expect(&[&[ints(&[0, 1, 2, 3])]]));
+}
+
+/// The all-shortest selector keeps every satisfying shortest trail: both
+/// 0→1→3 and 0→2→3 are length 2, and the predicate drops the second.
+#[test]
+fn where_predicate_filters_each_all_shortest_trail() {
+    let rels = [(0, 1), (1, 3), (0, 2), (2, 3)].map(|(a, b)| (a, b, "R"));
+    let g = build(&[&[], &[], &[], &[]], &rels).graph;
+    let q = "MATCH p = allShortestPaths((a {id: 0})-[*]->(b {id: 3})) \
+             WHERE NONE(n IN nodes(p) WHERE n.id = 2) \
+             RETURN [n IN nodes(p) | n.id]";
+    assert_eq!(on_route(&g, q), expect(&[&[ints(&[0, 1, 3])]]));
+}
+
+/// A predicate no path satisfies yields no rows instead of the unfiltered
+/// shortest path.
+#[test]
+fn where_predicate_that_no_path_satisfies_yields_nothing() {
+    let g = shortcut();
+    let q = "MATCH p = shortestPath((a {id: 0})-[*]->(b {id: 3})) \
+             WHERE length(p) > 10 \
+             RETURN length(p)";
+    assert!(on_route(&g, q).is_empty());
+}
+
+/// The zero-length path is a trail like any other to the predicate-filtered
+/// walk: `[*0..]` from a node to itself must still answer length 0 when the
+/// predicate accepts it.
+#[test]
+fn where_predicate_on_a_closed_path_keeps_the_zero_length_trail() {
+    let g = shortcut();
+    let q = "MATCH p = shortestPath((a {id: 0})-[*0..3]->(a)) \
+             WHERE length(p) <= 3 RETURN length(p)";
+    let (rows, counts) = run(&g, q);
+    assert_eq!(rows, vec![vec![Int(0)]]);
+    assert_eq!(
+        counts.route_runs, 1,
+        "the route declined a decidable filter"
+    );
+    assert_eq!(gpm(&g, q), expect(&[&[Int(0)]]));
+}
+
+/// A path-reading `WHERE` conjunct that also names a variable a *later*
+/// pattern in the same `MATCH` binds cannot be decided while the search runs:
+/// the route declines it to enumeration — an explicit outcome, never a silent
+/// "satisfied" — and the rows are exactly the GPM route's.
+#[test]
+fn where_conjunct_reading_a_later_pattern_name_declines_the_route() {
+    let g = shortcut();
+    let q = "MATCH p = shortestPath((a {id: 0})-[*]->(b {id: 3})), (x {id: 2}) \
+             WHERE length(p) = x.id RETURN length(p)";
+    let (rows, counts) = run(&g, q);
+    assert_eq!(
+        counts.route_runs, 0,
+        "the route chose a trail its predicate could not decide"
+    );
+    assert_eq!(rows, vec![vec![Int(2)]], "the enumeration stopped matching");
+    assert_eq!(sorted(rows), gpm(&g, q));
+}
+
+/// The same predicate over variables the route binds itself is decidable, so
+/// the route keeps the search: one that rejects the shortcut must answer the
+/// longer trail that satisfies it.
+#[test]
+fn path_where_over_own_variables_keeps_the_route() {
+    let g = shortcut();
+    let q = "MATCH p = ALL SHORTEST ((a {id: 0})-[*]->(b {id: 3}) \
+             WHERE NONE(n IN nodes(p) WHERE n.id = 4)) \
+             RETURN [n IN nodes(p) | n.id]";
+    assert_eq!(
+        on_route(&g, q),
+        expect(&[&[ints(&[0, 1, 2, 3])]]),
+        "the route must choose the shortest trail the predicate accepts"
+    );
+}
+
+/// An `EXISTS` subquery names its own `z`, which the route can never find
+/// bound in the row: the readiness check must not take that subquery-local
+/// name for an outer variable and skip the predicate, which answered zero
+/// rows (the unfiltered 0→4→3 was chosen, then rejected afterwards)
+/// instead of the length-3 path the predicate selects.
+#[test]
+fn where_predicate_with_subquery_local_variable_still_filters() {
+    let rels = [(0, 1), (1, 2), (2, 3), (0, 4), (4, 3)].map(|(a, b)| (a, b, "R"));
+    let g = build(&[&["A"], &[], &[], &[], &[]], &rels).graph;
+    let q = "MATCH p = shortestPath((a {id: 0})-[*]->(b {id: 3})) \
+             WHERE EXISTS { MATCH (z:A) WHERE length(p) = 3 } \
+             RETURN [n IN nodes(p) | n.id]";
+    assert_eq!(on_route(&g, q), expect(&[&[ints(&[0, 1, 2, 3])]]));
+}
+
+/// `ALL SHORTEST` stops at the shortest SATISFYING length: when a longer
+/// trail also satisfies the predicate, only the shortest one is returned
+/// (the satisfied flag must accumulate across the walk even under
+/// `shape.all`, else the search walks past the shortest satisfying length).
+#[test]
+fn all_shortest_stops_at_the_shortest_satisfying_length() {
+    // 0→1→3 (length 2) and 0→2→4→3 (length 3); both satisfy the predicate.
+    let rels = [(0, 1), (1, 3), (0, 2), (2, 4), (4, 3)].map(|(a, b)| (a, b, "R"));
+    let g = build(&[&[], &[], &[], &[], &[]], &rels).graph;
+    let q = "MATCH p = allShortestPaths((a {id: 0})-[*]->(b {id: 3})) \
+             WHERE NONE(n IN nodes(p) WHERE n.id = 99) \
+             RETURN [n IN nodes(p) | n.id]";
+    assert_eq!(on_route(&g, q), expect(&[&[ints(&[0, 1, 3])]]));
+}

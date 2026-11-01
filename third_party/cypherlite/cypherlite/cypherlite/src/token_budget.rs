@@ -14,11 +14,12 @@ use cypherlite_core::tokens::{
 };
 use cypherlite_core::{Error, Result, TokenOutcome, Value};
 
-/// Limits resolved at open. `enabled` false ignores the capacity.
+/// Limits resolved at open. `None` leaves admission off. `Some` is the
+/// pool capacity in logical bytes; the off state does not invent a zero
+/// pool.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TokenLimits {
-    pub enabled: bool,
-    pub capacity: u64,
+    pub capacity: Option<u64>,
 }
 
 /// How long an observed peak stays usable.
@@ -214,11 +215,13 @@ pub(crate) struct TokenBudget {
 
 impl TokenBudget {
     pub(crate) fn new(limits: TokenLimits) -> Arc<Self> {
+        let enabled = limits.capacity.is_some();
+        let capacity = limits.capacity.unwrap_or(0);
         Arc::new(Self {
-            enabled: limits.enabled,
-            capacity: limits.capacity,
+            enabled,
+            capacity,
             pool: Arc::new(Pool {
-                capacity: limits.capacity,
+                capacity,
                 reserved: AtomicU64::new(0),
                 ceiling_hook: Mutex::new(None),
             }),
@@ -442,7 +445,9 @@ mod tests {
     const Q: u64 = CHARGE_QUANTUM_BYTES;
 
     fn limits(enabled: bool, capacity: u64) -> Arc<TokenBudget> {
-        TokenBudget::new(TokenLimits { enabled, capacity })
+        TokenBudget::new(TokenLimits {
+            capacity: enabled.then_some(capacity),
+        })
     }
 
     fn key(commit_ts: u64, cypher: &str, max: i64) -> PeakKey {

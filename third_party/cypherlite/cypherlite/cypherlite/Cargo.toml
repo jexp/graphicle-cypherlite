@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Embedded in-memory OpenCypher graph database"
+license.workspace = true
 
 [features]
 default = ["parquet"]
@@ -31,4 +32,4 @@ web-time = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 crc32fast = { workspace = true }
-cypherlite-test-support = { workspace = true, features = ["nested_eval"] }
+cypherlite-test-support = { workspace = true, features = ["nested_eval", "vfs_walk"] }

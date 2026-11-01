@@ -18,34 +18,35 @@ use std::collections::{BTreeMap, HashSet};
 use cypherlite_core::{Result, Value};
 use cypherlite_ir::{expr_vars, Clause, Expr, Projection, Query};
 
-use super::{
-    empty_body_row, execute_query_seeded, import_seed, merge_body_export,
-    query_with_persistent_imports, SubquerySpec,
-};
+use super::{empty_body_row, execute_query_scoped, import_seed, merge_body_export, SubquerySpec};
 use crate::ctx::QueryCtx;
 use crate::eval::Row;
 use crate::exec::scope::nested_seed_row;
 use crate::overlay::ExecGraph;
 
-/// What one shared execution of a `CALL { … }` body needs.
+/// What one shared execution of a `CALL { … }` body needs: the single seed
+/// row — the first outer row's bindings. Every per-row fact the fast path
+/// needs derives from it, so the checked names are the seed's keys (one
+/// spelling, not a parallel set).
 pub(super) struct SharedExecution {
+    /// The single seed row: the first outer row's bindings.
+    pub(super) seed: Row,
+}
+
+impl SharedExecution {
     /// Outer names the body must not *compute* from (bare same-name
     /// pass-through projections excepted) for one shared execution to be
     /// row-equivalent; the merge also excludes these columns, mirroring the
-    /// per-row path's imported-name exclusion. For the naked form this is
-    /// every outer key — rebinding an outer name inside the body is a
-    /// compile error (`VariableAlreadyBound`), so a body-exported column
-    /// colliding with an outer name is always a same-name pass-through and
-    /// keeping the outer row's own value matches the per-row merge.
-    pub(super) check: HashSet<String>,
-    /// The scope's imported names, threaded through the body's `WITH`s
-    /// exactly like the per-row path's `query_with_persistent_imports`
-    /// (empty for the naked form, as there). Without the threading a body
-    /// that references an import after a `WITH` dropped it would read a
-    /// silent null instead of the seeded binding.
-    pub(super) imported: HashSet<String>,
-    /// The single seed row: the first outer row's bindings.
-    pub(super) seed: Row,
+    /// per-row path's imported-name exclusion. Exactly the seed's keys: for
+    /// a `(vars)` scope the seed is built from exactly those names, and for
+    /// the naked form it is every outer key — rebinding an outer name
+    /// inside the body is a compile error (`VariableAlreadyBound`), so a
+    /// body-exported column colliding with an outer name is always a
+    /// same-name pass-through and keeping the outer row's own value matches
+    /// the per-row merge.
+    pub(super) fn check(&self) -> HashSet<String> {
+        self.seed.keys().cloned().collect()
+    }
 }
 
 /// Builds the shared-execution plan for one CALL clause execution, or
@@ -65,8 +66,6 @@ pub(super) fn shared_execution_plan(
     };
     Ok(match scope {
         cypherlite_ir::CallScope::Vars(vars) if !vars.is_empty() => Some(SharedExecution {
-            check: vars.iter().cloned().collect(),
-            imported: vars.iter().cloned().collect(),
             seed: import_seed(vars, first)?,
         }),
         cypherlite_ir::CallScope::None => {
@@ -82,12 +81,7 @@ pub(super) fn shared_execution_plan(
             // stripped seed, since an internal slot is never a binding the
             // body could compute from.
             let seed = nested_seed_row(first);
-            let check: HashSet<String> = seed.keys().cloned().collect();
-            (!check.is_empty()).then(|| SharedExecution {
-                imported: HashSet::new(),
-                seed,
-                check,
-            })
+            (!seed.is_empty()).then_some(SharedExecution { seed })
         }
         _ => None,
     })
@@ -242,9 +236,9 @@ pub(super) fn import_invariant_body(query: &Query, check: &HashSet<String>) -> b
     clauses_clean && exprs_clean
 }
 
-/// The shared-execution fast path itself: thread the scope's persistent
-/// imports exactly like the per-row path, execute once on the plan's seed,
-/// then merge the single result against every outer row.
+/// The shared-execution fast path itself: execute once on the plan's seed
+/// with that seed as the body's importing scope (exactly like the per-row
+/// path), then merge the single result against every outer row.
 pub(super) fn exec_call_subquery_shared(
     graph: &ExecGraph<'_>,
     rows: Vec<Row>,
@@ -253,8 +247,10 @@ pub(super) fn exec_call_subquery_shared(
     params: &BTreeMap<String, Value>,
     qctx: QueryCtx<'_>,
 ) -> Result<Vec<Row>> {
-    let scoped_query = query_with_persistent_imports(spec.query, &plan.imported);
-    let result = execute_query_seeded(graph, &scoped_query, params, vec![plan.seed], qctx)?;
+    // One fact, one read: the checked names are the seed's keys, computed
+    // before the seed moves into the one scoped entry.
+    let check = plan.check();
+    let result = execute_query_scoped(graph, spec.query, params, plan.seed, qctx)?;
     if result.rows.is_empty() {
         return Ok(rows
             .into_iter()
@@ -264,7 +260,7 @@ pub(super) fn exec_call_subquery_shared(
     let mut out = Vec::new();
     for row in &rows {
         for values in &result.rows {
-            out.push(merge_body_export(row, &result.columns, values, &plan.check));
+            out.push(merge_body_export(row, &result.columns, values, &check));
         }
     }
     Ok(out)

@@ -45,6 +45,18 @@ impl Residual<'_> {
     }
 }
 
+/// Whether `expr` can be evaluated against `row`: every variable it names
+/// that `scope` can bind is present. Names outside the scope are
+/// subquery-local — `EXISTS { MATCH (z) … }` names `z`, which the
+/// subquery itself binds — so they never gate readiness; the caller's
+/// later predicate pass covers an expression that is not ready here.
+pub(crate) fn conjunct_ready(expr: &Expr, row: &Row, scope: &HashSet<String>) -> bool {
+    let mut vars = HashSet::new();
+    expr_vars(expr, &mut vars);
+    vars.retain(|v| scope.contains(v));
+    vars.iter().all(|v| row.contains_key(v))
+}
+
 pub(crate) fn residual_ok(
     graph: &ExecGraph<'_>,
     row: &Row,
@@ -53,10 +65,7 @@ pub(crate) fn residual_ok(
     residual: &Residual<'_>,
 ) -> Result<bool> {
     for c in residual.conjuncts {
-        let mut vars = HashSet::new();
-        expr_vars(c, &mut vars);
-        vars.retain(|v| residual.scope.contains(v));
-        if !vars.iter().all(|v| row.contains_key(v)) {
+        if !conjunct_ready(c, row, residual.scope) {
             continue;
         }
         if eval_match_predicate(graph, row, c, params, cypher_version)?.truthy() != Some(true) {
@@ -184,9 +193,7 @@ pub(crate) fn live_from(suffix: &[Clause]) -> Option<HashSet<String>> {
             Clause::CreateIndex { .. }
             | Clause::DropIndex { .. }
             | Clause::ShowIndexes
-            | Clause::Finish
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. } => {}
+            | Clause::Finish => {}
             Clause::LoadCsv { url, .. } => expr_vars(url, &mut needed),
             Clause::CallSubquery {
                 in_transactions,

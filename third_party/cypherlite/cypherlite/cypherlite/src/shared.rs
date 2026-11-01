@@ -127,7 +127,8 @@ pub(crate) struct OpenResolved {
     pub(crate) durability_mode: DurabilityMode,
     /// 0 = unlimited (ADR-0042).
     pub(crate) logical_graph_size_limit: u64,
-    /// Opt-in peak-token admission. Off, reservations do not refuse.
+    /// Peak-token admission (ADR-0452). On when a positive concurrent
+    /// logical-workspace limit was set. Off, reservations do not refuse.
     pub(crate) budget: Arc<token_budget::TokenBudget>,
     /// ADR-0209 bulk-write batching knobs, resolved once at open from
     /// `CYPHERLITE_BULK_BATCH_THRESHOLD` / `CYPHERLITE_BULK_BATCH_BUDGET`.
@@ -537,11 +538,24 @@ impl Shared {
     /// total — the caller that admits a batch carries it forward; a
     /// single-record caller ignores it.
     pub(crate) fn admit_redo_capacity(&self, ops: &[RedoOp], reserved: u64) -> Result<u64> {
+        self.admit_redo_capacity_with(ops, reserved, None)
+    }
+
+    /// [`Shared::admit_redo_capacity`] with the constraint-key entry growth
+    /// already computed by the group admission walk (ADR-0439).
+    pub(crate) fn admit_redo_capacity_with(
+        &self,
+        ops: &[RedoOp],
+        reserved: u64,
+        constraint_growth: Option<i64>,
+    ) -> Result<u64> {
         let limit = self.resolved.logical_graph_size_limit;
         if limit == 0 {
             return Ok(reserved);
         }
-        let delta = self.graph.estimate_redo_delta(ops);
+        let delta = self
+            .graph
+            .estimate_redo_delta_with_constraint_growth(ops, constraint_growth);
         // A net-freeing batch (`delta <= 0`, e.g. a DROP INDEX that
         // re-accounts retained versions at a smaller charge) admits nothing:
         // the cast below is only sound for a positive delta.

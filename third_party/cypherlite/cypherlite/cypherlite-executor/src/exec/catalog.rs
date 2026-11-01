@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use cypherlite_core::{Error, Result, Value};
-use cypherlite_parser::token::quote_identifier_always;
+use cypherlite_model::identifier::quote_identifier_always;
 
 use crate::eval::{eval, Row};
 use crate::graph::QueryStats;
@@ -164,9 +164,9 @@ pub(crate) fn string_list(values: impl IntoIterator<Item = String>) -> Value {
 }
 
 /// Render an identifier in the always-backtick-quoted form SHOW-rendered
-/// Cypher text and the CIP-180 canonical graph-type body use: the parser's
+/// Cypher text and the CIP-180 canonical graph-type body use: the model's
 /// one forced-quoting constructor,
-/// [`quote_identifier_always`](cypherlite_parser::token::quote_identifier_always)
+/// [`quote_identifier_always`](cypherlite_model::identifier::quote_identifier_always)
 /// (`Person` → `` `Person` ``), so the escape rule (embedded backticks
 /// doubled) is never re-spelled here.
 pub(crate) fn backtick(identifier: &str) -> String {

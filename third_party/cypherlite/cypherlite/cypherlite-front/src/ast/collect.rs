@@ -266,7 +266,7 @@ pub(crate) fn union_chain(stmt: &Statement) -> impl Iterator<Item = &Statement> 
 /// The column names a WITH/RETURN item list projects: a `*` item passes
 /// the incoming scope through, every other item contributes its
 /// [`effective_name`]. The one project-items-to-names skeleton: both
-/// projection arms of [`crate::validate::output_vars`]'s
+/// projection arms of [`crate::output_vars`]'s
 /// `local_stage_output_vars`, [`crate::validate::search`]'s WITH arm (a WITH
 /// replaces the scope), and the WITH arm of [`clause_introduced_names`]
 /// (introduction is exactly projection over an empty incoming scope).
@@ -290,8 +290,11 @@ pub(crate) fn projected_names(items: &[ReturnItem], bound: &HashSet<String>) -> 
 /// YIELD names for a procedure call, and the catalog columns for the
 /// SHOW/TERMINATE family. The canonical per-clause introduction fact: the
 /// composed-SHOW `WHERE` check, [`crate::validate::search`]'s Rule 5 scope
-/// walk, `call_scope`'s top-level accumulation and
-/// `validate::expressions`'s catalog arm all derive from it. Consumers that
+/// walk and `validate::expressions`'s catalog arm all derive from it.
+/// `call_scope` derives every arm except its catalog arm, which iterates
+/// [`crate::show_columns::catalog_output_columns`] directly — its ordered
+/// `Vec` fixes the shadow-error order, which this set-typed fold cannot.
+/// Consumers that
 /// need *more* than introduction — a WITH replaces the scope (a projection,
 /// [`crate::validate::search`]'s Rule 5 walk) and a `CALL { }` body's
 /// exports depend on the enclosing scope — spell those arms themselves.

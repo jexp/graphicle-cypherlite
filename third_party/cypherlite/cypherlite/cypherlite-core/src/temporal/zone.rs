@@ -3,7 +3,7 @@
 //! [`ResolvedZone`] a `timezone` field names (ADR-0178; extracted from
 //! `construct.rs` per ADR-0340).
 
-use chrono::{NaiveDateTime, Offset, TimeZone};
+use chrono::{DateTime, NaiveDateTime, Offset, TimeZone};
 use chrono_tz::Tz;
 
 use crate::{Error, Result, Value};
@@ -48,6 +48,37 @@ pub enum ZoneError {
     NonexistentWallTime,
 }
 
+/// The outcome of resolving a wall clock in an IANA zone — chrono's
+/// `LocalResult` under a typed name so its two consumers (the resolver
+/// [`zone_offset_at`] and the zoned-literal parse) match on one vocabulary
+/// and cannot drift when a new outcome appears.
+pub(super) enum LocalResolution {
+    /// Exactly one instant maps to the wall clock.
+    Unique(DateTime<Tz>),
+    /// A DST fall-back overlap: the wall clock occurs twice.
+    Ambiguous {
+        earlier: DateTime<Tz>,
+        later: DateTime<Tz>,
+    },
+    /// A DST gap: the wall clock never occurs in the zone.
+    None,
+}
+
+/// Resolve the wall clock `local` in `tz` — the one call site of chrono's
+/// `from_local_datetime`. Each consumer spells its own policy on the
+/// outcome: [`zone_offset_at`] keeps the earliest occurrence (ADR-0178),
+/// while the zoned-literal parse keeps its supplied-offset
+/// disambiguation.
+pub(super) fn resolve_local(tz: Tz, local: NaiveDateTime) -> LocalResolution {
+    match tz.from_local_datetime(&local) {
+        chrono::LocalResult::Single(dt) => LocalResolution::Unique(dt),
+        chrono::LocalResult::Ambiguous(earlier, later) => {
+            LocalResolution::Ambiguous { earlier, later }
+        }
+        chrono::LocalResult::None => LocalResolution::None,
+    }
+}
+
 /// Resolve the IANA wall clock `local` in `zone` to its UTC offset in
 /// seconds (ADR-0178).
 ///
@@ -56,11 +87,13 @@ pub enum ZoneError {
 /// time inside a DST gap are the two error outcomes.
 pub fn zone_offset_at(zone: &str, local: NaiveDateTime) -> std::result::Result<i32, ZoneError> {
     let tz: Tz = zone.parse().map_err(|_| ZoneError::UnknownZone)?;
-    let dt = tz
-        .from_local_datetime(&local)
-        .single()
-        .or_else(|| tz.from_local_datetime(&local).earliest())
-        .ok_or(ZoneError::NonexistentWallTime)?;
+    let dt = match resolve_local(tz, local) {
+        LocalResolution::Unique(dt) => dt,
+        // ADR-0178: an overlap resolves to its earliest (pre-transition)
+        // occurrence.
+        LocalResolution::Ambiguous { earlier, .. } => earlier,
+        LocalResolution::None => return Err(ZoneError::NonexistentWallTime),
+    };
     Ok(dt.offset().fix().local_minus_utc())
 }
 
@@ -96,6 +129,22 @@ pub(super) enum IanaAt {
     Utc(NaiveDateTime),
 }
 
+/// The one spelling of the "ambiguous datetime" failure: a wall clock a DST
+/// overlap leaves ambiguous, or one a DST gap never produces. The resolver's
+/// [`ZoneError::NonexistentWallTime`] outcome and the zoned-literal parse
+/// arms all consult it, so the text cannot drift (ADR-0178, ADR-0340).
+pub(super) fn ambiguous_datetime_err() -> Error {
+    Error::ty("ambiguous datetime")
+}
+
+/// The one spelling of the "unknown timezone" failure: a zone name the tz
+/// database does not carry. Both readings of the name — the resolver's
+/// [`ZoneError::UnknownZone`] outcome and the zoned-literal parse — consult
+/// it, so the text cannot drift (ADR-0178, ADR-0340).
+pub(super) fn unknown_zone_err(zone: &str) -> Error {
+    Error::ty(format!("unknown timezone '{zone}'"))
+}
+
 /// One failure vocabulary for both readings: the resolver's typed outcome
 /// mapped back to this path's message (ADR-0178, ADR-0340).
 fn iana_offset_at(zone: &str, at: IanaAt) -> Result<i32> {
@@ -104,8 +153,8 @@ fn iana_offset_at(zone: &str, at: IanaAt) -> Result<i32> {
         IanaAt::Utc(utc) => zone_offset_at_utc(zone, utc),
     };
     resolved.map_err(|e| match e {
-        ZoneError::UnknownZone => Error::ty(format!("unknown timezone '{zone}'")),
-        ZoneError::NonexistentWallTime => Error::ty("ambiguous datetime"),
+        ZoneError::UnknownZone => unknown_zone_err(zone),
+        ZoneError::NonexistentWallTime => ambiguous_datetime_err(),
     })
 }
 

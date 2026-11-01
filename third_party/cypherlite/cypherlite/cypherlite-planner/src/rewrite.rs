@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use cypherlite_ir::{BinaryOp, Clause, Expr, PathPattern, Projection};
+use cypherlite_ir::{BinaryOp, Clause, Expr, LabelExpr, PathPattern, Projection};
 
 use crate::order::order_patterns;
 use crate::stats::PatternStats;
@@ -57,9 +57,7 @@ pub fn rewrite_part(clauses: &mut [Clause], stats: &dyn PatternStats) {
             | Clause::CallSubquery { .. }
             | Clause::Conditional { .. }
             | Clause::Foreach { .. }
-            | Clause::Use { .. }
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. } => {}
+            | Clause::Use { .. } => {}
         }
     }
 }
@@ -145,8 +143,8 @@ fn fold_conjunct(
     {
         if let Expr::Variable(v) = expr.as_ref() {
             if introduced.contains(v) && !bound.contains(v) {
-                let labels = static_labels(label_expr);
-                if !labels.is_empty() {
+                if let Some(labels) = static_labels(label_expr).filter(|labels| !labels.is_empty())
+                {
                     return add_labels(patterns, v, &labels);
                 }
             }
@@ -165,18 +163,30 @@ fn fold_conjunct(
     add_prop(patterns, &v, key, val)
 }
 
-fn static_labels(expr: &cypherlite_ir::LabelExpr) -> Vec<String> {
+/// The flat label set of a static conjunction (`A`, `A&B`, `(A&B)&C`), or
+/// `None` when the expression is anything else — a disjunction, negation,
+/// wildcard or dynamic leaf anywhere in the tree makes the whole expression
+/// unfoldable. Gated on [`LabelExpr::is_static_conjunction`], the one
+/// predicate for "a conjunction of plain labels" and the only place it is
+/// consulted: callers ask this helper, never the raw predicate.
+///
+/// Flattening leaf by leaf and comparing the collected labels against the
+/// item count used to accept `(A&B)&!(B&C)` as `{A, B}` (the inner `And`
+/// contributed two labels for one item), folded the pattern to those two
+/// labels and dropped the predicate -- so the negation never applied.
+fn static_labels(expr: &LabelExpr) -> Option<Vec<String>> {
     match expr {
-        cypherlite_ir::LabelExpr::Label(label) => vec![label.clone()],
-        cypherlite_ir::LabelExpr::And(items) => {
-            let labels: Vec<_> = items.iter().flat_map(static_labels).collect();
-            if labels.len() == items.len() {
-                labels
-            } else {
-                Vec::new()
-            }
+        LabelExpr::Label(label) => Some(vec![label.clone()]),
+        LabelExpr::And(items) if expr.is_static_conjunction() => {
+            // `is_static_conjunction` guarantees every item is static too,
+            // so the recursion cannot drop one.
+            items
+                .iter()
+                .map(static_labels)
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.concat())
         }
-        _ => Vec::new(),
+        _ => None,
     }
 }
 
@@ -203,21 +213,31 @@ fn add_labels(patterns: &mut [PathPattern], var: &str, labels: &[String]) -> boo
     // in the WHERE clause.
     for p in patterns.iter_mut().filter(|p| !p.needs_gpm()) {
         for n in &mut p.nodes {
-            if n.variable.as_deref() == Some(var) {
-                for l in labels {
-                    if !n.labels.iter().any(|x| x == l) {
-                        n.labels.push(l.clone());
-                    }
-                }
-                n.label_expr = Some(cypherlite_ir::LabelExpr::And(
-                    n.labels
-                        .iter()
-                        .cloned()
-                        .map(cypherlite_ir::LabelExpr::Label)
-                        .collect(),
-                ));
-                return true;
+            if n.variable.as_deref() != Some(var) {
+                continue;
             }
+            // The rebuild below replaces `label_expr` with the pattern's
+            // own static label set plus the folded conjunct, so it is only
+            // faithful when that set holds every label the pattern needs: a
+            // disjunction/negation/wildcard/dynamic expression
+            // (`MATCH (n:A|B) WHERE n:C`) would be narrowed to `{C}`.
+            let mut folded = match n.label_expr.as_ref() {
+                None => n.labels.clone(),
+                Some(expr) => match static_labels(expr) {
+                    Some(labels) => labels,
+                    None => continue,
+                },
+            };
+            for l in labels {
+                if !folded.iter().any(|x| x == l) {
+                    folded.push(l.clone());
+                }
+            }
+            n.labels = folded;
+            n.label_expr = Some(LabelExpr::And(
+                n.labels.iter().cloned().map(LabelExpr::Label).collect(),
+            ));
+            return true;
         }
     }
     false
@@ -253,5 +273,64 @@ fn merge_prop_map(slot: &mut Option<Expr>, key: String, val: Expr) -> bool {
             true
         }
         Some(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lower `cypher`, run the MATCH rewrite, and return the first pattern
+    /// node's flat label list plus the WHERE clause that survived.
+    fn rewritten(cypher: &str) -> (Vec<String>, Option<Expr>) {
+        let mut query = cypherlite_front::parse_and_lower(cypher).unwrap();
+        rewrite_part(&mut query.parts[0].clauses, &crate::NoPatternStats);
+        let Clause::Match {
+            patterns,
+            where_clause,
+            ..
+        } = &query.parts[0].clauses[0]
+        else {
+            panic!("{cypher}: expected MATCH");
+        };
+        (patterns[0].nodes[0].labels.clone(), where_clause.clone())
+    }
+
+    #[test]
+    fn static_label_conjunction_folds_into_the_pattern() {
+        let (labels, where_clause) = rewritten("MATCH (n:A) WHERE n:B RETURN n");
+        assert_eq!(labels, vec!["A".to_string(), "B".to_string()]);
+        assert!(where_clause.is_none());
+    }
+
+    /// A negation or disjunction anywhere in the label expression makes it
+    /// unfoldable: folding `(A&B)&!(B&C)` to `{A, B}` and dropping the
+    /// predicate made it match `(:A:B:C)` as well (TCK
+    /// LabelExpressionAcceptance / IsLabeledPredicateAcceptance
+    /// `(A&B)&!(B&C)`).
+    #[test]
+    fn non_conjunctive_label_expression_is_not_folded() {
+        for cypher in [
+            "MATCH (n) WHERE n:(A&B)&!(B&C) RETURN n",
+            "MATCH (n) WHERE n:(A&B)&!(C) RETURN n",
+            "MATCH (n) WHERE n:(A|B)&!(C) RETURN n",
+            "MATCH (n) WHERE n:(A|B) RETURN n",
+            "MATCH (n) WHERE n:!(A) RETURN n",
+        ] {
+            let (labels, where_clause) = rewritten(cypher);
+            assert!(labels.is_empty(), "{cypher}");
+            assert!(where_clause.is_some(), "{cypher}");
+        }
+    }
+
+    /// Folding a conjunct into a pattern that already carries a
+    /// disjunction must leave that disjunction in place: rebuilding the
+    /// expression from the folded labels alone narrowed
+    /// `MATCH (n:A|B) WHERE n:C` to `(:C)`.
+    #[test]
+    fn fold_keeps_the_patterns_own_label_expression() {
+        let (labels, where_clause) = rewritten("MATCH (n:A|B) WHERE n:C RETURN n");
+        assert!(labels.is_empty(), "{labels:?}");
+        assert!(where_clause.is_some());
     }
 }

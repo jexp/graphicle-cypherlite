@@ -12,16 +12,54 @@
 use std::collections::HashSet;
 
 use cypherlite_core::{RelId, Result};
-use cypherlite_ir::{MatchMode, PathPattern};
+use cypherlite_ir::{Expr, MatchMode, PathPattern};
 
 use crate::ctx::ExecCtx;
-use crate::eval::Row;
+use crate::eval::{expr_vars, Row};
+use crate::exec::pushdown::Residual;
 
 mod guard;
 mod route;
 
 use guard::route_shape;
-use route::Route;
+use route::{PathFilter, Route};
+
+/// The predicates a routed shortest path must satisfy **during** the
+/// search: the pattern's own inline `WHERE`, plus the MATCH-level `WHERE`
+/// conjuncts that read the *path itself* — the named path variable or the
+/// relationship variable. A route that only filtered the selected shortest
+/// path afterwards answered zero rows whenever that shortest path violated
+/// such a predicate, instead of the shortest path that satisfies it.
+///
+/// Endpoint-only conjuncts are deliberately **not** a filter: the route
+/// answers one shortest path per `(start, end)` partition, so a predicate
+/// on the endpoints selects whole partitions and post-filtering it is
+/// exact — keeping those queries on the BFS search instead of the
+/// enumerated predicate walk.
+fn path_filter<'p>(path: &'p PathPattern, residual: &'p Residual<'_>) -> Option<PathFilter<'p>> {
+    let mut carriers: HashSet<&String> = path
+        .rels
+        .iter()
+        .filter_map(|rel| rel.variable.as_ref())
+        .collect();
+    if let Some(name) = &path.variable {
+        carriers.insert(name);
+    }
+    let conjuncts: Vec<&Expr> = residual
+        .conjuncts
+        .iter()
+        .filter(|conjunct| {
+            let mut vars = HashSet::new();
+            expr_vars(conjunct, &mut vars);
+            vars.iter().any(|name| carriers.contains(name))
+        })
+        .collect();
+    (path.where_clause.is_some() || !conjuncts.is_empty()).then_some(PathFilter {
+        conjuncts,
+        inline: path.where_clause.as_deref(),
+        scope: residual.scope,
+    })
+}
 
 #[cfg(test)]
 mod bounded_tests;
@@ -74,14 +112,18 @@ fn with_forced_gpm<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Match `path` on the BFS route, or `Ok(None)` when [`route_shape`] rejects
-/// it. Each row's used set is its trail's relationships, as GPM's would be:
-/// the guard admits only an empty incoming set.
+/// it or the route declines it: a predicate the search cannot decide against
+/// the rows it binds falls back to enumeration, which applies it to the
+/// complete row (`Route::predicates_decidable`). Each row's used set is its
+/// trail's relationships, as GPM's would be: the guard admits only an empty
+/// incoming set.
 pub(super) fn match_shortest_route(
     ctx: ExecCtx<'_>,
     path: &PathPattern,
     row: &Row,
     used: &HashSet<RelId>,
     match_mode: MatchMode,
+    residual: &Residual<'_>,
 ) -> Result<Option<Matched>> {
     #[cfg(test)]
     if FORCE_GPM.with(|c| c.get()) {
@@ -90,6 +132,9 @@ pub(super) fn match_shortest_route(
     let Some(shape) = route_shape(path, match_mode, used, row) else {
         return Ok(None);
     };
+    let Some(rows) = Route::new(ctx, path, row, shape, path_filter(path, residual)).run()? else {
+        return Ok(None);
+    };
     note_route_run();
-    Route::new(ctx, path, row, shape).run().map(Some)
+    Ok(Some(rows))
 }

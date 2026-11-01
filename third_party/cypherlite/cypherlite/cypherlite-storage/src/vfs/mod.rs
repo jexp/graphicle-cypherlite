@@ -3,7 +3,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod bundle;
 #[cfg(not(target_arch = "wasm32"))]
-mod host;
+pub(crate) mod host;
 mod memory;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native;
@@ -19,7 +19,7 @@ pub use bundle::BundleVfs;
 pub(crate) use bundle::HostAdmit;
 pub use memory::MemoryVfs;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::NativeLease;
+pub(crate) use native::lease::NativeLease;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::NativeVfs;
 
@@ -31,9 +31,134 @@ pub fn is_bundle_path(path: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("cl"))
 }
 
+/// The entry's own shape (lstat semantics: the entry itself, never the
+/// target of a symlink) — one typed fact instead of two independent bools
+/// whose other combinations are nonsense. Backends construct the variant;
+/// walkers match it totally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VfsEntryKind {
+    File,
+    Dir,
+    /// A symlink/junction/reparse point. Walkers refuse such entries
+    /// before any read, write, or delete through them.
+    Symlink,
+    /// Any other host entry shape (FIFO, socket, device): never admitted
+    /// where a plain file or directory shape is required. The native
+    /// backend reports it; the virtual backends never construct it.
+    Other,
+}
+
+/// The entry shapes `Vfs::metadata` reports —
+/// [`File`](Self::File), [`Dir`](Self::Dir),
+/// [`Symlink`](Self::Symlink) (junction/reparse included), and
+/// [`Other`](Self::Other) (FIFO, socket, device: never admitted where a
+/// plain shape is required). The native backend classifies all four;
+/// the virtual backends construct only `File` and `Dir`.
+///
+/// ```
+/// use cypherlite_storage::{VfsEntryKind, VfsMeta};
+///
+/// // The one spelling of each entry shape, and the derived predicates
+/// // a walker consults.
+/// let note = VfsMeta::file(42, None);
+/// assert_eq!(note.kind, VfsEntryKind::File);
+/// assert!(note.is_dir() == false && note.is_symlink() == false && note.is_other() == false);
+///
+/// let fifo = VfsMeta::other(0);
+/// assert_eq!(fifo.kind, VfsEntryKind::Other);
+/// assert!(fifo.is_other());
+/// ```
 pub struct VfsMeta {
+    pub kind: VfsEntryKind,
     pub len: u64,
-    pub is_dir: bool,
+    /// The entry's modification time (nanoseconds since the epoch) when
+    /// the backend reports one; virtual backends report `None`.
+    pub mtime: Option<u64>,
+}
+
+impl VfsMeta {
+    /// A regular file entry of `len` bytes with its modification time
+    /// when the backend reports one.
+    pub fn file(len: u64, mtime: Option<u64>) -> Self {
+        Self {
+            kind: VfsEntryKind::File,
+            len,
+            mtime,
+        }
+    }
+
+    /// A plain directory entry.
+    pub fn dir() -> Self {
+        Self {
+            kind: VfsEntryKind::Dir,
+            len: 0,
+            mtime: None,
+        }
+    }
+
+    /// A symlink/junction entry reporting its own length, never its
+    /// target's shape.
+    pub fn symlink(len: u64) -> Self {
+        Self {
+            kind: VfsEntryKind::Symlink,
+            len,
+            mtime: None,
+        }
+    }
+
+    /// A host entry of any other non-plain shape (FIFO, socket, device)
+    /// reporting its own length. Consumers refuse it exactly like a
+    /// symlink: never a read, write, or delete through it.
+    pub fn other(len: u64) -> Self {
+        Self {
+            kind: VfsEntryKind::Other,
+            len,
+            mtime: None,
+        }
+    }
+
+    /// Whether the entry is a directory — derived from [`Self::kind`],
+    /// the one shape fact, never an independent bool.
+    pub fn is_dir(&self) -> bool {
+        self.kind == VfsEntryKind::Dir
+    }
+
+    /// Whether the entry itself is a symlink/junction/reparse point —
+    /// derived from [`Self::kind`].
+    pub fn is_symlink(&self) -> bool {
+        self.kind == VfsEntryKind::Symlink
+    }
+
+    /// Whether the entry is neither a plain file, a directory, nor a
+    /// symlink — a FIFO, socket, or device — derived from
+    /// [`Self::kind`].
+    pub fn is_other(&self) -> bool {
+        self.kind == VfsEntryKind::Other
+    }
+}
+
+/// Whether any virtual-namespace key sits beneath `path` — the one
+/// directory-shape test the virtual backends share.
+pub(crate) fn is_virtual_prefix<'a>(mut keys: impl Iterator<Item = &'a str>, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    keys.any(|key| key.starts_with(&prefix))
+}
+
+/// Classify a virtual (non-durable) namespace entry: a file hit by exact
+/// name, a directory when any entry sits beneath it, otherwise missing —
+/// the one policy every virtual backend's `metadata` reports.
+pub(crate) fn virtual_entry_meta(
+    file_len: Option<u64>,
+    is_prefix: bool,
+    path: &str,
+) -> Result<VfsMeta> {
+    if let Some(len) = file_len {
+        return Ok(VfsMeta::file(len, None));
+    }
+    if is_prefix {
+        return Ok(VfsMeta::dir());
+    }
+    Err(Error::io(format!("missing {path}")))
 }
 
 #[derive(Clone, Copy)]
@@ -513,524 +638,7 @@ pub fn read_to_vec(vfs: &dyn Vfs, path: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn capped_vfs_writer_does_not_write_past_its_limit() {
-        let vfs = MemoryVfs::new();
-        let mut file = vfs.open("candidate", VfsOpen::create_new()).unwrap();
-        {
-            let mut writer = CappedVfsWriter::new(&mut *file, 3, "candidate is too large");
-            assert_eq!(writer.write(b"abc").unwrap(), 3);
-            assert!(writer.write(b"d").is_err());
-            assert!(writer.exceeded());
-        }
-        assert_eq!(file.len().unwrap(), 3);
-    }
-
-    // These wrappers deliberately claim durable storage while omitting one or
-    // both directory-persistence methods. The underlying bytes remain usable
-    // so an atomic write can reach the post-rename error path.
-    struct MissingDirectoryBarriers {
-        inner: MemoryVfs,
-    }
-
-    impl Vfs for MissingDirectoryBarriers {
-        fn durable(&self) -> bool {
-            true
-        }
-        fn create_dir_all(&self, path: &str) -> Result<()> {
-            self.inner.create_dir_all(path)
-        }
-        fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-            self.inner.list_dir(path)
-        }
-        fn exists(&self, path: &str) -> Result<bool> {
-            self.inner.exists(path)
-        }
-        fn metadata(&self, path: &str) -> Result<VfsMeta> {
-            self.inner.metadata(path)
-        }
-        fn open(&self, path: &str, opts: VfsOpen) -> Result<Box<dyn VfsFile>> {
-            self.inner.open(path, opts)
-        }
-        fn remove_file(&self, path: &str) -> Result<()> {
-            self.inner.remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &str) -> Result<()> {
-            self.inner.remove_dir_all(path)
-        }
-        fn rename(&self, from: &str, to: &str) -> Result<()> {
-            self.inner.rename(from, to)
-        }
-    }
-
-    struct MissingSync(MissingDirectoryBarriers);
-
-    impl Vfs for MissingSync {
-        fn durable(&self) -> bool {
-            self.0.durable()
-        }
-        fn create_dir_all(&self, path: &str) -> Result<()> {
-            self.0.create_dir_all(path)
-        }
-        fn create_dir_all_for_atomic(&self, path: &str) -> Result<()> {
-            self.0.create_dir_all(path)
-        }
-        fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-            self.0.list_dir(path)
-        }
-        fn exists(&self, path: &str) -> Result<bool> {
-            self.0.exists(path)
-        }
-        fn metadata(&self, path: &str) -> Result<VfsMeta> {
-            self.0.metadata(path)
-        }
-        fn open(&self, path: &str, opts: VfsOpen) -> Result<Box<dyn VfsFile>> {
-            self.0.open(path, opts)
-        }
-        fn remove_file(&self, path: &str) -> Result<()> {
-            self.0.remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &str) -> Result<()> {
-            self.0.remove_dir_all(path)
-        }
-        fn rename(&self, from: &str, to: &str) -> Result<()> {
-            self.0.rename(from, to)
-        }
-    }
-
-    #[test]
-    fn durable_vfs_missing_directory_barriers_cannot_claim_atomic_success() {
-        let vfs = MissingDirectoryBarriers {
-            inner: MemoryVfs::new(),
-        };
-        let error = atomic_write(&vfs, "nested/value", b"new").unwrap_err();
-        assert!(error.to_string().contains("create_dir_all_for_atomic"));
-        assert!(!vfs.exists("nested/value").unwrap());
-
-        let vfs = MissingSync(vfs);
-        let error = atomic_write(&vfs, "nested/value", b"new").unwrap_err();
-        assert!(error.to_string().contains("sync_dir"));
-        assert_eq!(read_to_vec(&vfs, "nested/value").unwrap(), b"new");
-        assert_eq!(vfs.list_dir("nested").unwrap(), ["value"]);
-    }
-
-    type CollisionHook<'a> = Box<dyn Fn(&str) + Send + Sync + 'a>;
-
-    struct FaultVfs<'a> {
-        inner: &'a dyn Vfs,
-        events: Arc<Mutex<Vec<&'static str>>>,
-        fail: Option<&'static str>,
-        fail_cleanup: bool,
-        collision: Option<CollisionHook<'a>>,
-        collided: Mutex<Option<String>>,
-    }
-
-    impl<'a> FaultVfs<'a> {
-        fn new(inner: &'a dyn Vfs, fail: Option<&'static str>) -> Self {
-            Self {
-                inner,
-                events: Arc::new(Mutex::new(Vec::new())),
-                fail,
-                fail_cleanup: false,
-                collision: None,
-                collided: Mutex::new(None),
-            }
-        }
-
-        fn event(&self, stage: &'static str) -> Result<()> {
-            self.events.lock().unwrap().push(stage);
-            if self.fail == Some(stage) || (stage == "cleanup" && self.fail_cleanup) {
-                Err(Error::io(format!("injected {stage} failure")))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn trace(&self) -> Vec<&'static str> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-
-    struct FaultFile {
-        inner: Option<Box<dyn VfsFile>>,
-        events: Arc<Mutex<Vec<&'static str>>>,
-        fail: Option<&'static str>,
-    }
-
-    impl Drop for FaultFile {
-        fn drop(&mut self) {
-            drop(self.inner.take());
-            self.events.lock().unwrap().push("close");
-        }
-    }
-
-    impl VfsFile for FaultFile {
-        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-            self.events.lock().unwrap().push("write");
-            if self.fail == Some("write") {
-                return Err(Error::io("injected write failure"));
-            }
-            self.inner.as_mut().unwrap().write_all(buf)
-        }
-        fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-            self.inner.as_mut().unwrap().read_exact(buf)
-        }
-        fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-            self.inner.as_mut().unwrap().seek(pos)
-        }
-        fn sync_all(&mut self) -> Result<()> {
-            self.events.lock().unwrap().push("file_sync");
-            if self.fail == Some("file_sync") {
-                return Err(Error::io("injected file_sync failure"));
-            }
-            self.inner.as_mut().unwrap().sync_all()
-        }
-        fn len(&self) -> Result<u64> {
-            self.inner.as_ref().unwrap().len()
-        }
-        fn set_len(&mut self, len: u64) -> Result<()> {
-            self.inner.as_mut().unwrap().set_len(len)
-        }
-    }
-
-    impl Vfs for FaultVfs<'_> {
-        fn durable(&self) -> bool {
-            self.inner.durable()
-        }
-        fn create_dir_all(&self, path: &str) -> Result<()> {
-            self.inner.create_dir_all(path)
-        }
-        fn create_dir_all_for_atomic(&self, path: &str) -> Result<()> {
-            self.event("parents")?;
-            self.inner.create_dir_all_for_atomic(path)
-        }
-        fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-            self.inner.list_dir(path)
-        }
-        fn exists(&self, path: &str) -> Result<bool> {
-            self.inner.exists(path)
-        }
-        fn metadata(&self, path: &str) -> Result<VfsMeta> {
-            self.inner.metadata(path)
-        }
-        fn open(&self, path: &str, opts: VfsOpen) -> Result<Box<dyn VfsFile>> {
-            self.inner.open(path, opts)
-        }
-        fn open_exclusive(&self, path: &str) -> Result<Option<Box<dyn VfsFile>>> {
-            self.event("exclusive_open")?;
-            if self.fail == Some("collision") {
-                return Ok(None);
-            }
-            if let Some(collision) = &self.collision {
-                let mut collided = self.collided.lock().unwrap();
-                if collided.is_none() {
-                    collision(path);
-                    *collided = Some(path.to_string());
-                }
-            }
-            self.inner.open_exclusive(path).map(|f| {
-                f.map(|inner| {
-                    Box::new(FaultFile {
-                        inner: Some(inner),
-                        events: Arc::clone(&self.events),
-                        fail: self.fail,
-                    }) as Box<dyn VfsFile>
-                })
-            })
-        }
-        fn remove_file(&self, path: &str) -> Result<()> {
-            self.event("cleanup")?;
-            self.inner.remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &str) -> Result<()> {
-            self.inner.remove_dir_all(path)
-        }
-        fn rename(&self, from: &str, to: &str) -> Result<()> {
-            self.event("rename")?;
-            self.inner.rename(from, to)?;
-            if self.fail == Some("post_rename_error") {
-                return Err(Error::io("injected post_rename_error failure"));
-            }
-            Ok(())
-        }
-        fn sync_dir(&self, path: &str) -> Result<()> {
-            self.event("dir_sync")?;
-            self.inner.sync_dir(path)
-        }
-    }
-
-    fn atomic_faults(vfs: &dyn Vfs) {
-        atomic_write(vfs, "nested/object", b"old").unwrap();
-        for stage in ["parents", "exclusive_open"] {
-            let fault = FaultVfs::new(vfs, Some(stage));
-            assert!(atomic_write(&fault, "nested/object", b"new")
-                .unwrap_err()
-                .to_string()
-                .contains(stage));
-            assert_eq!(read_to_vec(vfs, "nested/object").unwrap(), b"old");
-            assert_eq!(vfs.list_dir("nested").unwrap(), ["object"]);
-        }
-        for stage in ["write", "file_sync", "rename", "dir_sync"] {
-            let fault = FaultVfs::new(vfs, Some(stage));
-            let error = atomic_write(&fault, "nested/object", b"new").unwrap_err();
-            assert!(error.to_string().contains(stage), "{error}");
-            assert_eq!(
-                read_to_vec(vfs, "nested/object").unwrap(),
-                if stage == "dir_sync" { b"new" } else { b"old" }
-            );
-            assert_eq!(vfs.list_dir("nested").unwrap(), ["object"]);
-            let trace = fault.trace();
-            assert!(trace.starts_with(&["parents", "exclusive_open", "write"]));
-            assert!(trace.contains(&"close"));
-            if stage == "dir_sync" {
-                assert_eq!(
-                    trace,
-                    [
-                        "parents",
-                        "exclusive_open",
-                        "write",
-                        "file_sync",
-                        "close",
-                        "rename",
-                        "dir_sync"
-                    ]
-                );
-            } else {
-                assert_eq!(trace.last(), Some(&"cleanup"));
-                atomic_write(vfs, "nested/object", b"old").unwrap();
-            }
-        }
-        // Failed cleanup retains the original error and reports its own failure.
-        let mut fault = FaultVfs::new(vfs, Some("rename"));
-        fault.fail_cleanup = true;
-        let error = atomic_write(&fault, "nested/object", b"new").unwrap_err();
-        assert!(error.to_string().contains("injected rename failure"));
-        assert!(error.to_string().contains("temporary file cleanup failed"));
-        assert_eq!(read_to_vec(vfs, "nested/object").unwrap(), b"new");
-        let temp = vfs
-            .list_dir("nested")
-            .unwrap()
-            .into_iter()
-            .find(|name| name.starts_with("object.tmp-"))
-            .unwrap();
-        vfs.remove_file(&format!("nested/{temp}")).unwrap();
-
-        // Some backends can publish and then return a rename error. Cleanup
-        // must never touch the new destination after the temp was consumed.
-        let fault = FaultVfs::new(vfs, Some("post_rename_error"));
-        assert!(atomic_write(&fault, "nested/object", b"published")
-            .unwrap_err()
-            .to_string()
-            .contains("post_rename_error"));
-        assert_eq!(read_to_vec(vfs, "nested/object").unwrap(), b"published");
-        assert_eq!(vfs.list_dir("nested").unwrap(), ["object"]);
-        assert!(!fault.trace().contains(&"cleanup"));
-    }
-
-    fn atomic_collision(vfs: &dyn Vfs) {
-        let mut fault = FaultVfs::new(vfs, None);
-        fault.collision = Some(Box::new(|path| {
-            let mut f = vfs.open(path, VfsOpen::create_new()).unwrap();
-            f.write_all(b"occupied").unwrap();
-        }));
-        atomic_write(&fault, "collisions/value", b"new").unwrap();
-        let occupied = fault.collided.lock().unwrap().clone().unwrap();
-        assert_eq!(read_to_vec(vfs, &occupied).unwrap(), b"occupied");
-        assert_eq!(read_to_vec(vfs, "collisions/value").unwrap(), b"new");
-        assert_eq!(
-            fault
-                .trace()
-                .iter()
-                .filter(|&&e| e == "exclusive_open")
-                .count(),
-            2
-        );
-        vfs.remove_file(&occupied).unwrap();
-
-        let fault = FaultVfs::new(vfs, Some("collision"));
-        let error = atomic_write(&fault, "collisions/value", b"other").unwrap_err();
-        assert!(error.to_string().contains("after 8 collisions"));
-        assert_eq!(read_to_vec(vfs, "collisions/value").unwrap(), b"new");
-        assert_eq!(
-            fault
-                .trace()
-                .iter()
-                .filter(|&&event| event == "exclusive_open")
-                .count(),
-            TEMP_ATTEMPTS
-        );
-    }
-
-    fn roundtrip(vfs: &dyn Vfs) {
-        vfs.create_dir_all("wal").unwrap();
-        atomic_write(vfs, "obj.bin", b"one").unwrap();
-        assert_eq!(read_to_vec(vfs, "obj.bin").unwrap(), b"one");
-        atomic_write(vfs, "obj.bin", b"two").unwrap();
-        assert_eq!(read_to_vec(vfs, "obj.bin").unwrap(), b"two");
-        assert!(!vfs.exists("obj.bin.tmp").unwrap());
-        atomic_write(vfs, "nodes/part.parquet", b"shard").unwrap();
-        assert!(vfs.metadata("nodes").unwrap().is_dir);
-        let mut names = vfs.list_dir("wal").unwrap();
-        names.sort();
-        assert!(names.is_empty());
-        {
-            let mut f = vfs
-                .open("wal/00000001.log", VfsOpen::create_truncate())
-                .unwrap();
-            f.write_all(crate::wal::MAGIC).unwrap();
-            f.sync_all().unwrap();
-        }
-        let listed = vfs.list_dir("wal").unwrap();
-        assert_eq!(listed, vec!["00000001.log".to_string()]);
-        vfs.remove_file("wal/00000001.log").unwrap();
-        vfs.remove_file("missing.log").unwrap();
-        vfs.remove_dir_all("nodes").unwrap();
-        assert!(!vfs.exists("nodes/part.parquet").unwrap());
-    }
-
-    #[test]
-    fn memory_vfs_roundtrip() {
-        let vfs = MemoryVfs::new();
-        assert!(!vfs.durable());
-        roundtrip(&vfs);
-        atomic_faults(&vfs);
-        atomic_collision(&vfs);
-    }
-
-    #[test]
-    fn native_vfs_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let vfs = NativeVfs::new(dir.path());
-        assert!(vfs.durable());
-        roundtrip(&vfs);
-        atomic_faults(&vfs);
-        atomic_collision(&vfs);
-        assert_eq!(std::fs::read(dir.path().join("obj.bin")).unwrap(), b"two");
-    }
-
-    #[test]
-    fn bundle_vfs_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("graph.cl");
-        let vfs = BundleVfs::open_or_create(&path).unwrap();
-        assert!(vfs.durable());
-        roundtrip(&vfs);
-        atomic_faults(&vfs);
-        atomic_collision(&vfs);
-        drop(vfs);
-        let vfs = BundleVfs::open_or_create(&path).unwrap();
-        assert_eq!(read_to_vec(&vfs, "obj.bin").unwrap(), b"two");
-        assert!(path.is_file());
-        assert!(!dir.path().join("wal").exists());
-        assert_eq!(dir.path().read_dir().unwrap().count(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_atomic_temp_symlink_collision_never_follows_target() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let dir = tempfile::tempdir().unwrap();
-        let vfs = NativeVfs::new(dir.path());
-        let target = dir.path().join("victim");
-        std::fs::write(&target, b"secret").unwrap();
-        symlink(&target, dir.path().join("value.tmp")).unwrap();
-        // A dangling symlink occupying a randomly chosen name is also a collision.
-        let mut fault = FaultVfs::new(&vfs, None);
-        fault.collision = Some(Box::new(|path| {
-            symlink(dir.path().join("missing-target"), dir.path().join(path)).unwrap();
-        }));
-        atomic_write(&fault, "value", b"new").unwrap();
-        let collided = fault.collided.lock().unwrap().clone().unwrap();
-        assert!(std::fs::symlink_metadata(dir.path().join(collided))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
-        assert_eq!(std::fs::read(dir.path().join("value")).unwrap(), b"new");
-        assert!(std::fs::symlink_metadata(dir.path().join("value.tmp"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::metadata(dir.path().join("value"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_atomic_creates_and_syncs_ancestor_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let vfs = NativeVfs::new(dir.path().join("database"));
-        atomic_write(&vfs, "a/b/value", b"durable").unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("database/a/b/value")).unwrap(),
-            b"durable"
-        );
-        assert!(vfs.sync_dir("a/b").is_ok());
-        assert!(vfs.sync_dir("a/missing").is_err());
-    }
-
-    #[test]
-    fn bundle_tmp_sync_without_rename_does_not_publish() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("graph.cl");
-        {
-            let vfs = BundleVfs::open_or_create(&path).unwrap();
-            let mut f = vfs.open("obj.bin.tmp", VfsOpen::create_truncate()).unwrap();
-            f.write_all(b"secret").unwrap();
-            f.sync_all().unwrap();
-        }
-        let vfs = BundleVfs::open_or_create(&path).unwrap();
-        assert!(!vfs.exists("obj.bin").unwrap());
-        assert_eq!(read_to_vec(&vfs, "obj.bin.tmp").unwrap(), b"secret");
-    }
-
-    #[test]
-    fn memory_vfs_is_shareable() {
-        let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::new());
-        atomic_write(&*vfs, "a", b"x").unwrap();
-        assert_eq!(read_to_vec(&*vfs, "a").unwrap(), b"x");
-    }
-
-    #[test]
-    fn hex_16_is_lowercase_fixed_width_and_deterministic() {
-        assert_eq!(hex_16([0xab; 16]), "ab".repeat(16));
-        assert_eq!(hex_16([0x00; 16]), "00".repeat(16));
-        assert_eq!(hex_16([0x0f; 16]), "0f".repeat(16));
-    }
-
-    #[test]
-    fn random_hex_16_is_unique_canonical_token() {
-        let first = random_hex_16().unwrap();
-        let second = random_hex_16().unwrap();
-        assert!(is_lower_hex_32(&first));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn is_lower_hex_32_rejects_noncanonical_tokens() {
-        assert!(is_lower_hex_32("0123456789abcdef0123456789abcdef"));
-        for bad in [
-            "0123456789abcdef0123456789abcde",   // 31 chars
-            "0123456789abcdef0123456789abcdef0", // 33 chars
-            "0123456789abcdef0123456789ABCDEF",  // uppercase
-            "0123456789abcdef0123456789abcdeg",  // non-hex
-            "",
-        ] {
-            assert!(!is_lower_hex_32(bad), "{bad}");
-        }
-    }
-}
+mod tests;
 
 #[cfg(all(test, parquet_codec))]
 mod sink_tests;

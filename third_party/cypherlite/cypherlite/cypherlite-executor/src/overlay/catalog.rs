@@ -174,32 +174,23 @@ impl<'a> ExecGraph<'a> {
             .schema
             .map(|s| s.constraints.clone())
             .unwrap_or_else(|| self.base.named_constraints());
-        self.named_defs(committed, |map, op| match op {
-            RedoOp::CreateConstraint {
-                name,
-                relationship,
-                label,
-                properties,
-                kind,
-                property_type,
-            } => {
-                map.insert(
-                    name.clone(),
-                    ConstraintDef {
-                        name: name.clone(),
-                        relationship: *relationship,
-                        label: label.clone(),
-                        properties: properties.clone(),
-                        kind: kind.clone(),
-                        property_type: property_type.clone(),
-                    },
-                );
-            }
-            RedoOp::DropConstraint { name } => {
+        self.named_defs(committed, |map, op| {
+            if let Some(def) = op.constraint_def() {
+                map.insert(def.name.clone(), def);
+            } else if let RedoOp::DropConstraint { name } = op {
                 map.remove(name);
             }
-            _ => {}
         })
+    }
+
+    /// The named constraints with each row's enforced label resolved (see
+    /// [`resolve_enforced_labels`]): the one effective-identity view every
+    /// schema comparison reads (ADR-0450's legacy policy). Enforcement is
+    /// separate: `validate_slice` resolves the label from the theater alone,
+    /// the legacy-unenforced signal.
+    pub(crate) fn effective_constraints(&self) -> Result<Vec<ConstraintDef>> {
+        let derived = self.show_schema()?.data.derived_constraints;
+        Ok(resolve_enforced_labels(self.named_constraints(), &derived))
     }
 
     /// Index DDL: create a standalone index, counted in
@@ -251,26 +242,10 @@ impl<'a> ExecGraph<'a> {
         self.push_schema_redo(RedoOp::DropIndex { name }, |_| {})
     }
 
-    pub fn create_named_constraint(
-        &self,
-        name: String,
-        relationship: bool,
-        label: String,
-        properties: Vec<String>,
-        kind: String,
-        property_type: Option<String>,
-    ) -> Result<()> {
-        self.push_schema_redo(
-            RedoOp::CreateConstraint {
-                name,
-                relationship,
-                label,
-                properties,
-                kind,
-                property_type,
-            },
-            |stats| stats.constraints_added += 1,
-        )
+    pub fn create_named_constraint(&self, def: ConstraintDef) -> Result<()> {
+        self.push_schema_redo(RedoOp::create_constraint(def), |stats| {
+            stats.constraints_added += 1
+        })
     }
 
     pub fn drop_named_constraint(&self, name: String) -> Result<()> {
@@ -287,4 +262,26 @@ impl<'a> ExecGraph<'a> {
         scratch.push_redo(op);
         Ok(())
     }
+}
+
+/// Fill each row's missing enforced label from the theater's
+/// derived-constraint index — its historical source. ADR-0450's one
+/// legacy-resolution rule: a row that already carries the label keeps it,
+/// and a field-less legacy row resolves to the same identity its
+/// current-shape twin would have. New rows never change here.
+fn resolve_enforced_labels(
+    constraints: Vec<ConstraintDef>,
+    derived: &BTreeMap<String, cypherlite_model::Constraint>,
+) -> Vec<ConstraintDef> {
+    constraints
+        .into_iter()
+        .map(|mut def| {
+            if def.enforced_label.is_none() {
+                def.enforced_label = derived
+                    .get(&def.name)
+                    .and_then(|constraint| constraint.enforced_label.clone());
+            }
+            def
+        })
+        .collect()
 }

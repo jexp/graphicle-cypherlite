@@ -8,6 +8,11 @@ use cypherlite_core::{ArithmeticFailure, Error, Result, Value};
 /// the scale computation would overflow (ADR-0336).
 const MAX_ROUND_PRECISION: i64 = 15;
 
+/// `2^52`: the first f64 magnitude whose spacing exceeds 1, i.e. the point
+/// past which no value has a fractional part to round. `round()` is the
+/// identity from there on (TCK RoundingNumbers [4], [5]).
+const NO_FRACTION_LIMIT: f64 = 4_503_599_627_370_496.0;
+
 /// The `round()` mode vocabulary (Neo4j's eight names), parsed once at the
 /// call boundary so the rounding dispatch matches on a typed mode instead of
 /// re-classifying the raw strings (the `TruncUnit::parse` shape in
@@ -18,10 +23,16 @@ enum RoundingMode {
     Down,
     Ceiling,
     Floor,
+    /// The wire spelling `HALF_UP`: ties away from zero (Java's
+    /// `RoundingMode.HALF_UP`).
     HalfUp,
     HalfDown,
     HalfEven,
     Unnecessary,
+    /// The mode of a `round()` call that names none: ties toward positive
+    /// infinity (`floor(x + 0.5)`), which is *not* the wire `HALF_UP` —
+    /// `round(-1.5)` is -1.0 while `round(-1.5, 0, 'HALF_UP')` is -2.0.
+    HalfUpTowardPositiveInfinity,
 }
 
 impl RoundingMode {
@@ -74,11 +85,18 @@ pub(crate) fn round_function(vals: &[Value]) -> Result<Value> {
         }
     };
     let mode = match vals.get(2) {
-        None => RoundingMode::HalfUp,
+        None => RoundingMode::HalfUpTowardPositiveInfinity,
         Some(Value::String(mode)) => RoundingMode::parse(mode)?,
         _ => return Err(Error::invalid_argument_type("round mode must be STRING")),
     };
     if !value.is_finite() {
+        return Ok(Value::Float(value));
+    }
+    // At or beyond 2^52 an f64 has no fractional part left to round, and
+    // both scaling by 10^precision and `x + 0.5` perturb the value (the
+    // former injects ulp noise, the latter can step to the next float), so
+    // every mode is the identity there.
+    if value.abs() >= NO_FRACTION_LIMIT {
         return Ok(Value::Float(value));
     }
     let scale = 10_f64.powi(precision);
@@ -95,6 +113,7 @@ pub(crate) fn round_function(vals: &[Value]) -> Result<Value> {
         RoundingMode::Ceiling => scaled.ceil(),
         RoundingMode::Floor => scaled.floor(),
         RoundingMode::HalfUp => scaled.round(),
+        RoundingMode::HalfUpTowardPositiveInfinity => (scaled + 0.5).floor(),
         RoundingMode::HalfEven => scaled.round_ties_even(),
         RoundingMode::HalfDown => {
             let trunc = scaled.trunc();
@@ -195,9 +214,11 @@ mod tests {
             round_function(&[Value::Float(2.5)]).unwrap(),
             Value::Float(3.0)
         );
+        // The implicit form is HALF_UP toward positive infinity, not the
+        // wire `HALF_UP` (away from zero): -2.5 rounds to -2.0.
         assert_eq!(
             round_function(&[Value::Float(-2.5)]).unwrap(),
-            Value::Float(-3.0)
+            Value::Float(-2.0)
         );
         assert_eq!(
             round_function(&[Value::Float(2.5), Value::Int(2)]).unwrap(),

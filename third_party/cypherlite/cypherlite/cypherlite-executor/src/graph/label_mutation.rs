@@ -3,11 +3,11 @@
 //! domain, one direction each — in their own impl-block file (the
 //! graph module's methods-in-their-own-file precedent, the sibling of
 //! the degree-stats family). The twins' shape is deliberately paired:
-//! an entry guard per twin (the remove side's drop-set guard strictly
-//! generalizes the add side's input-shaped one — a request whose names
-//! are all uninterned removes nothing), the same
-//! actually-mutated-ids guard on the redo/dirty pair, the same
-//! effect-recording WAL payload, and the same unguarded hand-off to
+//! one effect-shaped guard per twin (the request's ids resolved against
+//! the live label set, so an empty request, an all-already-carried add,
+//! an all-uninterned remove, and a missing node all no-op), one effect id
+//! vector, the same actually-mutated-ids guard on the redo/dirty pair,
+//! the same effect-derived WAL payload, and the same unguarded hand-off to
 //! the degree-stats family's own empty-set early returns (LABS-425
 //! round-1 F-1-17, rounds 3-4).
 //! `Graph` (graph/mod.rs) keeps the struct; every label-set mutation
@@ -17,39 +17,58 @@ use super::*;
 
 impl Graph {
     pub fn add_labels(&self, id: NodeId, labels: &[String]) {
-        if labels.is_empty() {
+        let before = self.node(id);
+        if before.is_none() {
             return;
         }
-        let before = self.node(id);
         let before_len = self.node_chain_len(id);
-        let mut added = Vec::new();
+        // The effect, not the request: the ids the node does not already
+        // carry. ADD mints a name it has never seen (unlike REMOVE, whose
+        // drop set is lookups only), so each request label is interned here
+        // — before the scope probe takes the map lock (interner shard read,
+        // then map lock, the seam lock order). A request of only carried
+        // labels has no effect and no-ops below.
+        let live = self.live_label_ids(id);
         let mut added_ids: Vec<u32> = Vec::new();
-        let mut string_kids: Vec<u32> = Vec::new();
-        if let Some(mut n) = self.cow_node(id) {
-            for l in labels {
-                let lid = self.interner.intern(l);
-                if !n.has_label(lid) {
-                    n.labels.push(lid);
-                    added.push(l.clone());
-                    added_ids.push(lid);
-                }
+        for label in labels {
+            let lid = self.interner.intern(label);
+            if !live.contains(&lid) && !added_ids.contains(&lid) {
+                added_ids.push(lid);
             }
-            crate::memory::fit_reserved(&mut n.labels);
-            if !added_ids.is_empty() {
-                // New label pairs must pick up existing properties.
-                string_kids = n.props.iter().map(|(kid, _)| kid).collect();
-            }
-            self.put_node(id, n);
         }
-        self.bump_stats(|s| s.labels_added += added.len() as i64);
+        if added_ids.is_empty() {
+            return;
+        }
+        // ADR-0439: adding a constraint label introduces the node's
+        // constrained tuple; capture the before-image now. A label no
+        // constraint carries cannot change any tuple — the map's scope is
+        // the only source of that answer.
+        let keys = self.tracked_node_edit(id, |scope| scope.touches_node_labels(&added_ids));
+        let mut n = self
+            .cow_node(id)
+            .expect("a live node has a copy-on-write version");
+        n.labels.extend(added_ids.iter().copied());
+        crate::memory::fit_reserved(&mut n.labels);
+        // New label pairs must pick up existing properties.
+        let string_kids: Vec<u32> = n.props.iter().map(|(kid, _)| kid).collect();
+        // The edited live view is in hand: hand it to the map before it
+        // moves into the version chain (the canonical completion arm).
+        self.finish_node_edit(keys, id, Some(&n));
+        self.put_node(id, n);
+        // The WAL/catalog names derive from the effect ids, through the
+        // canonical id→name lookup (remove_labels' policy): the ids are node
+        // labels, so the published-before-use invariant holds.
+        let added: Vec<String> = added_ids
+            .iter()
+            .map(|&lid| String::from(&*self.interner.get(lid)))
+            .collect();
+        self.bump_stats(|s| s.labels_added += added_ids.len() as i64);
         self.catalog
             .lock()
             .unwrap()
             .record_labels(added.iter().cloned());
-        if !added.is_empty() {
-            self.push_redo(RedoOp::add_labels(id, added));
-            self.mark_node_dirty(id);
-        }
+        self.push_redo(RedoOp::add_labels(id, added));
+        self.mark_node_dirty(id);
         self.index_add(id);
         for &lid in &added_ids {
             for &kid in &string_kids {
@@ -57,19 +76,9 @@ impl Graph {
             }
         }
         self.charge_node_after_edit(id, before.as_ref(), before_len);
-        // LABS-351: a new label inherits the node's current out-degree
-        // buckets, so `SET n:Hub` on an already-connected supernode lands
-        // in the (Hub, type) histogram immediately — the never-miss
-        // invariant holds for labels added at any time, not only at node
-        // create (the blocker the local passes caught).
-        self.rebucket_added_labels(id, &added_ids);
-        // LABS-370: the added labels inherit the node's rel
-        // contributions on both endpoint sides — the canonical incident
-        // walk (graph/degree_stats.rs).
-        self.apply_incident_pair_counts(id, &added_ids, CountDelta::Add);
-        // LABS-370 (v1 follow-up): the exact label counts follow the
-        // actually-added ids.
-        self.bump_label_counts(&added_ids, CountDelta::Add);
+        // The one count-family entry: the degree rebucket (LABS-351), the
+        // incident pair counts and the exact label counts (LABS-370).
+        self.apply_label_delta_stats(id, &added_ids, CountDelta::Add);
     }
 
     pub fn remove_labels(&self, id: NodeId, labels: &[String]) {
@@ -100,16 +109,24 @@ impl Graph {
         }
         let before = self.node(id);
         let before_len = self.node_chain_len(id);
-        let mut actually_removed: Vec<u32> = Vec::new();
-        if let Some(mut n) = self.cow_node(id) {
-            // One pass, the overlay twin's canonical move: extract_if
-            // both collects the actually-removed ids and retains the
-            // rest.
-            actually_removed = n.labels.extract_if(.., |l| drop.contains(l)).collect();
-            crate::memory::fit_reserved(&mut n.labels);
-            self.put_node(id, n);
-        }
-        // The count reads at the bump site; a COW miss is the empty set.
+        // ADR-0439: a removed constraint label frees the node's constrained
+        // tuple; a label no constraint carries cannot change any tuple. The
+        // map's scope is the only source of that answer.
+        // `drop` is non-empty here (the effect guard above returned
+        // otherwise), so one scope read answers for the whole request.
+        let drop_ids: Vec<u32> = drop.iter().copied().collect();
+        let keys = self.tracked_node_edit(id, |scope| scope.touches_node_labels(&drop_ids));
+        let mut n = self
+            .cow_node(id)
+            .expect("a live node has a copy-on-write version");
+        // One pass, the overlay twin's canonical move: extract_if both
+        // collects the actually-removed ids and retains the rest.
+        let actually_removed: Vec<u32> = n.labels.extract_if(.., |l| drop.contains(l)).collect();
+        crate::memory::fit_reserved(&mut n.labels);
+        // The edited live view is in hand: hand it to the map before it
+        // moves into the version chain (the canonical completion arm).
+        self.finish_node_edit(keys, id, Some(&n));
+        self.put_node(id, n);
         self.bump_stats(|s| s.labels_removed += actually_removed.len() as i64);
         // The redo/dirty pair is guarded on the actually-mutated ids; the
         // degree-stats family calls below ride the family's own
@@ -129,19 +146,9 @@ impl Graph {
         }
         self.index_add(id);
         self.charge_node_after_edit(id, before.as_ref(), before_len);
-        // LABS-351: a removed label no longer owns the node's degree
-        // buckets (saturating: the high-water degree may exceed the
-        // current live count) — the ids are the labels ACTUALLY removed;
-        // the requested list would decrement buckets a label never
-        // contributed.
-        self.unbucket_removed_labels(id, &actually_removed);
-        // LABS-370: the actually-removed labels give up the node's rel
-        // contributions on both endpoint sides — the canonical incident
-        // walk, direction -1 (graph/degree_stats.rs).
-        self.apply_incident_pair_counts(id, &actually_removed, CountDelta::Remove);
-        // LABS-370 (v1 follow-up): the exact label counts follow the
-        // actually-removed ids.
-        self.bump_label_counts(&actually_removed, CountDelta::Remove);
+        // The one count-family entry, in the removal direction (the ids are
+        // the labels ACTUALLY removed, never the requested list).
+        self.apply_label_delta_stats(id, &actually_removed, CountDelta::Remove);
     }
 }
 

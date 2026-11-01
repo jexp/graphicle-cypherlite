@@ -33,6 +33,24 @@ pub fn civil_epoch_days(year: i64, month: u32, day: u32) -> i128 {
     era * 146097 + doe - 719468
 }
 
+/// The inverse of [`civil_epoch_days`]: the proleptic-Gregorian
+/// `year-month-day` that is `days` days from 1970-01-01 (civil-from-days
+/// over i128, matching the forward direction's unbounded civil years).
+/// The one inverse: changelog date rendering and any other days→date
+/// consumer consults it instead of re-deriving the algorithm.
+pub fn civil_from_days(days: i128) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = era * 400 + yoe;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y } as i64, m, d)
+}
+
 /// `dt + d`, erroring instead of panicking when the result is out of chrono
 /// range or the duration itself is out of `TimeDelta` bounds.
 fn checked_add_dur(dt: NaiveDateTime, d: Option<ChronoDur>) -> Result<NaiveDateTime> {
@@ -619,4 +637,168 @@ pub fn scale_duration(t: &Temporal, factor: f64) -> Result<Temporal> {
         days: super::f64_to_i64_range(days_out)?,
         nanos: super::f64_to_i128_range(nanos_out.trunc())?,
     })
+}
+
+/// The arith family's own tests: the date-plus-duration, scaling,
+/// duration-between and civil-day tests live beside the functions they
+/// pin (the cross-module temporal behavior stays in `tests.rs`, and the
+/// out-of-range sweep in `tests_ranges.rs`).
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::temporal::{construct_date, construct_duration, parse_iso};
+    use crate::Value;
+
+    /// The arithmetic path delegates to the exported resolver, keeping its
+    /// `Option` contract: a zoned wall clock resolves, a DST gap yields `None`
+    /// and surfaces as the path's existing error (ADR-0178).
+    #[test]
+    fn duration_between_zoned_wall_clock_delegates_to_resolver() {
+        let zoned = parse_iso("datetime", "2015-01-01T00:00[Europe/Stockholm]").unwrap();
+        let local = Temporal::LocalDateTime(
+            NaiveDate::from_ymd_opt(2015, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            duration_between(&local, &zoned).unwrap().iso_string(),
+            "PT0S"
+        );
+
+        let gap = Temporal::LocalDateTime(
+            NaiveDate::from_ymd_opt(2021, 3, 28)
+                .unwrap()
+                .and_hms_opt(2, 30, 0)
+                .unwrap(),
+        );
+        let gap_zone = parse_iso("datetime", "2021-03-28T01:00[Europe/Stockholm]").unwrap();
+        assert_eq!(
+            duration_between(&gap, &gap_zone),
+            Err(Error::ty("duration.between"))
+        );
+    }
+
+    #[test]
+    fn date_plus_fractional_duration() {
+        let date = construct_date(Some(&Value::Map(
+            [
+                ("year".into(), Value::Int(1984)),
+                ("month".into(), Value::Int(10)),
+                ("day".into(), Value::Int(11)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+        )))
+        .unwrap();
+        let dur = construct_duration(Some(&Value::Map(
+            [
+                ("years".into(), Value::Float(12.5)),
+                ("months".into(), Value::Float(5.5)),
+                ("days".into(), Value::Float(14.5)),
+                ("hours".into(), Value::Float(16.5)),
+                ("minutes".into(), Value::Float(12.5)),
+                ("seconds".into(), Value::Float(70.5)),
+                ("nanoseconds".into(), Value::Int(3)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+        )))
+        .unwrap();
+        assert_eq!(
+            add_duration(&date, &dur).unwrap().iso_string(),
+            "1997-10-11"
+        );
+        assert_eq!(
+            sub_duration(&date, &dur).unwrap().iso_string(),
+            "1971-10-12"
+        );
+    }
+
+    #[test]
+    fn date_plus_duration_months_and_neg_days() {
+        let d = construct_duration(Some(&Value::Map(
+            [
+                ("months".into(), Value::Int(1)),
+                ("days".into(), Value::Int(-14)),
+                ("hours".into(), Value::Int(16)),
+                ("minutes".into(), Value::Int(-12)),
+                ("seconds".into(), Value::Int(70)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+        )))
+        .unwrap();
+        let date = construct_date(Some(&Value::Map(
+            [
+                ("year".into(), Value::Int(1984)),
+                ("month".into(), Value::Int(10)),
+                ("day".into(), Value::Int(11)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+        )))
+        .unwrap();
+        let sum = add_duration(&date, &d).unwrap();
+        let diff = sub_duration(&date, &d).unwrap();
+        assert_eq!(sum.iso_string(), "1984-10-28", "sum {sum:?}");
+        assert_eq!(diff.iso_string(), "1984-09-25", "diff {diff:?}");
+    }
+
+    #[test]
+    fn scale_duration_half() {
+        let d = construct_duration(Some(&Value::Map(
+            [
+                ("years".into(), Value::Int(12)),
+                ("months".into(), Value::Int(5)),
+                ("days".into(), Value::Int(14)),
+                ("hours".into(), Value::Int(16)),
+                ("minutes".into(), Value::Int(12)),
+                ("seconds".into(), Value::Int(70)),
+                ("nanoseconds".into(), Value::Int(1)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+        )))
+        .unwrap();
+        let half = scale_duration(&d, 0.5).unwrap();
+        assert_eq!(half.iso_string(), "P6Y2M22DT13H21M8S");
+    }
+
+    /// ADR-0325: the one civil-day count, from the proleptic Gregorian epoch
+    /// origin — civil-date arithmetic and the Bolt Date struct both read it.
+    #[test]
+    fn civil_epoch_days_counts_from_the_epoch() {
+        assert_eq!(civil_epoch_days(1970, 1, 1), 0);
+        assert_eq!(civil_epoch_days(2024, 1, 2), 19724);
+        assert_eq!(civil_epoch_days(1969, 12, 31), -1);
+    }
+
+    /// The inverse holds over leap-day edges and both eras: every round trip
+    /// returns the input triple, including the Julian-era dates the proleptic
+    /// calendar spans.
+    #[test]
+    fn civil_from_days_inverts_civil_epoch_days() {
+        for &(y, m, d) in &[
+            (1970i64, 1u32, 1u32),
+            (2024, 1, 2),
+            (1969, 12, 31),
+            (2000, 2, 29),
+            (1900, 2, 28),
+            (2100, 3, 1),
+            (1, 1, 1),
+            (-1, 12, 31),
+        ] {
+            let days = civil_epoch_days(y, m, d);
+            assert_eq!(civil_from_days(days), (y, m, d));
+        }
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
 }

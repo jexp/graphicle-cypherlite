@@ -4,7 +4,7 @@
 //! exports) and by the planner to seed a `NEXT` stage's binding environment.
 
 use cypherlite_core::{Error, Result};
-use cypherlite_ir::{Clause, Expr, PathPattern, PatternElement, Query, SingleQuery};
+use cypherlite_ir::{Clause, Expr, PathPattern, PatternElement, Projection, Query, SingleQuery};
 
 pub(crate) fn query_output_names(query: &Query) -> Result<Vec<String>> {
     query_output_names_with_seed(query, Vec::new())
@@ -20,6 +20,55 @@ pub(crate) fn query_output_names_with_seed(
     } else {
         Ok(output)
     }
+}
+
+/// Push a synthetic bare-variable `Projection` for each imported name the
+/// item list does not already project. Shared by
+/// [`query_with_persistent_imports`]'s WITH-item and terminal-RETURN walks.
+fn push_missing_imports(items: &mut Vec<Projection>, imported: &[String]) {
+    for name in imported {
+        if !items
+            .iter()
+            .any(|item| matches!(&item.expr, Expr::Variable(variable) if variable == name))
+        {
+            items.push(Projection {
+                expr: Expr::Variable(name.clone()),
+                alias: None,
+                source_text: None,
+            });
+        }
+    }
+}
+
+/// Rewrite `query` so every imported name survives its `WITH`s: the name is
+/// added as a bare-variable projection item where the item list does not
+/// already carry it, and the terminal `RETURN` of a `NEXT` stage gets the
+/// same treatment. Validation uses the rewrite to admit the imports; the
+/// executor's expression subqueries (`EXISTS`/`COUNT`/`COLLECT`) use it so
+/// an implicitly imported outer variable stays a grouping key of an
+/// aggregating `WITH`. A query transformation, not a validation check: this
+/// module already owns the import/export name computation.
+pub fn query_with_persistent_imports(query: &Query, imported: &[String]) -> Query {
+    let mut query = query.clone();
+    // The NEXT-stage rule is a property of the query, not of each part:
+    // decide it once outside the part walk.
+    let has_next = query.next.is_some();
+    for part in &mut query.parts {
+        for clause in &mut part.clauses {
+            if let Clause::With { items, .. } = clause {
+                push_missing_imports(items, imported);
+            }
+        }
+        if has_next {
+            if let Some(Clause::Return { items, .. }) = part.clauses.last_mut() {
+                push_missing_imports(items, imported);
+            }
+        }
+    }
+    if let Some(next) = &mut query.next {
+        **next = query_with_persistent_imports(next, imported);
+    }
+    query
 }
 
 /// Output names of a single query stage (its `parts`, ignoring `next`).
@@ -144,9 +193,7 @@ fn part_output_names(clauses: &[Clause], mut names: Vec<String>) -> Result<Vec<S
             | Clause::Remove { .. }
             | Clause::CreateIndex { .. }
             | Clause::DropIndex { .. }
-            | Clause::ShowIndexes
-            | Clause::CreateConstraint { .. }
-            | Clause::DropConstraint { .. } => {}
+            | Clause::ShowIndexes => {}
         }
     }
     if matches!(clauses.last(), Some(Clause::Catalog(_))) {

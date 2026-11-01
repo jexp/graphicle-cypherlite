@@ -9,11 +9,7 @@ mod common;
 
 use cypherlite::Value;
 
-use common::{assert_unknown_output_fails, connection, string};
-
-fn strings(values: &[&str]) -> Value {
-    Value::List(values.iter().map(|v| string(v)).collect::<Vec<_>>().into())
-}
+use common::{assert_unknown_output_fails, connection, string, strings};
 
 /// Fixture covering every acceptance shape:
 /// - two single-label node kinds: `:Person` (name) and `:Movie` (title);
@@ -429,4 +425,73 @@ fn yield_of_unknown_column_fails_validation() {
     ] {
         assert_unknown_output_fails(&format!("{call} YIELD {unknown} RETURN {unknown}"), unknown);
     }
+}
+
+/// A null `options` argument selects no graph: Neo4j answers zero rows
+/// rather than the whole stored schema. (A missing argument keeps the
+/// documented whole-schema output; see the zero-arg cases above.)
+#[test]
+fn schema_visualization_null_options_selects_nothing() {
+    let mut c = visualization_fixture();
+    let result = c
+        .query("CALL db.schema.visualization(null) YIELD nodes, relationships RETURN nodes, relationships")
+        .unwrap();
+    assert!(
+        result.rows.is_empty(),
+        "a null options map must yield zero rows, got {:?}",
+        result.rows
+    );
+}
+
+/// The virtual entities `db.schema.visualization` yields carry their
+/// property maps through `keys()` and `properties()`: the nodes expose
+/// `name`/`indexes`/`constraints`, the relationships `name` (their type).
+/// They have no store entry (CIP-257), so the builtins read the value
+/// itself instead of the store.
+#[test]
+fn visualization_virtual_entities_expose_their_property_maps() {
+    let mut c = visualization_fixture();
+    let nodes = c
+        .query(
+            "CALL db.schema.visualization() YIELD nodes UNWIND nodes AS n \
+             RETURN n.name AS name, keys(n) AS keys, properties(n) AS props ORDER BY name",
+        )
+        .unwrap();
+    assert_eq!(nodes.header.columns, ["name", "keys", "props"]);
+    let first = &nodes.rows[0];
+    assert_eq!(first[0], Value::String("Employee".into()));
+    assert_eq!(
+        first[1],
+        Value::List(
+            vec![
+                Value::String("constraints".into()),
+                Value::String("indexes".into()),
+                Value::String("name".into()),
+            ]
+            .into()
+        )
+    );
+    let Value::Map(props) = &first[2] else {
+        panic!("properties(n) is a map, got {:?}", first[2]);
+    };
+    assert_eq!(props.get("name"), Some(&Value::String("Employee".into())));
+
+    let rels = c
+        .query(
+            "CALL db.schema.visualization() YIELD relationships UNWIND relationships AS r \
+             RETURN r.name AS name, keys(r) AS keys, properties(r) AS props ORDER BY name",
+        )
+        .unwrap();
+    assert!(!rels.rows.is_empty());
+    let Value::List(rel_keys) = &rels.rows[0][1] else {
+        panic!("keys(r) is a list, got {:?}", rels.rows[0][1]);
+    };
+    assert_eq!(rel_keys.as_slice(), [Value::String("name".into())]);
+    let Value::Map(rel_props) = &rels.rows[0][2] else {
+        panic!("properties(r) is a map, got {:?}", rels.rows[0][2]);
+    };
+    assert_eq!(
+        rel_props.get("name"),
+        Some(&Value::String("ACTED_IN".into()))
+    );
 }

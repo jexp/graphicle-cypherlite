@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use cypherlite_core::{Error, Result};
 
-use super::{Vfs, VfsFile, VfsMeta, VfsOpen};
+use super::{is_virtual_prefix, virtual_entry_meta, Vfs, VfsFile, VfsMeta, VfsOpen};
 
 struct MemoryInner {
     files: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -35,8 +35,7 @@ impl Default for MemoryVfs {
 }
 
 fn is_prefix(files: &BTreeMap<String, Vec<u8>>, path: &str) -> bool {
-    let p = format!("{path}/");
-    files.keys().any(|k| k.starts_with(&p))
+    is_virtual_prefix(files.keys().map(String::as_str), path)
 }
 
 impl Vfs for MemoryVfs {
@@ -79,19 +78,11 @@ impl Vfs for MemoryVfs {
 
     fn metadata(&self, path: &str) -> Result<VfsMeta> {
         let files = self.lock();
-        if let Some(b) = files.get(path) {
-            return Ok(VfsMeta {
-                len: b.len() as u64,
-                is_dir: false,
-            });
-        }
-        if is_prefix(&files, path) {
-            return Ok(VfsMeta {
-                len: 0,
-                is_dir: true,
-            });
-        }
-        Err(Error::io(format!("missing {path}")))
+        virtual_entry_meta(
+            files.get(path).map(|b| b.len() as u64),
+            is_prefix(&files, path),
+            path,
+        )
     }
 
     fn open(&self, path: &str, opts: VfsOpen) -> Result<Box<dyn VfsFile>> {

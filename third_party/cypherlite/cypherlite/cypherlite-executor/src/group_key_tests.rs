@@ -141,20 +141,47 @@ mod tests {
     }
 
     #[test]
-    fn temporal_instants_group_by_instant_not_offset() {
+    fn temporal_values_group_by_local_time_and_offset() {
         let g = Graph::default();
-        // 12:00+01:00 and 13:00+02:00 denote the same instant; equivalence
-        // follows Temporal::compare (and hence UNION/eq_non_null).
+        // 12:00+01:00 and 13:00+02:00 denote the same instant but are
+        // different times: `=` and the equivalence key both keep them apart
+        // (TCK TemporalCompare).
         let r = exec_cypher(
             &g,
             "UNWIND [time('12:00+01:00'), time('13:00+02:00')] AS x RETURN count(DISTINCT x)",
         );
-        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
         let r = exec_cypher(
             &g,
             "RETURN time('12:00+01:00') AS x UNION RETURN time('13:00+02:00') AS x",
         );
-        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows.len(), 2);
+        // `Z` and `+00:00` are one value.
+        let r = exec_cypher(
+            &g,
+            "UNWIND [time('12:00Z'), time('12:00+00:00')] AS x RETURN count(DISTINCT x)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn datetime_dst_overlap_groups_separately_while_equal() {
+        let g = Graph::default();
+        // Same local date-time and zone, different offsets: `=` holds, the
+        // key does not (the spec's documented divergence).
+        let r = exec_cypher(
+            &g,
+            "WITH datetime('2025-10-26T02:30:00.0+0200[Europe/Stockholm]') AS a, \
+                  datetime('2025-10-26T02:30:00.0+0100[Europe/Stockholm]') AS b \
+             UNWIND [a, b] AS x RETURN count(DISTINCT x)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        let r = exec_cypher(
+            &g,
+            "RETURN datetime('2025-10-26T02:30:00.0+0200[Europe/Stockholm]') = \
+                    datetime('2025-10-26T02:30:00.0+0100[Europe/Stockholm]') AS eq",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Bool(true)]]);
     }
 
     #[test]

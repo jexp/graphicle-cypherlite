@@ -5,6 +5,7 @@ pub(crate) mod ast;
 mod call_scope;
 pub(crate) mod local_callables;
 mod lower;
+mod output_vars;
 pub mod show_columns;
 pub mod validate;
 

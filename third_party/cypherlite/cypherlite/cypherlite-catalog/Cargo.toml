@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Label, relationship-type, and named-index catalog"
+license.workspace = true
 
 [dependencies]
 cypherlite-core = { workspace = true }

@@ -593,11 +593,17 @@ fn cip_expression_types_reductions_and_values() {
         .unwrap();
     assert_eq!(r.rows, vec![vec![Value::Float(f64::INFINITY)]]);
 }
+/// A deleted entity stays addressable through the variable that bound it:
+/// the row keeps an **empty tombstone** (the same id, no labels, no
+/// properties — a returned deleted node renders `()`, CIP-202 [21]-[24]),
+/// so a later `MATCH` on the same variable still matches it while the
+/// store no longer holds the node. Property *reads* against the deleted
+/// entity are refused (`DeletedEntityAccess`).
 #[test]
 fn deleted_node_binding_remains_as_empty_tombstone() {
     let db = Database::open(":memory:").unwrap();
     let mut c = db.connect().unwrap();
-    c.query("CREATE (:X), (:Y)").unwrap();
+    c.query("CREATE (:X {p: 1}), (:Y)").unwrap();
     let result = c
         .query("MATCH (u:X) DELETE u UNWIND [1] AS x RETURN u, x")
         .unwrap();
@@ -606,6 +612,24 @@ fn deleted_node_binding_remains_as_empty_tombstone() {
     };
     assert!(node.labels.is_empty());
     assert!(node.properties.is_empty());
+}
+
+/// A later `MATCH` on the deleted-but-bound variable still matches it: the
+/// row binds the entity, so the pattern re-match reads the snapshot rather
+/// than the (now empty) store.
+#[test]
+fn deleted_node_binding_still_matches_a_later_pattern() {
+    let db = Database::open(":memory:").unwrap();
+    let mut c = db.connect().unwrap();
+    c.query("CREATE (:X {p: 1}), (:X {p: 2}), (:X {p: 3})")
+        .unwrap();
+    let result = c
+        .query("MATCH (u:X) DELETE u WITH u MATCH (u) RETURN 1 AS one")
+        .unwrap();
+    assert_eq!(result.rows.len(), 3);
+    // The store really is empty: an unbound pattern finds nothing.
+    let after = c.query("MATCH (x:X) RETURN x").unwrap();
+    assert!(after.rows.is_empty());
 }
 
 fn symbol_file(path: &str, names: &[&str]) -> Value {

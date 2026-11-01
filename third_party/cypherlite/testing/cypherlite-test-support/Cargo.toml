@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Shared test-only helpers for the CypherLite workspace (big-stack runner, platform samplers, fixture files, loopback Query API fixture)"
 publish = false
+license.workspace = true
 
 # The loopback fixture is split in two: the wire side (client exchanges,
 # request builders, response parsers, scripted servers — `wire`, needing
@@ -22,6 +23,9 @@ cypherlite-error = { workspace = true, optional = true }
 cypherlite-executor = { workspace = true, optional = true }
 cypherlite-core = { workspace = true }
 cypherlite-load = { workspace = true, optional = true }
+# The recursive VFS traversal (`vfs_walk`) the store suites share: pulls
+# only the storage crate's `Vfs` trait, no engine features.
+cypherlite-storage = { workspace = true, optional = true }
 # The `wire` fixture's gzip inflate helper (the wire tests' gzip bodies).
 flate2 = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -41,9 +45,15 @@ bolt = ["dep:cypherlite-bolt"]
 # (cypherlite-executor and cypherlite as dev-deps) enable it, so the
 # general-purpose users of this crate do not compile the engine.
 nested_eval = ["dep:cypherlite-error", "dep:cypherlite-executor"]
+# The envelope-keys pin (ADR-0430 §6) the first-party children's tests and
+# the wire kit's own call.
+envelope = ["dep:serde_json"]
 # The wire fixtures: raw client, request builders, response parsers,
 # scripted servers. No loader.
 wire = ["dep:flate2"]
 # The full loopback Query API fixture: `wire` plus the `LoadOpts` bridge the
 # pull/loader tests use.
 loopback = ["wire", "dep:cypherlite-load", "dep:serde_json"]
+# The recursive `Vfs` traversal (`vfs_walk`): the golden-store and
+# markdown-vault suites' one walk policy.
+vfs_walk = ["dep:cypherlite-storage"]
