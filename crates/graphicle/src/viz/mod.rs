@@ -151,7 +151,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Supply-chain Risk",
         description: "Advisory exposure of files and symbols through the packages their imports resolve to",
         mermaid: true,
-        render: risk_overlay,
+        render: risk_overlay::view,
     },
     Family {
         slug: "drift-timeline",
@@ -549,13 +549,11 @@ fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) ->
     Ok(stub(false))
 }
 
-fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(true))
-}
-
 fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
+
+mod risk_overlay;
 
 #[cfg(test)]
 mod tests;

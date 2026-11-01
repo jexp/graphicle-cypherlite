@@ -7,12 +7,18 @@ use super::*;
 use crate::api::{self, App};
 use crate::model;
 use crate::store::s;
+use crate::supply_chain::resolve;
+use crate::supply_chain::tools_tests::{APP, Fixture, RUSTSEC_ID, import};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::result::Result;
 use tempfile::TempDir;
 
 /// The repository the fixtures seed.
 const REPO: &str = "viz";
+
+/// The families whose nodes have landed: their views are no longer stubs.
+const LANDED: [&str; 1] = ["risk-overlay"];
 
 /// A graph store with one repository and the least history facts a family
 /// reads: one commit, its one modification, one file (the history writer's
@@ -147,6 +153,9 @@ fn every_family_is_listed_as_a_resource_and_reads_as_a_stub() {
         // The stub's text report: the note, the section empty — a resource
         // answers, never errors, exactly as the history pack's families do
         // on a repository without their facts.
+        if LANDED.contains(&family.slug) {
+            continue;
+        }
         let report = report(&graph, REPO, family.slug).unwrap();
         assert_eq!(report, format!("{NOT_YET}:\n  none"), "{}", family.slug);
         // The stub's json view-model: the empty object, the family named.
@@ -284,7 +293,10 @@ fn mermaid_is_served_only_by_the_families_that_declare_it() {
     let graph = graph();
     // A declared family: the stub's note as a mermaid comment, which is a
     // valid diagram.
-    for family in FAMILIES.iter().filter(|family| family.mermaid) {
+    for family in FAMILIES
+        .iter()
+        .filter(|family| family.mermaid && !LANDED.contains(&family.slug))
+    {
         let answer = render(
             &graph,
             REPO,
@@ -468,5 +480,245 @@ fn viz_view_answers_on_the_tool_surface_read_only() {
         error.message.starts_with("Unknown viz family: city"),
         "{}",
         error.message
+    );
+}
+
+// The `risk-overlay` family, on the supply-chain facts the tools fixture
+// seeds: `src/app.rs` imports `time` on line 3 (locked at 0.2.22, which
+// GHSA-wcg3-cvx6-7396 and RUSTSEC-2020-0071 affect; the fix is 0.2.23 for
+// RUSTSEC) and `serde` on line 1 (clean).
+
+const TIME_KEY: &str = "pkg:cargo/time@0.2.22";
+
+/// The default fixture with a second file importing `time` on line 7.
+fn two_files() -> Fixture {
+    let fixture = Fixture::new();
+    import(
+        &fixture.graph(),
+        &fixture.repo,
+        "src/other.rs",
+        7,
+        "time::Duration",
+    );
+    resolve::resolve(&fixture.graph(), &fixture.repo).unwrap();
+    fixture
+}
+
+/// The entry of `key` in a model list, by its `field`.
+fn entry<'a>(list: &'a Value, field: &str, key: &str) -> &'a Value {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e[field] == key)
+        .unwrap_or_else(|| panic!("no {key} in {list}"))
+}
+
+#[test]
+fn risk_overlay_advisories_match_vuln_impact_for_the_same_files_and_fixed_in() {
+    let fixture = Fixture::new();
+    let view = risk_overlay::view(&fixture.graph(), &fixture.repo, &Params::default()).unwrap();
+    let advisories = &view.model["advisories"];
+    assert_eq!(advisories.as_array().unwrap().len(), 2, "{}", view.model);
+    let time = fixture
+        .call("vuln_impact", json!({"package": "time"}))
+        .unwrap();
+    for advisory in advisories.as_array().unwrap() {
+        let osv = advisory["osv_id"].as_str().unwrap();
+        let impact = fixture
+            .call("vuln_impact", json!({"advisory": osv}))
+            .unwrap();
+        // The same files, cited the same way, and the same advisory record.
+        assert_eq!(advisory["files"], impact["files"], "{osv}");
+        assert_eq!(advisory["exposure"], impact["summary"]["files"], "{osv}");
+        assert_eq!(
+            advisory["citations"], impact["summary"]["citations"],
+            "{osv}"
+        );
+        assert_eq!(advisory["title"], impact["advisory"]["title"], "{osv}");
+        assert_eq!(advisory["url"], impact["advisory"]["url"], "{osv}");
+        // Each version's fixed_in is the one the package answer names.
+        for version in advisory["versions"].as_array().unwrap() {
+            let locked = entry(
+                &time["versions"],
+                "purl_at_version",
+                version["purl_at_version"].as_str().unwrap(),
+            );
+            let record = entry(&locked["advisories"], "osv_id", osv);
+            assert_eq!(version["fixed_in"], record["fixed_in"], "{osv}");
+        }
+    }
+    let rustsec = entry(advisories, "osv_id", RUSTSEC_ID);
+    assert_eq!(rustsec["versions"][0]["purl_at_version"], TIME_KEY);
+    assert_eq!(rustsec["versions"][0]["fixed_in"], "0.2.23");
+    // The file's advisories carry the same fixed_in.
+    let file = &view.model["files"][0];
+    assert_eq!(file["path"], APP);
+    assert_eq!(file["exposure"], 2);
+    let in_file = entry(&file["advisories"], "osv_id", RUSTSEC_ID);
+    assert_eq!(in_file["fixed_in"], "0.2.23");
+}
+
+#[test]
+fn risk_overlay_column_is_the_ranked_list_projected_per_file() {
+    let fixture = two_files();
+    let view = risk_overlay::view(&fixture.graph(), &fixture.repo, &Params::default()).unwrap();
+    let files = view.model["files"].as_array().unwrap();
+    // Both files reach the same two advisories: ties break on the evidence.
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, [APP, "src/other.rs"]);
+    assert_eq!(files[1]["evidence"], "src/other.rs:7");
+    // The column is the list's own per-file projection, value for value.
+    let column: Vec<Value> = files
+        .iter()
+        .map(|f| json!({"path": f["path"], "value": f["exposure"]}))
+        .collect();
+    assert_eq!(view.model["overlay"]["values"], json!(column));
+    // The section prints the same rows in the same order.
+    let rows = &view.sections[0].1;
+    assert_eq!(rows.len(), files.len());
+    for (row, file) in rows.iter().zip(files) {
+        assert_eq!(row["file"], file["path"]);
+        assert_eq!(row["exposure"], file["exposure"]);
+    }
+    // A cap cuts the list and the column together.
+    let capped = Params {
+        cap: 1,
+        ..Params::default()
+    };
+    let view = risk_overlay::view(&fixture.graph(), &fixture.repo, &capped).unwrap();
+    assert_eq!(view.model["files"].as_array().unwrap().len(), 1);
+    assert_eq!(view.model["overlay"]["values"].as_array().unwrap().len(), 1);
+    assert_eq!(view.sections[0].1.len(), 1);
+    // The summary counts what the cap does not cut.
+    assert_eq!(view.model["summary"]["files"], 2);
+}
+
+#[test]
+fn risk_overlay_focus_draws_a_valid_quoted_exposure_subgraph() {
+    let fixture = two_files();
+    let graph = fixture.graph();
+    for focus in ["time", APP, "time::OffsetDateTime"] {
+        let params = Params {
+            focus: Some(focus.to_owned()),
+            ..Params::default()
+        };
+        let view = risk_overlay::view(&graph, &fixture.repo, &params).unwrap();
+        let mermaid = view
+            .mermaid
+            .unwrap_or_else(|| panic!("no mermaid for {focus}"));
+        assert!(mermaid.starts_with("graph LR\n"), "{mermaid}");
+        let mut declared = BTreeSet::new();
+        for line in mermaid.lines().skip(1) {
+            if let Some((id, label)) = line.trim().split_once("[\"") {
+                // A node: quoted, its quotes balanced, its citation or name in it.
+                assert!(label.ends_with("\"]"), "{line}");
+                assert_eq!(line.matches('"').count(), 2, "{line}");
+                declared.insert(id.to_owned());
+            } else {
+                assert!(line.contains(" --> "), "{line}");
+            }
+        }
+        for line in mermaid.lines().skip(1).filter(|l| l.contains(" --> ")) {
+            let (from, to) = line.trim().split_once(" --> ").unwrap();
+            assert!(declared.contains(from) && declared.contains(to), "{line}");
+        }
+        assert!(mermaid.contains("[\"src/app.rs:3\"]"), "{mermaid}");
+        assert!(
+            mermaid.contains(&format!("[\"{RUSTSEC_ID}\"]")),
+            "{mermaid}"
+        );
+    }
+    // No focus: no diagram. A focus no import resolves: no diagram, named.
+    let unfocused = risk_overlay::view(&graph, &fixture.repo, &Params::default()).unwrap();
+    assert!(unfocused.mermaid.is_none());
+    let absent = Params {
+        focus: Some("nothing_here".to_owned()),
+        ..Params::default()
+    };
+    let view = risk_overlay::view(&graph, &fixture.repo, &absent).unwrap();
+    assert!(view.mermaid.is_none());
+    assert!(
+        view.model["not_known"][0]
+            .as_str()
+            .unwrap()
+            .contains("nothing_here")
+    );
+    // The focus scopes the list too: serde (clean) has no exposure at all.
+    let serde = Params {
+        focus: Some("serde".to_owned()),
+        ..Params::default()
+    };
+    let view = risk_overlay::view(&graph, &fixture.repo, &serde).unwrap();
+    assert_eq!(view.model["files"], json!([]));
+    assert!(view.mermaid.is_none());
+}
+
+#[test]
+fn risk_overlay_is_deterministic_cited_and_repository_bound() {
+    let fixture = two_files();
+    let graph = fixture.graph();
+    let params = Params::parse(&json!({"cap": 10, "focus": "time"})).unwrap();
+    let reordered = Params::parse(&json!({"focus": "time", "cap": 10})).unwrap();
+    for (first_params, second_params) in
+        [(Params::default(), Params::default()), (params, reordered)]
+    {
+        let first = risk_overlay::view(&graph, &fixture.repo, &first_params).unwrap();
+        let second = risk_overlay::view(&graph, &fixture.repo, &second_params).unwrap();
+        assert_eq!(
+            serde_json::to_string(&first.model).unwrap(),
+            serde_json::to_string(&second.model).unwrap()
+        );
+        assert_eq!(first.mermaid, second.mermaid);
+        assert_eq!(
+            serde_json::to_string(&first.sections).unwrap(),
+            serde_json::to_string(&second.sections).unwrap()
+        );
+    }
+    // The text and json forms of the family serve the same bytes twice.
+    let text = report(&graph, &fixture.repo, "risk-overlay").unwrap();
+    assert_eq!(text, report(&graph, &fixture.repo, "risk-overlay").unwrap());
+    assert!(
+        text.contains("src/app.rs:3") && text.contains(RUSTSEC_ID),
+        "{text}"
+    );
+    // Citation rule: every ranked row names its file and line.
+    let view = risk_overlay::view(&graph, &fixture.repo, &Params::default()).unwrap();
+    for file in view.model["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap();
+        assert!(
+            file["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{path}:")),
+            "{file}"
+        );
+    }
+    for (_, rows) in &view.sections {
+        for row in rows {
+            assert!(
+                !row["evidence"].as_str().unwrap_or_default().is_empty(),
+                "{row}"
+            );
+        }
+    }
+    // Repository-bound: another project on the same store sees none of these
+    // facts (its own not-scanned note, no rows), and the view never reads
+    // through (:Project).
+    let other = fixture
+        .store
+        .register(
+            &fixture.workspace,
+            &fixture.key,
+            &json!({"project_key": "other", "name": "other"}),
+        )
+        .unwrap();
+    let view = risk_overlay::view(&graph, s(&other, "id"), &Params::default()).unwrap();
+    assert_eq!(view.model["files"], json!([]));
+    assert_eq!(view.model["summary"]["citations"], 0);
+    assert!(
+        view.model["not_known"][0]
+            .as_str()
+            .unwrap()
+            .contains("OSV has not scanned")
     );
 }
