@@ -1,0 +1,12 @@
+{
+  "_note": "Recorded shape of POST /v1/querybatch for two queries, in the order the client sends them (sorted by purl_at_version): serde 1.0.200 (clean) first, then time 0.2.22 (crates.io), which names two advisories. Hand-written from the OSV v1 documented shape and checked against a live api.osv.dev answer on 2026-11-01. OSV answers in query order; a query with no advisories is an empty object.",
+  "results": [
+    {},
+    {
+      "vulns": [
+        {"id": "GHSA-wcg3-cvx6-7396", "modified": "2026-09-10T03:49:08.359875Z"},
+        {"id": "RUSTSEC-2020-0071", "modified": "2026-02-04T02:31:56.682937Z"}
+      ]
+    }
+  ]
+}

@@ -458,6 +458,12 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
                            purl IS STRING, name IS STRING, version IS STRING,
                            source_kind IS STRING, source IS STRING, source_url IS STRING,
                            source_rev IS STRING}),
+    // OSV advisories (supply-chain plan §2; written by supply_chain::osv). Scoped
+    // to the repository like every label: one advisory in two projects is two
+    // nodes. `aliases` is the JSON array the advisory reports.
+    (ad:Advisory => {repository_id IS STRING NOT NULL, osv_id IS STRING NOT NULL,
+                     title IS STRING, aliases IS STRING, url IS STRING}),
+    (ac:AdvisoryCorpus => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -477,6 +483,8 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (tg:Tag) REQUIRE (tg.repository_id, tg.name) IS KEY,
     CONSTRAINT FOR (pk:Package) REQUIRE (pk.repository_id, pk.purl) IS KEY,
     CONSTRAINT FOR (pv:PackageVersion) REQUIRE (pv.repository_id, pv.purl_at_version) IS KEY,
+    CONSTRAINT FOR (ad:Advisory) REQUIRE (ad.repository_id, ad.osv_id) IS KEY,
+    CONSTRAINT FOR (ac:AdvisoryCorpus) REQUIRE (ac.repository_id, ac.source) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -548,6 +556,8 @@ const INDEXES: &[&str] = &[
     // MATCH lookups of the lockfile writer, scoped by repository_id.
     "CREATE INDEX package_key IF NOT EXISTS FOR (pk:Package) ON (pk.repository_id, pk.purl)",
     "CREATE INDEX package_version_key IF NOT EXISTS FOR (pv:PackageVersion) ON (pv.repository_id, pv.purl_at_version)",
+    // OSV advisories (supply_chain::osv): the MERGE anchor of the advisory batches.
+    "CREATE INDEX advisory_key IF NOT EXISTS FOR (ad:Advisory) ON (ad.repository_id, ad.osv_id)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:

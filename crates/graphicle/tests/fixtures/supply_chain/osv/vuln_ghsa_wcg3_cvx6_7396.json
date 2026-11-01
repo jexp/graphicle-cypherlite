@@ -1,0 +1,20 @@
+{
+  "_note": "Recorded shape of GET /v1/vulns/GHSA-wcg3-cvx6-7396, the GitHub advisory for the same time crate defect as RUSTSEC-2020-0071, trimmed to the fields the client reads. Hand-written from the OSV v1 documented shape and checked against a live api.osv.dev answer on 2026-11-01. Its two affected entries are the 0.1 and 0.2.7+ lines.",
+  "id": "GHSA-wcg3-cvx6-7396",
+  "summary": "Segmentation fault in time",
+  "aliases": ["CVE-2020-26235", "RUSTSEC-2020-0071"],
+  "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}],
+  "references": [
+    {"type": "ADVISORY", "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-26235"}
+  ],
+  "affected": [
+    {
+      "package": {"name": "time", "ecosystem": "crates.io", "purl": "pkg:cargo/time"},
+      "ranges": [{"type": "SEMVER", "events": [{"introduced": "0.1.0"}, {"fixed": "0.2.23"}]}]
+    },
+    {
+      "package": {"name": "time", "ecosystem": "crates.io", "purl": "pkg:cargo/time"},
+      "ranges": [{"type": "SEMVER", "events": [{"introduced": "0.2.7"}, {"fixed": "0.2.23"}]}]
+    }
+  ]
+}

@@ -198,6 +198,14 @@ pub async fn execute(worker: &Worker, job: &Job) -> Result<Value> {
                 .await
                 .map_err(|_| Error::bad("Co-change derivation interrupted"))?
         }
+        crate::supply_chain::osv::KIND => {
+            let store = worker.store.clone();
+            let job = job.clone();
+            // Blocking HTTP on a runtime of its own, and batched writes; off the async executor.
+            tokio::task::spawn_blocking(move || jobs::run_osv(&store, &job))
+                .await
+                .map_err(|_| Error::bad("OSV advisory query interrupted"))?
+        }
         _ => match crate::extension::installed().job(worker, job) {
             Some(run) => run.await,
             // Known by name, run only by an extension (never leased without one).

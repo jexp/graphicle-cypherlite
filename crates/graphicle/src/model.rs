@@ -268,6 +268,12 @@ pub struct SyncSettings {
     /// `GRAPHICLE_SYNC_TRACKED_IGNORED` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracked_ignored: Option<bool>,
+    /// `sync.osv`: whether a sync queues the OSV advisory query of the
+    /// lockfile (left out: yes; [`crate::supply_chain::osv::enabled`]). `false`
+    /// keeps a store offline: the lockfile is still read, nothing is sent. The
+    /// environment variable `GRAPHICLE_SYNC_OSV` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub osv: Option<bool>,
 }
 fn concurrency_default() -> usize {
     1

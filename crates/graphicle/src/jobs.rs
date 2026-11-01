@@ -328,6 +328,7 @@ const KINDS: &[(&str, &str)] = &[
     ("enrich", "read"),
     (crate::git_history::KIND, "read"),
     (crate::git_history::coupling::KIND, "read"),
+    (crate::supply_chain::osv::KIND, "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -1229,6 +1230,41 @@ pub fn enqueue_coupling(
     )
 }
 
+/// Queue the advisory query of a project's lockfile once the lockfile is
+/// ingested (supply-chain plan §4 P2): one `osv` job per lockfile digest, so a
+/// sync of an unchanged lockfile replays it. A failed or cancelled job starts
+/// again with a fresh budget. `enabled` is [`crate::supply_chain::osv::enabled`];
+/// a store that has it off queues nothing and says why.
+pub fn enqueue_osv(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    digest: &str,
+    enabled: bool,
+) -> Result<Value> {
+    let kind = crate::supply_chain::osv::KIND;
+    if !enabled {
+        return Ok(json!({"kind": kind, "queued": false,
+            "reason": "the store is offline (sync.osv)"}));
+    }
+    let input_hash = crate::supply_chain::osv::input_hash(digest);
+    let payload = json!({"kind": kind, "digest": digest,
+        "format": crate::supply_chain::osv::FORMAT});
+    enqueue_keyed(
+        store,
+        db,
+        repository,
+        p,
+        Keyed {
+            kind,
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({}),
+        },
+    )
+}
+
 /// Execute a `history` job: ingest the project folder's git history into
 /// the store (git-to-graph plan §2–§4 and §6), resuming from the recorded
 /// head or rescanning when it went stale. The job's lease is renewed while
@@ -1319,6 +1355,45 @@ fn coupling_job(store: &Store, job: &Job) -> Result<Value> {
     crate::git_history::coupling::derive(&graph, &identifier, chrono::Utc::now(), &config, &|| {
         leased(&graph, job)
     })
+}
+
+/// Execute an `osv` job: query the OSV advisories of the project's lockfile
+/// and write them (supply_chain::osv). The packages are read from the graph
+/// as the lockfile ingest left them. The network runs on a runtime of its
+/// own, and the lease is checked again before anything is written. The job's
+/// lease is renewed while it runs.
+pub fn run_osv(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || osv_job(store, job))
+}
+
+fn osv_job(store: &Store, job: &Job) -> Result<Value> {
+    use crate::supply_chain::osv;
+    let graph = store.graph().clone();
+    let identifier = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission(osv::KIND)?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok(s(&repository, "id").to_string())
+    })?;
+    let targets = osv::targets(&graph, &identifier)?;
+    let wire = osv::wire()?;
+    let cache = osv::cache(&store.directory);
+    let scan = on_own_runtime("The OSV query", move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(osv::scan(&osv::Client::new(wire, cache), &targets))
+    })?;
+    leased(&graph, job)?;
+    let known_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut result = osv::write(&graph, &identifier, &scan, &known_at)?;
+    result["digest"] = job.payload["digest"].clone();
+    Ok(result)
 }
 
 /// Run `repository`'s waiting graph work in this
@@ -1447,6 +1522,22 @@ pub fn drain_projection_until(
                 "ok": false, "error": error.message}),
         },
     )?);
+    // The advisory query each lockfile ingest queued (supply-chain plan §4
+    // P2): one job per lockfile digest. A store that turned it off queues none.
+    results.extend(drain_kind(
+        store,
+        repository,
+        crate::supply_chain::osv::KIND,
+        &stopped,
+        &|store, job| crate::phase::phase("job_osv", || run_osv(store, job)),
+        &|job, result| match result {
+            Ok(value) => json!({"job": job.id, "kind": crate::supply_chain::osv::KIND,
+                "ok": true, "queried": value["queried"], "affected": value["affected"],
+                "clean": value["clean"]}),
+            Err(error) => json!({"job": job.id, "kind": crate::supply_chain::osv::KIND,
+                "ok": false, "error": error.message}),
+        },
+    )?);
     let kinds = crate::extension::installed().post_projection_kinds();
     if !kinds.is_empty() && !stopped() {
         // Post-projection kinds make no model call (`JobKind::after_projection`).
@@ -1520,16 +1611,23 @@ pub fn busy(error: &Error) -> bool {
 /// own with a current-thread runtime, so synchronous callers and callers
 /// inside the program's runtime can both wait for it.
 fn run_on_own_runtime(worker: &Worker, job: &Job) -> Result<Value> {
+    on_own_runtime("A job that follows the projection", || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(crate::workflows::execute(worker, job))
+    })
+}
+
+/// Run `work` on a thread of its own, so it can build and enter a runtime
+/// whether or not the caller is inside one. A panic is an error that names
+/// `what`.
+fn on_own_runtime<T: Send>(what: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(crate::workflows::execute(worker, job))
-            })
+            .spawn(work)
             .join()
-            .unwrap_or_else(|_| Err(Error::bad("A job that follows the projection panicked")))
+            .unwrap_or_else(|_| Err(Error::bad(format!("{what} panicked"))))
     })
 }
 #[track_caller]
@@ -2996,6 +3094,171 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pair["count"], json!(1), "{pair:#}");
+        drop(dir);
+    }
+
+    /// A store with a project `repo-osv` whose lockfile ingest left its
+    /// package facts, and the owner's principal.
+    fn lockfile_project() -> (tempfile::TempDir, Store, Principal) {
+        use crate::supply_chain::{lock, osv_tests::LOCK};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let created = store.create_workspace("osv").unwrap();
+        let workspace = created["id"].as_str().unwrap().to_string();
+        let token = created["capability"].as_str().unwrap();
+        let graph = store.graph().clone();
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "CREATE (p:Project {id: $id, workspace_id: $ws, project_key: $key})",
+                    graph::params(&json!({"id": "repo-osv", "ws": workspace, "key": "repo-osv"})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // The relational row `store::repo` authorizes a job's repository by.
+        store
+            .transaction(|db| {
+                db.execute(
+                    "INSERT INTO repo_projects(id,workspace_id,project_key,name,created_at,updated_at) \
+                     VALUES(?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "repo-osv", workspace, "repo-osv", "repo-osv",
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        lock::write(&graph, "repo-osv", &lock::parse(LOCK).unwrap()).unwrap();
+        let p = Principal {
+            workspace,
+            credential: "owner".into(),
+            hash: graphicle_memory::text::sha256(token.as_bytes()),
+            role: "owner".into(),
+        };
+        (dir, store, p)
+    }
+
+    /// The fixture wire of the OSV queries: the golden `time` answer, and the
+    /// two advisory details it names.
+    fn osv_wire() {
+        use crate::supply_chain::http_cache::test_transport::{FixtureTransport, json as body};
+        use crate::supply_chain::osv::{BASE_URL, install_fixture};
+        let batch = include_str!("../tests/fixtures/supply_chain/osv/querybatch_time_serde.json");
+        let rustsec =
+            include_str!("../tests/fixtures/supply_chain/osv/vuln_rustsec_2020_0071.json");
+        let ghsa = include_str!("../tests/fixtures/supply_chain/osv/vuln_ghsa_wcg3_cvx6_7396.json");
+        install_fixture(std::sync::Arc::new(FixtureTransport::new([
+            (format!("{BASE_URL}/querybatch"), body(batch)),
+            (format!("{BASE_URL}/vulns/RUSTSEC-2020-0071"), body(rustsec)),
+            (format!("{BASE_URL}/vulns/GHSA-wcg3-cvx6-7396"), body(ghsa)),
+        ])));
+    }
+
+    #[test]
+    fn an_osv_job_is_keyed_on_the_lockfile_digest() {
+        use crate::supply_chain::osv;
+        let (dir, store, p) = lockfile_project();
+        let enqueue = |digest: &str, enabled: bool| {
+            store
+                .transaction(|db| enqueue_osv(&store, db, "repo-osv", &p, digest, enabled))
+                .unwrap()
+        };
+
+        let first = enqueue("digest-1", true);
+        assert_eq!(first["queued"], json!(true), "{first:#}");
+        assert_eq!(first["replayed"], json!(false), "{first:#}");
+        // The same lockfile digest replays the waiting job.
+        let replay = enqueue("digest-1", true);
+        assert_eq!(replay["replayed"], json!(true), "{replay:#}");
+        assert_eq!(replay["id"], first["id"], "{replay:#}");
+        // A re-locked digest is a new job.
+        let relocked = enqueue("digest-2", true);
+        assert_eq!(relocked["replayed"], json!(false), "{relocked:#}");
+        assert_ne!(relocked["id"], first["id"]);
+        // An offline store queues nothing and says why.
+        let offline = enqueue("digest-3", false);
+        assert_eq!(offline["queued"], json!(false), "{offline:#}");
+        assert_eq!(offline["reason"], json!("the store is offline (sync.osv)"));
+        let jobs = store
+            .graph()
+            .read(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.input_hash AS hash",
+                    graph::params(&json!({"repo": "repo-osv", "kind": osv::KIND})),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            jobs.len(),
+            2,
+            "one job per digest, none for the offline store"
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| job["hash"] != json!(osv::input_hash("digest-3")))
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn the_osv_job_drains_through_the_shared_loop_and_writes_the_advisory() {
+        use crate::supply_chain::osv;
+        let (dir, store, p) = lockfile_project();
+        osv_wire();
+        store
+            .transaction(|db| enqueue_osv(&store, db, "repo-osv", &p, "digest-1", true))
+            .unwrap();
+
+        // The drain runs the osv job; it is the only kind queued.
+        let results = drain_projection(&store, "repo-osv").unwrap();
+        assert_eq!(results.len(), 1, "{results:#?}");
+        assert_eq!(results[0]["kind"], json!("osv"), "{results:#?}");
+        assert_eq!(results[0]["ok"], json!(true), "{results:#?}");
+        assert_eq!(results[0]["clean"], json!(1), "{results:#?}");
+        assert_eq!(
+            results[0]["affected"][0],
+            json!({"purl_at_version": "pkg:cargo/time@0.2.22",
+                   "osv_id": "GHSA-wcg3-cvx6-7396", "fixed_in": "0.2.23"}),
+            "{results:#?}"
+        );
+
+        // The job completed under the digest's input hash, and its edges landed.
+        let graph = store.graph().clone();
+        let job = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) \
+                     RETURN j.state AS state, j.input_hash AS hash",
+                    graph::params(&json!({"repo": "repo-osv", "kind": osv::KIND})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job["state"], json!("complete"), "{job:#}");
+        assert_eq!(job["hash"], json!(osv::input_hash("digest-1")));
+        let edge = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: 'pkg:cargo/time@0.2.22'})\
+                     -[r:AFFECTED_BY {osv_id: 'RUSTSEC-2020-0071'}]->(a:Advisory) \
+                     RETURN r.source AS source, a.title AS title",
+                    graph::params(&json!({"repo": "repo-osv"})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge["source"], json!("osv"), "{edge:#}");
+        assert_eq!(
+            edge["title"],
+            json!("Potential segfault in the time crate"),
+            "{edge:#}"
+        );
         drop(dir);
     }
 }
