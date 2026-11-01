@@ -985,6 +985,15 @@ fn sync_folder_with(
         Ok(None) => {}
         Err(error) => result["cargo_lock"] = json!({"error": error.message}),
     }
+    // The seam (plan §3): the code graph's Rust imports resolve against the
+    // packages the lockfile just wrote. The projection job runs it again
+    // once this head set's symbols exist, so neither order of arrival
+    // leaves it stale; never a failed sync.
+    match crate::supply_chain::resolve::resolve(&store.graph(), &repository) {
+        Ok(Some(report)) => result["cargo_resolve"] = report,
+        Ok(None) => {}
+        Err(error) => result["cargo_resolve"] = json!({"error": error.message}),
+    }
     Ok(result)
 }
 

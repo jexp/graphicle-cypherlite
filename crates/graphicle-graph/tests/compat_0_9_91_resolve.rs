@@ -737,10 +737,13 @@ fn rust_use_lands_on_the_declaration_without_an_annotation() {
             .all(|n| !n["source_file"].as_str().unwrap_or("").is_empty())
     );
     assert!(edges(&r).iter().chain(nodes(&r)).all(|item| {
-        item.as_object()
-            .unwrap()
-            .keys()
-            .all(|k| !k.starts_with("_rust_use"))
+        item.as_object().unwrap().keys().all(|k| {
+            // Upstream's transient `use` markers are all stripped (#4439,
+            // #4135). The use path and its local marker stay on purpose:
+            // they are the supply-chain seam's input (supply-chain plan §3,
+            // resolved in graphicle-runtime against the lockfile packages).
+            !k.starts_with("_rust_use") || k == "_rust_use_path" || k == "_rust_use_local"
+        })
     }));
 }
 

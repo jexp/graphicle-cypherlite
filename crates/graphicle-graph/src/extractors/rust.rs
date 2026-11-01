@@ -855,12 +855,20 @@ impl<'tree> Extractor<'_, 'tree> {
                             line,
                             Some("import"),
                         );
+                        // The use path as written travels with the edge
+                        // (supply-chain plan §3): its first segment names the
+                        // crate the import resolves against. A path rooted in
+                        // this crate (`crate`, `self`, `super`, a `mod` item
+                        // beside the use) never names one.
+                        let edge = self.edges.last_mut().unwrap();
+                        edge["_rust_use_path"] = json!(&written);
                         if let Some(used) = use_name_in(&name, &written, &scope_mods) {
-                            self.edges.last_mut().unwrap()["_rust_use_name"] = json!(used);
+                            edge["_rust_use_name"] = json!(used);
+                            edge["_rust_use_local"] = json!(true);
                         }
                         if grouped {
                             // Call evidence as before; resolution drops it later.
-                            self.edges.last_mut().unwrap()["_rust_use_group"] = json!(true);
+                            edge["_rust_use_group"] = json!(true);
                         }
                     }
                     // A group imports what the plain `use` of each binding would
@@ -876,10 +884,13 @@ impl<'tree> Extractor<'_, 'tree> {
                                     line,
                                     Some("import"),
                                 );
+                                let edge = self.edges.last_mut().unwrap();
+                                edge["_rust_use_path"] = json!(&binding);
                                 if let Some(used) = use_name_in(&name, &binding, &scope_mods) {
-                                    self.edges.last_mut().unwrap()["_rust_use_name"] = json!(used);
+                                    edge["_rust_use_name"] = json!(used);
+                                    edge["_rust_use_local"] = json!(true);
                                 }
-                                self.edges.last_mut().unwrap()["_rust_use_binding"] = json!(true);
+                                edge["_rust_use_binding"] = json!(true);
                             }
                         }
                     }
@@ -1220,6 +1231,104 @@ mod tests {
         assert_eq!(l.node_kind_count(), 355);
         assert_eq!(l.parse_state_count(), 3825);
         assert_eq!(l.abi_version(), 15);
+    }
+
+    /// Each `imports_from` edge as `(target id, use path, local, group)`.
+    fn use_edges(result: &serde_json::Value) -> Vec<(String, String, bool, bool)> {
+        result["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["relation"] == "imports_from")
+            .map(|e| {
+                (
+                    e["target"].as_str().unwrap_or("").to_string(),
+                    e["_rust_use_path"].as_str().unwrap_or("").to_string(),
+                    e["_rust_use_local"] == true,
+                    e["_rust_use_group"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_use_records_the_path_it_was_written_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.rs");
+        std::fs::write(
+            &path,
+            concat!(
+                "use serde::Deserialize;\n",
+                "use serde_json::{Value, json};\n",
+                "use std::fs::File;\n",
+                "use crate::own::Thing;\n",
+                "mod item;\n",
+                "pub use item::Invoice;\n",
+                "use ::tokio::sync::Semaphore;\n",
+            ),
+        )
+        .unwrap();
+        let edges = use_edges(&super::extract_rust(&path));
+        // The written path travels with every use edge: its first segment is
+        // the crate the import resolves against (supply-chain plan §3).
+        assert!(
+            edges.contains(&(
+                super::make_id(["Deserialize"]).to_string(),
+                "serde::Deserialize".into(),
+                false,
+                false
+            )),
+            "{edges:?}"
+        );
+        // A group's plain edge names the group's crate and is dropped
+        // downstream (`_rust_use_group`); its bindings keep the full path.
+        assert!(
+            edges.iter().any(|(target, path, _, group)| *group
+                && target.ends_with("serde_json")
+                && path == "serde_json::{Value, json}"),
+            "{edges:?}"
+        );
+        assert!(
+            edges.contains(&(
+                super::make_id(["Value"]).to_string(),
+                "serde_json::Value".into(),
+                false,
+                false
+            )) && edges.contains(&(
+                super::make_id(["json"]).to_string(),
+                "serde_json::json".into(),
+                false,
+                false
+            )),
+            "{edges:?}"
+        );
+        // A leading `::` still names a crate, so the path keeps it and the
+        // resolver strips it.
+        assert!(
+            edges.contains(&(
+                super::make_id(["Semaphore"]).to_string(),
+                "::tokio::sync::Semaphore".into(),
+                false,
+                false
+            )),
+            "{edges:?}"
+        );
+        // A path rooted in this crate never names one: `crate` heads and a
+        // head that names a `mod` item beside the use are marked local.
+        assert!(
+            edges.contains(&(
+                super::make_id(["Thing"]).to_string(),
+                "crate::own::Thing".into(),
+                true,
+                false
+            )) && edges.contains(&(
+                super::make_id(["Invoice"]).to_string(),
+                "item::Invoice".into(),
+                true,
+                false
+            )),
+            "{edges:?}"
+        );
     }
 
     #[test]

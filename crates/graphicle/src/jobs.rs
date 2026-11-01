@@ -710,6 +710,17 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         }
         let mut out = serde_json::to_value(&info)?;
         out["labels"] = json!(labels);
+        // The supply-chain seam (supply-chain plan §3) runs here because the
+        // symbol facts this projection just wrote are one side of it and the
+        // lockfile packages the sync wrote are the other; the sync runs it
+        // after the lock ingest too, so a re-lock re-resolves without a new
+        // projection. A failure is reported, never a failed projection.
+        match crate::supply_chain::resolve::resolve(&store.graph(), identifier) {
+            Ok(Some(report)) => out["cargo_resolve"] = report,
+            // No lockfile packages: nothing to resolve, nothing to report.
+            Ok(None) => {}
+            Err(error) => out["cargo_resolve"] = json!({"error": error.message}),
+        }
         // Cross-repository import linkage follows every projection as its own
         // `link` job so the workspace's `gf_cross_edges` track the new episode
         // without extending the projection transaction; a failure to queue it

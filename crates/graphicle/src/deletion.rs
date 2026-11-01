@@ -182,6 +182,11 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     // the project's derived content; they are not history (see HISTORY).
     ("Package", "Package", Scoped::Repository),
     ("PackageVersion", "PackageVersion", Scoped::Repository),
+    // An import that resolved to no local path, member or locked crate
+    // (supply_chain::resolve): negative evidence, recomputed by every
+    // resolution run, so it walks with its project's derived content the
+    // same way.
+    ("UnresolvedPackage", "UnresolvedPackage", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),
