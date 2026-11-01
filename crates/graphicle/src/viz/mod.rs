@@ -137,7 +137,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Impact Neighborhood",
         description: "A focus symbol's bounded calls and imports neighborhood, with direction and depth",
         mermaid: true,
-        render: impact_neighborhood,
+        render: impact_neighborhood::view,
     },
     Family {
         slug: "arch-conformance",
@@ -541,10 +541,6 @@ fn knowledge_map(_graph: &GraphStore, _repository: &str, _params: &Params) -> Re
     Ok(stub(false))
 }
 
-fn impact_neighborhood(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(true))
-}
-
 fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
@@ -556,6 +552,8 @@ fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Res
 fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
+
+mod impact_neighborhood;
 
 #[cfg(test)]
 mod tests;
