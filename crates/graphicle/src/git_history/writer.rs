@@ -300,6 +300,24 @@ pub(super) struct Pass<'a> {
     pub(super) leasing: &'a dyn Fn() -> Result<()>,
 }
 
+impl<'a> Pass<'a> {
+    /// A pass that writes no commit facts, so the record-time stamp
+    /// (`known_at`, owned by the commit pass) stays empty: the one
+    /// constructor for the coupling and resolution passes.
+    pub(super) fn derived(
+        graph: &'a GraphStore,
+        repository_id: &'a str,
+        leasing: &'a dyn Fn() -> Result<()>,
+    ) -> Pass<'a> {
+        Pass {
+            graph,
+            repository_id,
+            known_at: "",
+            leasing,
+        }
+    }
+}
+
 /// Run `query` once per [`BATCH`]-row chunk of `rows`, one transaction per
 /// chunk, the lease checked before each. Every write pass funnels through
 /// here so the batch bound and the lease check live in exactly one place.

@@ -12,9 +12,9 @@
 //! Both sides are matched by key (`repository_id` with `episode` or `oid`),
 //! never through the `(:Project)` anchor (the supernode rule of this module).
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde_json::json;
 
@@ -158,32 +158,14 @@ pub(super) fn blob_digests(
     folder: &Path,
     tree: &BTreeMap<String, String>,
 ) -> std::result::Result<BTreeMap<String, String>, ReadError> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(folder)
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ReadError::GitNotInstalled
-            } else {
-                ReadError::Io(format!("failed to run git: {error}"))
-            }
-        })?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut child = reader::spawn_git(
+        folder,
+        &["cat-file", "--batch"],
+        Stdio::piped(),
+        Stdio::null(),
+    )?;
     let oids: Vec<String> = tree.values().cloned().collect();
-    // Written on its own thread: git answers each request as it reads it,
-    // so writing everything first could fill the stdout pipe and stall both.
-    let writer = std::thread::spawn(move || {
-        for oid in oids {
-            if writeln!(stdin, "{oid}").is_err() {
-                break;
-            }
-        }
-    });
+    let writer = reader::feed_lines(child.stdin.take().expect("piped stdin"), oids);
     let stdout = child.stdout.take().expect("piped stdout");
     let mut answers = BufReader::new(stdout);
     let mut digests = BTreeMap::new();

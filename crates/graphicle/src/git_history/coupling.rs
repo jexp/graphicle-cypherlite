@@ -184,12 +184,7 @@ pub fn derive(
     config: &Config,
     still_leasing: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
-    let pass = Pass {
-        graph,
-        repository_id,
-        known_at: "",
-        leasing: still_leasing,
-    };
+    let pass = Pass::derived(graph, repository_id, still_leasing);
     let files = commit_sets(graph, repository_id, &FILES)?;
     let symbols = commit_sets(graph, repository_id, &SYMBOLS)?;
     let mut windows = Vec::new();

@@ -1403,70 +1403,98 @@ pub fn drain_projection_until(
     // (architecture-concepts.md §1.5): one job per (rule set, episode), so
     // the drain leaves the episode fully post-processed. A failing rule is
     // part of the job's result; the job itself only fails on store errors.
-    while !stopped() {
-        let Some(job) = store.lease_job_of_kind(repository, "enrich")? else {
-            break;
-        };
-        let result = crate::phase::phase("job_enrich", || run_enrich(store, &job));
-        results.push(match &result {
+    results.extend(drain_kind(
+        store,
+        repository,
+        "enrich",
+        &stopped,
+        &|store, job| crate::phase::phase("job_enrich", || run_enrich(store, job)),
+        &|job, result| match result {
             Ok(value) => json!({"job": job.id, "kind": "enrich", "ok": true,
                 "applied": value["applied"], "failed": value["failed"], "skipped": value["skipped"]}),
             Err(error) => json!({"job": job.id, "kind": "enrich", "ok": false, "error": error.message}),
-        });
-        store.finish_job(&job, result)?;
-    }
+        },
+    )?);
     // The git history ingestion each completed projection queued
     // (git-to-graph plan §4): one job per (repository, HEAD, window), so
     // the drain leaves the project's history current. Background
     // derivation, like the enrichment before it.
-    while !stopped() {
-        let Some(job) = store.lease_job_of_kind(repository, crate::git_history::KIND)? else {
-            break;
-        };
-        let result = crate::phase::phase("job_history", || run_history(store, &job));
-        results.push(match &result {
+    results.extend(drain_kind(
+        store,
+        repository,
+        crate::git_history::KIND,
+        &stopped,
+        &|store, job| crate::phase::phase("job_history", || run_history(store, job)),
+        &|job, result| match result {
             Ok(value) => json!({"job": job.id, "kind": crate::git_history::KIND, "ok": true,
                 "mode": value["mode"], "commits": value["commits"]}),
             Err(error) => {
                 json!({"job": job.id, "kind": crate::git_history::KIND, "ok": false, "error": error.message})
             }
-        });
-        store.finish_job(&job, result)?;
-    }
+        },
+    )?);
     // The co-change derivation each completed history queued (plan §5).
-    while !stopped() {
-        let Some(job) = store.lease_job_of_kind(repository, crate::git_history::coupling::KIND)?
-        else {
-            break;
-        };
-        let result = crate::phase::phase("job_coupling", || run_coupling(store, &job));
-        results.push(match &result {
+    results.extend(drain_kind(
+        store,
+        repository,
+        crate::git_history::coupling::KIND,
+        &stopped,
+        &|store, job| crate::phase::phase("job_coupling", || run_coupling(store, job)),
+        &|job, result| match result {
             Ok(value) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
                 "ok": true, "windows": value["windows"]}),
             Err(error) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
                 "ok": false, "error": error.message}),
-        });
-        store.finish_job(&job, result)?;
-    }
+        },
+    )?);
     let kinds = crate::extension::installed().post_projection_kinds();
     if !kinds.is_empty() && !stopped() {
         // Post-projection kinds make no model call (`JobKind::after_projection`).
         let worker = Worker::new(store.clone(), model::Config::default())?;
         for kind in kinds {
-            while !stopped() {
-                let Some(job) = store.lease_job_of_kind(repository, kind)? else {
-                    break;
-                };
-                let result = run_on_own_runtime(&worker, &job);
-                results.push(match &result {
-                    Ok(_) => json!({"job":job.id,"kind":kind,"ok":true}),
+            results.extend(drain_kind(
+                store,
+                repository,
+                kind,
+                &stopped,
+                &|_store, job| run_on_own_runtime(&worker, job),
+                &|job, result| match result {
+                    Ok(_) => json!({"job": job.id, "kind": kind, "ok": true}),
                     Err(error) => {
-                        json!({"job":job.id,"kind":kind,"ok":false,"error":error.message})
+                        json!({"job": job.id, "kind": kind, "ok": false, "error": error.message})
                     }
-                });
-                store.finish_job(&job, result)?;
-            }
+                },
+            )?);
         }
+    }
+    Ok(results)
+}
+
+/// Lease, run and finish every job of one `kind` for `repository` until none
+/// is left or `stopped` is set, collecting one summary per job run. This is
+/// the one loop behind the drain's post-projection phases — the enrichment,
+/// the history ingestion, the co-change derivation, and each installed
+/// extension kind — which differ only in kind, runner and the fields of a
+/// successful run's summary. `run` is the job's body (its phase wrapper, or
+/// the extension's own runtime); the job is finished before anything else
+/// can fail, so its lease is released rather than left to expire.
+fn drain_kind(
+    store: &Store,
+    repository: &str,
+    kind: &str,
+    stopped: &dyn Fn() -> bool,
+    run: &dyn Fn(&Store, &Job) -> Result<Value>,
+    summary: &dyn Fn(&Job, &Result<Value>) -> Value,
+) -> Result<Vec<Value>> {
+    let mut results = Vec::new();
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, kind)? else {
+            break;
+        };
+        let result = run(store, &job);
+        let summary = summary(&job, &result);
+        store.finish_job(&job, result)?;
+        results.push(summary);
     }
     Ok(results)
 }

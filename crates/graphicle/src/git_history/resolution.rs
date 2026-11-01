@@ -66,14 +66,13 @@
 //! written through [`super::writer`]'s batches, so the lease is checked
 //! between them.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde_json::{Value, json};
 
 use super::correlation;
-use super::reader::{LOG_LIMIT, ReadError};
+use super::reader::{self, LOG_LIMIT, ReadError};
 use super::writer::{self, Pass};
 use crate::store_graph::{self, GraphStore};
 use crate::{Result, store_content};
@@ -437,10 +436,9 @@ fn git_hunks(folder: &Path, commits: &BTreeSet<String>) -> std::result::Result<H
     if commits.is_empty() {
         return Ok(HunkMap::new());
     }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(folder)
-        .args([
+    let mut child = reader::spawn_git(
+        folder,
+        &[
             "log",
             "--no-walk=unsorted",
             "--stdin",
@@ -452,46 +450,32 @@ fn git_hunks(folder: &Path, commits: &BTreeSet<String>) -> std::result::Result<H
             "--src-prefix=a/",
             "--dst-prefix=b/",
             "--format=%H",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ReadError::GitNotInstalled
-            } else {
-                ReadError::Io(format!("failed to run git: {error}"))
-            }
-        })?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let oids: Vec<String> = commits.iter().cloned().collect();
-    // On its own thread: git reads each commit as it writes its diff, so
-    // writing everything first could fill the stdout pipe and stall both.
-    let writer = std::thread::spawn(move || {
-        for oid in oids {
-            if writeln!(stdin, "{oid}").is_err() {
-                break;
-            }
-        }
-    });
-    let output = child
-        .wait_with_output()
-        .map_err(|error| ReadError::Io(format!("failed to read git output: {error}")))?;
+        ],
+        Stdio::piped(),
+        Stdio::piped(),
+    )?;
+    let writer = reader::feed_lines(
+        child.stdin.take().expect("piped stdin"),
+        commits.iter().cloned().collect(),
+    );
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stderr_reader = reader::drain_stderr(child.stderr.take().expect("piped stderr"));
+    // Streamed through the cap before buffering, as the reader's own git
+    // calls are: a commit that diffs a huge file never buffers whole.
+    let (stdout, stderr) = reader::read_bounded(&mut child, stdout_pipe, LOG_LIMIT, stderr_reader)?;
     let _ = writer.join();
-    if !output.status.success() {
-        return Err(ReadError::Git(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+    let status = child
+        .wait()
+        .map_err(|error| ReadError::Io(format!("failed to run git: {error}")))?;
+    if !status.success() {
+        return Err(ReadError::Git(stderr));
     }
-    if output.stdout.len() as u64 > LOG_LIMIT {
-        return Err(ReadError::LogTooLarge { limit: LOG_LIMIT });
-    }
-    Ok(parse_hunk_log(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_hunk_log(&String::from_utf8_lossy(&stdout)))
 }
 
-/// A batched `-p -U0` log: a 40-hex line opens a commit, `diff --git` opens a
-/// file, and the `+++ b/<path>` header of that file (before its first `@@`)
+/// A batched `-p -U0` log: a full commit id (40-hex SHA-1 or 64-hex SHA-256,
+/// as [`reader::is_oid`] recognizes both) opens a commit, `diff --git` opens
+/// a file, and the `+++ b/<path>` header of that file (before its first `@@`)
 /// names the new path. Only the new side of each hunk counts. A file with no
 /// `+++` header (binary, a pure rename, a deletion) gets no entry, and neither
 /// does a path git quotes, so both count as having no line information.
@@ -501,7 +485,7 @@ fn parse_hunk_log(log: &str) -> HunkMap {
     let mut path: Option<String> = None;
     let mut in_header = false;
     for line in log.lines() {
-        if is_oid(line) {
+        if reader::is_oid(line) {
             commit = Some(line.to_string());
             path = None;
             in_header = false;
@@ -529,14 +513,6 @@ fn parse_hunk_log(log: &str) -> HunkMap {
     map
 }
 
-/// Whether `line` is a full commit id: 40 lowercase hex digits.
-fn is_oid(line: &str) -> bool {
-    line.len() == 40
-        && line
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 /// The new-side range of a hunk header `@@ -a[,b] +c[,d] @@`. A pure
 /// deletion (`d` is 0) marks the line it fell after.
 fn hunk_range(header: &str) -> Option<LineRange> {
@@ -561,7 +537,7 @@ fn write_modifies(
     rows: &[Value],
     still_leasing: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    let pass = pass(graph, repository_id, still_leasing);
+    let pass = Pass::derived(graph, repository_id, still_leasing);
     writer::batches(
         &pass,
         rows,
@@ -579,7 +555,7 @@ fn write_touches(
     rows: &[Value],
     still_leasing: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    let pass = pass(graph, repository_id, still_leasing);
+    let pass = Pass::derived(graph, repository_id, still_leasing);
     writer::batches(
         &pass,
         rows,
@@ -590,21 +566,6 @@ fn write_touches(
          SET t.basis = row.basis, t.line_start = row.line_start, t.line_end = row.line_end",
         json!({}),
     )
-}
-
-/// The writer's batch context. A resolution writes no commit facts, so the
-/// record-time stamp (`known_at`, owned by the commit pass) stays empty.
-fn pass<'a>(
-    graph: &'a GraphStore,
-    repository_id: &'a str,
-    still_leasing: &'a dyn Fn() -> Result<()>,
-) -> Pass<'a> {
-    Pass {
-        graph,
-        repository_id,
-        known_at: "",
-        leasing: still_leasing,
-    }
 }
 
 fn read(graph: &GraphStore, cypher: &str, params: Value) -> Result<Vec<Value>> {
@@ -1034,6 +995,31 @@ mod tests {
         // A content line `+++ y` inside a hunk is content, not a file header.
         assert_eq!(map[&key("t.rs")], vec![(1, 1)]);
         assert_eq!(map.len(), 2);
+    }
+
+    /// The parser must recognize a 64-hex commit id (a SHA-256 repository)
+    /// the same way the reader's log parser does — the shared `is_oid`, not
+    /// a 40-hex-only copy that would sink every spanned change into
+    /// `no_line_info`.
+    #[test]
+    fn a_sha256_commit_id_opens_its_hunks() {
+        let commit = "a".repeat(64);
+        let log = format!(
+            "{commit}\n\
+             \n\
+             diff --git a/x.rs b/x.rs\n\
+             --- a/x.rs\n\
+             +++ b/x.rs\n\
+             @@ -1 +1 @@\n\
+             -x\n\
+             +y\n"
+        );
+        let map = parse_hunk_log(&log);
+        assert_eq!(
+            map[&(commit, "x.rs".to_string())],
+            vec![(1, 1)],
+            "a 64-hex commit line opens the commit's hunks"
+        );
     }
 
     #[test]

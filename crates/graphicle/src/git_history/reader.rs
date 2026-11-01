@@ -14,9 +14,9 @@
 //! `M`, `D` or `T` token is followed by one path. A rename is one token
 //! `R<similarity>` followed by the old path and then the new path.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 
 use chrono::{DateTime, FixedOffset};
 
@@ -285,60 +285,107 @@ pub(crate) struct Captured {
 /// past it is detected without buffering more. Stderr drains on its own
 /// thread, so git never blocks on a full pipe.
 pub(crate) fn run_git(dir: &Path, args: &[&str], limit: u64) -> Result<Captured, ReadError> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ReadError::GitNotInstalled
-        } else {
-            ReadError::Io(format!("failed to run git: {error}"))
-        }
-    })?;
+    let mut child = spawn_git(dir, args, Stdio::null(), Stdio::piped())?;
     let stdout_pipe = child
         .stdout
         .take()
         .expect("a child spawned with piped stdout has a stdout handle");
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .expect("a child spawned with piped stderr has a stderr handle");
-    let stderr_reader = std::thread::spawn(move || {
-        let mut pipe = stderr_pipe;
-        let mut retained = Vec::new();
-        let _ = (&mut pipe).take(STDERR_LIMIT).read_to_end(&mut retained);
-        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        String::from_utf8_lossy(&retained).trim().to_string()
-    });
-
-    let mut stdout = Vec::new();
-    let read = stdout_pipe.take(limit + 1).read_to_end(&mut stdout);
-    if let Err(error) = read {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_reader.join();
-        return Err(ReadError::Io(format!("failed to read git output: {error}")));
-    }
-    if stdout.len() as u64 > limit {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_reader.join();
-        return Err(ReadError::LogTooLarge { limit });
-    }
+    let stderr_reader = drain_stderr(
+        child
+            .stderr
+            .take()
+            .expect("a child spawned with piped stderr has a stderr handle"),
+    );
+    let (stdout, stderr) = read_bounded(&mut child, stdout_pipe, limit, stderr_reader)?;
     let status = child
         .wait()
         .map_err(|error| ReadError::Io(format!("failed to run git: {error}")))?;
-    let stderr = stderr_reader.join().unwrap_or_default();
     Ok(Captured {
         status,
         stdout,
         stderr,
     })
+}
+
+/// Spawn `git -C dir <args>` with no shell, piped stdout, the given stdin and
+/// stderr. Every git subprocess of this module spawns through here, so the
+/// NotFound→[`ReadError::GitNotInstalled`] mapping lives in exactly one place.
+pub(crate) fn spawn_git(
+    dir: &Path,
+    args: &[&str],
+    stdin: Stdio,
+    stderr: Stdio,
+) -> Result<Child, ReadError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ReadError::GitNotInstalled
+            } else {
+                ReadError::Io(format!("failed to run git: {error}"))
+            }
+        })
+}
+
+/// Feed `lines` to a child's piped stdin on a thread of its own, returning
+/// the thread's handle: git answers each request as it reads it, so writing
+/// everything on the caller's thread could fill the stdout pipe and stall
+/// both. A write that fails (git exited) stops the feed.
+pub(crate) fn feed_lines(stdin: ChildStdin, lines: Vec<String>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdin = stdin;
+        for line in lines {
+            if writeln!(stdin, "{line}").is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Drain a child's piped stderr on its own thread, keeping the first
+/// [`STDERR_LIMIT`] bytes and discarding the rest, so git never blocks on a
+/// full pipe. Join the handle for the retained stderr as a trimmed string.
+pub(crate) fn drain_stderr(pipe: ChildStderr) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut retained = Vec::new();
+        let _ = (&mut pipe).take(STDERR_LIMIT).read_to_end(&mut retained);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        String::from_utf8_lossy(&retained).trim().to_string()
+    })
+}
+
+/// Read a child's piped stdout through `take(limit + 1)`: memory is bounded
+/// by the cap, and the byte past it is detected without buffering more. A
+/// failed read or an output past the cap kills the child and joins the
+/// stderr reader, so neither outlives the call. Returns the stdout and the
+/// retained stderr.
+pub(crate) fn read_bounded(
+    child: &mut Child,
+    stdout: impl Read,
+    limit: u64,
+    stderr_reader: std::thread::JoinHandle<String>,
+) -> Result<(Vec<u8>, String), ReadError> {
+    let mut output = Vec::new();
+    let error = match stdout.take(limit + 1).read_to_end(&mut output) {
+        Err(error) => Some(ReadError::Io(format!("failed to read git output: {error}"))),
+        Ok(_) if output.len() as u64 > limit => Some(ReadError::LogTooLarge { limit }),
+        Ok(_) => None,
+    };
+    if let Some(error) = error {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(error);
+    }
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok((output, stderr))
 }
 
 /// The stdout of a call that must succeed.
@@ -364,8 +411,10 @@ fn oid_from_output(stdout: &[u8]) -> Option<String> {
     is_oid(text).then(|| text.to_string())
 }
 
-/// A full object id: 40 lowercase hex digits (SHA-1) or 64 (SHA-256).
-fn is_oid(value: &str) -> bool {
+/// A full object id: 40 lowercase hex digits (SHA-1) or 64 (SHA-256). Shared
+/// with the resolution module's hunk parser, which must recognize a commit
+/// line in a SHA-256 repository the same way the log parser does.
+pub(crate) fn is_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
             .bytes()
