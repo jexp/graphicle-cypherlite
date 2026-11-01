@@ -144,6 +144,11 @@ fn every_family_is_listed_as_a_resource_and_reads_as_a_stub() {
             .unwrap_or_else(|| panic!("no spec for {uri}: {specs:?}"));
         assert_eq!(spec["name"], family.name, "{uri}");
         assert_eq!(spec["mimeType"], "text/plain", "{uri}");
+        // The families whose node has landed answer their own view (see
+        // their own tests); the rest are still stubs.
+        if family.slug == "arch-conformance" {
+            continue;
+        }
         // The stub's text report: the note, the section empty — a resource
         // answers, never errors, exactly as the history pack's families do
         // on a repository without their facts.
@@ -469,4 +474,231 @@ fn viz_view_answers_on_the_tool_surface_read_only() {
         "{}",
         error.message
     );
+}
+
+/// The conformance fixture's rule document: two concepts that label the
+/// symbols (one of them a node the rule creates, so it has no location), a
+/// constraint over a call from the api folder into persistence, and one
+/// that passes.
+const CONFORMANCE_RULES: &str = "````concept\nid: arch:Viz/Persistence\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) WHERE s.stable_id STARTS WITH 'db_' SET s:Persistence\n```\n````\n\
+````concept\nid: arch:Viz/Api\n```cypher\nMATCH (s:Symbol {repository_id: $repo}) WHERE s.relpath STARTS WITH 'src/api/' SET s:Api\n```\n````\n\
+````concept\nid: arch:Viz/Layer\n```cypher\nMERGE (l:Layer {repository_id: $repo, name: 'Persistence'})\n```\n````\n\
+````constraint\nid: arch:Viz/NoApiPersistence\nseverity: MAJOR\nrequires: [arch:Viz/Api, arch:Viz/Persistence]\n```cypher\nMATCH (a:Api {repository_id: $repo})-[:CALLS]->(p:Persistence {repository_id: $repo}) RETURN a, p\n```\n````\n\
+````constraint\nid: arch:Viz/NoGhostLayer\nseverity: MINOR\nrequires: [arch:Viz/Layer]\n```cypher\nMATCH (l:Layer {repository_id: $repo, name: 'Ghost'}) RETURN l\n```\n````\n";
+
+/// The episode the conformance fixture's enrich run is recorded for.
+const EPISODE: &str = "ep-1";
+
+/// A store with the conformance rules run over a small code graph, as the
+/// `enrich` job leaves it: the concept applications and violations in the
+/// store, and the job's recorded report. No `:Project` node exists, so the
+/// view is answered without the supernode.
+fn conformance_graph() -> (GraphStore, crate::arch_rules::EnrichReport) {
+    use crate::store_graph;
+    let graph = GraphStore::open_in_memory().unwrap();
+    let document = crate::arch_rules::parse(CONFORMANCE_RULES).unwrap();
+    crate::arch_rules::store(&graph, REPO, "docs/architecture/viz.md", &document).unwrap();
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "CREATE (:Symbol {repository_id: $repo, stable_id: 'db_store', kind: 'function', \
+                   qualified_name: 'db_store', relpath: 'src/db/store.rs', line: 12}) \
+                 CREATE (:Symbol {repository_id: $repo, stable_id: 'db_pool', kind: 'function', \
+                   qualified_name: 'db_pool', relpath: 'src/db/pool.rs', line: 7}) \
+                 CREATE (:Symbol {repository_id: $repo, stable_id: 'api_routes', kind: 'function', \
+                   qualified_name: 'api_routes', relpath: 'src/api/routes.rs', line: 30}) \
+                 CREATE (:Symbol {repository_id: $repo, stable_id: 'api_health', kind: 'function', \
+                   qualified_name: 'api_health', relpath: 'src/api/routes.rs', line: 50}) \
+                 CREATE (:Symbol {repository_id: $repo, stable_id: 'util_hash', kind: 'function', \
+                   qualified_name: 'util_hash', relpath: 'src/util.rs', line: 3})",
+                store_graph::params(&json!({"repo": REPO})),
+            )?;
+            store_graph::write(
+                db,
+                "MATCH (a:Symbol {stable_id: 'api_routes'}), (b:Symbol {stable_id: 'db_store'}) \
+                 CREATE (a)-[:CALLS]->(b)",
+                store_graph::params(&json!({})),
+            )?;
+            store_graph::write(
+                db,
+                "MATCH (a:Symbol {stable_id: 'api_routes'}), (b:Symbol {stable_id: 'db_pool'}) \
+                 CREATE (a)-[:CALLS]->(b)",
+                store_graph::params(&json!({})),
+            )?;
+            store_graph::write(
+                db,
+                "MATCH (a:Symbol {stable_id: 'api_health'}), (b:Symbol {stable_id: 'db_pool'}) \
+                 CREATE (a)-[:CALLS]->(b)",
+                store_graph::params(&json!({})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut report = crate::arch_rules::enrich(&graph, REPO, EPISODE, &|| Ok(())).unwrap();
+    let constraints =
+        crate::arch_rules::constraints::evaluate(&graph, REPO, EPISODE, &report, &|| Ok(()))
+            .unwrap();
+    report.constraints = Some(constraints);
+    // The job the enrich queue records: the same result the analyze report
+    // reads back.
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "CREATE (:Job {repository_id: $repo, kind: 'enrich', state: 'complete', \
+                   id: 'job-1', input_hash: $hash, result: $result})",
+                store_graph::params(&json!({"repo": REPO,
+                    "hash": crate::jobs::enrich_input_hash(&report.rule_set, EPISODE),
+                    "result": report.to_value().to_string()})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    (graph, report)
+}
+
+/// The conformance view's rows of one section, by its rule id.
+fn row_of<'a>(rows: &'a Value, rule: &str) -> &'a Value {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == rule)
+        .unwrap_or_else(|| panic!("no row for {rule}: {rows}"))
+}
+
+#[test]
+fn a_violation_row_cites_its_rule_and_its_relpath_line() {
+    let (graph, _) = conformance_graph();
+    let view = super::arch_conformance::view(&graph, REPO, &Params::default()).unwrap();
+    let violations = &view.model["violations"];
+    assert_eq!(violations.as_array().unwrap().len(), 3, "{violations}");
+    // The caller's node is the one cited: the api symbol at its line.
+    let cited = violations
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["rule"] == "arch:Viz/NoApiPersistence")
+        .map(|row| row["evidence"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cited,
+        [
+            "src/api/routes.rs:30",
+            "src/api/routes.rs:30",
+            "src/api/routes.rs:50"
+        ]
+    );
+    // The text report prints the same citation beside the rule.
+    let text = super::report(&graph, REPO, "arch-conformance").unwrap();
+    assert!(text.contains("src/api/routes.rs:30  "), "{text}");
+    assert!(text.contains("rule=arch:Viz/NoApiPersistence"), "{text}");
+}
+
+#[test]
+fn coverage_and_results_match_the_enrich_report_of_the_same_store() {
+    let (graph, report) = conformance_graph();
+    let view = super::arch_conformance::view(&graph, REPO, &Params::default()).unwrap();
+    // Every concept's labels are the labels its application reported.
+    for applied in report.plans.iter().flat_map(|plan| &plan.applied) {
+        let row = row_of(&view.model["concepts"], &applied.rule);
+        assert_eq!(row["labels"], json!(applied.labels), "{}", applied.rule);
+    }
+    // The Layer concept labeled a node with no location: counted, not placed.
+    assert_eq!(
+        row_of(&view.model["concepts"], "arch:Viz/Layer")["unplaced"],
+        1
+    );
+    // Every constraint's status and count are the recorded result's.
+    let constraints = report.constraints.as_ref().unwrap();
+    for result in &constraints.results {
+        let row = row_of(&view.model["constraints"], &result.rule);
+        assert_eq!(row["status"], serde_json::to_value(result.status).unwrap());
+        assert_eq!(
+            row["violations"],
+            json!(result.violations.unwrap_or(0)),
+            "{}",
+            result.rule
+        );
+    }
+    assert_eq!(
+        view.model["totals"]["violations"],
+        json!(constraints.violations)
+    );
+    assert_eq!(view.model["episode"], EPISODE);
+    // The folder rollup places the api folder's violations beside their rule.
+    let api = view.model["folders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["evidence"] == "src/api")
+        .expect("the api folder is rolled up");
+    assert_eq!(api["violations"], 3);
+    assert_eq!(api["declared"], json!(["arch:Viz/NoApiPersistence"]));
+}
+
+#[test]
+fn the_conformance_view_is_byte_identical_and_capped_and_scoped() {
+    let (graph, _) = conformance_graph();
+    let params = Params::parse(&json!({"cap": 2, "focus": "src/api"})).unwrap();
+    let reordered = Params::parse(&json!({"focus": "src/api", "cap": 2})).unwrap();
+    assert_eq!(params, reordered);
+    let first = serde_json::to_string(
+        &render(&graph, REPO, "arch-conformance", &params, Format::Json).unwrap(),
+    )
+    .unwrap();
+    let second = serde_json::to_string(
+        &render(&graph, REPO, "arch-conformance", &reordered, Format::Json).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let again = serde_json::to_string(
+        &render(&graph, REPO, "arch-conformance", &params, Format::Json).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first, again);
+    let text = |params: &Params| {
+        serde_json::to_string(
+            &render(&graph, REPO, "arch-conformance", params, Format::Text).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(text(&params), text(&reordered));
+
+    // The cap cuts the rows and keeps the uncut total; the rank puts the
+    // violation of the highest severity first, then the smaller evidence.
+    let view = super::arch_conformance::view(&graph, REPO, &params).unwrap();
+    assert_eq!(view.model["violations"].as_array().unwrap().len(), 2);
+    assert_eq!(view.model["totals"]["violations"], 3);
+    assert_eq!(
+        view.model["violations"][0]["evidence"],
+        "src/api/routes.rs:30"
+    );
+    // The focus scopes the violations to the folder, and nothing beneath
+    // another folder leaks in.
+    let elsewhere = Params::parse(&json!({"focus": "src/db"})).unwrap();
+    let view = super::arch_conformance::view(&graph, REPO, &elsewhere).unwrap();
+    assert_eq!(view.model["totals"]["violations"], 0);
+    assert_eq!(view.model["episode"], EPISODE);
+    // Every cited row names what it is about: a relpath:line, a folder or a
+    // rule document location.
+    let full = super::arch_conformance::view(&graph, REPO, &Params::default()).unwrap();
+    for (_, rows) in &full.sections {
+        for row in rows {
+            assert!(
+                !row["evidence"].as_str().unwrap_or_default().is_empty(),
+                "{row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_empty_store_reads_as_an_empty_conformance_view() {
+    let graph = graph();
+    let view = super::arch_conformance::view(&graph, REPO, &Params::default()).unwrap();
+    assert_eq!(view.model["episode"], Value::Null);
+    assert_eq!(view.model["totals"]["violations"], 0);
+    assert!(view.mermaid.is_none());
+    assert!(view.sections.iter().all(|(_, rows)| rows.is_empty()));
 }

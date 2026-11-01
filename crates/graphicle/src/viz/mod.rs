@@ -144,7 +144,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Architecture Conformance",
         description: "Stored rule results with evidence: violations, concept coverage, declared against actual at folder rollup",
         mermaid: false,
-        render: arch_conformance,
+        render: arch_conformance::view,
     },
     Family {
         slug: "risk-overlay",
@@ -545,10 +545,6 @@ fn impact_neighborhood(_graph: &GraphStore, _repository: &str, _params: &Params)
     Ok(stub(true))
 }
 
-fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
-}
-
 fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(true))
 }
@@ -556,6 +552,8 @@ fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Res
 fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
+
+mod arch_conformance;
 
 #[cfg(test)]
 mod tests;
