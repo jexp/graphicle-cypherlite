@@ -230,6 +230,30 @@ fn select_rowids(
     Ok(out)
 }
 
+/// Delete the extraction reads (`am_document_reads`, still SQL-resident —
+/// migration plan §8.1.4) of the forgotten documents and of every read
+/// whose drafts named a `lost` memory or claim: an extraction read whose
+/// drafts were removed must run again, or the next `extract` reuses it and
+/// never re-derives what forgetting took (§8.4). The graph-side forget
+/// calls this too, with the memories and claims only it can see.
+pub(crate) fn forget_reads(
+    db: &Connection,
+    repository: &str,
+    scope: &Scope,
+    lost: &[String],
+) -> Result<usize> {
+    let reads = select_rowids(
+        db,
+        "SELECT rowid,source_id||char(10)||claim_ids FROM am_document_reads WHERE repository_id=?",
+        [repository],
+        |v| {
+            let (source, claims) = v.split_once('\n').unwrap_or((v, ""));
+            scope.source(source) || lost.iter().any(|id| claims.contains(id.as_str()))
+        },
+    )?;
+    delete_rowids(db, "am_document_reads", &reads)
+}
+
 fn delete_rowids(db: &Connection, table: &str, rowids: &[i64]) -> Result<usize> {
     for rowid in rowids {
         db.execute(&format!("DELETE FROM {table} WHERE rowid=?"), [rowid])?;
@@ -1128,17 +1152,7 @@ pub fn forget(
         |v| scope.passage(v),
     )?;
     let vectors = delete_rowids(db, "am_vectors", &vectors)?;
-    // An extraction read whose drafts were just removed must run again.
-    let reads = select_rowids(
-        db,
-        "SELECT rowid,source_id||char(10)||claim_ids FROM am_document_reads WHERE repository_id=?",
-        [repository],
-        |v| {
-            let (source, claims) = v.split_once('\n').unwrap_or((v, ""));
-            scope.source(source) || lost.iter().any(|id| claims.contains(id.as_str()))
-        },
-    )?;
-    let reads = delete_rowids(db, "am_document_reads", &reads)?;
+    let reads = forget_reads(db, repository, scope, &lost)?;
     // Artifacts computed while the documents were visible.
     let mut visible_since = BTreeMap::new();
     if let Some(since) = since {
