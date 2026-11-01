@@ -270,23 +270,27 @@ pub enum Section {
     Focus,
     Paths,
     Tests,
+    /// The packages the top ranked files import, from the lockfile and OSV
+    /// (supply_chain::tools); empty without a lockfile.
+    Dependencies,
     Docs,
     Breadth,
 }
 
 impl Section {
-    pub const CHOOSABLE: [Section; 8] = [
+    pub const CHOOSABLE: [Section; 9] = [
         Section::Manifest,
         Section::Architecture,
         Section::Map,
         Section::Focus,
         Section::Paths,
         Section::Tests,
+        Section::Dependencies,
         Section::Docs,
         Section::Breadth,
     ];
 
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 10] = [
         Section::Header,
         Section::Manifest,
         Section::Architecture,
@@ -294,6 +298,7 @@ impl Section {
         Section::Focus,
         Section::Paths,
         Section::Tests,
+        Section::Dependencies,
         Section::Docs,
         Section::Breadth,
     ];
@@ -307,6 +312,7 @@ impl Section {
             Self::Focus => "focus",
             Self::Paths => "paths",
             Self::Tests => "tests",
+            Self::Dependencies => "dependencies",
             Self::Docs => "docs",
             Self::Breadth => "breadth",
         }
@@ -321,6 +327,7 @@ impl Section {
             Self::Focus => "Focus code",
             Self::Paths => "Call paths",
             Self::Tests => "Tests",
+            Self::Dependencies => "Dependencies",
             Self::Docs => "Documentation",
             Self::Breadth => "Breadth",
         }
@@ -335,6 +342,7 @@ impl Section {
             "focus" => Self::Focus,
             "paths" => Self::Paths,
             "tests" => Self::Tests,
+            "dependencies" => Self::Dependencies,
             "docs" => Self::Docs,
             "breadth" => Self::Breadth,
             _ => return None,
@@ -361,7 +369,7 @@ impl Order {
         }
     }
 
-    fn sections(self) -> [Section; 8] {
+    fn sections(self) -> [Section; 9] {
         use Section::*;
         match self {
             Self::RelevantLast => [
@@ -371,6 +379,7 @@ impl Order {
                 Breadth,
                 Docs,
                 Tests,
+                Dependencies,
                 Paths,
                 Focus,
             ],
@@ -381,6 +390,7 @@ impl Order {
                 Focus,
                 Paths,
                 Tests,
+                Dependencies,
                 Docs,
                 Breadth,
             ],
@@ -526,7 +536,7 @@ impl Options {
             for name in &names {
                 chosen.insert(Section::parse(name).ok_or_else(|| {
                     Error::bad(format!(
-                        "Unknown section {name}: choose from arch, map, focus, paths, tests, docs, breadth, manifest"
+                        "Unknown section {name}: choose from arch, map, focus, paths, tests, dependencies, docs, breadth, manifest"
                     ))
                 })?);
             }
@@ -799,6 +809,9 @@ pub struct Corpus<'a> {
     pub graph: Option<GraphView<'a>>,
     /// The question-independent architecture, when cached.
     pub modules: Option<Arc<Modules>>,
+    /// The packages each file's imports resolve to (the dependencies
+    /// section's facts), by path.
+    pub dependencies: BTreeMap<String, Vec<crate::supply_chain::tools::Dependency>>,
     fetch: FetchFn<'a>,
     cache: HashMap<String, Option<Arc<str>>>,
 }
@@ -819,6 +832,7 @@ impl<'a> Corpus<'a> {
             ranking,
             graph,
             modules: None,
+            dependencies: BTreeMap::new(),
             fetch,
             cache: HashMap::new(),
         }
@@ -3111,6 +3125,11 @@ fn build_standard(corpus: &mut Corpus<'_>, options: &Options, counter: &Counter)
         );
     }
 
+    // Dependencies.
+    if options.on(Section::Dependencies) && !top_code.is_empty() {
+        fill_dependencies(&mut fill, corpus, &top_code, share(0.05));
+    }
+
     // Docs.
     if options.on(Section::Docs) && !ranked.is_empty() {
         let cap = share(0.05);
@@ -3540,6 +3559,31 @@ fn fill_paths(
 /// The tests section within `cap`: tests that reach the focus symbols in
 /// the code graph, then the test files named after the top code files.
 #[allow(clippy::too_many_arguments)]
+/// The dependencies section (plan §4 P3): for each top ranked code file, the
+/// locked packages its imports resolve to, with their versions' dependencies
+/// and advisories. A chunk per file, which the section's share bounds.
+fn fill_dependencies(fill: &mut Fill<'_>, corpus: &Corpus<'_>, top_code: &[Ranked], cap: usize) {
+    for file in top_code {
+        let Some(dependencies) = corpus.dependencies.get(&file.path) else {
+            continue;
+        };
+        if fill.room(Section::Dependencies, cap) < 64 {
+            break;
+        }
+        let text = format!(
+            "{} imports these locked packages:\n{}",
+            file.path,
+            crate::supply_chain::tools::dependency_lines(&file.path, dependencies)
+        );
+        let chunk = text_chunk(
+            &format!("dependencies of {}", file.path),
+            text,
+            fill.counter,
+        );
+        fill.add(Section::Dependencies, cap, chunk, None);
+    }
+}
+
 fn fill_tests(
     fill: &mut Fill<'_>,
     corpus: &mut Corpus<'_>,
@@ -3850,6 +3894,9 @@ fn build_cache(corpus: &mut Corpus<'_>, options: &Options, counter: &Counter) ->
                 sizing.share(0.10),
                 sizing.whole_limit,
             );
+        }
+        if options.on(Section::Dependencies) && !top_code.is_empty() {
+            fill_dependencies(&mut fill, corpus, &top_code, sizing.share(0.05));
         }
     }
     finish_cache(
@@ -4349,6 +4396,7 @@ fn finish_cache(
         Order::RelevantLast => [
             Section::Manifest,
             Section::Tests,
+            Section::Dependencies,
             Section::Paths,
             Section::Focus,
         ],
@@ -4357,6 +4405,7 @@ fn finish_cache(
             Section::Focus,
             Section::Paths,
             Section::Tests,
+            Section::Dependencies,
         ],
     };
     let mut with_manifest = fill.manifest;
@@ -4720,6 +4769,7 @@ fn finish(
     let style = options.style;
     let drop_order = [
         Section::Breadth,
+        Section::Dependencies,
         Section::Docs,
         Section::Tests,
         Section::Paths,
@@ -5026,6 +5076,10 @@ impl Store {
             let name = s(&repository, "name").to_string();
             let key = format!("{id}:{episode}");
             let mut corpus = Corpus::new(name, commit, files, ranking, graph, Box::new(fetch));
+            if options.on(Section::Dependencies) {
+                corpus.dependencies =
+                    crate::supply_chain::tools::dependencies_by_file(&self.graph(), id)?;
+            }
             corpus.modules = cached_modules(&key);
             let pack = build(&mut corpus, &options, &counter)?;
             if let Some(modules) = corpus.modules.take() {
@@ -5279,6 +5333,77 @@ mod tests {
         let counter = Counter::open(options.tokenizer.as_deref(), options.bytes_per_token).unwrap();
         let mut corpus = corpus(&files, &symbols, &calls, ranking());
         build(&mut corpus, &options, &counter).unwrap()
+    }
+
+    #[test]
+    fn the_dependencies_section_lists_the_packages_of_the_changed_files() {
+        let (files, symbols, calls) = project(40);
+        let options = Options::parse(&json!({
+            "question": "how does F4x3 compute widgets",
+            "budget": 4_000,
+            "sections": "dependencies",
+        }))
+        .unwrap();
+        let counter = Counter::open(options.tokenizer.as_deref(), options.bytes_per_token).unwrap();
+        let mut corpus = corpus(&files, &symbols, &calls, ranking());
+        // The file the question ranks first imports `time`, locked at 0.2.22,
+        // which depends on serde and has an advisory.
+        corpus.dependencies.insert(
+            "pkg/a/file4.go".into(),
+            vec![crate::supply_chain::tools::Dependency {
+                name: "time".into(),
+                line: Some(3),
+                versions: vec![crate::supply_chain::tools::VersionFacts {
+                    key: "pkg:cargo/time@0.2.22".into(),
+                    version: "0.2.22".into(),
+                    requires: vec!["serde 1.0.200".into()],
+                    advisories: vec!["RUSTSEC-2020-0071".into()],
+                }],
+            }],
+        );
+        let pack = build(&mut corpus, &options, &counter).unwrap();
+        let sections = pack["sections"].as_array().unwrap();
+        let section = sections
+            .iter()
+            .find(|s| s["name"] == "dependencies")
+            .expect("the dependencies section");
+        let text: String = section["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            text.contains("pkg/a/file4.go imports these locked packages"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- time 0.2.22, imported at pkg/a/file4.go:3; requires: serde 1.0.200; advisories: RUSTSEC-2020-0071"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|s| s["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["header", "dependencies"],
+            "{pack}"
+        );
+    }
+
+    #[test]
+    fn without_a_lockfile_the_dependencies_section_is_absent() {
+        let pack = pack("how does F4x3 compute widgets", 2_500, json!({}));
+        assert!(
+            pack["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != "dependencies"),
+            "{pack}"
+        );
     }
 
     fn recount(pack: &Value) -> usize {
@@ -5558,8 +5683,9 @@ mod tests {
                 .iter()
                 .map(|s| s["name"].as_str().unwrap())
                 .collect();
-            if section == Section::Map {
-                // The map is the cache layout's (tested there).
+            if section == Section::Map || section == Section::Dependencies {
+                // The map is the cache layout's (tested there); the
+                // dependencies need a lockfile (tested with one).
                 assert_eq!(names, ["header"]);
             } else {
                 assert_eq!(names, ["header", section.name()]);

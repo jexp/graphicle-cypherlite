@@ -762,6 +762,9 @@ pub enum Wire {
     Fixture(Arc<FixtureTransport>),
     #[cfg(test)]
     Panic(Arc<PanicTransport>),
+    /// A store with no network: every request fails to connect.
+    #[cfg(test)]
+    Refused,
 }
 
 impl Clone for Wire {
@@ -773,6 +776,8 @@ impl Clone for Wire {
             Self::Fixture(transport) => Self::Fixture(transport.clone()),
             #[cfg(test)]
             Self::Panic(transport) => Self::Panic(transport.clone()),
+            #[cfg(test)]
+            Self::Refused => Self::Refused,
         }
     }
 }
@@ -786,6 +791,8 @@ impl Transport for Wire {
             Self::Fixture(transport) => transport.get(url).await,
             #[cfg(test)]
             Self::Panic(transport) => transport.get(url).await,
+            #[cfg(test)]
+            Self::Refused => Err(refused()),
         }
     }
 
@@ -797,6 +804,8 @@ impl Transport for Wire {
             Self::Fixture(transport) => transport.post(url, body).await,
             #[cfg(test)]
             Self::Panic(transport) => transport.post(url, body).await,
+            #[cfg(test)]
+            Self::Refused => Err(refused()),
         }
     }
 }
@@ -822,6 +831,18 @@ pub(crate) fn install_panic() -> Arc<PanicTransport> {
     let transport = Arc::new(PanicTransport::default());
     INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Panic(transport.clone())));
     transport
+}
+
+/// Fail this thread's on-demand reads as a store with no network does: each
+/// request is a connection failure, and none reaches a transport.
+#[cfg(test)]
+pub(crate) fn install_refused() {
+    INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Refused));
+}
+
+#[cfg(test)]
+fn refused() -> FetchError {
+    FetchError::Transport("the store has no network".to_owned())
 }
 
 /// The wire of the next on-demand read, built on the calling thread: the
