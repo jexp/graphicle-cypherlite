@@ -78,6 +78,30 @@ pub(crate) fn try_exec_cypher_on(graph: &ExecGraph<'_>, cypher: &str) -> Result<
     execute(graph, &ExecRequest::new(&p, &BTreeMap::new(), cypher))
 }
 
+/// The cells of result column `name`, in result order, extracted through
+/// `value`. The one column reader for the exec tests: a missing column or a
+/// cell of the wrong variant panics with the column name.
+pub(crate) fn column<T>(
+    result: &QueryResult,
+    name: &str,
+    value: impl Fn(&Value) -> Option<T>,
+) -> Vec<T> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("no `{name}` column in {:?}", result.columns));
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            value(&row[index]).unwrap_or_else(|| {
+                panic!("`{name}` cell is not the expected type: {:?}", row[index])
+            })
+        })
+        .collect()
+}
+
 /// A write scratch reading at `ts`, its id allocators continuing the graph's.
 pub(crate) fn write_scratch_at(g: &Graph, ts: u64) -> RefCell<WriteScratch> {
     RefCell::new(WriteScratch::new(
@@ -112,14 +136,7 @@ pub(crate) fn exec_write_unvalidated(
     run_write(g, scratch, cypher, execute_unvalidated)
 }
 
-/// One autocommit statement: `cypher` on a fresh scratch through
-/// `execute`, committed when it succeeds and discarded when it fails.
-pub(crate) fn exec_autocommit(g: &Graph, cypher: &str) -> Result<QueryResult> {
-    let scratch = write_scratch(g);
-    let result = exec_write(g, &scratch, cypher)?;
-    commit_scratch(g, scratch);
-    Ok(result)
-}
+pub(crate) use crate::test_support::exec_autocommit;
 
 /// [`exec_write`] on a fresh scratch, unwrapped; the scratch is dropped
 /// without committing, so the graph is untouched. The uncommitted

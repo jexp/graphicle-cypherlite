@@ -532,3 +532,151 @@ fn clone_from_a_directory_reads_an_external_wal_into_a_bundle() {
     let cloned = Database::open_with(uri(&bundle), read_only()).unwrap();
     assert_eq!(count(&cloned, "Seed"), 1);
 }
+
+/// The ADR-0460 clone suite's one seed: a markdown source vault whose
+/// recorded body-property list is `summary,notes`, holding one node with
+/// both properties.
+fn seed_body_property_vault(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = dir.join("src");
+    let seed = OpenOptions {
+        checkpoint_interval: Some(std::time::Duration::ZERO),
+        snapshot_codec: Some(SnapshotCodecKind::Markdown),
+        markdown_body_properties: Some(
+            cypherlite::MarkdownBodyProperties::parse("summary,notes").unwrap(),
+        ),
+        ..OpenOptions::default()
+    };
+    {
+        let writer = Database::open_with(uri(&src), seed).unwrap();
+        let mut conn = writer.connect().unwrap();
+        conn.execute(
+            "CREATE (:Person {name: 'Ada', summary: 'The primary text.', \
+             notes: 'Scratch thoughts.'})",
+        )
+        .unwrap();
+        writer.checkpoint().unwrap();
+    }
+    src
+}
+
+/// Clone the seeded vault into `dst` and verify the destination: the
+/// exact `Person/Ada.md` bytes, and one property read back through a
+/// plain (flag-less) read-only open — the destination's sidecar carries
+/// the configuration either way.
+fn clone_and_verify_body_properties(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    opts: CloneOptions,
+    expected_ada_md: &str,
+    property: &str,
+    expected_value: &str,
+) {
+    Database::clone(uri(src), uri(dst), opts).unwrap();
+    let ada = fs::read_to_string(dst.join("Person/Ada.md")).unwrap();
+    assert_eq!(ada, expected_ada_md);
+    let reader = Database::open_with(uri(dst), read_only()).unwrap();
+    let query = format!("MATCH (p:Person) RETURN p.{property} AS {property}");
+    let rows = reader.connect().unwrap().execute(&query).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![Value::String(expected_value.into())]],
+        "property {property} on {}",
+        dst.display()
+    );
+}
+
+/// ADR-0460: a markdown→markdown clone with no explicit configuration
+/// keeps the source's recorded body-property layout.
+#[test]
+fn clone_keeps_the_source_recorded_body_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = seed_body_property_vault(dir.path());
+    clone_and_verify_body_properties(
+        &src,
+        &dir.path().join("copy"),
+        CloneOptions {
+            to_snapshot_format: Some(SnapshotCodecKind::Markdown),
+            ..CloneOptions::default()
+        },
+        "---\ntype: Person\nname: Ada\n---\n\nThe primary text.\n\n## notes\n\nScratch \
+         thoughts.\n",
+        "notes",
+        "Scratch thoughts.",
+    );
+}
+
+/// ADR-0460: an explicit configuration replaces the source's wholesale —
+/// with one listed property the copy renders the bare single-body form,
+/// and the unlisted property is never dropped, only relocated to the
+/// frontmatter.
+#[test]
+fn clone_overrides_the_recorded_body_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = seed_body_property_vault(dir.path());
+    clone_and_verify_body_properties(
+        &src,
+        &dir.path().join("bare"),
+        CloneOptions {
+            to_snapshot_format: Some(SnapshotCodecKind::Markdown),
+            markdown_body_properties: Some(
+                cypherlite::MarkdownBodyProperties::parse("summary").unwrap(),
+            ),
+            ..CloneOptions::default()
+        },
+        "---\ntype: Person\nname: Ada\nnotes: Scratch thoughts.\n---\n\nThe primary \
+         text.\n",
+        "summary",
+        "The primary text.",
+    );
+}
+
+/// ADR-0460's set-but-ignored contract on the clone path: an explicit
+/// body-property configuration with a non-markdown destination codec is
+/// refused before publish_into runs — the destination is never created,
+/// so there is nothing to clean up.
+#[test]
+fn a_body_property_config_on_a_non_markdown_clone_is_refused_before_the_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = seed_source(dir.path());
+    let dst = dir.path().join("copy");
+    let err = Database::clone(
+        uri(&src),
+        uri(&dst),
+        CloneOptions {
+            to_snapshot_format: Some(SnapshotCodecKind::Json),
+            markdown_body_properties: Some(
+                cypherlite::MarkdownBodyProperties::parse("summary").unwrap(),
+            ),
+            ..CloneOptions::default()
+        },
+    )
+    .expect_err("the clone must refuse the ignored configuration");
+    assert!(
+        err.to_string()
+            .contains("the configuration would be ignored"),
+        "{err}"
+    );
+    assert!(!dst.exists(), "the refused clone must create nothing");
+}
+
+/// ADR-0163 transcode regression (the ADR-0460 inheritance guard): a
+/// markdown source cloned into a json destination with **no** body
+/// configuration must transcode cleanly — inheritance never synthesizes
+/// a configuration for a non-markdown destination.
+#[test]
+fn a_markdown_source_transcodes_without_a_body_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = seed_body_property_vault(dir.path());
+    let dst = dir.path().join("as-json");
+    Database::clone(
+        uri(&src),
+        uri(&dst),
+        CloneOptions {
+            to_snapshot_format: Some(SnapshotCodecKind::Json),
+            ..CloneOptions::default()
+        },
+    )
+    .unwrap();
+    let reader = Database::open_with(uri(&dst), read_only()).unwrap();
+    assert_eq!(count(&reader, "Person"), 1);
+}

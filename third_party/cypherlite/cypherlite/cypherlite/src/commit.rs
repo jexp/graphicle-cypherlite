@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLockReadGuard};
 use web_time::Instant;
 
 use cypherlite_executor::{
-    execute, result_rows_bytes, ExecGraph, ExecRequest, Graph, QueryResult as ExecResult, RedoOp,
-    SnapshotPin, WriteScratch,
+    execute, result_rows_bytes, ConstraintAdmission, ExecGraph, ExecRequest, Graph,
+    QueryResult as ExecResult, RedoOp, SlotPosition, SnapshotPin, WriteScratch,
 };
 use cypherlite_storage::{Wal, WalRecord};
 
@@ -504,6 +504,70 @@ pub(crate) fn commit_replicated(shared: &Arc<Shared>, record: &WalRecord) -> Res
     Ok(committed.last_lsn)
 }
 
+/// Run one slot through every admission stage — element-id conflict,
+/// commit-time uniqueness, capacity, timestamp — and merge its constraint
+/// delta on acceptance. The one per-slot policy: the caller owns the single
+/// rejection sink, and the checked-but-unmerged delta never escapes this
+/// call (it is merged only after the capacity and timestamp decisions both
+/// pass, so a slot rejected there leaves no holds or constraint-set changes
+/// behind).
+///
+/// ADR-0439: the uniqueness probe runs beside the element-id conflict check
+/// and before the capacity reservation; a slot that would introduce a
+/// constrained tuple already held by another live entity is rejected with
+/// the same retryable `Error::Conflict`, and the rest of the group still
+/// commits.
+fn admit_slot(
+    shared: &Shared,
+    slot: CommitSlot,
+    accepted: &[(usize, Accepted)],
+    reserved: &mut u64,
+    constraint_admission: &mut ConstraintAdmission<'_>,
+    position: SlotPosition,
+    batch_start: Instant,
+) -> Result<Accepted> {
+    let wal_lock_ns = batch_start
+        .saturating_duration_since(slot.enqueued)
+        .as_nanos() as u64;
+    // Previously accepted slots' ops stand in for the old `unapplied` shadow
+    // list (ADR-0063: no second deep clone of the redo ops).
+    let conflict = shared
+        .graph
+        .write_set_conflicts(slot.snapshot_ts, &slot.ops)
+        || accepted
+            .iter()
+            .any(|(_, a)| Graph::redo_conflicts_with_later(&slot.ops, &a.ops));
+    if conflict {
+        return Err(Error::conflict());
+    }
+    let mut earlier_ops = accepted.iter().map(|(_, a)| a.ops.as_slice());
+    let (pending, constraint_growth) =
+        constraint_admission.check_with_earlier(&slot.ops, &mut earlier_ops, position)?;
+    *reserved = shared.admit_redo_capacity_with(&slot.ops, *reserved, Some(constraint_growth))?;
+    let commit_ts = {
+        let last = accepted
+            .last()
+            .map(|(_, a)| a.commit_ts)
+            .unwrap_or_else(|| shared.graph.commit_ts());
+        last.checked_add(1).map(|next| next.max(slot.txn_id))
+    };
+    // Timestamp overflow rejects the slot like the conflict and capacity
+    // stages above — never deferred to a sentinel the group-wide preflight
+    // must remember to catch.
+    let Some(commit_ts) = commit_ts else {
+        return Err(Error::storage("commit timestamp overflow"));
+    };
+    constraint_admission.accept(pending);
+    Ok(Accepted {
+        ops: slot.ops,
+        commit_ts,
+        encode_write_ns: 0,
+        wal_lock_ns,
+        parse_plan_ns: slot.parse_plan_ns,
+        execute_ns: slot.execute_ns,
+    })
+}
+
 fn flush_group(shared: &Arc<Shared>, batch: Vec<CommitSlot>) -> Result<()> {
     let mut waiters = Waiters::new(&batch);
     // Acquire the publication and WAL guards and run the commit core inside
@@ -519,55 +583,25 @@ fn flush_group(shared: &Arc<Shared>, batch: Vec<CommitSlot>) -> Result<()> {
         // parallel vector.
         let mut accepted: Vec<(usize, Accepted)> = Vec::new();
         let mut reserved = 0u64;
+        // ADR-0439: the group's constraint-key admission state — the
+        // committed map plus the delta earlier accepted slots establish.
+        let mut constraint_admission = shared.graph.begin_constraint_admission();
+        let batch_len = batch.len();
 
         for (index, slot) in batch.into_iter().enumerate() {
-            let wal_lock_ns = batch_start
-                .saturating_duration_since(slot.enqueued)
-                .as_nanos() as u64;
-            // Previously accepted slots' ops stand in for the old `unapplied`
-            // shadow list (ADR-0063: no second deep clone of the redo ops).
-            let conflict = shared
-                .graph
-                .write_set_conflicts(slot.snapshot_ts, &slot.ops)
-                || accepted
-                    .iter()
-                    .any(|(_, a)| Graph::redo_conflicts_with_later(&slot.ops, &a.ops));
-            if conflict {
-                waiters.reject(index, Error::conflict());
-                continue;
+            let position = SlotPosition::of(index, batch_len);
+            match admit_slot(
+                shared,
+                slot,
+                &accepted,
+                &mut reserved,
+                &mut constraint_admission,
+                position,
+                batch_start,
+            ) {
+                Ok(slot) => accepted.push((index, slot)),
+                Err(e) => waiters.reject(index, e),
             }
-            match shared.admit_redo_capacity(&slot.ops, reserved) {
-                Ok(next) => reserved = next,
-                Err(e) => {
-                    waiters.reject(index, e);
-                    continue;
-                }
-            }
-            let commit_ts = {
-                let last = accepted
-                    .last()
-                    .map(|(_, a)| a.commit_ts)
-                    .unwrap_or_else(|| shared.graph.commit_ts());
-                last.checked_add(1).map(|next| next.max(slot.txn_id))
-            };
-            // Timestamp overflow rejects the slot here, like the conflict
-            // and capacity arms above — never deferred to a sentinel the
-            // group-wide preflight must remember to catch.
-            let Some(commit_ts) = commit_ts else {
-                waiters.reject(index, Error::storage("commit timestamp overflow"));
-                continue;
-            };
-            accepted.push((
-                index,
-                Accepted {
-                    ops: slot.ops,
-                    commit_ts,
-                    encode_write_ns: 0,
-                    wal_lock_ns,
-                    parse_plan_ns: slot.parse_plan_ns,
-                    execute_ns: slot.execute_ns,
-                },
-            ));
         }
 
         // Strip the batch indices the records traveled with — the commit

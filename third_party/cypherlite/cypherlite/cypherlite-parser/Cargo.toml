@@ -2,6 +2,7 @@
 name = "cypherlite-parser"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 cypherlite-model = { workspace = true }

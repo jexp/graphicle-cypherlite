@@ -29,9 +29,8 @@ use cypherlite_parser::{
 };
 
 use crate::agg::contains_aggregation;
-use crate::ast::collect::{collect_expr_variables, collect_pattern_element_vars, search_score_var};
+use crate::ast::collect::{clause_introduced_names, collect_expr_variables, projected_names};
 use crate::ast::tree::walk_expr_with;
-use crate::show_columns::{catalog_output_columns, catalog_produces_rows};
 
 use crate::agg::SINGLE_INPUT_AGGREGATES;
 
@@ -39,7 +38,7 @@ mod ambiguity;
 mod comprehension;
 mod order_by;
 
-use self::ambiguity::{grouping_key_vars, is_ambiguous_aggregation};
+use self::ambiguity::{is_ambiguous_aggregation, GroupingKeys};
 
 pub use self::comprehension::validate_list_comprehension_aggregation;
 pub use self::order_by::validate_order_by_aggregation;
@@ -321,27 +320,32 @@ fn require_vars_defined(
     Ok(())
 }
 
-/// The names a projection item list exposes (F-1-10): each item's alias
-/// when present, else a bare variable's name, else the item's source
-/// text — plus the bare pre-alias variables, which a DISTINCT projection
-/// may still be ordered by. `*` items contribute nothing here; the call
-/// sites decide what a star means against the incoming scope.
-fn projected_names(items: &[ReturnItem]) -> (HashSet<String>, HashSet<String>) {
-    let mut projected = HashSet::new();
-    let mut source_vars = HashSet::new();
+/// The bare pre-alias variables of a projection item list (F-1-10):
+/// each item's variable when its expression is one — the names a
+/// DISTINCT projection may still be ordered by, narrower than the
+/// effective-name projection (a star item is never a bare variable, so
+/// stars contribute nothing here; the call sites decide what a star
+/// means against the incoming scope).
+fn source_vars(items: &[ReturnItem]) -> HashSet<String> {
+    let mut vars = HashSet::new();
     for item in items {
-        if let Some(alias) = &item.alias {
-            projected.insert(alias.clone());
-        } else if let Expr::Variable(v) = &item.expr {
-            projected.insert(v.clone());
-        } else if let Some(src) = &item.source_text {
-            projected.insert(src.clone());
-        }
         if let Expr::Variable(v) = &item.expr {
-            source_vars.insert(v.clone());
+            vars.insert(v.clone());
         }
     }
-    (projected, source_vars)
+    vars
+}
+
+/// The mixed-star projection policy, the one spelling both projection
+/// consumers in this module use (the RETURN DISTINCT orderable set and
+/// the WITH scope reset): the canonical [`projected_names`] sliced from
+/// the first `*` item — the star carries the incoming scope through,
+/// post-star items add their names on top, pre-star items are replaced
+/// away; no star, the slice is the whole list (the engine's established
+/// mixed-star dialect; `WITH a, *` parses and runs).
+fn star_sliced_names(items: &[ReturnItem], bound: &HashSet<String>) -> HashSet<String> {
+    let star = items.iter().position(|i| i.all).unwrap_or(0);
+    projected_names(&items[star..], bound)
 }
 
 /// The one construction of the grouping-key ambiguity rejection: the
@@ -363,16 +367,14 @@ fn check_projection_items(
     items: &[ReturnItem],
     grouping_key_exprs: &[&Expr],
 ) -> Result<(), EngineError> {
+    let keys = GroupingKeys::new(grouping_key_exprs);
     for item in items {
         check_nested_aggregation(&item.expr)?;
         check_non_constant_in_aggregation(&item.expr)?;
 
-        // Ambiguous aggregation: the expression contains aggregation but
-        // also references non-grouped variables.
-        if contains_aggregation(&item.expr)
-            && !is_direct_aggregation(&item.expr)
-            && is_ambiguous_aggregation(&item.expr, grouping_key_exprs)
-        {
+        // Ambiguous aggregation: is_ambiguous_aggregation owns both
+        // preconditions.
+        if is_ambiguous_aggregation(&item.expr, &keys) {
             return Err(ambiguous_aggregation_error());
         }
     }
@@ -419,16 +421,14 @@ fn check_return_distinct_order_by(
     if !rc.distinct || rc.order_by.is_empty() {
         return Ok(());
     }
-    // A `*` item resets the projection to the incoming scope; the
-    // pre-alias variables of the items before it remain orderable.
-    let (projected, source_vars) = match rc.items.iter().position(|i| i.all) {
-        Some(star) => (scope.clone(), projected_names(&rc.items[..star]).1),
-        None => projected_names(&rc.items),
-    };
+    // The orderable projection is [`star_sliced_names`] plus the
+    // pre-alias variables of every item.
+    let projected = star_sliced_names(&rc.items, scope);
+    let pre_alias_vars = source_vars(&rc.items);
     // The DISTINCT orderability rule, bound once (F-4-9): an ORDER BY
     // variable outside any aggregation must name a projected column or the
     // exact pre-alias variable a projected column was built from.
-    let orderable = |v: &str| projected.contains(v) || source_vars.contains(v);
+    let orderable = |v: &str| projected.contains(v) || pre_alias_vars.contains(v);
     for ob in &rc.order_by {
         // When the projection aggregates, an ORDER BY aggregate is
         // re-evaluated over the projection's input scope
@@ -436,13 +436,10 @@ fn check_return_distinct_order_by(
         // LABS-260): variables *inside* an aggregation are pre-projection
         // references and are checked against `scope`, exactly like the
         // WITH driver. Variables *outside* any aggregation still
-        // reference the projected rows and keep the DISTINCT check.
-        //
-        // Precondition (caller-enforced, F-4-3): the driver rejects every
-        // aggregating ORDER BY item of a non-aggregating RETURN before this
-        // check runs, so a RETURN reaching here with an aggregating ORDER
-        // BY item is itself aggregating and `contains_aggregation` alone
-        // selects the split-scope arm.
+        // reference the projected rows and keep the DISTINCT check —
+        // `contains_aggregation` alone selects the split-scope arm (the
+        // fn doc's caller-enforced precondition is what makes that
+        // sound).
         if contains_aggregation(&ob.expr) {
             check_order_by_vars(&ob.expr, |v| scope.contains(v), orderable)?;
         } else {
@@ -466,25 +463,26 @@ fn check_with_order_by(
     if !wc.items.iter().any(|item| contains_aggregation(&item.expr)) || wc.order_by.is_empty() {
         return Ok(());
     }
-    // Projected aliases (post-aggregation scope) — every aliased item's
-    // alias included unconditionally, so a separate alias→expr map would
-    // only ever test names this set already contains (F-4-2/F-4-4/F-4-7).
-    let (projected_aliases, _) = projected_names(&wc.items);
+    // The projected names (post-aggregation scope) — the canonical
+    // [`projected_names`] fold over an empty bound (a `*` item passes the
+    // empty bound through, contributing nothing here): every item's
+    // effective name, aliases included unconditionally, so a separate
+    // alias→expr map would only ever test names this set already contains
+    // (F-4-2/F-4-4/F-4-7).
+    let projected = projected_names(&wc.items, &HashSet::new());
 
-    // Grouping-key variables, shared by every ORDER BY item.
-    let grouping_vars = grouping_key_vars(grouping_key_exprs);
-
-    // Extended grouping keys include alias variables (e.g. `me.age AS
-    // age` means `age` is also a valid grouping reference); invariant
-    // across the ORDER BY items.
-    let alias_exprs: Vec<Expr> = wc
-        .items
-        .iter()
-        .filter(|i| !contains_aggregation(&i.expr))
-        .filter_map(|i| i.alias.as_ref().map(|a| Expr::Variable(a.clone())))
-        .collect();
-    let mut extended_keys = grouping_key_exprs.to_vec();
-    extended_keys.extend(alias_exprs.iter());
+    // Grouping-key coverage, shared by every ORDER BY item: the one
+    // star-aware model the ambiguity family owns (ADR-0198 ruling 1 — a
+    // `*` key covers every in-scope variable, which the plain
+    // variable-collect is blind to), extended by "a projected alias
+    // counts as a grouping reference" (e.g. `me.age AS age` means `age`
+    // is also a valid grouping reference) with the non-aggregating
+    // items' alias NAMES — invariant across the ORDER BY items. The
+    // definedness closure below consults the same extended model: an
+    // alias name it would newly cover is already covered by its
+    // `|| projected.contains(v)` disjunct.
+    let keys = GroupingKeys::new(grouping_key_exprs)
+        .with_aliases(non_aggregating(&wc.items).filter_map(|i| i.alias.clone()));
 
     for ob in &wc.order_by {
         if contains_aggregation(&ob.expr) {
@@ -500,11 +498,11 @@ fn check_with_order_by(
             // AmbiguousAggregationExpression).
             check_order_by_vars(
                 &ob.expr,
-                |v| scope.contains(v) || projected_aliases.contains(v),
-                |v| grouping_vars.contains(v) || projected_aliases.contains(v),
+                |v| scope.contains(v) || projected.contains(v),
+                |v| keys.covers_variable(v) || projected.contains(v),
             )?;
 
-            if is_ambiguous_aggregation(&ob.expr, &extended_keys) {
+            if is_ambiguous_aggregation(&ob.expr, &keys) {
                 return Err(ambiguous_aggregation_error());
             }
         }
@@ -517,53 +515,16 @@ fn check_with_order_by(
 /// - Nested aggregation (count(count(*)))
 /// - Non-constant expressions in aggregation (count(rand()))
 /// - Ambiguous aggregation expressions (non-grouped variables mixed with aggregation)
-/// - Aggregation in ORDER BY when clause has no aggregation (RETURN ... ORDER BY max(...))
+/// - Aggregation in ORDER BY when clause has no aggregation is owned by
+///   the battery's validate_order_by_aggregation, which runs before this
+///   validator (one owner for that policy)
 /// - Undefined variables in ORDER BY aggregation expressions
 pub fn validate_aggregation_semantics(stmt: &Statement) -> Result<(), EngineError> {
     let mut scope: HashSet<String> = HashSet::new();
 
     for clause in &stmt.clauses {
         match clause {
-            Clause::Match(mc) => {
-                for path in &mc.pattern {
-                    if let Some(pv) = &path.variable {
-                        scope.insert(pv.clone());
-                    }
-                    for elem in &path.elements {
-                        collect_pattern_element_vars(elem, &mut scope);
-                    }
-                }
-                if let Some(sv) = search_score_var(mc) {
-                    scope.insert(sv.to_string());
-                }
-            }
-            Clause::Unwind(uw) => {
-                scope.insert(uw.alias.clone());
-            }
-            Clause::LoadCSV(lc) => {
-                scope.insert(lc.alias.clone());
-            }
-            // Catalog commands (SHOW …, TERMINATE TRANSACTIONS) put their
-            // effective output columns in scope; the command set and the
-            // column math have one home in `show_columns` (F-1-1).
-            clause if catalog_produces_rows(clause) => {
-                for v in catalog_output_columns(clause) {
-                    scope.insert(v);
-                }
-            }
-            Clause::Create(cc) => {
-                for path in &cc.pattern {
-                    if let Some(pv) = &path.variable {
-                        scope.insert(pv.clone());
-                    }
-                    for elem in &path.elements {
-                        collect_pattern_element_vars(elem, &mut scope);
-                    }
-                }
-            }
             Clause::Return(rc) => {
-                let has_agg = rc.items.iter().any(|item| contains_aggregation(&item.expr));
-
                 // Collect grouping key expressions once for the clause
                 // (explicit GROUP BY keys when present, otherwise the
                 // non-aggregation items).
@@ -571,18 +532,11 @@ pub fn validate_aggregation_semantics(stmt: &Statement) -> Result<(), EngineErro
                 check_projection_items(&rc.items, &grouping_key_exprs)?;
                 check_clause_aggregate_arity(&rc.items, &grouping_key_exprs, &rc.order_by)?;
 
-                // Check ORDER BY for aggregation when RETURN has no aggregation
-                if !has_agg {
-                    for ob in &rc.order_by {
-                        if contains_aggregation(&ob.expr) {
-                            return Err(EngineError::semantic(ErrorKind::InvalidAggregation,
-                                "aggregation functions are not allowed in ORDER BY when there is no aggregation in RETURN"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-
+                // No local no-aggregation ORDER BY re-check: the
+                // battery's validate_order_by_aggregation (which runs at
+                // validate time, before lowering calls this validator,
+                // lower/mod.rs) already rejects it with the identical
+                // predicate — one owner for the policy.
                 check_return_distinct_order_by(rc, &scope)?;
             }
             Clause::With(wc) => {
@@ -593,18 +547,24 @@ pub fn validate_aggregation_semantics(stmt: &Statement) -> Result<(), EngineErro
                 check_clause_aggregate_arity(&wc.items, &grouping_key_exprs, &wc.order_by)?;
                 check_with_order_by(wc, &grouping_key_exprs, &scope)?;
 
-                // Reset scope to the projected variables. A `*` item
-                // carries the incoming scope; items after it still add
-                // their names on top.
-                scope = match wc.items.iter().position(|i| i.all) {
-                    Some(star) => {
-                        let mut carried = scope.clone();
-                        carried.extend(projected_names(&wc.items[star + 1..]).0);
-                        carried
-                    }
-                    None => projected_names(&wc.items).0,
-                };
+                // Reset scope to the projected variables through
+                // [`star_sliced_names`].
+                scope = star_sliced_names(&wc.items, &scope);
             }
+            // The scope-introduction policy consults the canonical
+            // per-clause fold (LABS-518), spelling the *exclusion*, not
+            // the inclusion: MERGE and CALL-procedure names stay
+            // deliberately out of this validator's scope (never tracked
+            // here — the scope feeds only the DISTINCT/ORDER BY checks),
+            // while every other kind derives from the fold — a new
+            // scope-introducing arm there flows through automatically,
+            // and kinds the fold does not introduce (SET, DELETE,
+            // FINISH, …) yield the empty set, a no-op.
+            other if !matches!(other, Clause::Merge(_) | Clause::CallProcedure(_)) => {
+                scope.extend(clause_introduced_names(other));
+            }
+            // The guard's two deliberate exclusions: MERGE and
+            // CALL-procedure.
             _ => {}
         }
     }
@@ -625,14 +585,8 @@ fn grouping_key_exprs<'a>(
     group_by: Option<&'a GroupBySpec>,
     items: &'a [cypherlite_parser::ReturnItem],
 ) -> Vec<&'a Expr> {
-    let inferred = || {
-        items
-            .iter()
-            .filter(|i| !contains_aggregation(&i.expr))
-            .map(|i| &i.expr)
-    };
     match group_by {
-        None | Some(GroupBySpec::All) => inferred().collect(),
+        None | Some(GroupBySpec::All) => non_aggregating(items).map(|i| &i.expr).collect(),
         Some(GroupBySpec::Empty) => Vec::new(),
         Some(GroupBySpec::Keys(keys)) => keys
             .iter()
@@ -646,6 +600,13 @@ fn grouping_key_exprs<'a>(
             })
             .collect(),
     }
+}
+
+/// The projection items that do not aggregate — the one partition the
+/// inferred grouping keys ([`grouping_key_exprs`]) and the alias
+/// extension of the WITH ORDER BY check both derive from.
+fn non_aggregating(items: &[ReturnItem]) -> impl Iterator<Item = &ReturnItem> {
+    items.iter().filter(|i| !contains_aggregation(&i.expr))
 }
 
 #[cfg(test)]

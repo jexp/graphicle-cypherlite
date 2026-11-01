@@ -19,8 +19,8 @@ use crate::show_columns::{catalog_output_columns, catalog_produces_rows};
 /// UNWIND/RETURN clauses to determine what its terminal projection (last
 /// RETURN, or a trailing WITH such as `EXISTS { WITH * }`) would output.
 /// Used by the scope validator's `CallSubquery` legacy-importing-WITH
-/// check (`super::scope`) to see whether an imported outer variable gets
-/// re-exported by a later `*`.
+/// check (`crate::validate::scope`) to see whether an imported outer
+/// variable gets re-exported by a later `*`.
 pub(crate) fn compute_subquery_output_vars(stmt: &Statement) -> Option<HashSet<String>> {
     compute_subquery_output_vars_seeded(stmt, &HashSet::new())
 }

@@ -1,4 +1,5 @@
-//! Commit-path tests for reader/writer races and the durability modes.
+//! Commit-path tests for reader/writer races and the durability modes; the
+//! ADR-0439 scheduler-driven uniqueness races live in `admission_races`.
 
 use super::super::*;
 use super::harness::spawn_person_create_storm;
@@ -7,7 +8,6 @@ use std::time::Duration;
 
 #[test]
 fn concurrent_readers_see_committed() {
-    use std::sync::Arc;
     let db = Database::open(":memory:").unwrap();
     {
         let mut c = db.connect().unwrap();
@@ -30,7 +30,6 @@ fn concurrent_readers_see_committed() {
 
 #[test]
 fn concurrent_disjoint_creates() {
-    use std::sync::Arc;
     let db = Arc::new(Database::open(":memory:").unwrap());
     let n = 8;
     spawn_person_create_storm(&db, n);

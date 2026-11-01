@@ -10,17 +10,15 @@
 //! are explicit parameters on [`StorageConstraintStyle`], so neither
 //! re-implements the other's policy.
 
+use cypherlite_model::identifier::{quote_identifier_always, quote_identifier_shaped};
 use cypherlite_model::{Constraint, ConstraintType};
-use cypherlite_parser::token::quote_identifier_shaped;
-
-use cypherlite_parser::token::quote_identifier_always;
 
 /// How a renderer spells the constraint parts that legitimately differ
 /// between CIP-180's canonical form and CIP-257's display form.
 pub(crate) struct StorageConstraintStyle {
     /// Renders one identifier (constraint name, label, property key):
     /// canonical always backticks (its always-quoted policy), display
-    /// applies the parser's shape-only display policy.
+    /// applies the model's shape-only display policy.
     identifier: fn(&str) -> String,
     /// Renders the constraint pattern's variable (`n`/`r`): canonical
     /// always backticks it, display leaves it bare.
@@ -39,7 +37,7 @@ impl StorageConstraintStyle {
         parenthesize_single_property: true,
     };
 
-    /// CIP-257's display form: the parser's shape-only display identifier
+    /// CIP-257's display form: the model's shape-only display identifier
     /// policy (keywords stay bare -- display text is not re-parsed), a bare
     /// `n`/`r` variable, and a single property left unparenthesized.
     pub(crate) const DISPLAY: Self = Self {

@@ -187,7 +187,7 @@ pub(crate) fn checkpoint_at_with_bytes(
     // even an unused alias before a new leaf can be created through it.
     for kind in Kind::ALL {
         if let Some(root) = &target.native_root {
-            validate_dir(root, kind.dir(), "shard directory", true)?;
+            validate_dir(root, kind.dir(), "shard directory", DirAdmit::Optional)?;
         }
     }
     let mut owned = Vec::new();
@@ -334,6 +334,7 @@ pub(crate) fn load_with_checkpoint_lsn(target: &StoreTarget) -> Result<LoadedSna
             checkpoint_lsn,
             ontology,
             marker,
+            deferred: None,
         }),
         // A legacy-store failure names the version where the loader knows
         // it (ADR-0127 Decision 4); a current store keeps its error verbatim.
@@ -376,9 +377,10 @@ fn load_manifest_body(
     for kind in Kind::ALL {
         load_kind(target, &graph, manifest, kind)?;
     }
-    if graph.commit_ts() == 0 && graph.live_node_count() > 0 {
-        graph.set_commit_ts(1);
-    }
+    // The load-tail commit-timestamp floor, through the one home of the
+    // policy (the graph is fresh, so its live nodes are this load's
+    // rows).
+    crate::snapshot::ensure_commit_ts(&graph, graph.live_node_count());
     for idx in &manifest.indexes {
         graph.install_named_index(idx.clone())?;
     }
@@ -441,18 +443,48 @@ pub(crate) fn read_manifest_for_test(target: &StoreTarget) -> Result<Option<Mani
     Ok(read_manifest(target)?.map(|(m, _)| m))
 }
 
+/// How [`validate_dir`] treats an absent directory — the two admission
+/// policies its callers select by name (mirroring `OpenAdmit` and
+/// `HostAdmit`), so a validate/create/re-validate sandwich reads by
+/// policy instead of by boolean position.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirAdmit {
+    /// The directory must already exist: absence is a refusal.
+    Required,
+    /// An absent entry is acceptable, for callers about to create it.
+    Optional,
+}
+
 /// Refuse a `root`-relative directory that is missing, is not a directory, or
-/// is reachable only through a symlink/junction/reparse point. `allow_missing`
-/// treats an absent entry as acceptable, for callers about to create it.
-fn validate_dir(root: &std::path::Path, rel: &str, what: &str, allow_missing: bool) -> Result<()> {
+/// is reachable only through a symlink/junction/reparse point.
+/// [`DirAdmit::Optional`] treats an absent entry as acceptable, for callers
+/// about to create it.
+fn validate_dir(root: &std::path::Path, rel: &str, what: &str, admit: DirAdmit) -> Result<()> {
     let path = root.join(rel);
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.is_dir() && native::plain_entry(&meta) => Ok(()),
-        Err(e) if allow_missing && e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        _ => Err(Error::storage(format!(
+        Ok(meta)
+            if matches!(
+                native::native_entry_kind(&meta),
+                native::NativeEntryKind::Dir
+            ) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(Error::storage(format!(
             "{what} is not a regular directory (symlinks refused): {}",
             path.display()
         ))),
+        // Absence is its own refusal — only `DirAdmit::Optional` promotes
+        // it to Ok — and every other inspection failure propagates instead
+        // of reading as a shape refusal.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match admit {
+            DirAdmit::Optional => Ok(()),
+            DirAdmit::Required => Err(Error::storage(format!(
+                "missing {what}: {}",
+                path.display()
+            ))),
+        },
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -549,7 +581,7 @@ fn validate_native_plain_file(root: &std::path::Path, rel: &str, what: &str) -> 
     let file = root.join(rel);
     let meta = std::fs::symlink_metadata(&file)
         .map_err(|e| Error::storage(format!("invalid {what} {}: {e}", file.display())))?;
-    if !meta.is_file() || !native::plain_entry(&meta) {
+    if native::native_entry_kind(&meta) != native::NativeEntryKind::File {
         return Err(Error::storage(format!("invalid {what} path: {rel}")));
     }
     Ok(())
@@ -559,7 +591,8 @@ fn validate_shard_name(target: &StoreTarget, name: ShardName) -> Result<()> {
     let path = name.path();
     let invalid = || Error::storage(format!("invalid manifest shard path: {path}"));
     if let Some(root) = &target.native_root {
-        validate_dir(root, name.kind.dir(), "shard directory", false).map_err(|_| invalid())?;
+        validate_dir(root, name.kind.dir(), "shard directory", DirAdmit::Required)
+            .map_err(|_| invalid())?;
         validate_native_plain_file(root, &path, "shard")?;
     }
     Ok(())
@@ -628,11 +661,11 @@ fn reserve_owned_object(
 /// caught (ADR-0089, ADR-0120 §5).
 fn prepare_object_dir(target: &StoreTarget, dir: &str, what: &str) -> Result<()> {
     if let Some(root) = &target.native_root {
-        validate_dir(root, dir, what, true)?;
+        validate_dir(root, dir, what, DirAdmit::Optional)?;
     }
     target.vfs.create_dir_all_for_atomic(dir)?;
     if let Some(root) = &target.native_root {
-        validate_dir(root, dir, what, false)?;
+        validate_dir(root, dir, what, DirAdmit::Required)?;
     }
     Ok(())
 }

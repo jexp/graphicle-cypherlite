@@ -1,9 +1,11 @@
 use super::*;
 use crate::memory_store_with_codec;
 use crate::snapshot::get_object;
+use cypherlite_catalog::ConstraintDef;
 use cypherlite_core::temporal::parse_iso;
 use cypherlite_core::{PointValue, Temporal, Value, VectorCoordKind};
 use cypherlite_executor::RedoOp;
+use cypherlite_model::ConstraintType;
 use std::collections::BTreeMap;
 
 #[path = "tests/corrupt_reads.rs"]
@@ -19,6 +21,44 @@ mod roundtrip;
 // checkpoint theater, legacy-unknown enforcement markers, and the boundary
 // guards for exhausted timestamps and negative ID cursors.
 
+/// ADR-0450: the JSON row carries the enforced label (the write side
+/// sources it from the theater). A checkpoint roundtrip installs that value
+/// into the catalog row instead of dropping it to `None`, so the reloaded
+/// graph's constraint identity matches the stored one.
+#[test]
+fn json_checkpoint_roundtrip_preserves_the_enforced_label() {
+    let target = memory_store_with_codec(SnapshotCodecKind::Json).unwrap();
+    let graph = Graph::default();
+    let def = ConstraintDef {
+        name: "rule".into(),
+        relationship: false,
+        label: "Person".into(),
+        properties: vec![],
+        kind: "nodeLabelExistence".into(),
+        property_type: None,
+        enforced_label: Some("Verified".into()),
+    };
+    graph
+        .apply_redo(
+            vec![
+                RedoOp::create_constraint(def.clone()),
+                RedoOp::CatalogDerivedConstraint {
+                    constraint: def.to_model(ConstraintType::NodeLabelExistence),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+    dump(&target, &graph, 1, 1, None).unwrap();
+    let loaded = load(&target).unwrap();
+    let def = loaded
+        .named_constraints()
+        .into_iter()
+        .find(|def| def.name == "rule")
+        .expect("the roundtrip keeps the constraint");
+    assert_eq!(def.enforced_label.as_deref(), Some("Verified"));
+}
+
 #[test]
 fn json_typed_theater_requires_every_named_enforced_label() {
     let target = memory_store_with_codec(SnapshotCodecKind::Json).unwrap();
@@ -26,14 +66,15 @@ fn json_typed_theater_requires_every_named_enforced_label() {
     graph
         .apply_redo(
             vec![
-                RedoOp::CreateConstraint {
+                RedoOp::create_constraint(ConstraintDef {
                     name: "rule".into(),
                     relationship: false,
                     label: "Person".into(),
                     properties: vec![],
                     kind: "nodeLabelExistence".into(),
                     property_type: None,
-                },
+                    enforced_label: None,
+                }),
                 RedoOp::CatalogDerivedConstraint {
                     constraint: cypherlite_model::Constraint {
                         name: "rule".into(),
@@ -200,4 +241,39 @@ fn dump_rejects_negative_next_ids_without_replacing_checkpoint() {
         assert_eq!(graph.dirty_node_ids().len(), 1);
         assert_eq!(load(&target).unwrap().live_node_count(), 1);
     }
+}
+
+/// A constraint row written before `ConstraintDef` carried the enforced
+/// label decodes it as `None` (the legacy identity-unknown policy), a
+/// current row round-trips it, and a non-enforced row keeps the pre-field
+/// byte shape (no `enforced_label` key).
+#[test]
+fn constraint_def_enforced_label_is_an_optional_durable_field() {
+    let legacy: cypherlite_catalog::ConstraintDef = serde_json::from_str(
+        r#"{"name":"rule","relationship":false,"label":"Person","properties":[],"kind":"nodeLabelExistence","property_type":null}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.enforced_label, None);
+
+    let current = cypherlite_catalog::ConstraintDef {
+        enforced_label: Some("Verified".into()),
+        ..legacy
+    };
+    let json = serde_json::to_string(&current).unwrap();
+    assert!(json.contains(r#""enforced_label":"Verified""#));
+    let decoded: cypherlite_catalog::ConstraintDef = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, current);
+
+    let unique = cypherlite_catalog::ConstraintDef {
+        name: "u".into(),
+        relationship: false,
+        label: "P".into(),
+        properties: vec!["id".into()],
+        kind: "unique".into(),
+        property_type: None,
+        enforced_label: None,
+    };
+    assert!(!serde_json::to_string(&unique)
+        .unwrap()
+        .contains("enforced_label"));
 }

@@ -16,10 +16,13 @@ mod common;
 
 use std::sync::Arc;
 
-use cypherlite::{Database, OpenOptions, Value};
+use cypherlite::{Database, Value};
 use cypherlite_storage::{MemoryVfs, SnapshotCodecKind, Vfs};
 
-use common::{assert_checkpoint_format, err_text, get_doc, magics, segment_magics, set_doc};
+use common::{
+    assert_checkpoint_format, err_text, get_doc, magics, opts, segment_magics, set_doc,
+    ExpectedOntology,
+};
 
 /// The YAML matrix document (the twin-ontology shape, freely formatted —
 /// the byte-identity legs pin verbatim storage across reopens).
@@ -52,16 +55,6 @@ const EXAMPLE_JSON: &str = include_str!("../../cypherlite-ontology/schema/exampl
 
 const GET_YAML: &str = "CALL db.ontology.get() YIELD ontology RETURN ontology";
 const GET_JSON: &str = "CALL db.ontology.get('json') YIELD ontology RETURN ontology";
-
-/// The default options pin the snapshot codec only: no automatic
-/// checkpoint interval, so every durability boundary below is the explicit
-/// `db.checkpoint()` in [`close`].
-fn opts(codec: SnapshotCodecKind) -> OpenOptions {
-    OpenOptions {
-        snapshot_codec: Some(codec),
-        ..OpenOptions::default()
-    }
-}
 
 /// Checkpoint, then drop the handle: an honest close on every store kind.
 /// On a shared `MemoryVfs` the explicit checkpoint is what carries the
@@ -227,8 +220,10 @@ fn bundle_procedure_matrix_both_codecs() {
 /// rotates the active WAL segment to `MDBWAL02`; segments created while
 /// the ontology is held stay `MDBWAL02`; after `db.ontology.drop()` +
 /// checkpoint + WAL recycle the manifest is format_version 3 (Parquet) /
-/// graph.json carries no `ontology` field at value_encoding 2 (JSON) and
-/// new segments are `MDBWAL01` again.
+/// graph.json carries no `ontology` field at value_encoding 2 (JSON), the
+/// markdown sidecar manifest publishing the ontology by the JSON
+/// envelope's inline rule (ADR-0406 §3), and new segments are `MDBWAL01`
+/// again.
 ///
 /// `ontology_store.rs` pins the same transitions through the facade; this
 /// is the Done-when coverage through Cypher, including the pre-checkpoint
@@ -243,12 +238,12 @@ fn procedure_driven_format_transitions() {
         let db = Database::open_with(&uri, opts(codec)).unwrap();
         let mut conn = db.connect().unwrap();
         // A fresh store is the plain format: one MDBWAL01 segment.
-        assert_eq!(magics(dir.path()), vec![*b"MDBWAL01"]);
+        assert_eq!(magics(dir.path(), codec), vec![*b"MDBWAL01"]);
 
         // The first set rotates the active segment to MDBWAL02, before any
         // checkpoint runs.
         set_doc(&mut conn, DOC_YAML).unwrap();
-        let segments = segment_magics(dir.path());
+        let segments = segment_magics(dir.path(), codec);
         assert_eq!(
             segments.last().unwrap().1,
             *b"MDBWAL02",
@@ -256,25 +251,29 @@ fn procedure_driven_format_transitions() {
         );
 
         // Segments created while the ontology is held stay MDBWAL02, and
-        // the checkpoint publishes the ontology.
-        conn.query("CREATE (:Widget {id: 1})").unwrap();
+        // the checkpoint publishes the ontology. The node carries a
+        // `name` because the markdown leg needs it: every vault node
+        // needs its label's unique key property (ADR-0406 §2).
+        conn.query("CREATE (:Widget {id: 1, name: 'Widget'})")
+            .unwrap();
         db.checkpoint().unwrap();
         assert!(
-            magics(dir.path()).iter().all(|m| m == b"MDBWAL02"),
+            magics(dir.path(), codec).iter().all(|m| m == b"MDBWAL02"),
             "every segment is MDBWAL02 while the ontology is held"
         );
-        assert_checkpoint_format(dir.path(), codec, true, None);
+        assert_checkpoint_format(dir.path(), codec, ExpectedOntology::Held);
 
         // Drop through the procedure, checkpoint, recycle: the store is
         // back at the plain format.
         conn.query("CALL db.ontology.drop()").unwrap();
         db.checkpoint().unwrap();
-        assert_checkpoint_format(dir.path(), codec, false, None);
-        assert_eq!(magics(dir.path()), vec![*b"MDBWAL01"]);
+        assert_checkpoint_format(dir.path(), codec, ExpectedOntology::Absent);
+        assert_eq!(magics(dir.path(), codec), vec![*b"MDBWAL01"]);
 
         // Segments created after the recycle are MDBWAL01 again.
-        conn.query("CREATE (:Widget {id: 2})").unwrap();
-        let segments = segment_magics(dir.path());
+        conn.query("CREATE (:Widget {id: 2, name: 'Widget2'})")
+            .unwrap();
+        let segments = segment_magics(dir.path(), codec);
         assert_eq!(segments.last().unwrap().1, *b"MDBWAL01");
 
         // And the empty state survives a reopen, observed through Cypher.
@@ -283,6 +282,6 @@ fn procedure_driven_format_transitions() {
         let db = Database::open_with(&uri, opts(codec)).unwrap();
         let mut conn = db.connect().unwrap();
         assert_eq!(get_doc(&mut conn, GET_YAML), Value::Null);
-        assert_eq!(magics(dir.path()), vec![*b"MDBWAL01"]);
+        assert_eq!(magics(dir.path(), codec), vec![*b"MDBWAL01"]);
     }
 }

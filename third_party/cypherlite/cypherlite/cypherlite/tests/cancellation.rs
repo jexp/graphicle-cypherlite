@@ -396,6 +396,62 @@ fn cancelling_inside_a_shortest_path_search_errors_promptly() {
     assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
 }
 
+/// Cancellation must be observed *inside* the predicate-filtered shortest-path
+/// enumeration (ADR-0111, ADR-0186), not between its per-length rounds. A
+/// path-level predicate replaces the route's BFS with a trail walk: on a dense
+/// mesh every extra length multiplies the trails by the mesh degree, so one
+/// length costs minutes while the query walks the whole 1..32 hop range. The
+/// cancel must therefore land inside one length's enumeration and be observed
+/// there — a walk that only checked between lengths would not return for hours.
+#[test]
+fn cancelling_inside_a_path_predicate_shortest_path_errors_promptly() {
+    // 40 mesh nodes with both directions on every pair (1560 relationships)
+    // plus an unreachable `:T` target, so no trail of any length ends the
+    // search early.
+    const MESH: i64 = 40;
+    let db = Database::open(":memory:").unwrap();
+    let mut conn = db.connect().unwrap();
+    conn.query(&format!(
+        "UNWIND range(1, {MESH}) AS i CREATE (:M {{v: i}})"
+    ))
+    .unwrap();
+    conn.query(&format!(
+        "UNWIND range(1, {MESH}) AS i UNWIND range(1, {MESH}) AS j WITH i, j \
+         WHERE i <> j MATCH (a:M {{v: i}}), (b:M {{v: j}}) CREATE (a)-[:R]->(b)"
+    ))
+    .unwrap();
+    conn.query("CREATE (:T)").unwrap();
+
+    let query = "MATCH (a:M {v: 1}), (t:T) \
+                 MATCH p = shortestPath((a)-[*]->(t)) \
+                 WHERE NONE(n IN nodes(p) WHERE n.v = 2) RETURN count(p) AS n";
+    let token = CancelToken::new();
+    let canceller = token.clone();
+    let started = std::time::Instant::now();
+    let outcome = std::thread::scope(|scope| {
+        let running =
+            scope.spawn(|| conn.query_with_params_cancellable(query, BTreeMap::new(), canceller));
+        std::thread::sleep(Duration::from_millis(20));
+        token.cancel();
+        running.join().unwrap()
+    });
+    let elapsed = started.elapsed();
+
+    let error = outcome.unwrap_err();
+    assert!(
+        error.to_string().contains("query cancelled"),
+        "expected a cancellation error from the predicate search, got {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancelled predicate search took {elapsed:?}, far longer than the cancel latency"
+    );
+
+    // The connection stays usable after the cancelled search.
+    let result = conn.query("RETURN 1 AS one").unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+}
+
 /// Cancellation must be observed *inside* constraint validation (ADR-0111,
 /// ADR-0174): `CREATE CONSTRAINT` over a large label re-checks every node
 /// of the label, so without a per-entity check in the recheck loop the

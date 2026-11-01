@@ -20,7 +20,10 @@ pub(super) fn bi_format(_graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> R
                 return Err(Error::ty("format() requires a temporal value"));
             };
             match vals.get(1) {
-                None => Value::String(t.iso_string().into()),
+                // The no-pattern default renders the same full-precision
+                // form toString does (ADR-0448): one temporal rendering
+                // for every string-producing surface.
+                None => Value::String(t.full_seconds_string().into()),
                 Some(Value::String(pattern)) => {
                     Value::String(temporal::format_pattern(t, pattern)?.into())
                 }

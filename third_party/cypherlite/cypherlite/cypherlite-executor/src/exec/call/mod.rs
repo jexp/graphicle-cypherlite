@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use cypherlite_core::{Error, Result, Value};
-use cypherlite_ir::{Clause, Expr, Projection, Query};
+use cypherlite_ir::{Clause, Expr, Query};
 
 use crate::ctx::{ExecCtx, QueryCtx};
-use crate::eval::{eval, Row};
+use crate::eval::{eval, is_agg_expr, Row};
 use crate::graph::QueryStats;
 use crate::overlay::ExecGraph;
 
@@ -17,8 +17,12 @@ mod shared;
 use shared::{exec_call_subquery_shared, import_invariant_body, shared_execution_plan};
 
 use super::constraint_validation::validate_constraints;
-use super::dispatch::run_nested_clauses;
-use super::scope::{nested_seed_row, return_columns, star_scope_names, visible_keys};
+use super::dispatch::{run_nested_clauses, run_nested_clauses_scoped};
+use super::final_stage;
+use super::scope::{
+    carry_scope_bindings, has_star_item, nested_seed_row, refresh_rows, return_columns,
+    star_scope_names, visible_keys,
+};
 use super::QueryResult;
 use crate::csv::{field_terminator_char, record_value, split_csv_line, split_csv_records};
 use crate::group_key::GroupKey;
@@ -99,7 +103,7 @@ pub(crate) fn exec_call_subquery(
         return exec_call_in_transactions(graph, rows, spec, tx, params, qctx);
     }
     if let Some(plan) = shared_execution_plan(spec.scope, &rows)? {
-        if import_invariant_body(spec.query, &plan.check) {
+        if import_invariant_body(spec.query, &plan.check()) {
             return exec_call_subquery_shared(graph, rows, spec, plan, params, qctx);
         }
     }
@@ -189,54 +193,40 @@ pub(crate) fn call_subquery_row(
     params: &BTreeMap<String, Value>,
     qctx: QueryCtx<'_>,
 ) -> Result<Vec<Row>> {
-    // One match over the CallScope vocabulary derives both the seed row and
-    // the imported-name set: the seed carries the imported bindings. The
-    // naked and `(*)` scopes hand the body the outer row, minus the enclosing
-    // clause engine's internal columns (`nested_seed_row`) — a parked
-    // `__ord*`/`__agg_*` slot is the enclosing clause's state, never a
-    // binding the body may read as its own. For `(*)` the imported set is
-    // derived from that same stripped seed: threading a name through the
-    // body's `WITH`s that the seed no longer binds would make the body
-    // evaluate an absent variable. A `(vars)` import list names its bindings
-    // explicitly, so it needs no strip.
-    let (seed, imported) = match scope {
-        cypherlite_ir::CallScope::None => (nested_seed_row(outer), HashSet::new()),
-        cypherlite_ir::CallScope::Wildcard => {
-            let seed = nested_seed_row(outer);
-            let imported = seed.keys().cloned().collect();
-            (seed, imported)
+    // One match over the CallScope vocabulary derives the seed row — the
+    // imported bindings. The naked and `(*)` scopes hand the body the outer
+    // row, minus the enclosing clause engine's internal columns
+    // (`nested_seed_row`): a parked `__ord*`/`__agg_*` slot is the enclosing
+    // clause's state, never a binding the body may read as its own. A
+    // `(vars)` import list names its bindings explicitly, so it needs no
+    // strip.
+    let seed = match scope {
+        cypherlite_ir::CallScope::None | cypherlite_ir::CallScope::Wildcard => {
+            nested_seed_row(outer)
         }
-        cypherlite_ir::CallScope::Vars(vars) => {
-            (import_seed(vars, outer)?, vars.iter().cloned().collect())
-        }
+        cypherlite_ir::CallScope::Vars(vars) => import_seed(vars, outer)?,
     };
-    // Called unconditionally: with the None scope's empty `imported` set
-    // `query_with_persistent_imports` pushes nothing and returns the clone
-    // a plain `query.clone()` would.
-    let scoped_query = query_with_persistent_imports(query, &imported);
-    let result = execute_query_seeded(graph, &scoped_query, params, vec![seed], qctx)?;
-    // A part merges its rows back only when its last clause produces a
-    // statement result: RETURN, a conditional, or a row-producing catalog
-    // command (the canonical `cypherlite-front` classification — a
-    // schema/admin DDL command's empty result must not suppress the
-    // pass-through).
-    if query.parts.iter().all(|part| match part.clauses.last() {
-        Some(Clause::Return { .. } | Clause::Conditional { .. }) => false,
-        Some(Clause::Catalog(command)) => {
-            !cypherlite_front::show_columns::catalog_produces_rows(command)
-        }
-        _ => true,
-    }) {
-        return Ok(vec![outer.clone()]);
-    }
-    if result.rows.is_empty()
-        && query
-            .parts
-            .iter()
-            .all(|part| matches!(part.clauses.last(), Some(Clause::Finish)))
+    // The seed is the body's importing scope: every binding it carries stays
+    // visible to the whole body, even across a `WITH` that does not project
+    // it (`run_nested_clauses_scoped` re-attaches a dropped binding after
+    // the projection, so it is never injected as a grouping key and a
+    // keyless aggregation over an emptied input keeps its identity row).
+    // This supersedes the `query_with_persistent_imports` rewrite: the
+    // scoped clause loop preserves the same bindings without altering the
+    // body's `WITH` items.
+    let result = execute_query_scoped(graph, query, params, seed, qctx)?;
+    // A part merges its rows back only when its last clause projects a
+    // statement result (`super::part_projects_rows` — one classification
+    // shared with the conditional branch body; a schema/admin DDL command's
+    // empty result must not suppress the pass-through).
+    if query
+        .parts
+        .iter()
+        .all(|part| !super::part_projects_rows(&part.clauses))
     {
         return Ok(vec![outer.clone()]);
     }
+    let imported = imported_names(scope, Some(outer));
     let mut produced = Vec::new();
     for values in result.rows {
         // Exclusion is by column name: imported bindings pass through from
@@ -268,51 +258,43 @@ fn project_row<'a>(
     columns.iter().cloned().zip(values.iter().cloned())
 }
 
-/// Push a `WITH`/`RETURN` projection for every imported binding the item
-/// list does not already carry — the persistent-import policy shared by the
-/// mid-part `WITH` and the concluding `RETURN` of
-/// [`query_with_persistent_imports`].
-fn ensure_imported(items: &mut Vec<Projection>, imported: &HashSet<String>) {
-    for name in imported {
-        if !items
-            .iter()
-            .any(|item| matches!(&item.expr, Expr::Variable(variable) if variable == name))
-        {
-            items.push(Projection {
-                expr: Expr::Variable(name.clone()),
-                alias: None,
-                source_text: None,
-            });
-        }
-    }
-}
-
-pub(crate) fn query_with_persistent_imports(query: &Query, imported: &HashSet<String>) -> Query {
-    let mut query = query.clone();
-    for part in &mut query.parts {
-        for clause in &mut part.clauses {
-            if let Clause::With { items, .. } = clause {
-                ensure_imported(items, imported);
-            }
-        }
-        if query.next.is_some() {
-            if let Some(Clause::Return { items, .. }) = part.clauses.last_mut() {
-                ensure_imported(items, imported);
-            }
-        }
-    }
-    if let Some(next) = &mut query.next {
-        **next = query_with_persistent_imports(next, imported);
-    }
-    query
-}
-
 pub(crate) fn execute_query_seeded(
     graph: &ExecGraph<'_>,
     query: &Query,
     params: &BTreeMap<String, Value>,
     seeds: Vec<Row>,
     qctx: QueryCtx<'_>,
+) -> Result<QueryResult> {
+    execute_query_seeded_in_scope(graph, query, params, seeds, qctx, None)
+}
+
+/// Execute `query` with `seed` as both its only input row and its
+/// importing-subquery scope (`run_nested_clauses_scoped`): the seed is the
+/// body's input, and every binding it carries stays visible for the whole
+/// body. The one entry for scoped callers; the two-argument form below is
+/// private because only the internal NEXT-stage recursion derives seeds
+/// that legitimately diverge from the scope.
+pub(crate) fn execute_query_scoped(
+    graph: &ExecGraph<'_>,
+    query: &Query,
+    params: &BTreeMap<String, Value>,
+    seed: Row,
+    qctx: QueryCtx<'_>,
+) -> Result<QueryResult> {
+    execute_query_seeded_in_scope(graph, query, params, vec![seed.clone()], qctx, Some(&seed))
+}
+
+/// [`execute_query_scoped`]'s two-argument core: arbitrary derived `seeds`
+/// and the optionally distinct importing scope. Private to this module's
+/// NEXT-stage recursion (the only caller whose seeds diverge from the
+/// scope) and [`execute_query_seeded`]'s unscoped form.
+fn execute_query_seeded_in_scope(
+    graph: &ExecGraph<'_>,
+    query: &Query,
+    params: &BTreeMap<String, Value>,
+    seeds: Vec<Row>,
+    qctx: QueryCtx<'_>,
+    scope: Option<&Row>,
 ) -> Result<QueryResult> {
     let mut combined: Option<QueryResult> = None;
     // `seen` is the UNION joiner state `union_merge` owns.
@@ -333,7 +315,12 @@ pub(crate) fn execute_query_seeded(
         // part count on the statement's budget instead of hiding its
         // width inside one invocation tick. The top-level statement
         // driver (exec/mod.rs) never enters here.
-        let (rows, last) = run_nested_clauses(graph, &part.clauses, params, part_seeds, qctx)?;
+        let (rows, last) = match scope {
+            Some(scope) => {
+                run_nested_clauses_scoped(graph, &part.clauses, params, part_seeds, qctx, scope)?
+            }
+            None => run_nested_clauses(graph, &part.clauses, params, part_seeds, qctx)?,
+        };
         let result = match last {
             Some(result) => result,
             None => super::rows_as_result(graph, &rows),
@@ -352,21 +339,20 @@ pub(crate) fn execute_query_seeded(
         };
         super::union_merge(&mut combined, result, all, &mut seen);
     }
-    let result = combined.unwrap_or(QueryResult::intermediate(
-        Vec::new(),
-        Vec::new(),
-        graph.stats(),
-    ));
+    // A `Query` invariantly carries at least one part, so the fold always
+    // produced a result.
+    let result = combined.expect("a Query invariantly carries at least one part");
     if let Some(next) = query.next.as_deref() {
         // The one NEXT-stage seeding policy: a `Query`'s parts are the
-        // same trailing-clause shape a `LogicalPlan`'s are.
-        execute_query_seeded(
-            graph,
-            next,
-            params,
-            super::next_seeds(&result, query.parts.iter().map(|p| p.clauses.as_slice())),
-            qctx,
-        )
+        // same trailing-clause shape a `LogicalPlan`'s are. An importing
+        // subquery's scope stays visible into the later stages, so the
+        // seeds carry it too.
+        let mut seeds =
+            super::next_seeds(&result, query.parts.iter().map(|p| p.clauses.as_slice()));
+        if let Some(scope) = scope {
+            carry_scope_bindings(&mut seeds, scope);
+        }
+        execute_query_seeded_in_scope(graph, next, params, seeds, qctx, scope)
     } else {
         Ok(result)
     }
@@ -389,9 +375,7 @@ pub(crate) fn call_export_columns(
     scope: &cypherlite_ir::CallScope,
     outer: Option<&Row>,
 ) -> Vec<String> {
-    if let Some(next) = query.next.as_deref() {
-        return call_export_columns(next, scope, outer);
-    }
+    let query = final_stage(query);
     // The columns-only path's imported set (`imported_names` — the per-row
     // merge derives its own set from the seed it just built instead):
     // `None` imports nothing, `(*)` imports every visible outer name,
@@ -457,35 +441,79 @@ pub(crate) fn exec_conditional(
     params: &BTreeMap<String, Value>,
     qctx: QueryCtx<'_>,
 ) -> Result<Vec<Row>> {
-    let mut out = Vec::new();
-    let mut remaining = rows;
-    for (predicate, query) in branches {
-        let mut selected = Vec::new();
-        let mut unmatched = Vec::new();
-        for row in remaining {
-            if eval(graph, &row, predicate, params, qctx.cypher_version)?.truthy() == Some(true) {
-                selected.push(row);
-            } else {
-                unmatched.push(row);
-            }
-        }
-        remaining = unmatched;
-        if !selected.is_empty() {
-            append_query_rows(
-                &mut out,
-                execute_query_seeded(graph, query, params, selected, qctx)?,
-            );
+    // One bucket per branch plus `ELSE`: the conditional's output is grouped
+    // by branch in the branches' written order (Neo4j's observed order — see
+    // the CIP-213 PE3.2 note), while each row is still driven on its own.
+    let mut buckets: Vec<Vec<Row>> = vec![Vec::new(); branches.len() + 1];
+    // CIP-135's conditional is a per-row operator: a driving row's branch
+    // predicate is evaluated against the state its predecessors left (the
+    // taken branch body ran already), so a branch that writes is visible to
+    // the next row's `WHEN` and a branch aggregates one incoming row at a
+    // time — the NEXT-stage scenarios' "sees updates made by the branch of
+    // a previous row" shape.
+    for mut row in rows {
+        // The row's element bindings were captured by the previous stage;
+        // a predecessor's branch may have relabelled or changed them since,
+        // so the predicate and the body read them again from the graph.
+        refresh_rows(graph, std::slice::from_mut(&mut row));
+        let Some((index, query)) = taken_branch(graph, &row, branches, else_query, params, qctx)?
+        else {
+            continue;
+        };
+        let result = execute_query_seeded(graph, query, params, vec![row], qctx)?;
+        // A body that projects no statement result (a write-only / `FINISH`
+        // / DDL body) contributes no rows: its surviving seed row is a
+        // pass-through, never a result. The branch still ran, so its writes
+        // stand.
+        if body_projects_rows(query) {
+            append_query_rows(&mut buckets[index], result);
         }
     }
-    if !remaining.is_empty() {
-        if let Some(query) = else_query {
-            append_query_rows(
-                &mut out,
-                execute_query_seeded(graph, query, params, remaining, qctx)?,
-            );
+    Ok(buckets.into_iter().flatten().collect())
+}
+
+/// The row's one taken branch, in source order — its bucket index and
+/// query. `None` when no predicate holds and there is no `ELSE`: nothing
+/// runs for the row. The `ELSE` body's index is `branches.len()`, one past
+/// the last `WHEN` bucket.
+fn taken_branch<'q>(
+    graph: &ExecGraph<'_>,
+    row: &Row,
+    branches: &'q [(Expr, Query)],
+    else_query: Option<&'q Query>,
+    params: &BTreeMap<String, Value>,
+    qctx: QueryCtx<'_>,
+) -> Result<Option<(usize, &'q Query)>> {
+    for (index, (predicate, query)) in branches.iter().enumerate() {
+        if eval(graph, row, predicate, params, qctx.cypher_version)?.truthy() == Some(true) {
+            return Ok(Some((index, query)));
         }
     }
-    Ok(out)
+    Ok(else_query.map(|query| (branches.len(), query)))
+}
+
+/// Whether a conditional branch body projects a statement result of its own
+/// — the rows a taken branch contributes. A body concluding in a write-only
+/// clause, a `FINISH`, schema DDL or a row-less catalog command has none
+/// (`super::part_projects_rows`). A body that is itself a NEXT chain is
+/// judged by its final stage.
+fn body_projects_rows(query: &Query) -> bool {
+    final_stage(query)
+        .parts
+        .iter()
+        .any(|part| super::part_projects_rows(&part.clauses))
+}
+
+/// Whether a conditional clause projects rows in any branch — the fact the
+/// NEXT-stage seeding policy reads: a conditional whose branches are all
+/// unit bodies is itself unit output, so an empty result still seeds the
+/// next stage with one row (ADR-0287) instead of ending the chain.
+pub(crate) fn conditional_produces_rows(
+    branches: &[(Expr, Query)],
+    else_query: Option<&Query>,
+) -> bool {
+    branches.iter().any(|(_, body)| body_projects_rows(body))
+        || else_query.is_some_and(body_projects_rows)
 }
 
 pub(crate) fn append_query_rows(out: &mut Vec<Row>, result: QueryResult) {
@@ -560,17 +588,21 @@ pub(crate) fn exec_call_in_transactions(
         let tx_id = format!("cypherlite-inner-{}", batch_index + 1);
         let mut batch_out = Vec::new();
         let attempt = (|| -> Result<()> {
+            // The success status is batch-invariant, so it is built once
+            // (only when a REPORT STATUS column exists) and cloned onto
+            // every produced row through the one writer.
+            let success_status = tx
+                .report_status
+                .as_ref()
+                .map(|_| transaction_status(true, true, Some(tx_id.clone()), None));
             for row in batch {
                 let mut produced = call_subquery_row(graph, row, query, scope, params, qctx)?;
                 if produced.is_empty() {
                     produced.extend(empty_body_row(row.clone(), optional, query, scope));
                 }
-                if let Some(name) = &tx.report_status {
+                if let Some(status) = &success_status {
                     for produced_row in &mut produced {
-                        produced_row.insert(
-                            name.clone(),
-                            transaction_status(true, true, Some(tx_id.clone()), None),
-                        );
+                        insert_status(produced_row, tx.report_status.as_deref(), status.clone());
                     }
                 }
                 batch_out.extend(produced);
@@ -611,30 +643,34 @@ pub(crate) fn exec_call_in_transactions(
                 if mode == cypherlite_ir::RetryFallback::Fail {
                     return Err(error);
                 }
-                // Pad the failed batch with the error status, and on BREAK
-                // every remaining row (no transaction starts) — one body.
-                let mut pad_row = |row: &Row, status: Value| {
-                    let mut row = null_pad_call_row(row.clone(), query, scope);
-                    if let Some(name) = &tx.report_status {
-                        row.insert(name.clone(), status);
-                    }
-                    out.push(row);
-                };
+                // Report the failed batch (its own rows are gone with the
+                // rollback), and on BREAK every remaining row, where no
+                // transaction ever started and nothing was bound.
+                let failed_status = transaction_status(
+                    true,
+                    false,
+                    Some(tx_id.clone()),
+                    Some(transaction_error_message(&error)),
+                );
                 for row in batch {
-                    pad_row(
-                        row,
-                        transaction_status(
-                            true,
-                            false,
-                            Some(tx_id.clone()),
-                            Some(transaction_error_message(&error)),
-                        ),
+                    let mut padded = failed_batch_row(graph, row, query, scope, params, qctx)?;
+                    insert_status(
+                        &mut padded,
+                        tx.report_status.as_deref(),
+                        failed_status.clone(),
                     );
+                    out.push(padded);
                 }
                 if mode == cypherlite_ir::RetryFallback::Break {
                     for (_, batch) in batches.by_ref() {
                         for row in batch {
-                            pad_row(row, transaction_status(false, false, None, None));
+                            let mut padded = null_pad_call_row(row.clone(), query, scope);
+                            insert_status(
+                                &mut padded,
+                                tx.report_status.as_deref(),
+                                transaction_status(false, false, None, None),
+                            );
+                            out.push(padded);
                         }
                     }
                     break;
@@ -643,6 +679,83 @@ pub(crate) fn exec_call_in_transactions(
         }
     }
     Ok(out)
+}
+
+/// Put `status` on a reported row under the `REPORT STATUS AS <name>`
+/// column, when the call declares one.
+fn insert_status(row: &mut Row, report_status: Option<&str>, status: Value) {
+    if let Some(name) = report_status {
+        row.insert(name.to_owned(), status);
+    }
+}
+
+/// The row a failed batch reports under `ON ERROR CONTINUE`.
+///
+/// Cypher keeps the **imported** bindings on the failed row — a body
+/// `RETURN i AS k` still answers `k = i` — while a value bound by the
+/// iteration that failed reads null, because the batch's own rows are
+/// dropped with the rollback. So the exported columns are evaluated over
+/// the import seed with every other body-bound name read as null, rather
+/// than all-nulled (which lost the imported values) or taken from the
+/// half-finished batch (which reported rows the rollback removed).
+///
+/// A body that does not end in a row projection, or whose projection
+/// aggregates or expands `*`, keeps the plain null-pad policy: there is no
+/// per-row export to evaluate.
+fn failed_batch_row(
+    graph: &ExecGraph<'_>,
+    outer: &Row,
+    query: &Query,
+    scope: &cypherlite_ir::CallScope,
+    params: &BTreeMap<String, Value>,
+    qctx: QueryCtx<'_>,
+) -> Result<Row> {
+    let projected = query
+        .parts
+        .first()
+        .and_then(|part| match part.clauses.last() {
+            Some(Clause::Return { items, .. })
+                if !has_star_item(items) && !items.iter().any(|item| is_agg_expr(&item.expr)) =>
+            {
+                Some((part, items))
+            }
+            _ => None,
+        });
+    let Some((part, items)) = projected else {
+        return Ok(null_pad_call_row(outer.clone(), query, scope));
+    };
+    // The imports plus, for every other name the body declares before its
+    // RETURN, an explicit null: a row miss is an undefined variable, and
+    // the failing iteration's bindings are gone with its rolled-back row.
+    let mut seed = match scope {
+        cypherlite_ir::CallScope::Vars(vars) => import_seed(vars, outer)?,
+        cypherlite_ir::CallScope::None | cypherlite_ir::CallScope::Wildcard => {
+            nested_seed_row(outer)
+        }
+    };
+    for name in star_scope_names(&part.clauses) {
+        seed.entry(name).or_insert(Value::Null);
+    }
+    let mut row = outer.clone();
+    for (index, item) in items.iter().enumerate() {
+        let name = item.output_name(index);
+        let mut vars = HashSet::new();
+        cypherlite_ir::expr_vars(&item.expr, &mut vars);
+        let value = if vars.iter().all(|v| seed.contains_key(v)) {
+            // The projection can fail for the same reason the batch did
+            // (the failing clause may be this very expression); the failed
+            // row reports that column as null — `ON ERROR CONTINUE` must
+            // not turn a handled batch failure into a statement failure.
+            match eval(graph, &seed, &item.expr, params, qctx.cypher_version) {
+                Ok(value) => value,
+                Err(_) => Value::Null,
+            }
+        } else {
+            Value::Null
+        };
+        row.insert(name, value);
+    }
+    Ok(row)
 }
 
 /// Render a failed inner-transaction batch's error for the `REPORT STATUS`

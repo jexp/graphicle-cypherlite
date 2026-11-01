@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::str::FromStr;
 
+use cypherlite_catalog::ConstraintDef;
 use cypherlite_core::{Error, Result, Value};
 use cypherlite_model::ConstraintType;
 
@@ -15,20 +16,12 @@ use crate::redo::RedoOp;
 
 use super::catalog::schema_name_value;
 
-/// The `IF NOT EXISTS` fork every existence probe shares: an existing
-/// rule either returns the statement's rows (the clause asked to tolerate
-/// it) or carries the probe's error.
-/// The `IF NOT EXISTS` fork every probe shares: an existing rule either
-/// returns the statement's rows (the clause asked to tolerate it) or
-/// carries the probe's error. Takes the rows by value — every caller is
-/// an early return.
-fn exists_result(
-    c: &cypherlite_parser::CreateIndexClause,
-    rows: Vec<Row>,
-    err: Error,
-) -> Result<Vec<Row>> {
-    if c.if_not_exists {
-        Ok(rows)
+/// The `IF NOT EXISTS` fork every existence probe shares: an existing rule
+/// either accepts (the caller returns its unchanged rows) or carries the
+/// probe's error.
+fn if_not_exists_accepts(if_not_exists: bool, err: Error) -> Result<()> {
+    if if_not_exists {
+        Ok(())
     } else {
         Err(err)
     }
@@ -56,18 +49,9 @@ pub(crate) fn catalog_create_index(
             c.properties.join("_")
         ),
     };
-    if graph.named_index(&name).is_some() {
-        return exists_result(c, rows, Error::semantic("IndexAlreadyExists"));
-    }
-    if c.if_not_exists
-        && matches!(c.kind, cypherlite_parser::IndexKind::Range)
-        && c.labels.len() == 1
-        && graph.named_indexes().iter().any(|index| {
-            index.label == c.labels[0]
-                && crate::redo::split_legacy_property_encoding(&index.property).0
-                    == c.properties.join(",")
-        })
-    {
+    // The conflict family is one named gate; the shape validation below and
+    // the detail/create tail stay here.
+    if matches!(index_conflict_gate(graph, c, &name)?, IndexGate::Skip) {
         return Ok(rows);
     }
     if matches!(
@@ -166,47 +150,6 @@ pub(crate) fn catalog_create_index(
         );
     }
 
-    let details = graph.show_schema()?.data.index_details;
-    let relationship_index = c.entity_type == cypherlite_parser::SchemaEntityType::Relationship;
-    let equivalent = details.values().any(|old| {
-        old.kind == crate::redo::IndexKindSpec::from(c.kind)
-            && old.relationship == relationship_index
-            && old.labels == c.labels
-            && old.properties == c.properties
-            && old.with_properties == c.with_properties
-    });
-    if equivalent {
-        return exists_result(
-            c,
-            rows,
-            Error::semantic("EquivalentSchemaRuleAlreadyExists"),
-        );
-    }
-    // ADR-0372: the schema-rule conflict is narrowed to serving pairs —
-    // only a RANGE index can back a constraint (ADR-0339), so only a RANGE
-    // index conflicts with an index-backed constraint on the same
-    // entity/label/properties. FULLTEXT/VECTOR/POINT indexes coexist with
-    // every constraint: they serve search, not validation, and cannot
-    // serve as a backing.
-    let conflicts_with_constraint = graph.named_constraints().iter().any(|constraint| {
-        crate::redo::serving_pair_conflicts(
-            crate::redo::ServingPairIndex {
-                kind: crate::redo::IndexKindSpec::from(c.kind),
-                relationship: relationship_index,
-                labels: &c.labels,
-                properties: &c.properties,
-            },
-            crate::redo::ServingPairConstraint {
-                backed: constraint.is_index_backed(),
-                relationship: constraint.relationship,
-                label: &constraint.label,
-                properties: &constraint.properties,
-            },
-        )
-    });
-    if conflicts_with_constraint {
-        return exists_result(c, rows, Error::semantic("IndexWithNameAlreadyExists"));
-    }
     let label = c.labels.first().cloned().unwrap_or_default();
     let property = format!(
         "{}#{}#{}",
@@ -247,6 +190,15 @@ pub(crate) fn catalog_drop_index(
     Ok(rows)
 }
 
+/// The create gate's verdict for the constraint path (the `IndexGate` twin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstraintGate {
+    /// Creation may proceed.
+    Proceed,
+    /// `IF NOT EXISTS` satisfied an existing rule; return the rows unchanged.
+    Skip,
+}
+
 pub(crate) fn catalog_create_constraint(
     graph: &ExecGraph<'_>,
     c: &cypherlite_parser::CreateConstraintClause,
@@ -281,46 +233,100 @@ pub(crate) fn catalog_create_constraint(
             c.properties.join("_")
         ),
     };
-    if graph.named_constraints().iter().any(|def| def.name == name) {
-        if c.if_not_exists {
-            return Ok(rows);
-        }
-        return Err(Error::semantic("ConstraintAlreadyExists"));
+    let def = ConstraintDef {
+        name,
+        relationship: c.entity_type == cypherlite_parser::SchemaEntityType::Relationship,
+        label: c.label.clone(),
+        properties: c.properties.clone(),
+        kind: c.constraint_type.clone(),
+        property_type,
+        enforced_label: c.enforced_label.clone(),
+    };
+    // The conflict policy is one named gate; this function stays shape
+    // validation plus the creation half.
+    if matches!(
+        constraint_create_gate(graph, c, &def, constraint_type, params, cypher_version)?,
+        ConstraintGate::Skip
+    ) {
+        return Ok(rows);
     }
-    let relationship = c.entity_type == cypherlite_parser::SchemaEntityType::Relationship;
+    // The theater record derives from the same def the catalog install
+    // consumes (one constraint shape per statement); the core pushes it
+    // between the constraint row and the backing index.
+    let derived_record = def
+        .enforced_label
+        .is_some()
+        .then(|| def.to_model(constraint_type));
+    super::ddl::create_constraint_core(graph, def, derived_record)?;
+    Ok(rows)
+}
+
+/// The `CREATE CONSTRAINT` conflict policy: duplicate name, graph-type
+/// dependence, schema equivalence, index-backed conflict, serving-pair
+/// conflict, duplicate index name, and the options shape. One place for the
+/// reply texts and the `IF NOT EXISTS` outcomes.
+fn constraint_create_gate(
+    graph: &ExecGraph<'_>,
+    c: &cypherlite_parser::CreateConstraintClause,
+    def: &ConstraintDef,
+    constraint_type: ConstraintType,
+    params: &BTreeMap<String, Value>,
+    cypher_version: Option<u32>,
+) -> Result<ConstraintGate> {
+    if graph
+        .named_constraints()
+        .iter()
+        .any(|existing| existing.name == def.name)
+    {
+        if_not_exists_accepts(c.if_not_exists, Error::semantic("ConstraintAlreadyExists"))?;
+        return Ok(ConstraintGate::Skip);
+    }
     let current_graph_type = graph.show_schema()?.data.current_graph_type.to_body();
     if matches!(
         constraint_type,
         ConstraintType::Exists | ConstraintType::PropertyType
-    ) && crate::graph_type::label_identifies_type(&current_graph_type, relationship, &c.label)
-    {
+    ) && crate::graph_type::label_identifies_type(
+        &current_graph_type,
+        def.relationship,
+        &def.label,
+    ) {
         return Err(Error::execution(
             "IncompatibleGraphTypeDependence: dependent constraints are managed by the graph type",
         ));
     }
-    let equivalent = graph.named_constraints().iter().any(|def| {
-        def.schema_equivalent(
-            relationship,
-            &c.label,
-            &c.properties,
-            &c.constraint_type,
-            property_type.as_deref(),
-        )
-    });
+    let constraints = graph.effective_constraints()?;
+    let equivalent = constraints
+        .iter()
+        .any(|existing| existing.schema_equivalent(def));
     if equivalent {
-        if c.if_not_exists {
-            return Ok(rows);
-        }
-        if constraint_type != ConstraintType::Exists {
-            return Err(Error::semantic("EquivalentSchemaRuleAlreadyExists"));
-        }
+        // Two outcomes, flat: `IF NOT EXISTS` accepts the existing rule; every
+        // other form gets the duplicate-schema reply. The earlier `exists`
+        // coexistence exemption was unreachable — the durable catalog gate
+        // (`Catalog::insert_constraint`) has always rejected an equivalent
+        // schema of any kind — so the two gates now state one policy.
+        if_not_exists_accepts(
+            c.if_not_exists,
+            Error::semantic("EquivalentSchemaRuleAlreadyExists"),
+        )?;
+        return Ok(ConstraintGate::Skip);
     }
-    if constraint_type.is_index_backed()
-        && graph.named_constraints().iter().any(|def| {
-            def.is_index_backed()
-                && def.relationship == relationship
-                && def.label == c.label
-                && def.properties == c.properties
+    // The same subject and kind with different options (a property-type
+    // constraint under another declared type, including the vector forms)
+    // is a conflict, never a distinct rule — and `IF NOT EXISTS` does not
+    // suppress it.
+    if constraints
+        .iter()
+        .any(|existing| existing.conflicts_with(def))
+    {
+        return Err(Error::semantic("ConstraintConflict"));
+    }
+    let backed = constraint_type.is_index_backed();
+    if backed
+        && constraints.iter().any(|existing| {
+            existing.is_index_backed()
+                && existing.relationship == def.relationship
+                && existing.label == def.label
+                && existing.properties == def.properties
         })
     {
         return Err(Error::semantic("ConstraintConflict"));
@@ -330,37 +336,36 @@ pub(crate) fn catalog_create_constraint(
     // (ADR-0339) would duplicate it — closing the index-first order's gap
     // (LABS-274) for the serving pair. Non-serving kinds
     // (FULLTEXT/VECTOR/POINT) coexist: they serve search, not validation.
-    // `IF NOT EXISTS` treats the existing index as satisfying the rule,
-    // mirroring the index direction's `if_not_exists` arm above.
-    let range_index_on_property = graph
-        .show_schema()?
-        .data
-        .index_details
-        .values()
-        .any(|detail| {
-            crate::redo::serving_pair_conflicts(
-                crate::redo::ServingPairIndex {
-                    kind: detail.kind,
-                    relationship: detail.relationship,
-                    labels: &detail.labels,
-                    properties: &detail.properties,
-                },
-                crate::redo::ServingPairConstraint {
-                    backed: constraint_type.is_index_backed(),
-                    relationship: c.entity_type
-                        == cypherlite_parser::SchemaEntityType::Relationship,
-                    label: &c.label,
-                    properties: &c.properties,
-                },
-            )
-        });
-    if constraint_type.is_index_backed() && range_index_on_property {
-        if c.if_not_exists {
-            return Ok(rows);
-        }
-        return Err(Error::semantic("EquivalentSchemaRuleAlreadyExists"));
+    let range_index_on_property = backed
+        && graph
+            .show_schema()?
+            .data
+            .index_details
+            .values()
+            .any(|detail| {
+                crate::redo::serving_pair_conflicts(
+                    crate::redo::ServingPairIndex {
+                        kind: detail.kind,
+                        relationship: detail.relationship,
+                        labels: &detail.labels,
+                        properties: &detail.properties,
+                    },
+                    crate::redo::ServingPairConstraint {
+                        backed,
+                        relationship: def.relationship,
+                        label: &def.label,
+                        properties: &def.properties,
+                    },
+                )
+            });
+    if range_index_on_property {
+        if_not_exists_accepts(
+            c.if_not_exists,
+            Error::semantic("EquivalentSchemaRuleAlreadyExists"),
+        )?;
+        return Ok(ConstraintGate::Skip);
     }
-    if graph.named_index(&name).is_some() {
+    if graph.named_index(&def.name).is_some() {
         return Err(Error::semantic("DuplicatedIndexName"));
     }
     for (key, value) in &c.options {
@@ -373,39 +378,87 @@ pub(crate) fn catalog_create_constraint(
             return Err(Error::semantic("InvalidOptionsMap"));
         }
     }
-    graph.create_named_constraint(
-        name.clone(),
-        relationship,
-        c.label.clone(),
-        c.properties.clone(),
-        c.constraint_type.clone(),
-        property_type.clone(),
-    )?;
-    if let Some(enforced_label) = &c.enforced_label {
-        graph.push_catalog_redo(RedoOp::CatalogDerivedConstraint {
-            constraint: cypherlite_model::Constraint {
-                name: name.clone(),
-                label: c.label.clone(),
-                properties: c.properties.clone(),
-                constraint_type,
-                property_type: property_type.clone(),
-                entity_type: cypherlite_model::EntityKind::from_relationship_flag(relationship)
-                    .display_name()
-                    .into(),
-                enforced_label: Some(enforced_label.clone()),
-            },
-        });
+    Ok(ConstraintGate::Proceed)
+}
+
+/// The create gate's verdict for the index path (the `ConstraintGate` twin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexGate {
+    /// Creation may proceed.
+    Proceed,
+    /// `IF NOT EXISTS` satisfied an existing rule; return the rows unchanged.
+    Skip,
+}
+
+/// The `CREATE INDEX` conflict policy: duplicate name, the legacy-range
+/// `IF NOT EXISTS` probe, schema equivalence, and the serving-pair conflict.
+/// The `ConstraintGate` twin; shape validation stays in the handler.
+fn index_conflict_gate(
+    graph: &ExecGraph<'_>,
+    c: &cypherlite_parser::CreateIndexClause,
+    name: &str,
+) -> Result<IndexGate> {
+    if graph.named_index(name).is_some() {
+        if_not_exists_accepts(c.if_not_exists, Error::semantic("IndexAlreadyExists"))?;
+        return Ok(IndexGate::Skip);
     }
-    if constraint_type.is_index_backed() {
-        super::ddl::create_constraint_backing_index(
-            graph,
-            &name,
-            relationship,
-            &c.label,
-            &c.properties,
+    if c.if_not_exists
+        && matches!(c.kind, cypherlite_parser::IndexKind::Range)
+        && c.labels.len() == 1
+        && graph.named_indexes().iter().any(|index| {
+            index.label == c.labels[0]
+                && crate::redo::split_legacy_property_encoding(&index.property).0
+                    == c.properties.join(",")
+        })
+    {
+        return Ok(IndexGate::Skip);
+    }
+    let details = graph.show_schema()?.data.index_details;
+    let relationship_index = c.entity_type == cypherlite_parser::SchemaEntityType::Relationship;
+    let equivalent = details.values().any(|old| {
+        old.kind == crate::redo::IndexKindSpec::from(c.kind)
+            && old.relationship == relationship_index
+            && old.labels == c.labels
+            && old.properties == c.properties
+            && old.with_properties == c.with_properties
+    });
+    if equivalent {
+        if_not_exists_accepts(
+            c.if_not_exists,
+            Error::semantic("EquivalentSchemaRuleAlreadyExists"),
         )?;
+        return Ok(IndexGate::Skip);
     }
-    Ok(rows)
+    // ADR-0372: the schema-rule conflict is narrowed to serving pairs —
+    // only a RANGE index can back a constraint (ADR-0339), so only a RANGE
+    // index conflicts with an index-backed constraint on the same
+    // entity/label/properties. FULLTEXT/VECTOR/POINT indexes coexist with
+    // every constraint: they serve search, not validation, and cannot
+    // serve as a backing.
+    let conflicts_with_constraint = graph.named_constraints().iter().any(|constraint| {
+        crate::redo::serving_pair_conflicts(
+            crate::redo::ServingPairIndex {
+                kind: crate::redo::IndexKindSpec::from(c.kind),
+                relationship: relationship_index,
+                labels: &c.labels,
+                properties: &c.properties,
+            },
+            crate::redo::ServingPairConstraint {
+                backed: constraint.is_index_backed(),
+                relationship: constraint.relationship,
+                label: &constraint.label,
+                properties: &constraint.properties,
+            },
+        )
+    });
+    if conflicts_with_constraint {
+        if_not_exists_accepts(
+            c.if_not_exists,
+            Error::semantic("IndexWithNameAlreadyExists"),
+        )?;
+        return Ok(IndexGate::Skip);
+    }
+    Ok(IndexGate::Proceed)
 }
 
 pub(crate) fn catalog_drop_constraint(

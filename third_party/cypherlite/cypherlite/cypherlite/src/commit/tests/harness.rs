@@ -2,7 +2,7 @@
 //! connection/commit helpers the themed test modules build on.
 
 use super::super::*;
-use crate::{Database, OpenOptions};
+use crate::{Database, OpenOptions, Value};
 use cypherlite_storage::{Vfs, VfsFile, VfsMeta, VfsOpen, Wal};
 use std::collections::BTreeMap;
 use std::io::SeekFrom;
@@ -108,6 +108,30 @@ impl Vfs for FaultVfs {
 /// (`shared` must stay alive while the connection is used).
 pub(super) fn raw_connection(shared: &Arc<Shared>) -> crate::Connection {
     crate::connection::fresh(Arc::clone(shared), cypherlite_core::Namespace::Neo4j)
+}
+
+/// The number of racing sides the ADR-0439 race helpers drive.
+pub(super) const SIDES: usize = 2;
+
+/// The shared ADR-0439 race fixture: a fresh in-memory database already
+/// carrying the `person_email` uniqueness constraint. Each race test seeds
+/// its own nodes on top.
+pub(super) fn person_email_db() -> Arc<Database> {
+    let db = Arc::new(Database::open(":memory:").unwrap());
+    db.connect()
+        .unwrap()
+        .query("CREATE CONSTRAINT person_email FOR (n:Person) REQUIRE n.email IS UNIQUE")
+        .unwrap();
+    db
+}
+
+/// One `MATCH … RETURN count(…)` scalar on a fresh connection.
+pub(super) fn count(db: &Database, query: &str) -> i64 {
+    let mut c = db.connect().unwrap();
+    match c.query(query).unwrap().rows[0][0] {
+        Value::Int(n) => n,
+        _ => panic!("expected an integer count"),
+    }
 }
 
 /// Spawn `n` threads that all wait on one barrier, then each connects and

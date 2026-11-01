@@ -8,14 +8,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use cypherlite::{Database, OpenOptions, Value};
+use cypherlite::{Database, Value};
 use cypherlite_storage::{read_to_vec, MemoryVfs, SnapshotCodecKind, Vfs, VfsOpen};
 
 use common::{
-    active_segment, assert_checkpoint_format, err_text, get_doc, magics, ontology_set_frame,
-    seed_store, set_doc, store_vfs,
+    active_segment, assert_checkpoint_format, err_text, get_doc, magics, ontology_set_frame, opts,
+    seed_store, set_doc, store_vfs, ExpectedOntology,
 };
 
 /// A small main-shape document (the gate URI, one node entry with two
@@ -30,14 +29,6 @@ const DOC: &str = concat!(
     "\"from\":{\"node\":\"Person\"},",
     "\"to\":{\"node\":\"Person\",\"max_count\":5}}}}"
 );
-
-fn opts(codec: SnapshotCodecKind) -> OpenOptions {
-    OpenOptions {
-        checkpoint_interval: Some(Duration::ZERO),
-        snapshot_codec: Some(codec),
-        ..OpenOptions::default()
-    }
-}
 
 fn roundtrip_set_reopen(reopen: impl Fn() -> Database, db: Database) {
     assert_eq!(db.ontology_document().unwrap(), None);
@@ -146,13 +137,13 @@ fn drop_checkpoint_and_recycle_returns_the_store_to_the_plain_format() {
         // everything below is deterministic. The store now publishes the
         // document and every remaining segment is MDBWAL02.
         db.checkpoint().unwrap();
-        assert_checkpoint_format(dir.path(), codec, true, Some(DOC));
-        assert!(magics(dir.path()).iter().all(|m| m == b"MDBWAL02"));
+        assert_checkpoint_format(dir.path(), codec, ExpectedOntology::Document(DOC));
+        assert!(magics(dir.path(), codec).iter().all(|m| m == b"MDBWAL02"));
 
         db.commit_ontology_drop().unwrap();
         db.checkpoint().unwrap();
-        assert_checkpoint_format(dir.path(), codec, false, None);
-        assert_eq!(magics(dir.path()), vec![*b"MDBWAL01"]);
+        assert_checkpoint_format(dir.path(), codec, ExpectedOntology::Absent);
+        assert_eq!(magics(dir.path(), codec), vec![*b"MDBWAL01"]);
 
         drop(db);
         let db = Database::open_with(&uri, opts(codec)).unwrap();

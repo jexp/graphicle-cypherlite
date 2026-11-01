@@ -357,7 +357,7 @@ fn non_scalar_message(name: &str, because: &str) -> String {
 /// The columns a procedure body exports, in projection order: `None`
 /// when the body does not export (a FINISH/void body or an unnamed item).
 pub(super) fn body_export_names(body: &Statement) -> Option<Vec<String>> {
-    let set = crate::validate::compute_subquery_output_vars(body)?;
+    let set = crate::output_vars::compute_subquery_output_vars(body)?;
     for link in chain_links(body) {
         if let Some(names) = terminal_names(link) {
             if names.iter().all(|name| set.contains(name)) {

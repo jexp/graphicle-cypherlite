@@ -1,5 +1,6 @@
 use super::*;
 use crate::redo::wal_format_json::value_json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn sample_ops() -> Vec<RedoOp> {
@@ -77,14 +78,15 @@ fn is_catalog_splits_entity_ops_from_catalog_ops() {
             property: "k".into(),
         },
         RedoOp::DropIndex { name: "i".into() },
-        RedoOp::CreateConstraint {
+        RedoOp::create_constraint(ConstraintDef {
             name: "c".into(),
             relationship: false,
             label: "L".into(),
             properties: vec!["k".into()],
             kind: "unique".into(),
             property_type: None,
-        },
+            enforced_label: None,
+        }),
         RedoOp::DropConstraint { name: "c".into() },
         RedoOp::CatalogDerivedConstraint {
             constraint: cypherlite_model::Constraint {
@@ -171,14 +173,15 @@ fn catalog_names_cover_data_and_ddl_names_monotonically() {
     assert!(mentions(&index, CatalogName::Label("L")));
     assert!(mentions(&index, CatalogName::PropertyKey("k")));
 
-    let constraint = RedoOp::CreateConstraint {
+    let constraint = RedoOp::create_constraint(ConstraintDef {
         name: "c".into(),
         relationship: true,
         label: "T".into(),
         properties: vec!["k".into()],
         kind: "unique".into(),
         property_type: None,
-    };
+        enforced_label: None,
+    });
     assert!(mentions(&constraint, CatalogName::RelType("T")));
     assert!(mentions(&constraint, CatalogName::PropertyKey("k")));
 

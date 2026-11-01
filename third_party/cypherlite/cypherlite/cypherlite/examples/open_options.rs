@@ -10,18 +10,9 @@ fn main() -> cypherlite::Result<()> {
     let db = Database::open_with(
         dir.to_str().expect("temp dir is valid UTF-8"),
         OpenOptions {
-            wal_dir: None,
             checkpoint_interval: Some(Duration::from_secs(60)),
-            durability_mode: Default::default(),
             logical_graph_size_limit: Some(1 << 30),
-            snapshot_codec: None,
-            load_csv_dir: None,
-            load_csv_max_bytes: None,
-            mode: cypherlite::OpenMode::Writable,
-
-            token_admission: false,
-            concurrent_logical_workspace_limit: None,
-            follow_gap: Default::default(),
+            ..OpenOptions::default()
         },
     )?;
     let mut conn = db.connect()?;

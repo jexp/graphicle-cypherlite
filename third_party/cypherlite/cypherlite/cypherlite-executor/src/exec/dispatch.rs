@@ -27,10 +27,7 @@ use super::create::{
     create_patterns, patterns_have_graph_sensitive_expr, reject_null_merge_props,
     resolve_create_patterns,
 };
-use super::ddl::{
-    exec_create_constraint, exec_create_index, exec_drop_constraint, exec_drop_index,
-    ConstraintSpec,
-};
+use super::ddl::{exec_create_index, exec_drop_index};
 use super::exists_probe::try_fold_boolean_count;
 use super::foreach::exec_foreach;
 use super::match_clause::{match_clause, match_paths};
@@ -43,7 +40,7 @@ use super::pushdown::{
     live_from, match_limit_cap, trim_rows, try_fold_one_hop_aggs, try_fold_path_aggs, FoldedReturn,
     Residual,
 };
-use super::scope::{refresh_rows, star_scope_names};
+use super::scope::{carry_scope_bindings, refresh_rows, star_scope_names};
 use super::search::search_match_clause;
 use super::unwind::Source;
 use super::write::{apply_resolved_removes, apply_sets, delete_value, resolve_removes};
@@ -84,6 +81,37 @@ pub(crate) fn run_clauses(
         rows,
         qctx,
         profile,
+        None,
+    )
+}
+
+/// The subquery-body variant of [`run_clauses`]: `scope` carries the
+/// bindings an importing subquery (`CALL (vars) { … }`, `CALL(*) { … }`,
+/// an expression subquery) keeps visible for the whole body. Cypher does
+/// not let a body `WITH` drop them, and the value is constant across the
+/// body's rows, so the clause loop re-attaches a missing scope binding
+/// after every `WITH` projection (`carry_scope_bindings`). Threading the
+/// items through the `WITH` instead would make an injected import a
+/// grouping key, which loses the keyless aggregation's identity row over
+/// an emptied input.
+pub(crate) fn run_nested_clauses_scoped(
+    graph: &ExecGraph<'_>,
+    clauses: &[Clause],
+    params: &BTreeMap<String, Value>,
+    rows: Vec<Row>,
+    qctx: QueryCtx<'_>,
+    scope: &Row,
+) -> Result<(Vec<Row>, Option<QueryResult>)> {
+    graph.nested_evals().tick()?;
+    run_clauses_mode(
+        graph,
+        ClauseMode::Write,
+        clauses,
+        params,
+        rows,
+        qctx,
+        None,
+        Some(scope),
     )
 }
 
@@ -104,6 +132,7 @@ pub(crate) fn run_nested_clauses(
     run_clauses(graph, clauses, params, rows, qctx, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_clauses_mode(
     graph: &ExecGraph<'_>,
     mode: ClauseMode,
@@ -112,6 +141,7 @@ fn run_clauses_mode(
     mut rows: Vec<Row>,
     qctx: QueryCtx<'_>,
     profile: Option<PlanMetricsSite<'_>>,
+    scope: Option<&Row>,
 ) -> Result<(Vec<Row>, Option<QueryResult>)> {
     let mut last_result: Option<QueryResult> = None;
     // LABS-370 (v1): the count-only short-circuit — a whole-population
@@ -308,31 +338,6 @@ fn run_clauses_mode(
                 exec_foreach(graph, &rows, variable, list, clauses, params, qctx)?;
             }
             Clause::Use { .. } => {}
-            Clause::CreateConstraint {
-                name,
-                if_not_exists,
-                relationship,
-                label,
-                properties,
-                kind,
-                property_type,
-            } => {
-                exec_create_constraint(
-                    graph,
-                    &ConstraintSpec {
-                        name: name.as_deref(),
-                        if_not_exists: *if_not_exists,
-                        relationship: *relationship,
-                        label,
-                        properties,
-                        kind,
-                        property_type: property_type.as_ref(),
-                    },
-                )?;
-            }
-            Clause::DropConstraint { name, if_exists } => {
-                exec_drop_constraint(graph, name, *if_exists)?;
-            }
             Clause::Match {
                 optional,
                 match_mode,
@@ -467,6 +472,10 @@ fn run_clauses_mode(
                         delete_value(graph, &value, *detach)?;
                     }
                 }
+                // The deleted binding stays addressable as an empty
+                // tombstone (`refresh_rows`), which a later `MATCH` on the
+                // same variable still matches (`node_ok`'s snapshot path)
+                // while the store no longer holds the node.
                 refresh_rows(graph, &mut rows);
             }
             Clause::Set { items } => {
@@ -519,7 +528,9 @@ fn run_clauses_mode(
                 if i + 1 == clauses.len()
                     && graph
                         .procedure(name)
-                        .or_else(|| builtin_procedure(graph, name, qctx.principal))
+                        .or_else(|| {
+                            builtin_procedure(graph, name, qctx.principal, &BTreeMap::new())
+                        })
                         .is_some_and(|procedure| procedure.yield_names.is_empty())
                 {
                     last_result = Some(QueryResult::intermediate(
@@ -584,6 +595,12 @@ fn run_clauses_mode(
                     false,
                     rows_from,
                 )?;
+                // An importing subquery's scope bindings survive a `WITH`
+                // (Cypher never lets a body projection drop them); re-attach
+                // the ones it did drop.
+                if let Some(scope) = scope {
+                    carry_scope_bindings(&mut rows, scope);
+                }
             }
             Clause::Return {
                 distinct,
@@ -794,6 +811,7 @@ pub(crate) fn execute_part_read_seeded(
         rows,
         qctx,
         profile,
+        None,
     )?;
     // The read path reports no write stats; its wrapper resets stats on
     // the way out regardless.

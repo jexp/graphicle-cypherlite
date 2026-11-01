@@ -13,6 +13,7 @@ use crate::eval::{eval, is_agg_expr, Row};
 use crate::group_key::GroupKey;
 use crate::overlay::ExecGraph;
 
+use super::project::{park_order_keys, OrderKeys};
 use super::scope::{has_star_item, is_internal_column, is_star_item, visible_keys};
 
 /// CIP-236: `group_by` carries explicit grouping keys when a GROUP BY
@@ -20,6 +21,11 @@ use super::scope::{has_star_item, is_internal_column, is_star_item, visible_keys
 /// form: the keys come from those expressions instead of being inferred
 /// from the non-aggregating projection items. `Some(&[])` is the empty
 /// grouping set (`GROUP BY ()`): one global group.
+///
+/// `order` is the projection's `ORDER BY` key list with its per-key
+/// alias-scope decision. The group is the only place a key's aggregate calls
+/// can be answered, so each output row parks them through
+/// [`park_order_keys`] for the sort to read back.
 pub(crate) fn aggregate_ex(
     graph: &ExecGraph<'_>,
     rows: Vec<Row>,
@@ -27,6 +33,7 @@ pub(crate) fn aggregate_ex(
     group_by: Option<&[Expr]>,
     params: &BTreeMap<String, Value>,
     cypher_version: Option<u32>,
+    order: &OrderKeys<'_>,
 ) -> Result<Vec<Row>> {
     // The grouping strategy is loop-invariant: decide once whether the key
     // comes from the explicit `group_by` expressions or from the inferred
@@ -91,17 +98,14 @@ pub(crate) fn aggregate_ex(
             match groups.entry(key) {
                 Entry::Occupied(mut entry) => {
                     meter.add_row(entry.index(), &row);
-                    groups_charge.resize(meter.bytes)?;
-                    cypherlite_core::tokens::peak_hold("aggregation");
                     entry.get_mut().push(row);
                 }
                 Entry::Vacant(entry) => {
                     meter.add_group(entry.key(), &row);
-                    groups_charge.resize(meter.bytes)?;
-                    cypherlite_core::tokens::peak_hold("aggregation");
                     entry.insert(vec![row]);
                 }
             }
+            charge_group_map(&mut groups_charge, &meter)?;
         } else {
             groups.entry(key).or_default().push(row);
         }
@@ -111,8 +115,7 @@ pub(crate) fn aggregate_ex(
         groups.insert(Vec::new(), Vec::new());
         if account {
             meter.add_empty_group();
-            groups_charge.resize(meter.bytes)?;
-            cypherlite_core::tokens::peak_hold("aggregation");
+            charge_group_map(&mut groups_charge, &meter)?;
         }
     }
     let mut out = Vec::new();
@@ -130,7 +133,13 @@ pub(crate) fn aggregate_ex(
             }
             let name = p.output_name(i);
             let val = if is_agg_expr(&p.expr) {
-                agg_eval(graph, &group, &p.expr, params, cypher_version)?
+                agg_eval(
+                    graph,
+                    AggScope::of_group(&group),
+                    &p.expr,
+                    params,
+                    cypher_version,
+                )?
             } else if let Some(row) = group.first() {
                 eval(graph, row, &p.expr, params, cypher_version)?
             } else {
@@ -138,10 +147,41 @@ pub(crate) fn aggregate_ex(
             };
             n.insert(name, val);
         }
+        // Park the `ORDER BY` keys beside the projected columns, through the
+        // same decision and writer every other projection path uses. A key
+        // reads `n`, the projected row, so an aggregate call in it folds this
+        // group and the deprecated implicit-grouping shapes still answer from
+        // their item; a key that cannot be evaluated orders as null rather
+        // than failing the statement — the documented `ORDER BY` policy.
+        park_order_keys(order, &mut n, |expr, scope| {
+            match agg_eval(
+                graph,
+                AggScope::of_row(&group, scope),
+                expr,
+                params,
+                cypher_version,
+            ) {
+                Ok(value) => value,
+                Err(_) => Value::Null,
+            }
+        });
         out.push(n);
     }
     drop(groups_charge);
     Ok(out)
+}
+
+/// Charge the group map's growth after an entry insert, then sample the
+/// peak hold. The one spelling of that pair: the row loop and the keyless
+/// empty-group seed both bill the map through it, and both derive the
+/// charge from `meter.bytes` (already updated by `add_row`/`add_group`).
+fn charge_group_map(
+    charge: &mut cypherlite_core::tokens::WorkspaceCharge,
+    meter: &crate::workspace::GroupMapMeter,
+) -> Result<()> {
+    charge.resize(meter.bytes)?;
+    cypherlite_core::tokens::peak_hold("aggregation");
+    Ok(())
 }
 
 /// ADR-0198 ruling 1: desugar a `*` key ONCE, before the row loop, into
@@ -349,13 +389,47 @@ impl SumAcc {
     }
 }
 
+/// The two scopes one aggregation evaluation reads, bundled so they travel
+/// together through the recursion: `group` is what an aggregate call folds,
+/// `seed` the row a non-aggregate leaf is asked about.
+#[derive(Clone, Copy)]
+pub(crate) struct AggScope<'a> {
+    group: &'a [Row],
+    seed: Option<&'a Row>,
+}
+
+impl<'a> AggScope<'a> {
+    /// A projection item's scope: its expression runs over the group and
+    /// asks about the group's first row.
+    pub(crate) fn of_group(group: &'a [Row]) -> Self {
+        Self {
+            group,
+            seed: group.first(),
+        }
+    }
+
+    /// An `ORDER BY` key's scope: aggregate calls still fold the group, but
+    /// every non-aggregate leaf asks about `row` — the projected output row,
+    /// whose names the projection's aliases shadow.
+    pub(crate) fn of_row(group: &'a [Row], row: &'a Row) -> Self {
+        Self {
+            group,
+            seed: Some(row),
+        }
+    }
+}
+
+/// Evaluate `expr` in `scope`. Aggregate calls fold the group's rows; every
+/// non-aggregate leaf evaluates against the seed row. No seed means an empty
+/// group: there is no row to ask, so a non-aggregate leaf is null.
 pub(crate) fn agg_eval(
     graph: &ExecGraph<'_>,
-    group: &[Row],
+    scope: AggScope<'_>,
     expr: &Expr,
     params: &BTreeMap<String, Value>,
     cypher_version: Option<u32>,
 ) -> Result<Value> {
+    let AggScope { group, seed } = scope;
     match expr {
         Expr::CountStar => Ok(Value::Int(group.len() as i64)),
         Expr::Function {
@@ -369,7 +443,7 @@ pub(crate) fn agg_eval(
             // already lowercased here, and lowering has already
             // canonicalized alias spellings).
             if !cypherlite_ir::AGGREGATES.contains(&n.as_str()) {
-                return agg_eval_function(graph, group, name, args, params, cypher_version);
+                return agg_eval_function(graph, scope, name, args, params, cypher_version);
             }
             // LABS-276 / ADR-0225/0217: every aggregate's arity contract
             // comes from the single `aggregate_arity` table in
@@ -472,19 +546,39 @@ pub(crate) fn agg_eval(
                     acc.finish_avg()?
                 }
                 "stdev" | "stdevp" => {
+                    // ADR-0205: the sample is the non-null numeric values.
+                    // No numeric value at all (`[]`, `[null]`) is null — the
+                    // empty sample has no deviation to report. A single
+                    // value is 0.0: its spread is zero, and the divisor (0
+                    // for the sample form) must not turn the 0/0 into NaN.
                     let nums: Vec<f64> = vals.iter().filter_map(Value::as_number).collect();
+                    let Some((&first, rest)) = nums.split_first() else {
+                        return Ok(Value::Null);
+                    };
                     let divisor = if n == "stdev" {
-                        nums.len().saturating_sub(1)
+                        nums.len() - 1
                     } else {
                         nums.len()
                     };
                     if divisor == 0 {
                         Value::Float(0.0)
                     } else {
-                        let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-                        let variance =
-                            nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / divisor as f64;
-                        Value::Float(variance.sqrt())
+                        // Welford's online mean/M2 update, not
+                        // `sum((x - mean)^2)`: squaring values near
+                        // `f64::MAX` overflows to +Inf and a naive sum
+                        // reports Inf where Cypher reports NaN (and where a
+                        // `[MAX, MAX]` sample must stay 0.0). Welford keeps
+                        // the mean bounded by the inputs' magnitude, and for
+                        // a `[MAX, -MAX]` sample its M2 goes negative
+                        // infinite, so the final `sqrt` yields the NaN.
+                        let mut mean = first;
+                        let mut m2 = 0.0;
+                        for (i, &x) in rest.iter().enumerate() {
+                            let delta = x - mean;
+                            mean += delta / (i + 2) as f64;
+                            m2 += delta * (x - mean);
+                        }
+                        Value::Float((m2 / divisor as f64).sqrt())
                     }
                 }
                 "percentilecont" | "percentiledisc" => {
@@ -534,7 +628,7 @@ pub(crate) fn agg_eval(
             for (k, e) in es {
                 m.insert(
                     k.clone(),
-                    agg_eval(graph, group, e, params, cypher_version)?,
+                    agg_eval(graph, scope, e, params, cypher_version)?,
                 );
             }
             Ok(Value::Map(m.into()))
@@ -542,7 +636,7 @@ pub(crate) fn agg_eval(
         Expr::List(xs) => {
             let mut out = Vec::new();
             for e in xs {
-                out.push(agg_eval(graph, group, e, params, cypher_version)?);
+                out.push(agg_eval(graph, scope, e, params, cypher_version)?);
             }
             Ok(Value::List(out.into()))
         }
@@ -553,7 +647,7 @@ pub(crate) fn agg_eval(
             projection,
         } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__agg_list", list)],
             params,
             cypher_version,
@@ -573,7 +667,7 @@ pub(crate) fn agg_eval(
             value_expr,
         } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__agg_map", source)],
             params,
             cypher_version,
@@ -593,7 +687,7 @@ pub(crate) fn agg_eval(
             predicate,
         } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__agg_list", list)],
             params,
             cypher_version,
@@ -610,7 +704,7 @@ pub(crate) fn agg_eval(
             else_expr,
         } => agg_eval_case(
             graph,
-            group,
+            scope,
             operand,
             when_then,
             else_expr,
@@ -628,7 +722,7 @@ pub(crate) fn agg_eval(
         // row this arm used to pass explicitly.
         Expr::Binary { op, left, right } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__l", left), ("__r", right)],
             params,
             cypher_version,
@@ -640,7 +734,7 @@ pub(crate) fn agg_eval(
         ),
         Expr::Subscript { expr, index } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__agg_base", expr)],
             params,
             cypher_version,
@@ -651,7 +745,7 @@ pub(crate) fn agg_eval(
         ),
         Expr::Slice { expr, start, end } => agg_eval_combinator(
             graph,
-            group,
+            scope,
             &[("__agg_base", expr)],
             params,
             cypher_version,
@@ -661,34 +755,31 @@ pub(crate) fn agg_eval(
                 end: end.clone(),
             },
         ),
-        _ => {
-            if let Some(row) = group.first() {
-                eval(graph, row, expr, params, cypher_version)
-            } else {
-                Ok(Value::Null)
-            }
-        }
+        _ => match seed {
+            Some(row) => eval(graph, row, expr, params, cypher_version),
+            None => Ok(Value::Null),
+        },
     }
 }
 
 /// Shared shape of the transparent-combinator arms: recursively `agg_eval`
 /// each child, bind the results under their synthetic `__agg_*` names in a
-/// row seeded from the group's first row (cloned, or default for an empty
-/// group), and delegate the `rebuild`'d combinator — which references those
+/// row seeded from the scope's seed row (cloned, or default when there is
+/// none), and delegate the `rebuild`'d combinator — which references those
 /// names via `Expr::Variable` — to scalar `eval`.
 fn agg_eval_combinator<S: AsRef<str>>(
     graph: &ExecGraph<'_>,
-    group: &[Row],
+    scope: AggScope<'_>,
     children: &[(S, &Expr)],
     params: &BTreeMap<String, Value>,
     cypher_version: Option<u32>,
     rebuild: impl FnOnce() -> Expr,
 ) -> Result<Value> {
-    let mut row = group.first().cloned().unwrap_or_default();
+    let mut row = scope.seed.cloned().unwrap_or_default();
     for (name, child) in children {
         row.insert(
             name.as_ref().into(),
-            agg_eval(graph, group, child, params, cypher_version)?,
+            agg_eval(graph, scope, child, params, cypher_version)?,
         );
     }
     eval(graph, &row, &rebuild(), params, cypher_version)
@@ -698,7 +789,7 @@ fn agg_eval_combinator<S: AsRef<str>>(
 /// argument under `__agg_arg{i}` and re-run the call as scalar `eval`.
 fn agg_eval_function(
     graph: &ExecGraph<'_>,
-    group: &[Row],
+    scope: AggScope<'_>,
     name: &str,
     args: &[Expr],
     params: &BTreeMap<String, Value>,
@@ -709,7 +800,7 @@ fn agg_eval_function(
         .enumerate()
         .map(|(i, a)| (format!("__agg_arg{i}"), a))
         .collect();
-    agg_eval_combinator(graph, group, &children, params, cypher_version, || {
+    agg_eval_combinator(graph, scope, &children, params, cypher_version, || {
         Expr::Function {
             name: name.into(),
             distinct: false,
@@ -728,7 +819,7 @@ fn agg_eval_function(
 /// variables, so scalar `eval_case` picks the arm.
 fn agg_eval_case<'e>(
     graph: &ExecGraph<'_>,
-    group: &[Row],
+    scope: AggScope<'_>,
     operand: &'e Option<Box<Expr>>,
     when_then: &'e [(Expr, Expr, bool)],
     else_expr: &'e Option<Box<Expr>>,
@@ -758,7 +849,7 @@ fn agg_eval_case<'e>(
     let else_expr = else_expr
         .as_deref()
         .map(|e| Box::new(bind("__agg_else".into(), e)));
-    agg_eval_combinator(graph, group, &children, params, cypher_version, || {
+    agg_eval_combinator(graph, scope, &children, params, cypher_version, || {
         Expr::Case {
             operand,
             when_then,

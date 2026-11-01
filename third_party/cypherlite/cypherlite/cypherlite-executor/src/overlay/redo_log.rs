@@ -100,12 +100,13 @@ impl LiveRedo {
 /// in constraint-name order (the `named_constraints()` order).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ValidatedCatalog {
-    /// `(definition, enforced label)` per constraint, in name order.
-    entries: Vec<(ConstraintDef, Option<String>)>,
+    /// The effective definition per constraint, in name order (its enforced
+    /// label is resolved into the row).
+    entries: Vec<ConstraintDef>,
 }
 
 impl ValidatedCatalog {
-    pub(crate) fn new(entries: Vec<(ConstraintDef, Option<String>)>) -> Self {
+    pub(crate) fn new(entries: Vec<ConstraintDef>) -> Self {
         Self { entries }
     }
 
@@ -114,19 +115,15 @@ impl ValidatedCatalog {
     /// they join the next validation's recheck set. A constraint only in
     /// `remembered` was dropped; it cannot be violated and needs nothing.
     pub(crate) fn new_or_changed_since(&self, remembered: &Self) -> HashSet<String> {
-        let before: std::collections::HashMap<&str, &(ConstraintDef, Option<String>)> = remembered
+        let before: std::collections::HashMap<&str, &ConstraintDef> = remembered
             .entries
             .iter()
-            .map(|entry| (entry.0.name.as_str(), entry))
+            .map(|def| (def.name.as_str(), def))
             .collect();
         self.entries
             .iter()
-            .filter(|entry| {
-                before
-                    .get(entry.0.name.as_str())
-                    .is_none_or(|old| **old != **entry)
-            })
-            .map(|entry| entry.0.name.clone())
+            .filter(|def| before.get(def.name.as_str()).is_none_or(|old| *old != *def))
+            .map(|def| def.name.clone())
             .collect()
     }
 }

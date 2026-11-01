@@ -20,6 +20,14 @@ pub struct CloneOptions {
     /// `kind`. A codec not compiled into this build is [`Error::Storage`]
     /// raised before the destination is created.
     pub to_snapshot_format: Option<SnapshotCodecKind>,
+    /// The markdown vault's body-property configuration (ADR-0460) for a
+    /// markdown destination: the published checkpoint renders node files
+    /// with it and the destination sidecar records it, so later opens need
+    /// no flag. `None` (the default) keeps the source's recorded
+    /// configuration when the source is a markdown store. A set
+    /// configuration on a non-markdown destination is [`Error::Semantic`]
+    /// raised before the destination is created.
+    pub markdown_body_properties: Option<crate::MarkdownBodyProperties>,
 }
 
 const SOURCE_STORE: &str = "clone source must be a native directory or .cl bundle path";
@@ -54,7 +62,7 @@ impl Database {
         let source_db = Database::open_with(
             source,
             OpenOptions {
-                wal_dir: opts.wal_dir,
+                wal_dir: opts.wal_dir.clone(),
                 mode: OpenMode::ReadOnly,
                 ..OpenOptions::default()
             },
@@ -65,8 +73,49 @@ impl Database {
         if let Some(source_dir) = source_db.inner.store.filesystem_dir() {
             reject_same_source(source_dir, uri_path(dest))?;
         }
-        publish_into(dest, &source_db, "clone", opts.to_snapshot_format)
+        // The destination codec is resolved once, here, and travels
+        // with its configuration — publish_into never re-derives it.
+        let dest_codec = opts
+            .to_snapshot_format
+            .unwrap_or_else(|| source_db.inner.store.snapshot_codec());
+        let codec_config = clone_codec_config(&opts, &source_db, dest_codec)?;
+        publish_into(dest, &source_db, "clone", dest_codec, codec_config)
     }
+}
+
+/// The clone's codec-specific open-time configuration (ADR-0460), the
+/// one home of the inheritance policy: an explicit
+/// [`CloneOptions::markdown_body_properties`] wins; without one, a
+/// markdown destination cloning a markdown source inherits the source's
+/// recorded configuration, so a copy keeps the source's note layout
+/// without a flag; anything else carries nothing and the destination's
+/// own defaults govern.
+fn clone_codec_config(
+    opts: &CloneOptions,
+    source_db: &Database,
+    dest_codec: SnapshotCodecKind,
+) -> Result<Option<cypherlite_storage::CodecOpenConfig>> {
+    Ok(match &opts.markdown_body_properties {
+        // An explicit configuration passes through unconditionally: the
+        // storage create path owns the set-but-ignored refusal, raised
+        // before the destination's lease or bundle create.
+        Some(bodies) => Some(cypherlite_storage::CodecOpenConfig::MarkdownBodies(
+            bodies.clone(),
+        )),
+        // The inheritance case: a markdown destination cloning a
+        // markdown source keeps the source's recorded layout — a
+        // transcode never synthesizes a configuration, and an
+        // unreadable source sidecar fails the clone rather than
+        // silently deciding the layout.
+        None if dest_codec == SnapshotCodecKind::Markdown
+            && source_db.inner.store.snapshot_codec() == SnapshotCodecKind::Markdown =>
+        {
+            Some(cypherlite_storage::CodecOpenConfig::MarkdownBodies(
+                cypherlite_storage::recorded_body_properties(&source_db.inner.store)?,
+            ))
+        }
+        None => None,
+    })
 }
 
 /// Clone-specific pre-check: the destination must not be the source

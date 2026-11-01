@@ -36,7 +36,9 @@ impl CachedKey {
 
 use super::candidates::{node_candidates, node_ok, resolve_rel_seek, SeekedRel};
 use super::match_clause::eval_match_predicate;
-use super::project::{skip_limit_count, sort_rows_by_order};
+use super::project::{
+    folded_order_items, skip_limit_count, sort_rows_by_parked_keys, unpark_order_keys, OrderKeys,
+};
 use super::pushdown::{flatten_and_owned, match_scope, Residual};
 use super::scope::{has_star_item, is_internal_column, projection_collides_with_internal_names};
 use super::QueryResult;
@@ -121,14 +123,19 @@ pub(super) fn note_path_binding() {
 pub(super) struct FoldReturn<'a> {
     items: &'a [Projection],
     order: &'a [OrderItem],
+    /// Per `ORDER BY` key: the item index its folded value is read from
+    /// (`folded_order_items`).
+    order_sources: Vec<usize>,
     skip: Option<&'a Expr>,
     limit: Option<&'a Expr>,
 }
 
 /// Shared RETURN gate for both folds: no DISTINCT, no GROUP BY, no `RETURN *`,
-/// at least one aggregate, and no user alias in the internal `__` namespace
+/// at least one aggregate, no user alias in the internal `__` namespace
 /// (the reservation [`super::scope::projection_collides_with_internal_names`]
-/// owns — the contract and its rationale live there).
+/// owns — the contract and its rationale live there), and every `ORDER BY`
+/// key answerable from the folded row (the fold keeps no input rows; see
+/// [`folded_order_items`]).
 pub(super) fn fold_return(suffix: &[Clause]) -> Option<FoldReturn<'_>> {
     let Clause::Return {
         distinct,
@@ -151,9 +158,11 @@ pub(super) fn fold_return(suffix: &[Clause]) -> Option<FoldReturn<'_>> {
     if !items.iter().any(|item| is_agg_expr(&item.expr)) {
         return None;
     }
+    let order_sources = folded_order_items(order, items)?;
     Some(FoldReturn {
         items,
         order,
+        order_sources,
         skip: skip.as_ref(),
         limit: limit.as_ref(),
     })
@@ -162,6 +171,7 @@ pub(super) fn fold_return(suffix: &[Clause]) -> Option<FoldReturn<'_>> {
 pub(super) struct FoldOutput<'a> {
     items: &'a [Projection],
     order: &'a [OrderItem],
+    order_sources: &'a [usize],
     skip: Option<&'a Expr>,
     limit: Option<&'a Expr>,
     params: &'a BTreeMap<String, Value>,
@@ -195,14 +205,27 @@ pub(super) fn finish_folded_rows(
         None => None,
     };
     if !output.order.is_empty() {
-        sort_rows_by_order(
-            graph,
-            output.items,
-            output.params,
-            output.order,
-            &mut out,
-            output.cypher_version,
-        )?;
+        // The folded row is the only row the fold kept: each key parks the
+        // value of the item `folded_order_items` resolved for it, and the
+        // shared sort entry point orders the rows by those parked columns.
+        let keys = OrderKeys::new(output.order, output.items, false);
+        for row in out.iter_mut() {
+            let parked: Vec<Value> = output
+                .order_sources
+                .iter()
+                .map(|&index| {
+                    let name = output.items[index].output_name(index);
+                    row.get(&name)
+                        .cloned()
+                        .expect("the folded row carries every resolved ORDER BY item")
+                })
+                .collect();
+            for (index, value) in parked.into_iter().enumerate() {
+                row.insert(keys.name(index), value);
+            }
+        }
+        sort_rows_by_parked_keys(&keys, &mut out, None)?;
+        unpark_order_keys(&keys, &mut out);
     }
     if skip_n > 0 {
         if skip_n >= out.len() {
@@ -387,6 +410,7 @@ pub(crate) fn try_fold_one_hop_aggs(
     let output = FoldOutput {
         items,
         order: ret.order,
+        order_sources: &ret.order_sources,
         skip: ret.skip,
         limit: ret.limit,
         params,

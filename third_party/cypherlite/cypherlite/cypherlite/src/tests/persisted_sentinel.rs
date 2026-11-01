@@ -248,14 +248,15 @@ fn replicated_incomplete_label_constraint_does_not_append() {
     db.connect().unwrap().query("CREATE (:Prior)").unwrap();
     let wal_file = uri.join("wal/00000001.log");
     let before = std::fs::read(&wal_file).unwrap();
-    let constraint = RedoOp::CreateConstraint {
+    let constraint = RedoOp::create_constraint(cypherlite_catalog::ConstraintDef {
         name: "rule".into(),
         relationship: false,
         label: "Person".into(),
         properties: vec![],
         kind: "nodeLabelExistence".into(),
         property_type: None,
-    };
+        enforced_label: None,
+    });
     let mismatched = RedoOp::CatalogDerivedConstraint {
         constraint: cypherlite_model::Constraint {
             name: "rule".into(),

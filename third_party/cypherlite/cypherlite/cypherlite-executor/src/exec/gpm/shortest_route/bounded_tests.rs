@@ -4,10 +4,11 @@
 //! are above zero as well as the expansions under their bound.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use cypherlite_core::Value::{self, Int};
 
-use crate::exec::test_support::{exec_cypher, Builder};
+use crate::exec::test_support::{build, exec_cypher, Builder};
 use crate::graph::Graph;
 
 use super::fixtures::run;
@@ -107,6 +108,64 @@ fn attack_graph() -> (Graph, u64) {
         b.rel(ids[from], ids[to], t, &[]);
     }
     (b.done(), rels.len() as u64)
+}
+
+/// Nodes of the dense mesh below.
+const MESH: usize = 8;
+
+/// A `:M` mesh with both directions on every pair — `MESH * (MESH - 1)`
+/// relationships, each node of degree `MESH - 1` — plus an isolated `:T`
+/// target nothing points at. No trail of any length ends at the target, so a
+/// path-level predicate sends the route through the whole length range: the
+/// trail count multiplies by the mesh degree per hop, orders of magnitude more
+/// work than the BFS layer over the same mesh.
+fn mesh_and_isolated_target() -> Graph {
+    let mut labels: Vec<&[&str]> = vec![&["M"]; MESH];
+    labels.push(&["T"]);
+    let mut rels = Vec::new();
+    for from in 0..MESH {
+        for to in 0..MESH {
+            if from != to {
+                rels.push((from, to, "R"));
+            }
+        }
+    }
+    build(&labels, &rels).graph
+}
+
+/// The dense-graph predicate shape (ADR-0186): a path-level predicate turns the
+/// BFS into a trail enumeration, so the route walks every trail of every length
+/// instead of one shortest path. The query still answers within the bound,
+/// charging the statement's cancellation window as it walks rather than only
+/// between lengths.
+#[test]
+fn dense_mesh_path_predicate_search_is_bounded() {
+    let g = mesh_and_isolated_target();
+    let q = "MATCH (a:M {id: 0}) MATCH (t:T) \
+             MATCH p = shortestPath((a)-[*1..6]->(t)) \
+             WHERE NONE(n IN nodes(p) WHERE n.id = 0) RETURN count(p)";
+    let started = std::time::Instant::now();
+    let (rows, counts) = run(&g, q);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        rows,
+        vec![vec![Int(0)]],
+        "the unreachable target must match nothing"
+    );
+    assert!(
+        counts.route_runs > 0,
+        "the predicate search fell back to GPM"
+    );
+    assert!(
+        counts.expands > 100_000,
+        "expands={} did not exercise the dense enumeration",
+        counts.expands
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the dense predicate search took {elapsed:?} for {} expansions",
+        counts.expands
+    );
 }
 
 #[test]

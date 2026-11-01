@@ -10,6 +10,62 @@ use crate::snapshot::{self, LoadedSnapshot};
 use crate::wal::Wal;
 use crate::{codec, version, SnapshotCodecKind, StoreTarget};
 
+/// The codec vocabulary's one behavioral surface on the open path: which
+/// loader reads the snapshot, what the codec does at the open tail — the
+/// dirty-WAL guard plus the load's deferred open-time action — and
+/// whether it sweeps orphaned store objects after open. One fn table per
+/// codec ([`codec_ops`]), so a codec's open behavior is spelled once
+/// instead of one arm bolted onto every dispatch the open walk passes;
+/// a fourth codec lands in that table alone.
+struct CodecOpenOps {
+    load: fn(&StoreTarget) -> Result<LoadedSnapshot>,
+    finish_open: fn(&StoreTarget, u64, u64, Option<snapshot::DeferredOpenAction>) -> Result<()>,
+    sweep_after_open: fn(&StoreTarget) -> Result<()>,
+}
+
+/// The classic codecs' open-tail default: no dirty-WAL window (their
+/// durable form cannot change underneath them) and no deferred action —
+/// every replay is admitted, nothing is deferred.
+fn admit_every_replay(
+    _target: &StoreTarget,
+    _wal_lsn: u64,
+    _checkpoint_lsn: u64,
+    _deferred: Option<snapshot::DeferredOpenAction>,
+) -> Result<()> {
+    Ok(())
+}
+
+/// The file-per-checkpoint codecs' sweep default: the checkpoint image is
+/// rewritten wholesale, so no object is orphaned and there is nothing to
+/// retire.
+fn nothing_to_sweep(_target: &StoreTarget) -> Result<()> {
+    Ok(())
+}
+
+/// The one codec → open-ops mapping: Parquet overrides the sweep (it
+/// retires objects its newest manifest orphaned, ADR-0089), markdown
+/// overrides the open tail (the dirty-WAL guard and the deferred
+/// re-baseline, ADR-0406 §5), and every codec names its own loader.
+fn codec_ops(codec: SnapshotCodecKind) -> CodecOpenOps {
+    match codec {
+        SnapshotCodecKind::Parquet => CodecOpenOps {
+            load: snapshot::load_with_checkpoint_lsn,
+            finish_open: admit_every_replay,
+            sweep_after_open: snapshot::sweep_orphans,
+        },
+        SnapshotCodecKind::Json => CodecOpenOps {
+            load: codec::json::load_with_checkpoint_lsn,
+            finish_open: admit_every_replay,
+            sweep_after_open: nothing_to_sweep,
+        },
+        SnapshotCodecKind::Markdown => CodecOpenOps {
+            load: codec::markdown::load_with_checkpoint_lsn,
+            finish_open: codec::markdown::finish_open,
+            sweep_after_open: nothing_to_sweep,
+        },
+    }
+}
+
 pub fn load(target: &StoreTarget) -> Result<Graph> {
     Ok(load_with_checkpoint_lsn(target)?.graph)
 }
@@ -20,10 +76,34 @@ pub fn load(target: &StoreTarget) -> Result<Graph> {
 /// the ontology document the snapshot carries (ADR-0120; `None` when the
 /// store holds none).
 fn load_with_checkpoint_lsn(target: &StoreTarget) -> Result<LoadedSnapshot> {
-    match target.codec {
-        SnapshotCodecKind::Parquet => snapshot::load_with_checkpoint_lsn(target),
-        SnapshotCodecKind::Json => codec::json::load_with_checkpoint_lsn(target),
-    }
+    (codec_ops(target.codec).load)(target)
+}
+
+/// The codec-owned open tail, through the codec's one ops table
+/// ([`codec_ops`]): prove the loaded base safe for replay (the dirty-WAL
+/// guard, ADR-0406 §5 — with WAL records past the checkpoint LSN, a
+/// codec whose durable form can change underneath it refuses the open
+/// instead of corrupting the base), then run the load's deferred
+/// open-time action — the markdown re-baseline over externally-edited
+/// vaults, the only deferred action today. The classic codecs have no
+/// such window, admit every replay, and defer nothing. The read-only
+/// open calls this with `None` — the guard alone, no deferred action;
+/// the writable open passes the action the load deferred.
+fn finish_open(
+    target: &StoreTarget,
+    wal: &Wal,
+    checkpoint_lsn: u64,
+    deferred: Option<snapshot::DeferredOpenAction>,
+) -> Result<()> {
+    (codec_ops(target.codec).finish_open)(target, wal.lsn, checkpoint_lsn, deferred)
+}
+
+/// The codec-owned post-open sweep, through the codec's one ops table
+/// ([`codec_ops`]): the Parquet codec retires store objects its newest
+/// manifest orphaned (ADR-0089); the file-per-checkpoint codecs rewrite
+/// their image wholesale and have nothing to sweep.
+fn sweep_after_open(target: &StoreTarget) -> Result<()> {
+    (codec_ops(target.codec).sweep_after_open)(target)
 }
 
 /// Open a store: load snapshot, then stream validated WAL records (ADR-0014).
@@ -113,10 +193,12 @@ pub fn open_writer_wal(target: &StoreTarget) -> Result<Wal> {
 }
 
 fn manifest_stamp(target: &StoreTarget) -> Result<Option<Vec<u8>>> {
-    // The one Option-returning manifest read: `None` when the store has no
-    // manifest yet, with the `JSON_META` bounded-read class enforced by
-    // `get_object_opt` itself.
-    snapshot::get_object_opt(target, snapshot::MANIFEST_JSON)
+    // The one Option-returning checkpoint-image read, stamped through
+    // the codec's own `checkpoint_image` — the file that codec's writer
+    // actually rewrites — so the before/after comparison observes the
+    // image a concurrent checkpoint really touches (`None` when the
+    // store has no image yet).
+    snapshot::get_object_opt(target, target.codec.checkpoint_image())
 }
 
 fn open_store_readonly_once(target: &StoreTarget) -> Result<(Graph, Wal, Option<String>)> {
@@ -128,6 +210,11 @@ fn open_store_readonly_once(target: &StoreTarget) -> Result<(Graph, Wal, Option<
     } = load_with_checkpoint_lsn(target)?;
     let (wal_vfs, wal_prefix) = target.wal_vfs();
     let wal = Wal::open_readonly(wal_vfs, wal_prefix, checkpoint_lsn)?;
+    // The read-only open tail: the one call with no deferred action —
+    // for the markdown codec that is exactly the dirty-WAL guard
+    // (`markdown::finish_open` runs its guard before any deferred
+    // action); the classic codecs admit every replay.
+    finish_open(target, &wal, checkpoint_lsn, None)?;
     let ontology = replay_after_ontology(&graph, &wal, checkpoint_lsn, ontology)?;
     Ok((graph, wal, ontology))
 }
@@ -157,9 +244,14 @@ pub(crate) fn open_store_with_report(
         checkpoint_lsn,
         ontology,
         marker,
+        deferred,
     } = load_with_checkpoint_lsn(target)?;
     let (wal_vfs, wal_prefix) = target.wal_vfs();
     let mut wal = Wal::open(wal_vfs, wal_prefix, checkpoint_lsn)?;
+    // The writable-open tail (ADR-0406 §5), codec-owned through the ops
+    // table: the dirty-WAL guard first, then — no WAL deltas pending
+    // over the loaded base — the load's deferred action runs.
+    finish_open(target, &wal, checkpoint_lsn, deferred)?;
     let ontology = replay_after_ontology(&graph, &wal, checkpoint_lsn, ontology)?;
     let mut report = version::MigrationReport::default();
     if let version::SnapshotMarker::Legacy(subsystem, from) = marker {
@@ -185,9 +277,7 @@ pub(crate) fn open_store_with_report(
             wal.recycle(cut)?;
         }
     }
-    if target.codec == SnapshotCodecKind::Parquet {
-        snapshot::sweep_orphans(target)?;
-    }
+    sweep_after_open(target)?;
     Ok((graph, wal, ontology, report))
 }
 

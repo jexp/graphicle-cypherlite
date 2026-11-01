@@ -31,9 +31,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use cypherlite_model::identifier::quote_identifier_shaped;
 use cypherlite_model::Constraint;
 use cypherlite_model::CypherValue;
-use cypherlite_parser::token::quote_identifier_shaped;
 use cypherlite_parser::{
     render_canon, type_expr_to_canon, AnyNodeMode, GraphTypeBody, GraphTypeConstraintSpec,
     GraphTypeConstraintVerb, GraphTypeElementRef, GraphTypePropertyType,

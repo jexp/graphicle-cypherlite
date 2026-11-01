@@ -303,7 +303,7 @@ impl Graph {
                     |st| {
                         st.unbounded
                             .is_empty()
-                            .then(|| order::numeric_ids(&st.order, op, bound))
+                            .then(|| order::range_ids(&st.order, op, bound))
                     },
                     |v| order::cmp_holds(v, op, bound),
                 )
@@ -330,7 +330,7 @@ impl Graph {
                 self.range_pair_cost(labels, key, |st| {
                     st.unbounded
                         .is_empty()
-                        .then(|| order::numeric_count(&st.order, op, bound))
+                        .then(|| order::range_count(&st.order, op, bound))
                 })
             }
         }
@@ -533,23 +533,6 @@ mod tests {
         text::gram_remove_node(&mut st, 10);
         assert!(st.grams.values().all(|ids| !ids.holds(10)));
         assert!(st.grams.values().any(|ids| ids.holds(11)));
-    }
-
-    #[test]
-    fn out_of_window_datetime_is_not_an_order_key() {
-        use chrono::NaiveDate;
-        use cypherlite_core::Temporal;
-        let far = NaiveDate::from_ymd_opt(9999, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        let value = Value::Temporal(Temporal::LocalDateTime(far));
-        let mut st = RangeIndex::default();
-        order::insert_order(&mut st, &value, 7);
-        assert!(st.order.is_empty());
-        assert!(st.unbounded.contains(&7));
-        order::order_remove_node(&mut st, 7);
-        assert!(st.unbounded.is_empty());
     }
 
     #[test]

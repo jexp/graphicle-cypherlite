@@ -67,9 +67,7 @@ impl ExecGraph<'_> {
         properties: BTreeMap<String, Value>,
     ) -> Result<RelId> {
         if !self.node_exists(start) || !self.node_exists(end) {
-            return Err(cypherlite_core::Error::semantic(
-                "cannot create relationship on missing node",
-            ));
+            return Err(crate::graph::missing_rel_endpoint_error());
         }
         let properties = std::sync::Arc::new(cypherlite_core::PropertyMap::from(properties));
         let mut s = self.scratch_mut();

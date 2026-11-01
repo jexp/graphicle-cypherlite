@@ -40,7 +40,9 @@ use std::time::Duration;
 pub use cypherlite_core::{
     node_element_id, parse_node_element_id, parse_rel_element_id, rel_element_id,
 };
-pub use cypherlite_storage::{cypher_to_value, value_to_cypher, SnapshotCodecKind, WalRecord};
+pub use cypherlite_storage::{
+    cypher_to_value, value_to_cypher, MarkdownBodyProperties, SnapshotCodecKind, WalRecord,
+};
 pub use plan_node::{ClauseMetrics, PlanArtifacts, PlanNode, PlanWarning};
 
 pub use binding::{
@@ -71,8 +73,9 @@ pub use connection::{Connection, Executed, ExecutionFailure};
 pub use cypherlite_core::CancelToken;
 pub use cypherlite_core::Namespace;
 pub use cypherlite_core::{
-    parse_memory_limit, uuid_hyphenated, uuid_parse, ArithmeticFailure, Error, Node, Path,
-    PropertyMap, Relationship, Result, Temporal, Value,
+    parse_memory_limit, parse_positive_memory_limit, require_positive_memory_limit,
+    uuid_hyphenated, uuid_parse, ArithmeticFailure, Error, Node, Path, PropertyMap, Relationship,
+    Result, Temporal, Value,
 };
 pub use cypherlite_core::{ExecutionReceipt, TokenEstimate, TokenOutcome};
 pub use cypherlite_executor::{
@@ -89,6 +92,7 @@ pub use cypherlite_model::wire::{
     Notification, NotificationCategory, NotificationKind, NotificationSeverity,
 };
 pub use cypherlite_planner::QueryType;
+pub use open_config::workspace_limit_from_setting;
 pub use query_worker::Heartbeat;
 pub use result::{QueryResult, ResultHeader};
 #[cfg(test)]
@@ -235,12 +239,13 @@ pub struct OpenOptions {
     /// or unlimited when that variable is unset. A set value that does not
     /// parse fails open with the same semantic error as a bad `--logical-graph-size-limit`.
     pub logical_graph_size_limit: Option<u64>,
-    /// Opt-in peak-token admission. `CYPHERLITE_TOKEN_ADMISSION=1` enables it
-    /// and `=0` disables it, including when this field is true. Unset follows
-    /// this field. Off, queries are not refused for overlap.
-    pub token_admission: bool,
-    /// Concurrent peak tokens. Required and positive when admission is on.
-    /// `None` reads `CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT`.
+    /// Concurrent logical-workspace pool in bytes (ADR-0452). A positive
+    /// value turns admission on at that capacity and does not read the
+    /// environment. `None` reads `CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT`
+    /// (`SIZE`: bytes or `mb`/`mib`/`gb`/`gib`); unset or blank leaves
+    /// admission off. `Some(0)`, and a zero or unparseable environment
+    /// value, fail open. A set `CYPHERLITE_TOKEN_ADMISSION` fails open:
+    /// the limit is the switch.
     pub concurrent_logical_workspace_limit: Option<u64>,
     /// Snapshot codec for an empty URI (ADR-0050). `None` uses
     /// `CYPHERLITE_SNAPSHOT_FORMAT` or the build's default,
@@ -248,6 +253,15 @@ pub struct OpenOptions {
     /// JSON otherwise; ADR-0105). Existing directories use the envelope; a
     /// mismatch is an error.
     pub snapshot_codec: Option<cypherlite_storage::SnapshotCodecKind>,
+    /// The markdown vault's body-property configuration (ADR-0460):
+    /// which properties render as the node file's body — the list's
+    /// first entry bare, each subsequent one as a `## <property>`
+    /// section. `None` — the default — uses
+    /// `CYPHERLITE_MARKDOWN_BODY_PROPERTIES` or the sidecar manifest's
+    /// recorded configuration; the unconfigured form is ADR-0406's
+    /// single `body` property. A set configuration on a store whose
+    /// codec is not markdown fails the open instead of being ignored.
+    pub markdown_body_properties: Option<cypherlite_storage::MarkdownBodyProperties>,
     /// Existing directory allowed for local LOAD CSV (ADR-0081). `None` uses
     /// `CYPHERLITE_LOAD_CSV_DIR` or denies local files.
     pub load_csv_dir: Option<PathBuf>,

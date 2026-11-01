@@ -4,17 +4,8 @@ use crate::{Database, DurabilityMode, OpenOptions, SnapshotCodecKind, Value};
 
 fn no_timer() -> OpenOptions {
     OpenOptions {
-        wal_dir: None,
         checkpoint_interval: Some(Duration::ZERO),
-        durability_mode: Default::default(),
-        logical_graph_size_limit: None,
-        snapshot_codec: None,
-        load_csv_dir: None,
-        load_csv_max_bytes: None,
-        mode: crate::OpenMode::Writable,
-        token_admission: false,
-        concurrent_logical_workspace_limit: None,
-        follow_gap: Default::default(),
+        ..OpenOptions::default()
     }
 }
 
@@ -89,8 +80,21 @@ fn open_options_default_durability_is_full() {
     assert_eq!(OpenOptions::default().durability_mode, DurabilityMode::Full);
 }
 
+/// The checkpoint recycled the WAL: the first segment is gone — the
+/// published snapshot carries everything recovery needs.
+fn assert_wal_recycled(dir: &std::path::Path, codec: SnapshotCodecKind) {
+    let wal_files: Vec<_> = std::fs::read_dir(dir.join(codec.wal_dir()))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !wal_files.iter().any(|name| name == "00000001.log"),
+        "{codec:?}: {wal_files:?}"
+    );
+}
+
 #[test]
-fn checkpoint_recycles_enforced_label_and_show_theater_for_both_codecs() {
+fn checkpoint_recycles_enforced_label_and_show_theater_for_every_compiled_codec() {
     for &codec in SnapshotCodecKind::compiled() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -134,14 +138,7 @@ fn checkpoint_recycles_enforced_label_and_show_theater_for_both_codecs() {
             assert!(matches!(err, crate::Error::Execution(_)), "{err}");
             db.checkpoint().unwrap();
         }
-        let wal_files: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !wal_files.iter().any(|name| name == "00000001.log"),
-            "{codec:?}: {wal_files:?}"
-        );
+        assert_wal_recycled(dir.path(), codec);
         // The checkpoint LSN is already past the DDL records; recovery must
         // work from the published snapshot even when those records are gone.
         let db = Database::open_with(uri, no_timer()).unwrap();
@@ -191,10 +188,7 @@ fn legacy_untyped_label_constraint_survives_checkpoint_and_wal_recycle() {
                 .unwrap();
             db.checkpoint().unwrap();
         }
-        let path = dir.path().join(match codec {
-            SnapshotCodecKind::Parquet => "manifest.json",
-            SnapshotCodecKind::Json => "graph.json",
-        });
+        let path = dir.path().join(codec.checkpoint_image());
         let mut old: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         if codec == SnapshotCodecKind::Parquet {
@@ -219,7 +213,7 @@ fn legacy_untyped_label_constraint_survives_checkpoint_and_wal_recycle() {
                 conn.query(show).unwrap().rows,
                 vec![vec![Value::String("label_rule".into()), Value::Null]]
             );
-            conn.query("CREATE (:Person)").unwrap();
+            conn.query("CREATE (:Person {name: 'Per'})").unwrap();
             conn.query("ALTER DATABASE neo4j SET DEFAULT LANGUAGE CYPHER 5")
                 .unwrap();
             conn.query("CREATE CONSTRAINT known_rule FOR (n:Known) REQUIRE n:Verified")
@@ -245,14 +239,7 @@ fn legacy_untyped_label_constraint_survives_checkpoint_and_wal_recycle() {
             saved["theater"]["derived_constraints"]["known_rule"]["enforced_label"],
             "Verified"
         );
-        let wal_files: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !wal_files.iter().any(|name| name == "00000001.log"),
-            "{codec:?}: {wal_files:?}"
-        );
+        assert_wal_recycled(dir.path(), codec);
         let db = Database::open(uri).unwrap();
         let mut conn = db.connect().unwrap();
         assert_eq!(
@@ -296,16 +283,9 @@ fn open_rejects_incomplete_typed_theater_after_wal_recycle() {
                 .unwrap();
             db.checkpoint().unwrap();
         }
-        let wal_files: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!wal_files.iter().any(|name| name == "00000001.log"));
+        assert_wal_recycled(dir.path(), codec);
 
-        let path = dir.path().join(match codec {
-            SnapshotCodecKind::Parquet => "manifest.json",
-            SnapshotCodecKind::Json => "graph.json",
-        });
+        let path = dir.path().join(codec.checkpoint_image());
         let mut data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(data["theater"]["derived_constraints"]

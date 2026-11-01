@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "WAL plus pluggable snapshot codecs (CypherLite JSON, Parquet behind the default-on parquet feature)"
+license.workspace = true
 
 [features]
 default = ["parquet"]
@@ -15,6 +16,7 @@ parquet = ["dep:arrow", "dep:parquet", "dep:bytes"]
 cypherlite-catalog = { workspace = true }
 cypherlite-core = { workspace = true }
 cypherlite-executor = { workspace = true }
+cypherlite-markdown = { workspace = true }
 cypherlite-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,9 +55,13 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The one recursive VFS walk the markdown-vault integration suites
+# share with the golden-store suite (`vfs_walk` feature; test-only).
+cypherlite-test-support = { workspace = true, features = ["vfs_walk"] }
 # Property-testing harness for WAL/checkpoint invariants (ADR-0268).
-# Dev-only: never compiled into the library or the released artifact. This is
-# the ONLY crate that adopts proptest; its rand 0.9 requirement unifies with
-# the workspace's rand 0.9 (ADR-0268).
-proptest = "1.11"
+# Dev-only: never compiled into the library or the released artifact. This was
+# the first crate to adopt proptest; `cypherlite-executor` also does now, for
+# the ADR-0439 admission property, under the same pin. Its rand 0.9
+# requirement unifies with the workspace's rand 0.9 (ADR-0268).
+proptest = { workspace = true }
 proptest-state-machine = "0.8"

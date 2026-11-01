@@ -9,7 +9,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::overlay::ExecGraph;
 
 use super::super::string::{char_range, str_unary, string_arg, trim_function, TrimMode};
-use super::write_scalar;
+use super::render_scalar;
 
 pub(super) fn bi_string_interp(
     _graph: &ExecGraph<'_>,
@@ -26,11 +26,12 @@ pub(super) fn bi_string_interp(
             Value::Null => return Ok(Value::Null),
             Value::Vector { .. } => out.push_str(&v.to_display_string()),
             other => {
-                if !write_scalar(&mut out, other) {
+                let Some(rendered) = render_scalar(other) else {
                     return Err(Error::ty(
                         "InvalidArgumentValue: string interpolation cannot coerce value to STRING",
                     ));
-                }
+                };
+                out.push_str(&rendered);
             }
         }
     }
@@ -310,7 +311,7 @@ pub(super) fn bi_right(_graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::super::coerce_scalar_to_string;
+    use super::super::render_scalar;
     use super::*;
     use crate::graph::Graph;
 
@@ -376,9 +377,9 @@ mod tests {
         ];
         let expected = format!(
             "-42|0.5|false|ñ|{}|{}|{}|{}",
-            coerce_scalar_to_string(&uuid).unwrap(),
-            coerce_scalar_to_string(&date).unwrap(),
-            coerce_scalar_to_string(&point).unwrap(),
+            render_scalar(&uuid).unwrap(),
+            render_scalar(&date).unwrap(),
+            render_scalar(&point).unwrap(),
             vector.to_display_string(),
         );
         assert_eq!(interp(parts).unwrap(), s(&expected));

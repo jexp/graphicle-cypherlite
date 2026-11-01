@@ -6,6 +6,9 @@ use super::identity::reset_path_starts_with;
 use super::reset::rename_reset_noreplace;
 #[cfg(unix)]
 use super::reset::reset_native_with_barrier;
+#[cfg(unix)]
+use super::reset::ResetStage;
+use super::reset::{MoveKind, RESET_TOMBSTONE_MARK};
 use super::*;
 use crate::tests::person_ada;
 use crate::{
@@ -31,6 +34,18 @@ fn read_all_locked(owner: &std::fs::File, path: &std::path::Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).unwrap();
     bytes
+}
+
+/// No reset-tombstone residue beside a refused or rolled-back reset —
+/// the shared refusal-safety assertion every "without any mutation"
+/// test consults, keyed on the transaction's own tombstone-name mark so
+/// the sweep and the container naming cannot drift apart.
+pub(crate) fn assert_no_reset_residue(dir: &std::path::Path) {
+    assert!(!std::fs::read_dir(dir).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(RESET_TOMBSTONE_MARK)));
 }
 
 #[test]
@@ -265,7 +280,7 @@ fn offline_adoption_refuses_live_lease_wrong_role_and_incomplete_reset() {
     std::fs::create_dir_all(&wal).unwrap();
     std::fs::write(root.join("manifest.json"), b"root evidence").unwrap();
     std::fs::write(wal.join("00000001.log"), crate::wal::MAGIC).unwrap();
-    let (_, root_owner) = NativeVfs::lock_directory(&root).unwrap();
+    let (_, root_owner) = NativeVfs::lock_directory(&root, LOCK_MARKER).unwrap();
     std::fs::write(wal.join(LOCK_MARKER), b"").unwrap();
     let root_lock = root.join(LOCK_MARKER);
     assert!(matches!(
@@ -274,7 +289,7 @@ fn offline_adoption_refuses_live_lease_wrong_role_and_incomplete_reset() {
     ));
     assert_eq!(read_locked(&root_owner, &root_lock), b"");
     drop(root_owner);
-    let (_, wal_owner) = NativeVfs::lock_directory(&wal).unwrap();
+    let (_, wal_owner) = NativeVfs::lock_directory(&wal, LOCK_MARKER).unwrap();
     assert!(matches!(
         adopt_native_default_wal(&root),
         Err(Error::Locked(_))
@@ -308,9 +323,12 @@ fn legacy_root_with_typed_direct_wal_opens_then_reset_migrates_root() {
     std::fs::write(root.join(LOCK_MARKER), b"").unwrap();
     std::fs::write(root.join("wal").join(LOCK_MARKER), WAL_ROLE).unwrap();
     let (resolved, wal, owner) = lease(&root, &root.join("wal")).unwrap();
-    assert_eq!(read_locked(&owner._root, &resolved.join(LOCK_MARKER)), b"");
     assert_eq!(
-        read_locked(owner._wal.as_ref().unwrap(), &wal.join(LOCK_MARKER)),
+        read_locked(owner.root_file(), &resolved.join(LOCK_MARKER)),
+        b""
+    );
+    assert_eq!(
+        read_locked(owner.wal_file().unwrap(), &wal.join(LOCK_MARKER)),
         WAL_ROLE
     );
     drop(owner);
@@ -322,18 +340,6 @@ fn legacy_root_with_typed_direct_wal_opens_then_reset_migrates_root() {
         WAL_ROLE
     );
 
-    let missing = dir.path().join("pre-lock");
-    std::fs::create_dir(&missing).unwrap();
-    std::fs::write(missing.join("manifest.json"), b"root evidence").unwrap();
-    std::fs::create_dir(missing.join("wal")).unwrap();
-    std::fs::write(missing.join("wal").join(LOCK_MARKER), WAL_ROLE).unwrap();
-    drop(lease(&missing, &missing.join("wal")).unwrap());
-    assert_eq!(std::fs::read(missing.join(LOCK_MARKER)).unwrap(), b"");
-    assert_eq!(
-        std::fs::read(missing.join("wal").join(LOCK_MARKER)).unwrap(),
-        WAL_ROLE
-    );
-
     #[cfg(unix)]
     {
         let error = reset_native_with_barrier(
@@ -341,7 +347,7 @@ fn legacy_root_with_typed_direct_wal_opens_then_reset_migrates_root() {
             None,
             |_| Ok(()),
             |stage, _| {
-                if stage == "root-reserve-parent" {
+                if stage == ResetStage::RootReserveParent {
                     Err(Error::io("stop after role migration"))
                 } else {
                     Ok(())
@@ -356,7 +362,31 @@ fn legacy_root_with_typed_direct_wal_opens_then_reset_migrates_root() {
             WAL_ROLE
         );
     }
+}
 
+/// A root with root evidence but no root marker adopts an empty marker
+/// during the lease, without rewriting the typed direct WAL's role.
+#[test]
+fn markerless_root_with_evidence_adopts_empty_marker_beside_typed_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("pre-lock");
+    std::fs::create_dir(&missing).unwrap();
+    std::fs::write(missing.join("manifest.json"), b"root evidence").unwrap();
+    std::fs::create_dir(missing.join("wal")).unwrap();
+    std::fs::write(missing.join("wal").join(LOCK_MARKER), WAL_ROLE).unwrap();
+    drop(lease(&missing, &missing.join("wal")).unwrap());
+    assert_eq!(std::fs::read(missing.join(LOCK_MARKER)).unwrap(), b"");
+    assert_eq!(
+        std::fs::read(missing.join("wal").join(LOCK_MARKER)).unwrap(),
+        WAL_ROLE
+    );
+}
+
+/// A reset whose WAL is the root itself refuses: the one tree cannot be
+/// both the root move and the WAL move.
+#[test]
+fn reset_refuses_a_wal_aliasing_its_own_root() {
+    let dir = tempfile::tempdir().unwrap();
     let same = dir.path().join("same");
     drop(parse_uri_with_wal(same.to_str().unwrap(), Some(same.clone())).unwrap());
     assert_eq!(std::fs::read(same.join(LOCK_MARKER)).unwrap(), ROOT_ROLE);
@@ -469,11 +499,7 @@ fn closed_legacy_root_at_direct_wal_is_never_claimed_by_outer_root() {
             }
             assert_eq!(std::fs::read(external.join(LOCK_MARKER)).unwrap(), WAL_ROLE);
             assert!(!root.join(RESET_INCOMPLETE).exists());
-            assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".reset-")));
+            assert_no_reset_residue(dir.path());
         }
     }
 }
@@ -556,624 +582,14 @@ fn typed_wal_with_root_evidence_and_unknown_roles_fail_without_rewriting_marker(
     );
 }
 
-#[test]
-#[cfg(unix)]
-fn reset_sync_failure_strands_old_wal_and_blocks_old_root() {
-    for failed in [
-        "marker-dir",
-        "wal-reserve-parent",
-        "wal-old-parent",
-        "wal-tombstone",
-        "root-reserve-parent",
-        "root-old-parent",
-        "root-tombstone",
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("root");
-        let wal = dir.path().join("external");
-        let target = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-        target
-            .wal_vfs()
-            .0
-            .open("old", VfsOpen::create_new())
-            .unwrap()
-            .write_all(b"old WAL")
-            .unwrap();
-        drop(target);
-        let mut stages = Vec::new();
-        let err = reset_native_with_barrier(
-            &root,
-            Some(&wal),
-            |_| Ok(()),
-            |stage, _| {
-                stages.push(stage.to_string());
-                if stage == failed {
-                    Err(Error::io("injected fsync failure"))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .unwrap_err();
-        assert!(
-            stages.iter().any(|stage| stage == failed),
-            "{failed}: {err}"
-        );
-        if failed != "marker-dir" {
-            assert!(err.to_string().contains("reset"), "{err}");
-        }
-        assert!(
-            root.join(RESET_INCOMPLETE).exists() || !root.exists(),
-            "{failed}"
-        );
-        if root.exists() {
-            assert!(
-                matches!(
-                    parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())),
-                    Err(Error::Storage(_)) | Err(Error::Locked(_))
-                ),
-                "{failed}"
-            );
-        } else {
-            let fresh = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-            assert!(
-                !wal.join("old").exists(),
-                "{failed}: old WAL attached to fresh root"
-            );
-            drop(fresh);
-        }
-        let old_wal = if wal.join("old").exists() {
-            wal.join("old")
-        } else {
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().path().join("data/old"))
-                .find(|path| path.exists())
-                .expect("old WAL retained")
-        };
-        assert_eq!(std::fs::read(old_wal).unwrap(), b"old WAL", "{failed}");
-    }
-}
+// The reset-refusal and reset-process arcs: sibling files keeping this
+// module under the no-1k-line rule (LABS-311). Each shares this file's
+// imports and helpers through `use super::*`.
+#[path = "tests_reset_refusal.rs"]
+mod reset_refusal;
 
-#[test]
-#[cfg(unix)]
-fn reset_durable_wal_barrier_precedes_root_move_and_deletion() {
-    use std::cell::RefCell;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("root");
-    let wal = dir.path().join("external");
-    drop(parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap());
-    let order = RefCell::new(Vec::new());
-    reset_native_with_barrier(
-        &root,
-        Some(&wal),
-        |step| {
-            order.borrow_mut().push(format!("staged-{step}"));
-            Ok(())
-        },
-        |stage, _| {
-            order.borrow_mut().push(stage.to_string());
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        *order.borrow(),
-        [
-            "marker-dir",
-            "wal-reserve-parent",
-            "wal-old-parent",
-            "wal-tombstone",
-            "staged-wal",
-            "root-reserve-parent",
-            "root-old-parent",
-            "root-tombstone",
-            "staged-root"
-        ]
-    );
-    assert!(!root.exists());
-    assert!(!wal.exists());
-}
-
-#[test]
-fn reset_uri_removes_filesystem_db() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let (g, mut wal) = person_ada();
-    let target = parse_uri(uri).unwrap();
-    checkpoint_with_lsn(&target, &g, wal.lsn, None).unwrap();
-    let lsn = wal.rotate().unwrap();
-    wal.recycle(lsn).unwrap();
-    assert!(dir.path().join("manifest.json").exists());
-    drop(target);
-    reset_uri(uri, None).unwrap();
-    assert!(!dir.path().exists());
-    reset_uri(uri, None).unwrap();
-}
-
-#[test]
-fn reset_refuses_ancestor_wal_without_touching_live_sibling_or_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("databases");
-    let root = parent.join("root");
-    let sibling = parent.join("sibling");
-    let target = parse_uri(root.to_str().unwrap()).unwrap();
-    target
-        .vfs()
-        .open("wal/root.log", VfsOpen::create_new())
-        .unwrap()
-        .write_all(b"root WAL")
-        .unwrap();
-    drop(target);
-    let live_sibling = parse_uri(sibling.to_str().unwrap()).unwrap();
-    live_sibling
-        .vfs()
-        .open("wal/sibling.log", VfsOpen::create_new())
-        .unwrap()
-        .write_all(b"sibling WAL")
-        .unwrap();
-    let names = |path: &Path| {
-        let mut names: Vec<_> = std::fs::read_dir(path)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        names.sort();
-        names
-    };
-    let before = (names(&parent), names(&root), names(&sibling));
-    // The WAL override is an ancestor of root, while the independently
-    // leased sibling lives under it. No ancestor marker is created.
-    let alias = parent.join(".");
-    let error = reset_uri(root.to_str().unwrap(), Some(&alias)).unwrap_err();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert_eq!(before, (names(&parent), names(&root), names(&sibling)));
-    assert!(!parent.join(LOCK_MARKER).exists());
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert_eq!(
-        std::fs::read(root.join("wal/root.log")).unwrap(),
-        b"root WAL"
-    );
-    assert_eq!(
-        std::fs::read(sibling.join("wal/sibling.log")).unwrap(),
-        b"sibling WAL"
-    );
-    assert!(matches!(
-        parse_uri(sibling.to_str().unwrap()),
-        Err(Error::Locked(_))
-    ));
-    drop(live_sibling);
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    drop(parse_uri(sibling.to_str().unwrap()).unwrap());
-}
-
-#[test]
-fn nested_native_and_bundle_open_refused_with_live_or_closed_parent() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    let child = root.join("data").join("child");
-    let bundle = root.join("data").join("child.CL");
-    let mut parent = Some(parse_uri(root.to_str().unwrap()).unwrap());
-    for live in [true, false] {
-        if !live {
-            drop(parent.take());
-        }
-        for result in [
-            parse_uri(child.to_str().unwrap()),
-            parse_uri(bundle.to_str().unwrap()),
-        ] {
-            assert!(matches!(result, Err(Error::Storage(_))));
-        }
-        assert!(!child.exists());
-        assert!(!bundle.exists());
-        assert!(!root.join("data").exists());
-    }
-}
-
-#[test]
-fn opening_new_parent_over_existing_child_refuses_before_creating_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("container");
-    let child = root.join("child");
-    let owner = parse_uri(child.to_str().unwrap()).unwrap();
-    assert!(!root.join(LOCK_MARKER).exists());
-    let err = parse_uri(root.to_str().unwrap()).err().unwrap();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
-    assert!(!root.join(LOCK_MARKER).exists());
-    assert!(matches!(
-        parse_uri(child.to_str().unwrap()),
-        Err(Error::Locked(_))
-    ));
-    drop(owner);
-    drop(parse_uri(child.to_str().unwrap()).unwrap());
-}
-
-#[test]
-fn wal_scan_rejects_nested_owner_under_case_variant_of_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("Graph");
-    let wal = dir.path().join("graph");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    // On a case-sensitive macOS/Windows volume these are different trees,
-    // but the reset overlap predicate still calls the WAL contained.
-    // On a case-insensitive volume the spellings alias the same tree;
-    // that path also tests the post-lock scan with root/wal/.cypherlite.lock present.
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(reset_path_starts_with(&wal, &root).unwrap());
-    drop(parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap());
-
-    // Simulate a legacy writer which created a child before the WAL was
-    // attached. A normal child open would reject its parent's marker.
-    let child = wal.join("legacy").join("child");
-    let (_, owner) = NativeVfs::lock_directory(&child).unwrap();
-    std::fs::write(child.join("important"), b"independent database").unwrap();
-    let error = parse_uri_with_wal(root.to_str().unwrap(), Some(wal))
-        .err()
-        .unwrap();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert!(error.to_string().contains("legacy"), "{error}");
-    assert_eq!(
-        std::fs::read(child.join("important")).unwrap(),
-        b"independent database"
-    );
-    assert!(matches!(
-        NativeVfs::lock_directory(&child),
-        Err(Error::Locked(_))
-    ));
-    drop(owner);
-}
-
-#[test]
-#[cfg(unix)]
-fn nested_aliases_follow_physical_identity_without_following_outbound_links_on_reset() {
-    use std::os::unix::fs::symlink;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let alias = dir.path().join("db-alias");
-    symlink(&root, &alias).unwrap();
-    let child = alias.join("nested");
-    assert!(matches!(
-        parse_uri(child.to_str().unwrap()),
-        Err(Error::Storage(_))
-    ));
-
-    let external = dir.path().join("external.cl");
-    drop(BundleVfs::open_or_create(&external).unwrap());
-    symlink(&external, root.join("outbound.cl")).unwrap();
-    // The actual host file is outside the root; reset only removes the
-    // symlink and leaves the independent external bundle unchanged.
-    let owner = BundleVfs::open_or_create(&external).unwrap();
-    reset_uri(root.to_str().unwrap(), None).unwrap();
-    assert!(external.exists());
-    assert!(matches!(
-        BundleVfs::open_or_create(&external),
-        Err(Error::Locked(_))
-    ));
-    drop(owner);
-}
-
-#[test]
-fn reset_refuses_preexisting_nested_native_owner_without_any_mutation() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let child = root.join("legacy").join("nested");
-    // Fixture bypasses the URI policy, as a legacy/external writer could.
-    let (_, owner) = NativeVfs::lock_directory(&child).unwrap();
-    std::fs::write(child.join("important"), b"independent native data").unwrap();
-    let before = std::fs::read(root.join(LOCK_MARKER)).unwrap();
-    let err = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
-    assert_eq!(std::fs::read(root.join(LOCK_MARKER)).unwrap(), before);
-    assert_eq!(
-        std::fs::read(child.join("important")).unwrap(),
-        b"independent native data"
-    );
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    assert!(matches!(
-        NativeVfs::lock_directory(&child),
-        Err(Error::Locked(_))
-    ));
-    drop(owner);
-    assert!(child.join(LOCK_MARKER).exists());
-}
-
-#[test]
-fn reset_refuses_nested_uppercase_lock_marker_without_mutation() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let child = root.join("legacy");
-    std::fs::create_dir(&child).unwrap();
-    std::fs::write(
-        child.join(LOCK_MARKER.to_ascii_uppercase()),
-        b"nested owner",
-    )
-    .unwrap();
-    std::fs::write(child.join("important"), b"preserve").unwrap();
-    let error = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert_eq!(std::fs::read(child.join("important")).unwrap(), b"preserve");
-    assert_eq!(
-        std::fs::read(child.join(LOCK_MARKER.to_ascii_uppercase())).unwrap(),
-        b"nested owner"
-    );
-    assert!(root.join(LOCK_MARKER).exists());
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-}
-
-#[test]
-fn reset_distinguishes_extra_uppercase_marker_from_own_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    // A case-sensitive volume can hold both spellings. The uppercase
-    // marker is not the root's own lock merely because its name folds.
-    let extra = root.join(LOCK_MARKER.to_ascii_uppercase());
-    if !extra.exists() {
-        std::fs::write(&extra, b"other marker").unwrap();
-        let error = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)), "{error}");
-        assert_eq!(std::fs::read(&extra).unwrap(), b"other marker");
-        assert!(root.join(LOCK_MARKER).exists());
-    }
-}
-
-#[test]
-fn reset_markerless_parent_treats_direct_wal_lock_as_independent_child() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("container");
-    let child = root.join("wal");
-    let (_, owner) = NativeVfs::lock_directory(&child).unwrap();
-    std::fs::write(child.join("important"), b"independent wal-named database").unwrap();
-    assert!(!root.join(LOCK_MARKER).exists());
-    let err = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
-    assert!(!root.join(LOCK_MARKER).exists());
-    assert_eq!(
-        std::fs::read(child.join("important")).unwrap(),
-        b"independent wal-named database"
-    );
-    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    drop(owner);
-}
-
-#[test]
-fn reset_refuses_preexisting_live_bundle_without_any_mutation() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let bundle = root.join("legacy").join("nested.CL");
-    // A valid legacy bundle, installed without going through URI parsing.
-    let seed = dir.path().join("seed.cl");
-    drop(BundleVfs::open_or_create(&seed).unwrap());
-    std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
-    std::fs::copy(seed, &bundle).unwrap();
-    let owner = NativeVfs::lock_regular_file(&bundle).unwrap();
-    let before = read_all_locked(&owner, &bundle);
-    let err = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
-    assert_eq!(read_all_locked(&owner, &bundle), before);
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    assert!(matches!(
-        NativeVfs::lock_regular_file(&bundle),
-        Err(Error::Locked(_))
-    ));
-    drop(owner);
-    assert_eq!(std::fs::read(&bundle).unwrap(), before);
-}
-
-#[test]
-#[cfg(unix)]
-fn reset_recognizes_internal_cl_alias_to_non_cl_bundle_host() {
-    use std::os::unix::fs::symlink;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let seed = dir.path().join("seed.cl");
-    drop(BundleVfs::open_or_create(&seed).unwrap());
-    let host = root.join("payload.bin");
-    std::fs::copy(&seed, &host).unwrap();
-    let alias = root.join("alias.cl");
-    symlink(&host, &alias).unwrap();
-    let owner = NativeVfs::lock_regular_file(&host).unwrap();
-    let before = std::fs::read(&host).unwrap();
-    let err = reset_uri(root.to_str().unwrap(), None).unwrap_err();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
-    assert_eq!(std::fs::read(&host).unwrap(), before);
-    assert!(alias.exists());
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    drop(owner);
-}
-
-#[test]
-fn reset_absent_root_refuses_ancestor_override_before_creating_any_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("parent");
-    let root = parent.join("not-created");
-    let sibling = parent.join("sibling");
-    let live = parse_uri(sibling.to_str().unwrap()).unwrap();
-    let error = reset_uri(root.to_str().unwrap(), Some(&parent)).unwrap_err();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert!(!root.exists());
-    assert!(!parent.join(LOCK_MARKER).exists());
-    assert!(!std::fs::read_dir(&parent).unwrap().any(|entry| entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    assert!(sibling.join("wal").join(LOCK_MARKER).exists());
-    drop(live);
-}
-
-#[test]
-#[cfg(any(target_os = "macos", windows))]
-fn reset_rejects_case_alias_ancestor_even_when_paths_are_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("CaseParent");
-    std::fs::create_dir(&parent).unwrap();
-    let alias = dir.path().join("caseparent");
-    // macOS volumes can be case-sensitive; only exercise the physical
-    // alias regression when this temp directory is case-insensitive.
-    if !alias.exists() {
-        return;
-    }
-    let sibling = parent.join("sibling");
-    let live = parse_uri(sibling.to_str().unwrap()).unwrap();
-    let root = parent.join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    std::fs::write(root.join("important"), b"root").unwrap();
-    for path in [&root, &parent.join("absent")] {
-        let error = reset_uri(path.to_str().unwrap(), Some(&alias)).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)), "{error}");
-    }
-    // Both paths below are absent; their unresolved components can
-    // still alias on this volume. Check before any lock creation.
-    let missing_root = parent.join("New").join("db");
-    let missing_wal = parent.join("new");
-    let error = reset_uri(missing_root.to_str().unwrap(), Some(&missing_wal)).unwrap_err();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert!(!parent.join("New").exists());
-    assert!(!parent.join("absent").exists());
-    assert!(!parent.join(LOCK_MARKER).exists());
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert_eq!(std::fs::read(root.join("important")).unwrap(), b"root");
-    assert!(matches!(
-        parse_uri(sibling.to_str().unwrap()),
-        Err(Error::Locked(_))
-    ));
-    drop(live);
-}
-
-#[test]
-fn reset_case_sensitive_sibling_wal_is_not_direct_wal() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let alternate = root.join("WAL");
-    if !alternate.exists() {
-        std::fs::create_dir(&alternate).unwrap();
-        let error = reset_uri(root.to_str().unwrap(), Some(&alternate)).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)), "{error}");
-        assert!(!alternate.join(LOCK_MARKER).exists());
-        assert!(root.join("wal").join(LOCK_MARKER).exists());
-    }
-}
-
-#[test]
-fn reset_missing_unicode_components_fail_closed_on_casefolding_platforms() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("caf\u{e9}").join("db");
-    let wal = dir.path().join("cafe\u{301}");
-    let overlap = validate_reset_overlap(&root, &wal);
-    #[cfg(any(target_os = "macos", windows))]
-    assert!(matches!(overlap, Err(Error::Storage(_))));
-    #[cfg(not(any(target_os = "macos", windows)))]
-    assert!(overlap.is_ok());
-    assert!(!root.exists());
-    assert!(!wal.exists());
-}
-
-#[test]
-#[cfg(any(target_os = "macos", windows))]
-fn reset_accepts_physical_direct_wal_with_different_casing() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let upper_wal = root.join("WAL");
-    if !upper_wal.exists() {
-        // On a case-sensitive volume this is an independent directory,
-        // not the default WAL identity.
-        return;
-    }
-    if !root.join("wal").exists() {
-        return;
-    }
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    #[cfg(target_os = "macos")]
-    {
-        std::fs::rename(
-            root.join(LOCK_MARKER),
-            root.join(LOCK_MARKER.to_ascii_uppercase()),
-        )
-        .unwrap();
-        std::fs::rename(
-            upper_wal.join(LOCK_MARKER),
-            upper_wal.join(LOCK_MARKER.to_ascii_uppercase()),
-        )
-        .unwrap();
-    }
-    std::fs::write(root.join("important"), b"owned root").unwrap();
-    reset_uri(root.to_str().unwrap(), Some(&upper_wal)).unwrap();
-    assert!(!root.exists());
-}
-
-#[test]
-fn reset_overlap_rejects_equal_and_unsafe_descendants_without_mutation() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("root");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    for wal in [root.join("."), root.join("nested"), root.join("wal/nested")] {
-        let error = reset_uri(root.to_str().unwrap(), Some(&wal)).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)), "{error}");
-        assert!(root.join(LOCK_MARKER).exists());
-        assert!(!wal.join(LOCK_MARKER).exists() || wal == root.join("."));
-        assert!(!root.join(RESET_INCOMPLETE).exists());
-    }
-    assert!(root.join("wal").is_dir());
-    reset_uri(root.to_str().unwrap(), Some(&root.join("wal"))).unwrap();
-    assert!(!root.exists());
-}
-
-#[test]
-#[cfg(unix)]
-fn reset_rejects_symlink_aliases_to_ancestor_and_unsafe_descendant() {
-    use std::os::unix::fs::symlink;
-    let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("parent");
-    let root = parent.join("db");
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-    let alias = dir.path().join("alias");
-    symlink(&parent, &alias).unwrap();
-    let root_alias = alias.join("db");
-    for wal in [&alias, &root_alias.join("wal/other")] {
-        let error = reset_uri(root_alias.to_str().unwrap(), Some(wal)).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)), "{error}");
-    }
-    assert!(!parent.join(LOCK_MARKER).exists());
-    assert!(!root.join("wal/other").exists());
-    assert!(!root.join(RESET_INCOMPLETE).exists());
-    assert!(!std::fs::read_dir(&parent).unwrap().any(|entry| entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".reset-")));
-    drop(parse_uri(root.to_str().unwrap()).unwrap());
-}
+#[path = "tests_reset_process.rs"]
+mod reset_process;
 
 #[test]
 fn native_writable_files_retain_both_leases_after_vfs_and_target_drop() {
@@ -1214,286 +630,6 @@ fn native_writable_files_retain_both_leases_after_vfs_and_target_drop() {
 }
 
 #[test]
-fn reset_handoff_keeps_fresh_root_and_wal_while_removing_only_old_tree() {
-    use std::sync::mpsc;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    let uri = root.to_str().unwrap();
-    let old = parse_uri(uri).unwrap();
-    let old_vfs = old.vfs();
-    let mut old_file = old_vfs.open("wal/old.log", VfsOpen::create_new()).unwrap();
-    old_file.write_all(b"old").unwrap();
-    drop((old_file, old_vfs, old));
-
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (resume_tx, resume_rx) = mpsc::channel();
-    let reset_path = root.clone();
-    let reset = std::thread::spawn(move || {
-        reset_native_with(&reset_path, None, |step| {
-            ready_tx.send(step.to_string()).unwrap();
-            resume_rx.recv().unwrap();
-            Ok(())
-        })
-    });
-    assert_eq!(ready_rx.recv().unwrap(), "root");
-    assert!(!root.exists());
-    let fresh = parse_uri(uri).unwrap();
-    let vfs = fresh.vfs();
-    let mut file = vfs.open("wal/fresh.log", VfsOpen::create_new()).unwrap();
-    file.write_all(b"new").unwrap();
-    drop((file, vfs));
-    resume_tx.send(()).unwrap();
-    reset.join().unwrap().unwrap();
-    assert_eq!(std::fs::read(root.join("wal/fresh.log")).unwrap(), b"new");
-    assert!(matches!(parse_uri(uri), Err(Error::Locked(_))));
-    drop(fresh);
-    drop(parse_uri(uri).unwrap());
-}
-
-#[test]
-#[cfg(unix)]
-fn reset_external_wal_handoff_never_exposes_old_wal_to_fresh_root() {
-    use std::sync::mpsc;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    let wal = dir.path().join("external-wal");
-    let other = dir.path().join("other");
-    drop(parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap());
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (resume_tx, resume_rx) = mpsc::channel();
-    let reset_root = root.clone();
-    let reset_wal = wal.clone();
-    let reset = std::thread::spawn(move || {
-        reset_native_with(&reset_root, Some(&reset_wal), |step| {
-            ready_tx.send(step.to_string()).unwrap();
-            resume_rx.recv().unwrap();
-            Ok(())
-        })
-    });
-    assert_eq!(ready_rx.recv().unwrap(), "wal");
-    assert!(matches!(
-        parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())),
-        Err(Error::Locked(_))
-    ));
-    assert!(!wal.exists(), "old WAL was staged before the root");
-    // A different root may create a fresh WAL, but it cannot access the
-    // staged old WAL and must release the new one before our fresh open.
-    let independent = parse_uri_with_wal(other.to_str().unwrap(), Some(wal.clone())).unwrap();
-    drop(independent);
-    resume_tx.send(()).unwrap();
-    assert_eq!(ready_rx.recv().unwrap(), "root");
-    let fresh = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-    let (vfs, _) = fresh.wal_vfs();
-    let mut file = vfs.open("fresh.log", VfsOpen::create_new()).unwrap();
-    file.write_all(b"new").unwrap();
-    drop((file, vfs));
-    resume_tx.send(()).unwrap();
-    reset.join().unwrap().unwrap();
-    assert_eq!(std::fs::read(wal.join("fresh.log")).unwrap(), b"new");
-    drop(fresh);
-}
-
-#[test]
-fn reset_child() {
-    let Ok(mode) = std::env::var("CYPHERLITE_RESET_CHILD") else {
-        return;
-    };
-    let root = PathBuf::from(std::env::var_os("CYPHERLITE_RESET_ROOT").unwrap());
-    let wal = PathBuf::from(std::env::var_os("CYPHERLITE_RESET_WAL").unwrap());
-    match mode.as_str() {
-        #[cfg(unix)]
-        "crash-wal" | "crash-root" => {
-            let phase = mode.strip_prefix("crash-").unwrap();
-            let _ = reset_native_with(&root, Some(&wal), |step| {
-                if step == phase {
-                    // Simulate abrupt termination, including no Drop of
-                    // either lock or the staged tombstones.
-                    std::process::exit(0);
-                }
-                Ok(())
-            });
-            panic!("reset did not reach requested crash phase {phase}");
-        }
-        "locked" => assert!(matches!(
-            parse_uri_with_wal(root.to_str().unwrap(), Some(wal)),
-            Err(Error::Locked(_))
-        )),
-        "fresh" => {
-            let target = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-            assert!(!wal.join("old").exists());
-            target
-                .wal_vfs()
-                .0
-                .open("fresh", VfsOpen::create_new())
-                .unwrap()
-                .write_all(b"new")
-                .unwrap();
-        }
-        _ => panic!("unknown reset child mode"),
-    }
-}
-
-#[test]
-#[cfg(unix)]
-fn process_crash_at_each_reset_stage_never_attaches_old_wal() {
-    for phase in ["wal", "root"] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("db");
-        let wal = dir.path().join("external");
-        let target = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-        target
-            .wal_vfs()
-            .0
-            .open("old", VfsOpen::create_new())
-            .unwrap()
-            .write_all(b"old")
-            .unwrap();
-        drop(target);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native_ownership::tests::reset_child",
-                "--nocapture",
-            ])
-            .env("CYPHERLITE_RESET_CHILD", format!("crash-{phase}"))
-            .env("CYPHERLITE_RESET_ROOT", &root)
-            .env("CYPHERLITE_RESET_WAL", &wal)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(!wal.join("old").exists(), "{phase}");
-        let stranded = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path().join("data/old"))
-            .find(|path| path.exists())
-            .expect("the old WAL is retained in a tombstone");
-        assert_eq!(std::fs::read(stranded).unwrap(), b"old");
-        if phase == "wal" {
-            assert!(root.join(RESET_INCOMPLETE).exists());
-            assert!(matches!(
-                parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())),
-                Err(Error::Storage(_))
-            ));
-        } else {
-            let fresh = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-            assert!(!wal.join("old").exists());
-            drop(fresh);
-        }
-    }
-}
-
-#[test]
-#[cfg(unix)]
-fn reset_wal_first_cross_process_handoff() {
-    use std::sync::mpsc;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    let wal = dir.path().join("external-wal");
-    let target = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-    target
-        .wal_vfs()
-        .0
-        .open("old", VfsOpen::create_new())
-        .unwrap()
-        .write_all(b"old")
-        .unwrap();
-    drop(target);
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (resume_tx, resume_rx) = mpsc::channel();
-    let reset_root = root.clone();
-    let reset_wal = wal.clone();
-    let reset = std::thread::spawn(move || {
-        reset_native_with(&reset_root, Some(&reset_wal), |step| {
-            ready_tx.send(step.to_string()).unwrap();
-            resume_rx.recv().unwrap();
-            Ok(())
-        })
-    });
-    let run_child = |mode| {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native_ownership::tests::reset_child",
-                "--nocapture",
-            ])
-            .env("CYPHERLITE_RESET_CHILD", mode)
-            .env("CYPHERLITE_RESET_ROOT", &root)
-            .env("CYPHERLITE_RESET_WAL", &wal)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-    };
-    assert_eq!(ready_rx.recv().unwrap(), "wal");
-    run_child("locked");
-    resume_tx.send(()).unwrap();
-    assert_eq!(ready_rx.recv().unwrap(), "root");
-    run_child("fresh");
-    resume_tx.send(()).unwrap();
-    reset.join().unwrap().unwrap();
-    assert_eq!(std::fs::read(wal.join("fresh")).unwrap(), b"new");
-    assert!(!wal.join("old").exists());
-}
-
-#[test]
-#[cfg(unix)]
-fn failed_reset_after_fresh_root_keeps_old_wal_isolated_and_recoverable() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("db");
-    let wal = dir.path().join("external-wal");
-    let target = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-    let (graph, memory_wal) = person_ada();
-    checkpoint_with_lsn(&target, &graph, memory_wal.lsn, None).unwrap();
-    target
-        .wal_vfs()
-        .0
-        .open("old", VfsOpen::create_new())
-        .unwrap()
-        .write_all(b"old")
-        .unwrap();
-    drop(target);
-    let error = reset_native_with(&root, Some(&wal), |step| {
-        if step == "root" {
-            let fresh = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone()))?;
-            fresh
-                .wal_vfs()
-                .0
-                .open("fresh", VfsOpen::create_new())?
-                .write_all(b"new")?;
-            return Err(Error::io("injected after fresh root"));
-        }
-        Ok(())
-    })
-    .unwrap_err();
-    assert!(matches!(error, Error::Storage(_)), "{error}");
-    assert_eq!(std::fs::read(wal.join("fresh")).unwrap(), b"new");
-    assert!(!wal.join("old").exists());
-    let mut old_root = None;
-    let mut old_wal = None;
-    for entry in std::fs::read_dir(dir.path()).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(".db.reset-") {
-            old_root = Some(entry.path().join("data"));
-        } else if name.starts_with(".external-wal.reset-") {
-            old_wal = Some(entry.path().join("data"));
-        }
-    }
-    let old_root = old_root.unwrap();
-    let old_wal = old_wal.unwrap();
-    assert!(error.to_string().contains(&old_root.display().to_string()));
-    assert!(error.to_string().contains(&old_wal.display().to_string()));
-    assert_eq!(std::fs::read(old_wal.join("old")).unwrap(), b"old");
-    assert!(old_root.join(RESET_INCOMPLETE).exists());
-    reset_uri(root.to_str().unwrap(), Some(&wal)).unwrap();
-    std::fs::rename(&old_root, &root).unwrap();
-    std::fs::rename(&old_wal, &wal).unwrap();
-    std::fs::remove_file(root.join(RESET_INCOMPLETE)).unwrap();
-    let recovered = parse_uri_with_wal(root.to_str().unwrap(), Some(wal.clone())).unwrap();
-    assert_eq!(load(&recovered).unwrap().live_node_count(), 1);
-    assert_eq!(std::fs::read(wal.join("old")).unwrap(), b"old");
-}
-
-#[test]
 #[cfg(unix)]
 fn failed_reset_refuses_dangling_symlink_rollback_and_blocks_old_root() {
     use std::os::unix::fs::symlink;
@@ -1510,7 +646,7 @@ fn failed_reset_refuses_dangling_symlink_rollback_and_blocks_old_root() {
         .unwrap();
     drop(target);
     let error = reset_native_with(&root, Some(&wal), |step| {
-        assert_eq!(step, "wal");
+        assert_eq!(step, MoveKind::Wal);
         symlink(dir.path().join("missing"), &wal).unwrap();
         Err(Error::io("injected rollback"))
     })
@@ -1670,7 +806,7 @@ fn failed_reset_staging_restores_intact_root_and_external_wal() {
         .unwrap();
     drop((target, root_vfs, wal_vfs));
     let error = reset_native_with(&root, Some(&wal), |step| {
-        if step == "wal" {
+        if step == MoveKind::Wal {
             Err(Error::io("injected"))
         } else {
             Ok(())
@@ -1784,28 +920,11 @@ mod native_tests {
         fs::write(&marker, DirectoryRole::Root.marker()).unwrap();
         let owner = NativeVfs::lock_regular_file(&marker).unwrap();
         assert!(matches!(
-            preflight_role(
-                &root,
-                DirectoryRole::Root,
-                RoleCheck {
-                    reset: true,
-                    direct_wal: false,
-                    newly_created: false,
-                }
-            ),
+            preflight_role(&root, RoleCheck::reset_ordinary_root()),
             Err(Error::Locked(_))
         ));
         drop(owner);
-        assert!(preflight_role(
-            &root,
-            DirectoryRole::Root,
-            RoleCheck {
-                reset: true,
-                direct_wal: false,
-                newly_created: false,
-            }
-        )
-        .unwrap());
+        assert!(preflight_role(&root, RoleCheck::reset_ordinary_root()).unwrap());
         assert_eq!(fs::read(marker).unwrap(), DirectoryRole::Root.marker());
     }
 

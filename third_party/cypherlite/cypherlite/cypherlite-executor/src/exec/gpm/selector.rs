@@ -52,8 +52,6 @@ struct Member {
 /// (count parameters resolve once, and `All` — handled by the early
 /// return in `apply_gpm_selector` — is unrepresentable here).
 enum Plan {
-    /// Keep the first `count` members in enumeration order.
-    Any(usize),
     /// Keep the `count` shortest members.
     ShortestPaths(usize),
     /// Keep every member of the `count` shortest distinct lengths.
@@ -73,7 +71,16 @@ pub(crate) fn apply_gpm_selector(
     // return the input unchanged).
     let plan = match selector {
         PathSelector::All => return Ok(states),
-        PathSelector::Any(count) => Plan::Any(resolve_gpm_count(count.as_ref(), 1, params)?),
+        // `ANY` chooses arbitrarily, and the reference's arbitrary choice is
+        // its breadth-first enumeration order — so the `count` paths it keeps
+        // are the `count` shortest, sharing `SHORTEST`'s tie-break. The
+        // conformance suite pins exactly that: every `ANY k` expectation is
+        // its `SHORTEST k` row (`ANY` == `ANY SHORTEST`, `ANY 2` == `SHORTEST
+        // 2`), and a DFS enumeration's first `count` paths are the deepest,
+        // which no reference result matches.
+        PathSelector::Any(count) => {
+            Plan::ShortestPaths(resolve_gpm_count(count.as_ref(), 1, params)?)
+        }
         PathSelector::AnyShortest => Plan::ShortestPaths(1),
         PathSelector::AllShortest => Plan::ShortestGroups(1),
         PathSelector::Shortest { count, group } => {
@@ -120,11 +127,6 @@ pub(crate) fn apply_gpm_selector(
     // `values()` (BTreeMap key order) is fine.
     for members in partitions.values() {
         match plan {
-            Plan::Any(count) => {
-                for member in members.iter().take(count) {
-                    keep[member.index] = true;
-                }
-            }
             Plan::ShortestPaths(count) => select_shortest_paths(members, count, &mut keep),
             Plan::ShortestGroups(count) => {
                 select_shortest_length_groups(members, count, &mut keep);
@@ -147,7 +149,7 @@ pub(crate) fn apply_gpm_selector(
 /// CIP-73's `SHORTEST 1 WALK` closed walk returns `[1, 2, 1]`, not the
 /// walk the (newest-first) expansion enumerated first. Expansion order
 /// still decides fully tied members (parallel relationships share the node
-/// sequence), and `PathSelector::Any` keeps pure enumeration order.
+/// sequence).
 fn sorted_members(members: &[Member]) -> Vec<&Member> {
     let mut sorted: Vec<&Member> = members.iter().collect();
     sorted.sort_by(|left, right| {

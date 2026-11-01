@@ -358,3 +358,30 @@ fn unwind_call_importing_form_bulk_create_commits_per_batch() {
     assert_eq!(nodes, Value::Int(6));
     assert_eq!(rels, Value::Int(6));
 }
+
+/// A failed batch under `ON ERROR CONTINUE` reports the **imported**
+/// bindings: `RETURN i AS k` still answers `k = i` on the failed row, while
+/// `j` — bound inside the rolled-back batch — reads null. The batch's
+/// partially produced rows are dropped with the rollback.
+#[test]
+fn failed_batch_keeps_imported_bindings_and_nulls_the_failing_iteration() {
+    let mut c = connection();
+    let result = c
+        .query(
+            "UNWIND [3] AS i \
+             CALL (i) { UNWIND [1, 0] AS j CREATE (n:N {p: 1 / (i - 3)}) RETURN i AS k, j } \
+             IN TRANSACTIONS OF 2 ROWS ON ERROR CONTINUE \
+             RETURN i, j, k",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int(3), Value::Null, Value::Int(3)]],
+        "the failed row keeps the import (i → k) and nulls the iteration's j"
+    );
+    assert_eq!(
+        scalar(&mut c, "MATCH (n:N) RETURN count(n)"),
+        Value::Int(0),
+        "the failed batch's creates roll back"
+    );
+}

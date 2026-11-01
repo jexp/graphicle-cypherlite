@@ -22,8 +22,8 @@ mod zone;
 use zone::{add_offset, zone_kind, ZoneSpec};
 
 pub use arith::{
-    add_duration, civil_epoch_days, duration_between, duration_between_unit, scale_duration,
-    sub_duration, BetweenUnit,
+    add_duration, civil_epoch_days, civil_from_days, duration_between, duration_between_unit,
+    scale_duration, sub_duration, BetweenUnit,
 };
 pub use construct::{
     construct_date, construct_datetime, construct_duration, construct_localdatetime,
@@ -66,6 +66,27 @@ pub enum Temporal {
     },
 }
 
+/// The zone half of a `DateTime`'s equality identity (TCK TemporalCompare):
+/// an IANA zone is identified by its name — so the two halves of a DST
+/// fall-back overlap stay equal — and every other spelling (`Z`, `+00:00`,
+/// `UTC`, …) by the UTC offset it denotes, so `Z` equals `+00:00` while a
+/// named zone never equals the offset it happens to denote.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ZoneId {
+    Named(String),
+    Offset(i32),
+}
+
+impl ZoneId {
+    /// The identity of a `DateTime`'s `zone` at `offset`.
+    pub fn of(zone: Option<&str>, offset: i32) -> ZoneId {
+        match zone_region(zone) {
+            Some(name) => ZoneId::Named(name.to_string()),
+            None => ZoneId::Offset(offset),
+        }
+    }
+}
+
 impl Temporal {
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -79,44 +100,60 @@ impl Temporal {
     }
 
     pub fn iso_string(&self) -> String {
+        self.render(false)
+    }
+
+    /// The full-precision ISO rendering: [`Temporal::iso_string`] with
+    /// the time-of-day's seconds always present. The value layer's
+    /// temporal rendering policy for every string-producing surface —
+    /// `toString` (top-level, nested in a map or accepted list, or
+    /// through `toStringOrNull`) and the interpolated-string scalar
+    /// path — one rendering for one value, however it was built or
+    /// wherever it is embedded (ADR-0448).
+    pub fn full_seconds_string(&self) -> String {
+        self.render(true)
+    }
+
+    /// The one ISO renderer both public forms delegate to: identical
+    /// except for the time-of-day's seconds-omission rule
+    /// (`format_time`'s `%H:%M` truncation for a whole minute), which
+    /// `full_seconds` disables.
+    fn render(&self, full_seconds: bool) -> String {
         match self {
             Temporal::Date(d) => d.format("%Y-%m-%d").to_string(),
-            Temporal::CivilDate { year, month, day } => {
-                if *year < 0 {
-                    format!("-{year:09}-{month:02}-{day:02}", year = year.unsigned_abs())
-                } else {
-                    format!("+{year}-{month:02}-{day:02}")
-                }
-            }
-            Temporal::LocalTime(t) => format_time(*t),
+            Temporal::CivilDate { year, month, day } => format_civil_date(*year, *month, *day),
+            Temporal::LocalTime(t) => format_time(*t, full_seconds),
             Temporal::Time { time, offset } => {
                 format!(
                     "{}{}",
-                    format_time(*time),
+                    format_time(*time, full_seconds),
                     format_zone_suffix(*offset, None)
                 )
             }
-            Temporal::LocalDateTime(dt) => format_local_dt(*dt),
+            Temporal::LocalDateTime(dt) => format_local_dt(*dt, full_seconds),
             Temporal::CivilDateTime {
                 year,
                 month,
                 day,
                 time,
-            } => {
-                let date = if *year < 0 {
-                    format!("-{year:09}-{month:02}-{day:02}", year = year.unsigned_abs())
-                } else {
-                    format!("+{year}-{month:02}-{day:02}")
-                };
-                format!("{date}T{}", format_time(*time))
-            }
+            } => format!(
+                "{}T{}",
+                format_civil_date(*year, *month, *day),
+                format_time(*time, full_seconds)
+            ),
             Temporal::DateTime { utc, offset, zone } => {
-                // Constructors keep `utc + offset` in chrono range; the
-                // fallback only guards hand-constructed values from panicking.
+                // A deliberate, stated fallback — not a silent one: the
+                // Bolt parameter decoders accept any i32 offset, so a
+                // crafted or extreme `utc + offset` can leave chrono's
+                // range (constructors cannot, parameters can); rendering
+                // has no error channel and must not panic on a decodable
+                // value, so the UTC wall clock renders beside the
+                // offset/zone suffix. (`local_of` is the identity
+                // helper's stricter form; render does not use it.)
                 let local = add_offset(*utc, *offset).unwrap_or(*utc);
                 format!(
                     "{}{}",
-                    format_local_dt(local),
+                    format_local_dt(local, full_seconds),
                     format_zone_suffix(*offset, zone.as_deref())
                 )
             }
@@ -140,6 +177,104 @@ impl Temporal {
         }
     }
 
+    /// Cypher `=` between two values of the same temporal kind (`false` for
+    /// unlike kinds). The relation is deliberately *not* the ordering one:
+    ///
+    /// * `Time` — local time **and** offset, so `12:00+01:00` and `11:00Z`
+    ///   (the same instant) are different times, while `12:00Z` and
+    ///   `12:00+00:00` are the same.
+    /// * `DateTime` — local date-time **and** zone identity, so the two
+    ///   halves of a DST fall-back overlap (`02:30+02:00[Europe/Stockholm]`
+    ///   and `02:30+01:00[Europe/Stockholm]`) are equal even though they are
+    ///   different instants, while `[Europe/Stockholm]` never equals
+    ///   `+01:00` (`ZoneId`).
+    pub fn equals(&self, other: &Temporal) -> bool {
+        match (self, other) {
+            (Temporal::Date(a), Temporal::Date(b)) => a == b,
+            (
+                Temporal::CivilDate {
+                    year: ya,
+                    month: ma,
+                    day: da,
+                },
+                Temporal::CivilDate {
+                    year: yb,
+                    month: mb,
+                    day: db,
+                },
+            ) => (ya, ma, da) == (yb, mb, db),
+            (Temporal::LocalTime(a), Temporal::LocalTime(b)) => a == b,
+            (
+                Temporal::Time {
+                    time: a,
+                    offset: oa,
+                },
+                Temporal::Time {
+                    time: b,
+                    offset: ob,
+                },
+            ) => a == b && oa == ob,
+            (Temporal::LocalDateTime(a), Temporal::LocalDateTime(b)) => a == b,
+            (
+                Temporal::CivilDateTime {
+                    year: ya,
+                    month: ma,
+                    day: da,
+                    time: ta,
+                },
+                Temporal::CivilDateTime {
+                    year: yb,
+                    month: mb,
+                    day: db,
+                    time: tb,
+                },
+            ) => (ya, ma, da, ta) == (yb, mb, db, tb),
+            (Temporal::DateTime { .. }, Temporal::DateTime { .. }) => {
+                self.datetime_eq_identity() == other.datetime_eq_identity()
+            }
+            (
+                Temporal::Duration {
+                    months: am,
+                    days: ad,
+                    nanos: an,
+                },
+                Temporal::Duration {
+                    months: bm,
+                    days: bd,
+                    nanos: bn,
+                },
+            ) => (am, ad, an) == (bm, bd, bn),
+            _ => false,
+        }
+    }
+
+    /// The two components [`Self::equals`] compares for a zoned `DateTime`:
+    /// its local wall clock and its [`ZoneId`]. `None` for every other
+    /// temporal kind. Exposed so a caller that buckets values by equality —
+    /// the executor's property index, the uniqueness probe, `MERGE` — derives
+    /// *this* identity instead of re-deriving it: `a = b` must imply one
+    /// bucket, which a key built from the UTC instant alone does not give
+    /// (the two halves of a DST fall-back overlap share a local wall clock
+    /// and zone but not an instant).
+    pub fn datetime_eq_identity(&self) -> Option<(NaiveDateTime, ZoneId)> {
+        match self {
+            Temporal::DateTime { utc, offset, zone } => Some((
+                local_of(*utc, *offset),
+                ZoneId::of(zone.as_deref(), *offset),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Three-valued ordering for `<`, `>`, `<=`, `>=` (`None` is the null
+    /// result of comparing incomparable values):
+    ///
+    /// * `Time` — UTC nanos-of-day (not wrapped at midnight, so it can be
+    ///   negative), then the offset, so two times at the same instant still
+    ///   order.
+    /// * `DateTime` — instant (nanos included), then offset, then a plain
+    ///   offset before a named zone, then the zone name.
+    /// * `Duration` — not orderable at all; only `=` is defined for it.
     pub fn compare(&self, other: &Temporal) -> Option<Ordering> {
         match (self, other) {
             (Temporal::Date(a), Temporal::Date(b)) => Some(a.cmp(b)),
@@ -166,14 +301,40 @@ impl Temporal {
                     time: b,
                     offset: ob,
                 },
-            ) => {
-                let an = time_to_nanos(*a) - i64::from(*oa) * 1_000_000_000;
-                let bn = time_to_nanos(*b) - i64::from(*ob) * 1_000_000_000;
-                Some(an.cmp(&bn))
-            }
-            (Temporal::DateTime { utc: a, .. }, Temporal::DateTime { utc: b, .. }) => {
-                Some(a.cmp(b))
-            }
+            ) => Some(
+                utc_time_nanos(*a, *oa)
+                    .cmp(&utc_time_nanos(*b, *ob))
+                    .then(oa.cmp(ob)),
+            ),
+            (
+                Temporal::DateTime {
+                    utc: ua,
+                    offset: oa,
+                    zone: za,
+                },
+                Temporal::DateTime {
+                    utc: ub,
+                    offset: ob,
+                    zone: zb,
+                },
+            ) => Some(
+                ua.cmp(ub)
+                    .then_with(|| oa.cmp(ob))
+                    // A named (IANA) zone sorts after the plain offset it
+                    // equals, by name: `None < Some(_)`.
+                    .then_with(|| zone_region(za.as_deref()).cmp(&zone_region(zb.as_deref()))),
+            ),
+            (Temporal::Duration { .. }, Temporal::Duration { .. }) => None,
+            _ => None,
+        }
+    }
+
+    /// Total order for `ORDER BY`, `min` and `max`: [`Self::compare`] where it
+    /// is defined, the `(months, days, nanos)` triple for durations (which
+    /// equality alone cannot rank), and `Equal` across unlike kinds — the
+    /// callers keep unlike temporals distinct by the value type rank.
+    pub(crate) fn total_cmp(&self, other: &Temporal) -> Ordering {
+        match (self, other) {
             (
                 Temporal::Duration {
                     months: am,
@@ -185,8 +346,8 @@ impl Temporal {
                     days: bd,
                     nanos: bn,
                 },
-            ) => Some((am, ad, an).cmp(&(bm, bd, bn))),
-            _ => None,
+            ) => (am, ad, an).cmp(&(bm, bd, bn)),
+            _ => self.compare(other).unwrap_or(Ordering::Equal),
         }
     }
 }
@@ -197,10 +358,23 @@ impl fmt::Display for Temporal {
     }
 }
 
-fn format_time(t: NaiveTime) -> String {
+/// The signed, zero-padded civil-date form both civil variants render:
+/// a negative year is zero-padded to nine digits behind the sign.
+fn format_civil_date(year: i64, month: u32, day: u32) -> String {
+    if year < 0 {
+        format!("-{year:09}-{month:02}-{day:02}", year = year.unsigned_abs())
+    } else {
+        format!("+{year}-{month:02}-{day:02}")
+    }
+}
+
+/// The time-of-day renderer: `full_seconds` disables the whole-minute
+/// truncation (`%H:%M`) — the one place the seconds-omission fact
+/// lives, consulted by both of `render`'s modes (ADR-0448).
+fn format_time(t: NaiveTime, full_seconds: bool) -> String {
     let n = t.nanosecond();
     if n == 0 {
-        if t.second() == 0 {
+        if t.second() == 0 && !full_seconds {
             t.format("%H:%M").to_string()
         } else {
             t.format("%H:%M:%S").to_string()
@@ -218,11 +392,11 @@ fn format_time(t: NaiveTime) -> String {
     }
 }
 
-fn format_local_dt(dt: NaiveDateTime) -> String {
+fn format_local_dt(dt: NaiveDateTime, full_seconds: bool) -> String {
     format!(
         "{}T{}",
         dt.date().format("%Y-%m-%d"),
-        format_time(dt.time())
+        format_time(dt.time(), full_seconds)
     )
 }
 
@@ -242,12 +416,17 @@ fn format_offset(secs: i32) -> String {
 }
 
 fn format_zone_suffix(offset: i32, zone: Option<&str>) -> String {
+    // The IANA arm is the canonical classifier's answer; the remaining
+    // spellings (UTC, a numeric offset, anything else) keep their rule.
+    if let Some(name) = zone_region(zone) {
+        return format!("{}[{name}]", format_offset(offset));
+    }
     match zone.map(zone_kind) {
-        Some(ZoneSpec::Iana(name)) => format!("{}[{name}]", format_offset(offset)),
+        // `zone_region` already answered the IANA arm.
         Some(ZoneSpec::Utc) => "Z".into(),
         Some(ZoneSpec::Fixed(z)) => z.to_string(),
         // Non-canonical spellings keep the stored numeric offset.
-        Some(ZoneSpec::Other(_)) | None => {
+        Some(ZoneSpec::Iana(_) | ZoneSpec::Other(_)) | None => {
             if offset == 0 {
                 "Z".into()
             } else {
@@ -304,6 +483,24 @@ fn format_duration(months: i64, days: i64, nanos: i128) -> String {
 
 fn time_to_nanos(t: NaiveTime) -> i64 {
     t.num_seconds_from_midnight() as i64 * 1_000_000_000 + t.nanosecond() as i64
+}
+
+/// Nanoseconds of the UTC clock time a `Time` denotes. Deliberately *not*
+/// wrapped at midnight: an offset can push the wall clock out of the day, and
+/// the ordering contract is this signed value plus the offset.
+fn utc_time_nanos(t: NaiveTime, offset: i32) -> i64 {
+    time_to_nanos(t) - i64::from(offset) * 1_000_000_000
+}
+
+/// The wall clock a zoned instant reads at (`utc + offset`). Constructors
+/// keep the sum inside chrono's range, but the Bolt parameter decoders
+/// accept any i32 offset (the render path's comment at the `DateTime` arm
+/// documents this input class), and equality bucketing has no error
+/// channel — so an out-of-range sum degrades to the UTC wall clock, the
+/// same stated fallback render uses, instead of panicking. Deterministic
+/// per payload, so `a = b` still implies one bucket.
+fn local_of(utc: NaiveDateTime, offset: i32) -> NaiveDateTime {
+    add_offset(utc, offset).unwrap_or(utc)
 }
 
 /// `n` is always a within-day nanosecond count (rem_euclid at the call sites),

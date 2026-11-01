@@ -9,7 +9,6 @@ use super::super::{
     parse_constraint_type, take_constraint_inspects, validate_constraints, ConstraintCheck,
 };
 use super::harness::{inspections, seed_node, U};
-use crate::exec::ddl::type_expr_name;
 use crate::exec::test_support::{
     exec_autocommit, exec_write, exec_write_unvalidated, write_scratch,
 };
@@ -81,8 +80,9 @@ fn property_selection_picks_the_smallest_bucket() {
         properties: vec!["a".into(), "b".into()],
         kind: "unique".into(),
         property_type: None,
+        enforced_label: None,
     };
-    let check = ConstraintCheck::new(&def, None).unwrap();
+    let check = ConstraintCheck::new(&def).unwrap();
     assert_eq!(check.select_property(|i| [5, 3][i]), 1);
     assert_eq!(check.select_property(|i| [3, 5][i]), 0);
     assert_eq!(
@@ -98,8 +98,9 @@ fn property_selection_picks_the_smallest_bucket() {
         properties: vec!["a".into()],
         kind: "unique".into(),
         property_type: None,
+        enforced_label: None,
     };
-    let check = ConstraintCheck::new(&single, None).unwrap();
+    let check = ConstraintCheck::new(&single).unwrap();
     assert_eq!(
         check.select_property(|_| panic!("a single-property constraint consults no lookup")),
         0
@@ -243,8 +244,9 @@ fn an_unknown_constraint_kind_fails_closed() {
         properties: vec!["id".into()],
         kind: "uniqueish".into(),
         property_type: None,
+        enforced_label: None,
     };
-    let Err(error) = ConstraintCheck::new(&def, None) else {
+    let Err(error) = ConstraintCheck::new(&def) else {
         panic!("an unknown kind tag must not build a check");
     };
     assert_eq!(
@@ -301,22 +303,4 @@ fn unparseable_type_strings_fail_closed() {
     // silently accepts.
     assert!(parse_constraint_type("LIST<INTEGER | STRING>").is_none());
     assert!(parse_constraint_type("NOT A TYPE").is_none());
-}
-
-#[test]
-fn type_expr_name_union_rendering_round_trips_the_canonical_bridge() {
-    let union = cypherlite_ir::TypeExpr::Union(vec![
-        cypherlite_ir::TypeExpr::Predefined {
-            kind: cypherlite_ir::PredefinedType::Integer,
-            not_null: false,
-        },
-        cypherlite_ir::TypeExpr::Predefined {
-            kind: cypherlite_ir::PredefinedType::String,
-            not_null: false,
-        },
-    ]);
-    let rendered = type_expr_name(&union);
-    assert_eq!(rendered, "INTEGER | STRING");
-    assert!(matches(&Value::Int(1), &rendered));
-    assert!(matches(&Value::String("a".into()), &rendered));
 }

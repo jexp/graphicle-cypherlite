@@ -29,15 +29,18 @@ struct RedoPreflight<'a> {
 impl RedoPreflight<'_> {
     fn check_op(&mut self, op: &RedoOp) -> Result<()> {
         op.validate_ids()?;
+        // The constraint row is one shape: fold its def first, so no arm
+        // re-derives or expect-guards it.
+        if let Some(def) = op.constraint_def() {
+            return self.insert_constraint(def);
+        }
         match op {
             RedoOp::CreateNode { id, .. } => {
                 self.nodes.insert(*id, true);
             }
             RedoOp::CreateRel { id, start, end, .. } => {
                 if !self.node_exists(*start) || !self.node_exists(*end) {
-                    return Err(cypherlite_core::Error::semantic(
-                        "cannot create relationship on missing node",
-                    ));
+                    return Err(super::missing_rel_endpoint_error());
                 }
                 self.rels.insert(*id, Some((*start, *end)));
             }
@@ -59,28 +62,20 @@ impl RedoPreflight<'_> {
             RedoOp::DropIndex { name } => {
                 self.indexes.insert(name.clone(), None);
             }
-            RedoOp::CreateConstraint {
-                name,
-                relationship,
-                label,
-                properties,
-                kind,
-                property_type,
-            } => {
-                self.insert_constraint(ConstraintDef {
-                    name: name.clone(),
-                    relationship: *relationship,
-                    label: label.clone(),
-                    properties: properties.clone(),
-                    kind: kind.clone(),
-                    property_type: property_type.clone(),
-                })?;
-            }
+            // Handled by the def fold above; listed for exhaustiveness.
+            RedoOp::CreateConstraint { .. } => {}
             RedoOp::DropConstraint { name } => {
                 self.constraints.insert(name.clone(), None);
                 self.derived.insert(name.clone(), None);
             }
             RedoOp::CatalogDerivedConstraint { constraint } => {
+                // A WAL record can carry any `entity_type` string: a value
+                // naming neither kind is corruption, and the typed error here
+                // (the same fail-loud-not-panic rule as `set_current_graph_type`
+                // above) is what turns it into a typed storage error — the
+                // classification itself (`entity_kind`) is total and never
+                // panics, so every pre-preflight seam stays panic-free too.
+                constraint.entity_kind().map_err(Error::storage)?;
                 self.derived
                     .insert(constraint.name.clone(), Some(constraint.clone()));
             }

@@ -16,7 +16,7 @@ mod catalog;
 mod host;
 
 use super::host::host_durability_barrier;
-use super::{Vfs, VfsFile, VfsMeta, VfsOpen};
+use super::{is_virtual_prefix, virtual_entry_meta, Vfs, VfsFile, VfsMeta, VfsOpen};
 use alloc::{alloc_pages, free_pages, merge_adjacent_freelist};
 use catalog::{encode_catalog, pages_for, wal_tail_hint, write_superblock};
 pub(crate) use host::HostAdmit;
@@ -560,8 +560,7 @@ fn drop_inode(b: &mut Bundle, path: &str) {
 }
 
 fn is_prefix(inodes: &BTreeMap<String, Inode>, path: &str) -> bool {
-    let p = format!("{path}/");
-    inodes.keys().any(|k| k.starts_with(&p))
+    is_virtual_prefix(inodes.keys().map(String::as_str), path)
 }
 
 fn persist(b: &mut Bundle, catalog: bool) -> Result<()> {
@@ -646,19 +645,11 @@ impl Vfs for BundleVfs {
 
     fn metadata(&self, path: &str) -> Result<VfsMeta> {
         let b = self.lock();
-        if let Some(inode) = b.inodes.get(path) {
-            return Ok(VfsMeta {
-                len: inode.len,
-                is_dir: false,
-            });
-        }
-        if is_prefix(&b.inodes, path) {
-            return Ok(VfsMeta {
-                len: 0,
-                is_dir: true,
-            });
-        }
-        Err(Error::io(format!("missing {path}")))
+        virtual_entry_meta(
+            b.inodes.get(path).map(|inode| inode.len),
+            is_prefix(&b.inodes, path),
+            path,
+        )
     }
 
     fn open(&self, path: &str, opts: VfsOpen) -> Result<Box<dyn VfsFile>> {

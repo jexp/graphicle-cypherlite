@@ -7,7 +7,8 @@ use cypherlite_core::{Error, Result};
 
 use crate::native_ownership::reject_nested;
 
-use super::super::native::{map_lock_result, NativeVfs, OpenAdmit};
+use super::super::native::lease::{map_lock_result, OpenAdmit};
+use super::super::native::{native_entry_kind, NativeEntryKind, NativeVfs};
 use super::catalog::{init_empty, load_existing, load_peek};
 use super::{Bundle, BundleVfs, Inner};
 
@@ -57,22 +58,26 @@ fn resolve_bundle_path(path: &Path, admit: HostAdmit) -> Result<PathBuf> {
         Ok(_) if exclusive => {
             return Err(crate::destination_exists(&resolved));
         }
-        Ok(meta) if meta.file_type().is_symlink() => {
-            resolved = std::fs::canonicalize(&resolved)?;
-        }
-        Ok(meta) if meta.file_type().is_dir() => {
-            return Err(Error::storage(format!(
-                "{} is a directory; .cl URIs require a file",
-                resolved.display()
-            )));
-        }
-        Ok(meta) if shared && !meta.is_file() => {
-            return Err(Error::storage(format!(
-                "{} is not a .cl bundle file",
-                resolved.display()
-            )));
-        }
-        Ok(_) => {}
+        // The entry's shape decides admission through the one native
+        // classifier — never hand-spelled file-type conjuncts per arm.
+        Ok(meta) => match native_entry_kind(&meta) {
+            NativeEntryKind::Alias => {
+                resolved = std::fs::canonicalize(&resolved)?;
+            }
+            NativeEntryKind::Dir => {
+                return Err(Error::storage(format!(
+                    "{} is a directory; .cl URIs require a file",
+                    resolved.display()
+                )));
+            }
+            NativeEntryKind::Other if shared => {
+                return Err(Error::storage(format!(
+                    "{} is not a .cl bundle file",
+                    resolved.display()
+                )));
+            }
+            NativeEntryKind::File | NativeEntryKind::Other => {}
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if shared {
                 return Err(Error::storage(format!(

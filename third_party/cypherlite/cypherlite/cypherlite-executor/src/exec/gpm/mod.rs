@@ -58,6 +58,7 @@ struct GpmRelWalk {
     trail: Vec<cypherlite_core::Relationship>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_gpm_path(
     ctx: ExecCtx<'_>,
     path: &PathPattern,
@@ -66,11 +67,16 @@ pub(crate) fn match_gpm_path(
     match_mode: MatchMode,
     reduce: Option<&MatchReduce<'_>>,
     keep_used: bool,
+    where_clause: &Residual<'_>,
 ) -> Result<Matched> {
     let graph = ctx.graph;
     let params = ctx.params;
     let cypher_version = ctx.cypher_version;
-    if let Some(rows) = match_shortest_route(ctx, path, &row, &used, match_mode)? {
+    // The MATCH-level residual rides along for the shortest-path route,
+    // which must choose its path *against* the WHERE predicate; the walk
+    // below keeps its own empty residual (it checks inline pattern
+    // predicates per element and the caller applies the WHERE afterwards).
+    if let Some(rows) = match_shortest_route(ctx, path, &row, &used, match_mode, where_clause)? {
         return apply_reduce(graph, rows, reduce, keep_used);
     }
     let residual = Residual::empty();
@@ -118,15 +124,14 @@ pub(crate) fn match_gpm_path(
         if !gpm_path_mode_allows(path.mode, &state.nodes, &state.rels) {
             continue;
         }
-        if let Some(predicate) = path.where_clause.as_deref() {
-            if gpm_expr_ready(predicate, &state.row)
-                && eval_match_predicate(graph, &state.row, predicate, params, cypher_version)?
-                    .truthy()
-                    != Some(true)
-            {
-                continue;
-            }
-        }
+        // The path variable is bound before the pattern's own predicate: a
+        // parenthesized path pattern's `WHERE` names it (`... WHERE q <> p`),
+        // and that predicate is a restrictor the selector must see — it
+        // narrows the candidate paths the selector picks from, rather than
+        // filtering the one path the selector already chose (CIP-60 §5.4.4.2,
+        // CIP-73 §5.4 "the restrictor runs before the selector"). A predicate
+        // that also names a variable this pattern does not bind stays a
+        // post-filter (`gpm_inline_predicates_ok`).
         if let Some(name) = &path.variable {
             state.row.insert(
                 name.clone(),
@@ -135,6 +140,11 @@ pub(crate) fn match_gpm_path(
                     rels: state.rels.clone(),
                 }),
             );
+        }
+        if let Some(predicate) = path.where_clause.as_deref() {
+            if !inline_predicate_holds(graph, &state.row, predicate, params, cypher_version)? {
+                continue;
+            }
         }
         candidates.push(state);
     }
@@ -223,10 +233,7 @@ fn gpm_start_nodes(
             continue;
         }
         if let Some(predicate) = &node.where_clause {
-            if gpm_expr_ready(predicate, &bound)
-                && eval_match_predicate(graph, &bound, predicate, params, cypher_version)?.truthy()
-                    != Some(true)
-            {
+            if !inline_predicate_holds(graph, &bound, predicate, params, cypher_version)? {
                 continue;
             }
         }
@@ -288,17 +295,13 @@ fn gpm_walk_elements(
             )? && gpm_bind_node(graph, node, state.current, &mut state.row)
             {
                 if let Some(predicate) = &node.where_clause {
-                    if gpm_expr_ready(predicate, &state.row)
-                        && eval_match_predicate(
-                            graph,
-                            &state.row,
-                            predicate,
-                            params,
-                            cypher_version,
-                        )?
-                        .truthy()
-                            != Some(true)
-                    {
+                    if !inline_predicate_holds(
+                        graph,
+                        &state.row,
+                        predicate,
+                        params,
+                        cypher_version,
+                    )? {
                         continue;
                     }
                 }
@@ -470,11 +473,7 @@ fn gpm_rel_dfs(
             if let Some(name) = &rel.variable {
                 predicate_row.insert(name.clone(), Value::from_relationship(rel_value.clone()));
             }
-            if gpm_expr_ready(predicate, &predicate_row)
-                && eval_match_predicate(graph, &predicate_row, predicate, params, cypher_version)?
-                    .truthy()
-                    != Some(true)
-            {
+            if !inline_predicate_holds(graph, &predicate_row, predicate, params, cypher_version)? {
                 return Ok(());
             }
         }
@@ -530,10 +529,7 @@ fn gpm_accept_target(
         return Ok(false);
     }
     if let Some(predicate) = &node.where_clause {
-        if gpm_expr_ready(predicate, &state.row)
-            && eval_match_predicate(graph, &state.row, predicate, params, cypher_version)?.truthy()
-                != Some(true)
-        {
+        if !inline_predicate_holds(graph, &state.row, predicate, params, cypher_version)? {
             return Ok(false);
         }
     }
@@ -544,6 +540,21 @@ fn gpm_expr_ready(expr: &Expr, row: &Row) -> bool {
     let mut vars = HashSet::new();
     expr_vars(expr, &mut vars);
     vars.iter().all(|name| row.contains_key(name))
+}
+
+/// Whether `predicate` holds on `row`. A row that does not yet bind every
+/// variable the predicate names leaves the predicate to the post-filter
+/// ([`gpm_inline_predicates_ok`]) instead of rejecting the row.
+fn inline_predicate_holds(
+    graph: &ExecGraph<'_>,
+    row: &Row,
+    predicate: &Expr,
+    params: &BTreeMap<String, Value>,
+    cypher_version: Option<u32>,
+) -> Result<bool> {
+    Ok(!gpm_expr_ready(predicate, row)
+        || eval_match_predicate(graph, row, predicate, params, cypher_version)?.truthy()
+            == Some(true))
 }
 
 pub(crate) fn gpm_inline_predicates_ok(

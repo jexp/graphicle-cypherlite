@@ -22,13 +22,14 @@ use cypherlite_parser::{
     YieldMode,
 };
 
-use super::output_vars::{compute_subquery_output_vars, compute_subquery_output_vars_seeded};
+use super::duplicate_variable;
 use super::writes::{
     validate_create_bindings, validate_dynamic_label_no_any, validate_dynamic_label_scope,
     validate_merge_bindings,
 };
-use super::{duplicate_outer_variable, duplicate_variable};
 use crate::ast::collect::{bind_pattern_vars, effective_name, search_score_var};
+use crate::call_scope::duplicate_outer_variable;
+use crate::output_vars::{compute_subquery_output_vars, compute_subquery_output_vars_seeded};
 use crate::show_columns::{catalog_output_columns, catalog_produces_rows};
 
 /// The TCK-keyed error kind for a type-conflicting reuse: the kind keys on

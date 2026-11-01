@@ -121,6 +121,15 @@ impl fmt::Display for ConstraintType {
     }
 }
 
+impl ConstraintType {
+    /// The one spelling of the pinned unknown-kind reply
+    /// (`ConstraintValidationFailed: `<name>` unknown constraint type "…"`),
+    /// shared by the catalog's durable-row gate and the executor's validator.
+    pub fn unknown_kind_message(name: &str, reason: &str) -> String {
+        format!("ConstraintValidationFailed: `{name}` {reason}")
+    }
+}
+
 impl FromStr for ConstraintType {
     type Err = String;
     /// Parse a stored tag. Unknown tags are rejected rather than silently
@@ -295,6 +304,32 @@ pub struct Constraint {
     /// before this field existed loadable.
     #[serde(default)]
     pub enforced_label: Option<String>,
+}
+
+impl Constraint {
+    /// The entity kind this constraint names. The one classifier every
+    /// durable boundary (WAL preflight, checkpoint theater, JSON decode)
+    /// routes through, so a value naming neither kind has one message.
+    pub fn entity_kind(&self) -> Result<EntityKind, String> {
+        EntityKind::parse(&self.name, &self.entity_type)
+    }
+}
+
+impl EntityKind {
+    /// Classify a stored `entity_type` for the named record, with the one
+    /// unknown-kind message. The row-agnostic spelling
+    /// [`Constraint::entity_kind`] delegates to.
+    pub fn parse(name: &str, entity_type: &str) -> Result<EntityKind, String> {
+        EntityKind::from_display_name(entity_type)
+            .ok_or_else(|| EntityKind::unknown_message(name, entity_type))
+    }
+
+    /// The one message for a stored `entity_type` naming neither kind.
+    pub fn unknown_message(name: &str, entity_type: &str) -> String {
+        format!(
+            "derived constraint {name} entity_type '{entity_type}' names neither NODE nor RELATIONSHIP"
+        )
+    }
 }
 
 #[cfg(test)]

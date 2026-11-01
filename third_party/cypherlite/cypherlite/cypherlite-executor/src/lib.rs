@@ -28,6 +28,8 @@ mod shortest;
 mod show_catalog;
 mod spatial;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod vector_similarity;
 
 pub use catalog_meta::{DeprecatedBy, DeprecationForm};
@@ -48,6 +50,7 @@ pub use exec::{
     execute, execute_read_at, value_matches_proc_type, ExecRequest, QueryResult, ReadAdmission,
 };
 pub use function_registry::builtin_function_deprecation;
+pub use graph::constraint_keys::admission::{ConstraintAdmission, SlotPosition};
 pub use graph::{
     CheckpointTheater, DatabaseEntry, Graph, Procedure, QueryStats, SchemaSnapshot, SnapshotPin,
 };

@@ -1,4 +1,5 @@
 use super::*;
+use cypherlite_catalog::ConstraintDef;
 use std::sync::Arc;
 
 mod bundle;
@@ -111,13 +112,19 @@ pub(crate) fn person_ada() -> (Graph, Wal) {
     (g, wal)
 }
 
-/// The checkpoint-image object of `codec`, the one that carries the
-/// theater: the manifest for Parquet, the graph body for JSON.
-fn checkpoint_image(codec: SnapshotCodecKind) -> &'static str {
-    match codec {
-        SnapshotCodecKind::Parquet => crate::snapshot::MANIFEST_JSON,
-        SnapshotCodecKind::Json => crate::codec::json::GRAPH_JSON,
-    }
+/// The codecs whose checkpoint image is a root-level store object —
+/// the set layout-asserting tests iterate: the markdown codec keeps its
+/// manifest under the `.cypherlite/` sidecar with journal-based crash
+/// safety of its own (ADR-0406 §5), so a test that asserts on the
+/// JSON/Parquet root-object layout directly covers these two only.
+fn root_layout_codecs() -> impl Iterator<Item = SnapshotCodecKind> {
+    // The typed layout fact decides (engine_dir): the codecs whose
+    // engine state lives at the store root, never a variant-name
+    // comparison a future sidecar codec would silently drift past.
+    SnapshotCodecKind::compiled()
+        .iter()
+        .copied()
+        .filter(|codec| codec.engine_dir().is_none())
 }
 
 #[test]
@@ -142,14 +149,15 @@ fn legacy_wal_label_constraint_replays_with_typed_marker_after_recycle() {
         let store = memory_store_with_codec(codec).unwrap();
         let (vfs, prefix) = store.wal_vfs();
         let mut wal = Wal::open(vfs, prefix, 0).unwrap();
-        let old = RedoOp::CreateConstraint {
+        let old = RedoOp::create_constraint(ConstraintDef {
             name: "old_rule".into(),
             relationship: false,
             label: "Person".into(),
             properties: vec![],
             kind: "nodeLabelExistence".into(),
             property_type: None,
-        };
+            enforced_label: None,
+        });
         wal.append_commit(1, &[old]).unwrap();
         wal.sync().unwrap();
         let graph = load_with_wal(&store, &wal).unwrap();
@@ -163,7 +171,7 @@ fn legacy_wal_label_constraint_replays_with_typed_marker_after_recycle() {
             recovered.checkpoint_theater().enforced_label("old_rule"),
             None
         );
-        let bytes = crate::snapshot::get_object(&store, checkpoint_image(codec)).unwrap();
+        let bytes = crate::snapshot::get_object(&store, codec.checkpoint_image()).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             value["theater"]["legacy_unknown_constraints"]["old_rule"]["name"], "old_rule",
@@ -174,16 +182,27 @@ fn legacy_wal_label_constraint_replays_with_typed_marker_after_recycle() {
 
 #[test]
 fn direct_graph_incomplete_label_constraint_fails_before_checkpoint_writes() {
-    for &codec in SnapshotCodecKind::compiled() {
+    for codec in root_layout_codecs() {
         let store = memory_store_with_codec(codec).unwrap();
         let graph = Graph::default();
         checkpoint_with_lsn(&store, &graph, 0, None).unwrap();
-        let old_manifest = crate::snapshot::get_object(&store, "manifest.json").unwrap();
-        let old_graph = store
-            .vfs
-            .exists("graph.json")
-            .unwrap()
-            .then(|| crate::snapshot::get_object(&store, "graph.json").unwrap());
+        // The root objects this codec's checkpoint rewrites, stated from
+        // the typed codec the loop holds — its checkpoint image plus,
+        // for the JSON codec, the root envelope that checkpoint also
+        // republishes — never a filesystem probe deciding the layout.
+        let covered: Vec<&str> = match codec {
+            SnapshotCodecKind::Parquet => vec![codec.checkpoint_image()],
+            SnapshotCodecKind::Json => {
+                vec![crate::snapshot::MANIFEST_JSON, codec.checkpoint_image()]
+            }
+            SnapshotCodecKind::Markdown => {
+                unreachable!("root_layout_codecs yields only codecs without an engine sidecar")
+            }
+        };
+        let old: Vec<(&str, Vec<u8>)> = covered
+            .iter()
+            .map(|&path| (path, crate::snapshot::get_object(&store, path).unwrap()))
+            .collect();
         graph
             .install_named_constraint(cypherlite_catalog::ConstraintDef {
                 name: "new_rule".into(),
@@ -192,22 +211,18 @@ fn direct_graph_incomplete_label_constraint_fails_before_checkpoint_writes() {
                 properties: vec![],
                 kind: "nodeLabelExistence".into(),
                 property_type: None,
+                enforced_label: None,
             })
             .unwrap();
         let error = checkpoint_with_lsn(&store, &graph, 1, None).unwrap_err();
         assert!(matches!(error, Error::Storage(_)), "{codec:?}: {error}");
-        assert_eq!(
-            crate::snapshot::get_object(&store, "manifest.json").unwrap(),
-            old_manifest
-        );
-        assert_eq!(
-            store
-                .vfs
-                .exists("graph.json")
-                .unwrap()
-                .then(|| crate::snapshot::get_object(&store, "graph.json").unwrap()),
-            old_graph
-        );
+        for (path, bytes) in &old {
+            assert_eq!(
+                &crate::snapshot::get_object(&store, path).unwrap(),
+                bytes,
+                "{codec:?}: the failed checkpoint rewrote {path}"
+            );
+        }
         assert!(load(&store).unwrap().named_constraints().is_empty());
     }
 }
@@ -223,6 +238,7 @@ fn legacy_omission_never_masks_a_new_incomplete_definition() {
         properties: vec![],
         kind: "nodeLabelExistence".into(),
         property_type: None,
+        enforced_label: None,
     };
     graph.install_named_constraint(old.clone()).unwrap();
     graph.mark_legacy_unenforced();
@@ -234,6 +250,7 @@ fn legacy_omission_never_masks_a_new_incomplete_definition() {
         properties: vec![],
         kind: "nodeLabelExistence".into(),
         property_type: None,
+        enforced_label: None,
     };
     graph.install_named_constraint(new).unwrap();
     assert!(matches!(
@@ -280,14 +297,15 @@ fn legacy_omission_never_masks_a_new_incomplete_definition() {
     graph
         .apply_redo(
             vec![
-                RedoOp::CreateConstraint {
+                RedoOp::create_constraint(ConstraintDef {
                     name: "old".into(),
                     relationship: false,
                     label: "Old".into(),
                     properties: vec![],
                     kind: "nodeLabelExistence".into(),
                     property_type: None,
-                },
+                    enforced_label: None,
+                }),
                 RedoOp::CatalogDerivedConstraint {
                     constraint: cypherlite_model::Constraint {
                         name: "old".into(),
@@ -320,14 +338,15 @@ fn typed_checkpoint_rejects_forged_legacy_unknown_markers_in_both_codecs() {
         graph
             .apply_redo(
                 vec![
-                    RedoOp::CreateConstraint {
+                    RedoOp::create_constraint(ConstraintDef {
                         name: "known".into(),
                         relationship: false,
                         label: "Person".into(),
                         properties: vec![],
                         kind: "nodeLabelExistence".into(),
                         property_type: None,
-                    },
+                        enforced_label: None,
+                    }),
                     RedoOp::CatalogDerivedConstraint {
                         constraint: cypherlite_model::Constraint {
                             name: "known".into(),
@@ -344,7 +363,7 @@ fn typed_checkpoint_rejects_forged_legacy_unknown_markers_in_both_codecs() {
             )
             .unwrap();
         checkpoint_with_lsn(&store, &graph, 1, None).unwrap();
-        let image = checkpoint_image(codec);
+        let image = codec.checkpoint_image();
         let original: serde_json::Value =
             serde_json::from_slice(&crate::snapshot::get_object(&store, image).unwrap()).unwrap();
         let definition = serde_json::to_value(&graph.named_constraints()[0]).unwrap();

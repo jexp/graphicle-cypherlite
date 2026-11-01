@@ -25,7 +25,6 @@ fn open_tokens(capacity: u64) -> Database {
         ":memory:",
         OpenOptions {
             checkpoint_interval: Some(Duration::ZERO),
-            token_admission: true,
             concurrent_logical_workspace_limit: Some(capacity),
             ..OpenOptions::default()
         },
@@ -60,22 +59,18 @@ fn admission_off_runs_overlapping_queries_without_a_receipt() {
 }
 
 #[test]
-fn token_admission_requires_positive_limits() {
+fn zero_workspace_limit_fails_open() {
     let err = match Database::open_with(
         ":memory:",
         OpenOptions {
-            token_admission: true,
+            concurrent_logical_workspace_limit: Some(0),
             ..OpenOptions::default()
         },
     ) {
         Err(err) => err,
-        Ok(_) => panic!("open should fail without token limits"),
+        Ok(_) => panic!("open should fail with a zero workspace limit"),
     };
-    assert!(
-        err.to_string()
-            .contains("CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("must be positive"), "{err}");
 }
 
 #[test]
@@ -242,8 +237,10 @@ fn wal_commit_workspace_refusal_happens_before_commit() {
 fn cached_peak_is_reserved_and_a_commit_misses() {
     // The sort's real peak sits above the admit ceiling and inside the
     // pool, so the first run finishes by spending the tail and the retry
-    // is refused at the door.
-    let capacity = 220 * Q;
+    // is refused at the door. The sorted rows carry their parked
+    // `ORDER BY` key beside the projected value, which is what lifts the
+    // peak above the ceiling.
+    let capacity = 272 * Q;
     let ceiling = capacity - capacity / 8;
     let db = open_tokens(capacity);
     let mut conn = db.connect().unwrap();

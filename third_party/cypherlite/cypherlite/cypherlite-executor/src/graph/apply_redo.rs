@@ -115,18 +115,26 @@ impl Graph {
                     properties,
                     kind,
                     property_type,
+                    enforced_label,
                 } => {
-                    self.catalog
-                        .lock()
-                        .unwrap()
-                        .insert_constraint(ConstraintDef {
-                            name,
-                            relationship,
-                            label,
-                            properties,
-                            kind,
-                            property_type,
-                        })?;
+                    let def = ConstraintDef {
+                        name,
+                        relationship,
+                        label,
+                        properties,
+                        kind,
+                        property_type,
+                        enforced_label,
+                    };
+                    // ADR-0439: a uniqueness constraint backfills its
+                    // committed tuple map from the live graph. The catalog
+                    // validates the kind first (its vocabulary is closed), so
+                    // the spec builds before the insert moves the def.
+                    let spec = super::constraint_keys::spec_from_def(&self.interner, &def);
+                    self.catalog.lock().unwrap().insert_constraint(def)?;
+                    if let Some(spec) = spec {
+                        self.constraint_keys_install(spec);
+                    }
                 }
                 RedoOp::DropConstraint { name } => {
                     self.catalog.lock().unwrap().drop_constraint(&name);
@@ -136,6 +144,7 @@ impl Graph {
                         .derived_constraints
                         .remove(&name);
                     self.legacy_unenforced.lock().unwrap().remove(&name);
+                    self.constraint_keys_drop(&name);
                 }
                 RedoOp::CatalogDerivedConstraint { constraint } => {
                     if let Some(enforced) = &constraint.enforced_label {
@@ -162,6 +171,16 @@ impl Graph {
                         .unwrap()
                         .derived_constraints
                         .insert(constraint.name.clone(), constraint);
+                    // No install here: the load-bearing invariant is that
+                    // no durable image carries a uniqueness kind in this
+                    // record. Witness 1: its only production constructor
+                    // (the CREATE CONSTRAINT push) is gated on
+                    // `enforced_label`. Witness 2: the parser sets that
+                    // field only on `nodeLabelExistence` /
+                    // `sourceLabelExistence` / `targetLabelExistence`.
+                    // Derived uniqueness reachable via `SetCurrentGraphType`
+                    // is the theater half of `uniqueness_specs`;
+                    // `rebuild_constraint_keys` covers it.
                 }
                 RedoOp::CatalogIndexDetail {
                     name,
@@ -217,6 +236,20 @@ impl Graph {
                                 .is_some_and(|constraint| matching_enforced_label(def, constraint))
                         })
                     });
+                    drop(catalog);
+                    // ADR-0439: this arm is the constraint-key map's fourth
+                    // rebuild trigger. The derived set was just replaced
+                    // wholesale from the persisted body, and the per-op row
+                    // stream does not mirror it in every reachable shape:
+                    // a legacy replay record may carry `SetCurrentGraphType`
+                    // alone, without the `CreateConstraint` rows a current
+                    // statement emits first, and a current statement's
+                    // `sync_derived_constraints` skips a derived constraint
+                    // that is schema-equivalent to a surviving catalog one,
+                    // so that derived name has no row either. Rebuild from
+                    // the committed catalog + the re-derived set so the map
+                    // still covers both.
+                    self.rebuild_constraint_keys();
                 }
                 RedoOp::PullIdentityPut {
                     source,

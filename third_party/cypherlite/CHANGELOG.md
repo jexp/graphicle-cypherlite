@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-31
+
 ### Added
 
 - **Zero-effect write notes on stderr (ADR-0402):** a batch statement (one-shot
@@ -58,8 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CYPHERLITE_CONCURRENT_PEAK_TOKEN_LIMIT` is
   `CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT`. The workspace limit
   is logical bytes: a former token capacity `N` is `N × 4096` bytes.
-  The pool is required and positive when admission is on; the engine
-  does not default it. `OpenOptions.memory_limit` is
+  The engine does not default the pool. `OpenOptions.memory_limit` is
   `logical_graph_size_limit` and `concurrent_peak_token_limit` is
   `concurrent_logical_workspace_limit`. `TokenEstimate` and
   `ExecutionReceipt` keep their type names; `peak_tokens` is
@@ -69,6 +70,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   likewise); `metrics.tokenSchedule` is unchanged. The refusal name
   `concurrent-peak-token-limit` is `concurrent-logical-workspace-limit`.
 
+- **The workspace limit is the admission switch (ADR-0452).**
+  `--token-admission` and `OpenOptions.token_admission` are removed.
+  `CYPHERLITE_TOKEN_ADMISSION`, if set, fails open and names
+  `CYPHERLITE_CONCURRENT_LOGICAL_WORKSPACE_LIMIT`. A positive
+  `--concurrent-logical-workspace-limit` (bytes or `mb`/`mib`/`gb`/`gib`)
+  turns admission on, on the query session, on `cypherlite serve`, on
+  the bolt crate's `Args`, and on `OpenOptions`. Unset leaves admission
+  off. `0` is rejected. The flag wins over the environment variable.
+
+### Removed
+
+- **The `lab` namespace retires; the importers are first-party extension
+  crates (ADR-0431 §11–§12, ADR-0434):** `fs-to-graph` and `git-to-graph`
+  leave the CLI as workspace crates under the new `extensions/` group,
+  each speaking the extension wire v1 (ADR-0430) as a child the
+  `cypherlite run <name>` host drives — the parsing and row generation
+  moved, not forked, and the crates carry no `Database`. The hidden
+  `lab neo` egg is deleted entirely. `lab` is not a command word in any
+  build: a bare `cypherlite lab` falls into the path-first form and fails
+  as a Cypher syntax error, and `cypherlite lab <action> …` fails as the
+  unexpected-argument usage error. On a fresh install the importer names
+  are uninstalled like any other and fail closed with the
+  `cypherlite extension install <name>` hint (ADR-0431); the importers
+  can also be run from a hand-placed package directory under
+  `$XDG_CONFIG_HOME/cypherlite/extensions/`.
+
+### Changed
+
+- **Importer summaries and value refusals ride the wire (ADR-0430,
+  ADR-0429 §5):** the child's summary names its target `the store` — the
+  child never sees the store path — with the same counts, phrases and
+  starter queries the compiled-in importers printed, and the pointer to
+  the question catalog rides as the summary's last starter. The git
+  importer always `MERGE`s its edges (the fresh-store `CREATE` fast path
+  required reading the target's node count, which a child cannot), so
+  re-runs complete partially imported stores exactly as before.
+  Value-range refusals (`--max-changeset` above 1000, a negative
+  `--max-commits`, an empty `--ignore-patterns` value) are now the
+  child's `error` records (exit 1) with the same wordings, not exit-2
+  usage errors, and `--max-commits 0` means all history.
 ## [0.13.0] — 2026-10-24
 
 ## [0.12.9] — 2026-10-22
@@ -1640,7 +1681,8 @@ created by earlier versions keep opening — the JSON storage format is unchange
 
 - The Go implementation and its build tooling. Preserved at [`v0.2.0-go-final`][go-final].
 
-[Unreleased]: https://github.com/neo4j-labs/cypherlite/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/neo4j-labs/cypherlite/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/neo4j-labs/cypherlite/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/neo4j-labs/cypherlite/compare/v0.12.9...v0.13.0
 [0.12.9]: https://github.com/neo4j-labs/cypherlite/compare/v0.12.8...v0.12.9
 [0.12.8]: https://github.com/neo4j-labs/cypherlite/compare/v0.12.7...v0.12.8

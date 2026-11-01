@@ -193,20 +193,6 @@ pub enum Clause {
     Use {
         graph: Expr,
     },
-    /// Constraint catalog op recorded in WAL via create/set checks (wave D).
-    CreateConstraint {
-        name: Option<String>,
-        if_not_exists: bool,
-        relationship: bool,
-        label: String,
-        properties: Vec<String>,
-        kind: String,
-        property_type: Option<TypeExpr>,
-    },
-    DropConstraint {
-        name: String,
-        if_exists: bool,
-    },
 }
 
 /// Native CypherLite representation of a SEARCH subclause (CIP-224, the

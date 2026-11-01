@@ -317,3 +317,60 @@ fn batch_commit_returns_its_own_assigned_commit_ts() {
     assert_eq!(ts2, shared.graph.commit_ts());
     assert_eq!(shared.graph.all_node_ids(), [0, 1]);
 }
+
+/// ADR-0439's group overlay is wired where the commit loop merges a checked
+/// slot's delta: `admit_slot` calls `ConstraintAdmission::accept`, and the
+/// hold it records is what rejects a later slot of the same group. The
+/// property harness drives `check_with_earlier` plus `accept` itself, so it
+/// cannot observe this wiring — dropping the `accept` merge leaves that
+/// harness, and the rest of this suite, green.
+///
+/// This test drives a real two-slot batch through `flush_group` (hand-built
+/// slots are its deterministic form: a scheduler-driven auto-commit or
+/// explicit-transaction group cannot be forced to coalesce its slots, which
+/// is why the race tests above retry instead of pinning one batch). Slot 0
+/// creates `(:Person {email: 'dup'})` and must be accepted, so its
+/// introduction enters the group overlay; slot 1 introduces the same tuple
+/// and must be rejected with the retryable `Error::Conflict`. If the accept
+/// merge is a no-op, slot 1 sees no overlay hold, both records commit, and
+/// the assertions below fail.
+#[test]
+fn group_overlay_hold_from_an_earlier_slot_rejects_a_later_duplicate() {
+    let db = person_email_db();
+    let shared = db.shared();
+    // Both statements pin before either commits: the shared snapshot is the
+    // state the constraint was installed at, so only the group admission can
+    // separate the two introductions.
+    let snapshot_ts = shared.graph.commit_ts();
+    // The constraint's own DDL record already owns an LSN; the group adds at
+    // most one more.
+    let lsn_before = shared.wal.lock().unwrap().lsn;
+    let waiters: Vec<_> = (0..SIDES).map(|_| CommitWaiter::new()).collect();
+    let batch: Vec<_> = (0..SIDES)
+        .map(|i| {
+            let mut candidate = slot(i as i64, i as u64 + 1, snapshot_ts, &waiters[i]);
+            candidate.ops = vec![RedoOp::CreateNode {
+                id: i as i64,
+                labels: Arc::new(vec!["Person".into()]),
+                properties: cypherlite_core::PropertyMap::share(BTreeMap::from([(
+                    "email".into(),
+                    Value::String("dup".into()),
+                )])),
+            }];
+            candidate
+        })
+        .collect();
+    flush_group(&shared, batch).unwrap();
+    waiters[0]
+        .wait()
+        .expect("the first slot is accepted and its hold enters the overlay");
+    assert_eq!(
+        waiters[1].wait().unwrap_err(),
+        Error::Conflict,
+        "the earlier accepted slot's hold must reject the later duplicate"
+    );
+    // Only the accepted record reached the WAL and the graph.
+    assert_eq!(shared.wal.lock().unwrap().lsn, lsn_before + 1);
+    assert_eq!(shared.graph.all_node_ids(), [0]);
+    assert_eq!(count(&db, "MATCH (n:Person) RETURN count(n)"), 1);
+}

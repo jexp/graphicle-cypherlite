@@ -280,9 +280,12 @@ fn exec_registry_call(ctx: ExecCtx<'_>, rows: Vec<Row>, call: CallSpec<'_>) -> R
         where_clause,
     } = call;
     let registered = graph.procedure(name);
+    // The signature needs no arguments; a builtin whose rows depend on them
+    // is re-produced per input row below. A no-argument builtin's rows are
+    // fixed, so this resolution's rows are the ones used.
     let proc = registered
         .clone()
-        .or_else(|| builtin_procedure(graph, name, principal))
+        .or_else(|| builtin_procedure(graph, name, principal, &BTreeMap::new()))
         .ok_or_else(|| Error::procedure_not_found(name))?;
     // Minimum arity: a registered procedure requires every argument; a
     // built-in only its parameters without defaults (registry truth — e.g.
@@ -345,8 +348,17 @@ fn exec_registry_call(ctx: ExecCtx<'_>, rows: Vec<Row>, call: CallSpec<'_>) -> R
                 }
             }
         }
-        let matched: Vec<_> = proc
-            .rows
+        // A built-in's rows are a function of its bound arguments (a null
+        // `db.schema.visualization` options map selects nothing at all); a
+        // registered procedure's rows are fixed, and a no-argument
+        // builtin's cannot depend on them.
+        let argument_rows = (registered.is_none() && !proc.arg_names.is_empty()).then(|| {
+            builtin_procedure(graph, name, principal, &call_args)
+                .expect("builtin resolved above")
+                .rows
+        });
+        let proc_rows = argument_rows.as_deref().unwrap_or(&proc.rows);
+        let matched: Vec<_> = proc_rows
             .iter()
             .filter(|pr| {
                 proc.arg_names

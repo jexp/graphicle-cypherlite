@@ -533,6 +533,7 @@ pub(crate) fn try_fold_path_aggs(
     let output = FoldOutput {
         items: ret.items,
         order: ret.order,
+        order_sources: &ret.order_sources,
         skip: ret.skip,
         limit: ret.limit,
         params,

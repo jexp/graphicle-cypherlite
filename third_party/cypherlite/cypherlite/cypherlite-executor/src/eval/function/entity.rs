@@ -4,13 +4,48 @@
 //! virtual graph-type nodes lives behind the graph layer
 //! (`ExecGraph::node_value`).
 
-use cypherlite_core::{ElementIdRef, Error, Result, Value};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use cypherlite_core::{is_virtual_id, ElementIdRef, Error, PropertyMap, Result, Value};
 
 use crate::overlay::ExecGraph;
 
 use super::super::expr::reject_deleted_access;
-#[cfg(test)]
-use std::sync::Arc;
+
+/// A property map as the value `properties()` returns: the canonical
+/// [`PropertyMap`] → map conversion, shared by the node and relationship
+/// arms.
+fn properties_value(properties: &PropertyMap) -> Value {
+    Value::Map(BTreeMap::from(properties.clone()).into())
+}
+
+/// A `Value::List` of property keys, in map order, shared by the node,
+/// relationship and map arms of [`bi_keys`].
+fn key_list(keys: impl IntoIterator<Item = String>) -> Value {
+    Value::List(
+        keys.into_iter()
+            .map(|key| Value::String(key.into()))
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+
+/// CIP-257: the property map that backs an entity's reads. A virtual entity
+/// — a synthesized value with a negative id and no store entry — carries its
+/// own map; every other entity reads the store entry `stored` returns.
+/// `None` means the value names an entry the store does not have.
+///
+/// The one policy behind `properties()` and `keys()`: `keys()` reads the
+/// keys of the very map `properties()` returns, so a virtual entity can
+/// never report one map's values under another map's keys.
+fn backing_properties(
+    id: i64,
+    own: &Arc<PropertyMap>,
+    stored: Option<Arc<PropertyMap>>,
+) -> Option<Arc<PropertyMap>> {
+    stored.or_else(|| is_virtual_id(id).then(|| Arc::clone(own)))
+}
 
 pub(super) fn bi_uuid(_graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> Result<Value> {
     Ok(match vals.as_slice() {
@@ -165,31 +200,25 @@ pub(super) fn bi_properties(graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -
     Ok(match vals.first() {
         Some(v @ Value::Node(n)) => {
             reject_deleted_access(graph, v)?;
-            graph
-                .node(n.id)
-                .map(|n| {
-                    Value::Map(std::sync::Arc::new(
-                        n.properties
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    ))
-                })
-                .unwrap_or_else(|| Value::Map(Default::default()))
+            let properties = backing_properties(
+                n.id,
+                &n.properties,
+                graph.node(n.id).map(|fresh| fresh.properties),
+            )
+            .ok_or_else(|| Error::execution("internal: properties() node has no store entry"))?;
+            properties_value(&properties)
         }
         Some(v @ Value::Relationship(r)) => {
             reject_deleted_access(graph, v)?;
-            graph
-                .rel(r.id)
-                .map(|r| {
-                    Value::Map(std::sync::Arc::new(
-                        r.properties
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    ))
-                })
-                .unwrap_or_else(|| Value::Map(Default::default()))
+            let properties = backing_properties(
+                r.id,
+                &r.properties,
+                graph.rel(r.id).map(|fresh| fresh.properties),
+            )
+            .ok_or_else(|| {
+                Error::execution("internal: properties() relationship has no store entry")
+            })?;
+            properties_value(&properties)
         }
         Some(Value::Map(m)) => Value::Map(m.clone()),
         Some(Value::Null) | None => Value::Null,
@@ -202,28 +231,29 @@ pub(super) fn bi_properties(graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -
 }
 pub(super) fn bi_keys(graph: &ExecGraph<'_>, _n: &str, vals: Vec<Value>) -> Result<Value> {
     Ok(match vals.first() {
-        Some(Value::Node(n)) => Value::List(
-            graph
-                .node_prop_keys(n.id)
-                .into_iter()
-                .map(|k| Value::String(k.into()))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        Some(Value::Relationship(r)) => Value::List(
-            graph
-                .rel_prop_keys(r.id)
-                .into_iter()
-                .map(|k| Value::String(k.into()))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        Some(Value::Map(m)) => Value::List(
-            m.keys()
-                .map(|k| Value::String(k.as_str().into()))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
+        Some(Value::Node(n)) => {
+            // The same typed internal error `properties()` answers: `keys()`
+            // reads the keys of the very map `properties()` returns, so a
+            // missing store entry is the one broken invariant, never a
+            // silent empty list.
+            let properties = backing_properties(
+                n.id,
+                &n.properties,
+                graph.node(n.id).map(|fresh| fresh.properties),
+            )
+            .ok_or_else(|| Error::execution("internal: keys() node has no store entry"))?;
+            key_list(properties.keys().cloned())
+        }
+        Some(Value::Relationship(r)) => {
+            let properties = backing_properties(
+                r.id,
+                &r.properties,
+                graph.rel(r.id).map(|fresh| fresh.properties),
+            )
+            .ok_or_else(|| Error::execution("internal: keys() relationship has no store entry"))?;
+            key_list(properties.keys().cloned())
+        }
+        Some(Value::Map(m)) => key_list(m.keys().cloned()),
         Some(Value::Null) | None => Value::Null,
         _ => Value::Null,
     })

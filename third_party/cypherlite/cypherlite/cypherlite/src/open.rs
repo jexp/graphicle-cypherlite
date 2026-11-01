@@ -10,20 +10,20 @@ use std::sync::Arc;
 use cypherlite_core::{Error, PreviewFeatures, Result};
 use cypherlite_executor::{CsvPolicy, Graph};
 use cypherlite_storage::{
-    open_store_readonly_with_ontology, open_store_with_ontology, parse_uri_opening,
-    SnapshotCodecKind, StoreTarget, Vfs, Wal,
+    open_store_readonly_with_ontology, open_store_with_ontology, parse_uri_opening_with_config,
+    CodecOpenConfig, SnapshotCodecKind, StoreTarget, Vfs, Wal,
 };
 
 use super::cdc;
 use super::commit::commit_timing_env;
 use super::ontology;
 use super::open_config::{
-    resolve_bulk_batch_limits, resolve_checkpoint_interval, resolve_memory_limit,
-    resolve_preview_features, resolve_snapshot_codec, resolve_token_limits,
+    resolve_bulk_batch_limits, resolve_checkpoint_interval, resolve_markdown_bodies,
+    resolve_memory_limit, resolve_preview_features, resolve_snapshot_codec, resolve_token_limits,
 };
 use super::shared::{OpenResolved, SharedOpenState};
 use super::token_budget;
-use super::{check_loaded_graph, Database, DurabilityMode, OpenMode, OpenOptions, Shared};
+use super::{check_loaded_graph, Database, OpenMode, OpenOptions, Shared};
 
 /// [`open_store_readonly_with_ontology`] plus the screen every consumer of a
 /// loaded ontology document owes it: a stored document must parse before it
@@ -40,16 +40,21 @@ pub(crate) fn open_store_readonly_screened(
 
 /// The preflight-resolved open knobs, in one named carrier: the validated
 /// LOAD CSV policy, the memory limit, the store's resolved preview set
-/// (ADR-0371) and the requested snapshot codec. [`Database::open_preflight`]
+/// (ADR-0371), the requested snapshot codec, and the markdown vault's
+/// body-property configuration (ADR-0460). [`Database::open_preflight`]
 /// resolves every knob before a store directory is leased.
 /// [`Database::open_store`] installs the CSV policy, the memory limit and
-/// the preview set; the snapshot codec is spent earlier, when `open_with` /
-/// `open_vfs` build the `StoreTarget`.
+/// the preview set; the snapshot codec and the body properties are spent
+/// earlier, when `open_with` / `open_vfs` build the `StoreTarget`.
 struct OpenKnobs {
     csv_policy: CsvPolicy,
     logical_graph_size_limit: u64,
     preview: PreviewFeatures,
     snapshot_codec: Option<SnapshotCodecKind>,
+    /// The resolved codec-specific open-time configuration (ADR-0460) —
+    /// the spent form; the option→config conversion happens once, in the
+    /// preflight below.
+    codec_config: Option<CodecOpenConfig>,
 }
 
 impl Database {
@@ -81,16 +86,7 @@ impl Database {
             uri,
             OpenOptions {
                 wal_dir,
-                checkpoint_interval: None,
-                durability_mode: DurabilityMode::Full,
-                logical_graph_size_limit: None,
-                snapshot_codec: None,
-                load_csv_dir: None,
-                load_csv_max_bytes: None,
-                mode: OpenMode::Writable,
-                token_admission: false,
-                concurrent_logical_workspace_limit: None,
-                follow_gap: Default::default(),
+                ..Default::default()
             },
         )
     }
@@ -98,12 +94,22 @@ impl Database {
     /// Open with WAL directory, checkpoint-timer, and memory-limit overrides
     /// (ADR-0041, ADR-0042).
     pub fn open_with(uri: &str, opts: OpenOptions) -> Result<Self> {
-        // Reject an invalid LOAD CSV policy, memory limit, and preview
-        // feature list before parse_uri_opening leases a directory. A
-        // failed open must not leave that directory behind.
+        // Reject an invalid LOAD CSV policy, memory limit, preview
+        // feature list, and markdown body-property spec before
+        // parse_uri_opening leases a directory. A failed open must not
+        // leave that directory behind.
         let knobs = Self::open_preflight(&opts)?;
         let read_only = opts.mode.is_read_only();
-        let store = parse_uri_opening(uri, opts.wal_dir.clone(), knobs.snapshot_codec, read_only)?;
+        // The codec-specific configuration rides the parse: the storage
+        // layer installs — or refuses — it before the native lease, so
+        // a failed open on a fresh path leaves nothing behind.
+        let store = parse_uri_opening_with_config(
+            uri,
+            opts.wal_dir.clone(),
+            knobs.snapshot_codec,
+            read_only,
+            knobs.codec_config.clone(),
+        )?;
         Self::open_store(store, opts, knobs)
     }
 
@@ -114,8 +120,14 @@ impl Database {
     /// `snapshot_codec: None` uses [`SnapshotCodecKind::default`].
     pub fn open_vfs(vfs: Arc<dyn Vfs>, opts: OpenOptions) -> Result<Self> {
         let knobs = Self::open_preflight(&opts)?;
+        // No lease to protect here (the VFS is caller-supplied): the
+        // target's own installer refuses a mismatched codec config.
         let codec = knobs.snapshot_codec.unwrap_or_default();
         let store = StoreTarget::from_vfs_with_codec(vfs, codec)?;
+        let store = match knobs.codec_config.clone() {
+            Some(config) => store.with_codec_config(config)?,
+            None => store,
+        };
         Self::open_store(store, opts, knobs)
     }
 
@@ -141,6 +153,7 @@ impl Database {
             logical_graph_size_limit: resolve_memory_limit(opts)?,
             preview: resolve_preview_features()?,
             snapshot_codec: resolve_snapshot_codec(opts)?,
+            codec_config: resolve_markdown_bodies(opts)?.map(CodecOpenConfig::MarkdownBodies),
         })
     }
 
@@ -163,13 +176,15 @@ impl Database {
         }
         // Every field is named: a new `OpenKnobs` field must be handled here
         // (or explicitly discarded) instead of riding an unnoticed `..`.
-        // `snapshot_codec` was spent before the store existed — it selected
-        // the codec in `open_with`/`open_vfs`.
+        // `snapshot_codec` and `codec_config` were spent before the store
+        // existed — they selected the store's codec and installed its
+        // open-time configuration in `open_with`/`open_vfs`.
         let OpenKnobs {
             csv_policy,
             logical_graph_size_limit,
             preview,
             snapshot_codec: _,
+            codec_config: _,
         } = knobs;
         let (mut graph, mut wal, ontology) = if read_only && store.vfs().durable() {
             open_store_readonly_screened(&store)?
@@ -203,7 +218,7 @@ impl Database {
         // The knob cluster, stated once: the open path resolves every knob
         // and hands `Shared::new` the whole `OpenResolved` value.
         let resolved = OpenResolved {
-            read_only: opts.mode.is_read_only(),
+            read_only,
             opened_as_follow: follow,
             durability_mode: opts.durability_mode,
             logical_graph_size_limit,
@@ -213,7 +228,7 @@ impl Database {
             checkpoint_interval: interval,
             follow_gap: opts.follow_gap,
         };
-        let cdc = cdc::CdcState::load(store.vfs())?;
+        let cdc = cdc::CdcState::load(store.vfs(), store.engine_dir())?;
         let commit_timing = commit_timing_env();
         let db = Self {
             inner: Arc::new(Shared::new(

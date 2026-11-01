@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use cypherlite_catalog::ConstraintDef;
 use cypherlite_core::{Error, Result};
 use cypherlite_ir::DropIndexTarget;
 
@@ -10,12 +11,6 @@ use crate::redo::{IndexDetailSpec, IndexKindSpec, RedoOp};
 
 pub(crate) fn default_index_name(label: &str, property: &str) -> String {
     format!("{label}_{property}")
-}
-
-/// Default name of a `CREATE CONSTRAINT` without an explicit name — the
-/// one place the `{label}_{props}_cstr` rule lives.
-pub(crate) fn default_constraint_name(label: &str, properties: &[String]) -> String {
-    format!("{label}_{}_cstr", properties.join("_"))
 }
 
 /// Create the range backing index of an index-backed (`unique`/`key`)
@@ -197,98 +192,28 @@ pub(crate) fn exec_drop_index(
     graph.drop_named_index(name)
 }
 
-/// Field references of a `CREATE CONSTRAINT` clause.
-#[derive(Clone, Copy)]
-pub(crate) struct ConstraintSpec<'a> {
-    pub name: Option<&'a str>,
-    pub if_not_exists: bool,
-    pub relationship: bool,
-    pub label: &'a str,
-    pub properties: &'a [String],
-    pub kind: &'a str,
-    pub property_type: Option<&'a cypherlite_ir::TypeExpr>,
-}
-
-pub(crate) fn exec_create_constraint(
+/// The one creation half of both constraint paths: install the named
+/// constraint, push the derived theater record the statement path carries
+/// (between the constraint row and its backing index), and, when the kind is
+/// index-backed, its range backing index (an index already holding the name
+/// is left alone). `CREATE CONSTRAINT` reaches it through the
+/// `Clause::Catalog` passthrough's catalog handler;
+/// [`sync_derived_constraints`] calls it directly with no derived record.
+pub(crate) fn create_constraint_core(
     graph: &ExecGraph<'_>,
-    spec: &ConstraintSpec<'_>,
+    def: ConstraintDef,
+    derived: Option<cypherlite_model::Constraint>,
 ) -> Result<()> {
-    let ConstraintSpec {
-        name,
-        if_not_exists,
-        relationship,
-        label,
-        properties,
-        kind,
-        property_type,
-    } = *spec;
-    let name = name
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| default_constraint_name(label, properties));
-    let property_type = property_type.map(type_expr_name);
-    let constraints = graph.named_constraints();
-    if constraints.iter().any(|d| d.name == name) {
-        if if_not_exists {
-            return Ok(());
-        }
-        return Err(Error::semantic(format!(
-            "ConstraintAlreadyExists: `{name}`"
-        )));
+    let index_backed = def.is_index_backed();
+    // The backing index needs the def's fields after it moves.
+    let name = def.name.clone();
+    let relationship = def.relationship;
+    let label = def.label.clone();
+    let properties = def.properties.clone();
+    graph.create_named_constraint(def)?;
+    if let Some(constraint) = derived {
+        graph.push_catalog_redo(RedoOp::CatalogDerivedConstraint { constraint });
     }
-    if constraints.iter().any(|d| {
-        d.schema_equivalent(
-            relationship,
-            label,
-            properties,
-            kind,
-            property_type.as_deref(),
-        )
-    }) {
-        if if_not_exists {
-            return Ok(());
-        }
-        return Err(Error::semantic(
-            "EquivalentSchemaRuleAlreadyExists: equivalent constraint exists",
-        ));
-    }
-    create_constraint_core(
-        graph,
-        name,
-        relationship,
-        label.to_string(),
-        properties.to_vec(),
-        kind.to_string(),
-        property_type,
-    )
-}
-
-/// The creation half of [`exec_create_constraint`]: insert the named
-/// constraint and, when its kind is index-backed, its range backing index
-/// (an index already holding the name is left alone). Shared with
-/// [`sync_derived_constraints`], which layers its own skip policy
-/// (schema-equivalent survivors stay) in front instead of `CREATE
-/// CONSTRAINT`'s error behaviors.
-fn create_constraint_core(
-    graph: &ExecGraph<'_>,
-    name: String,
-    relationship: bool,
-    label: String,
-    properties: Vec<String>,
-    kind: String,
-    property_type: Option<String>,
-) -> Result<()> {
-    // Index-backedness is a function of the in-scope kind tag alone —
-    // derive it here rather than re-reading the catalog row after the
-    // insert.
-    let index_backed = cypherlite_catalog::constraint_kind_is_index_backed(&kind);
-    graph.create_named_constraint(
-        name.clone(),
-        relationship,
-        label.clone(),
-        properties.clone(),
-        kind,
-        property_type,
-    )?;
     // An index-backed constraint (unique/key) owns a range backing index
     // under the same effective name; an index already holding the name is
     // left alone.
@@ -314,64 +239,6 @@ pub(crate) fn exec_drop_constraint(
         graph.drop_backing_index(name.to_string())?;
     }
     Ok(())
-}
-
-pub(crate) fn type_expr_name(ty: &cypherlite_ir::TypeExpr) -> String {
-    match ty {
-        cypherlite_ir::TypeExpr::Predefined { kind, not_null } => {
-            use cypherlite_ir::PredefinedType as T;
-            let name = match kind {
-                T::Nothing => "NOTHING",
-                T::Null => "NULL",
-                T::Any => "ANY",
-                T::Boolean => "BOOLEAN",
-                T::String => "STRING",
-                T::Uuid => "UUID",
-                T::Integer => "INTEGER",
-                T::Float => "FLOAT",
-                T::Date => "DATE",
-                T::Duration => "DURATION",
-                T::Point => "POINT",
-                T::LocalTime => "LOCAL TIME",
-                T::ZonedTime => "ZONED TIME",
-                T::LocalDateTime => "LOCAL DATETIME",
-                T::ZonedDateTime => "ZONED DATETIME",
-                T::Node => "NODE",
-                T::Relationship => "RELATIONSHIP",
-                T::Path => "PATH",
-                T::Map => "MAP",
-            };
-            format!("{name}{}", if *not_null { " NOT NULL" } else { "" })
-        }
-        cypherlite_ir::TypeExpr::List { element, not_null } => format!(
-            "LIST<{}>{}",
-            type_expr_name(element),
-            if *not_null { " NOT NULL" } else { "" }
-        ),
-        cypherlite_ir::TypeExpr::PropertyValue { not_null } => {
-            format!("PROPERTY VALUE{}", if *not_null { " NOT NULL" } else { "" })
-        }
-        cypherlite_ir::TypeExpr::Union(items) => items
-            .iter()
-            .map(type_expr_name)
-            .collect::<Vec<_>>()
-            .join(" | "),
-        cypherlite_ir::TypeExpr::Vector {
-            coord,
-            dimension,
-            not_null,
-        } => {
-            let coord = coord.as_deref().unwrap_or("FLOAT");
-            let element = format!("{coord} NOT NULL");
-            let dimension = dimension
-                .map(|value| format!("({value})"))
-                .unwrap_or_default();
-            format!(
-                "VECTOR<{element}>{dimension}{}",
-                if *not_null { " NOT NULL" } else { "" }
-            )
-        }
-    }
 }
 
 /// Which constraints an `ALTER CURRENT GRAPH TYPE` purges before the
@@ -404,61 +271,25 @@ pub(crate) fn sync_derived_constraints(
     for name in purge {
         exec_drop_constraint(graph, &name, true)?;
     }
-    // The enforced label of each surviving constraint (the theater's
-    // derived-constraint index, overlaid with this scratch's catalog
-    // ops), read once: a label/endpoint-label existence constraint's
-    // identity includes it -- two implied labels of one node element
-    // type are two constraints (CIP-266's multi-parent `(:A => :B&C)`),
-    // not a schema-equivalent duplicate of the first.
-    // A borrowed index over the bound show_schema() snapshot (the
-    // round-11 rust Low): no owned HashMap of cloned names and enforced
-    // labels per DDL sync.
-    let schema = graph.show_schema()?;
-    let enforced_of = |name: &str| -> Option<&str> {
-        schema
-            .data
-            .derived_constraints
-            .get(name)
-            .and_then(|constraint| constraint.enforced_label.as_deref())
-    };
     for derived_constraint in derived {
         let crate::graph_type::DerivedConstraint { constraint, entity } = derived_constraint;
-        let cypherlite_model::Constraint {
-            name,
-            label,
-            properties,
-            constraint_type,
-            property_type,
-            enforced_label,
-            ..
-        } = constraint;
-        let relationship = entity.is_relationship();
+        let def = ConstraintDef::from_model(&constraint, entity);
         // A committed constraint that is schema-equivalent to the derived
         // one survives the purge; the derived constraint is skipped, not
         // re-created (no `CREATE CONSTRAINT` error behaviors here). The
-        // enforced label joins the equivalence: without it, a node
-        // element type's second implied label looked schema-equivalent to
-        // its first and was silently skipped (never enforced).
-        if graph.named_constraints().iter().any(|existing| {
-            existing.schema_equivalent(
-                relationship,
-                &label,
-                &properties,
-                constraint_type.as_str(),
-                property_type.as_deref(),
-            ) && enforced_of(&existing.name) == enforced_label.as_deref()
-        }) {
+        // enforced label joins the equivalence (CIP-266's multi-parent
+        // `(:A => :B&C)`): without it, a node element type's second implied
+        // label looked schema-equivalent to its first and was silently
+        // skipped. The effective view resolves a legacy row's label first
+        // (ADR-0450), so an upgraded store keeps its old skip behavior.
+        if graph
+            .effective_constraints()?
+            .iter()
+            .any(|existing| existing.schema_equivalent(&def))
+        {
             continue;
         }
-        create_constraint_core(
-            graph,
-            name,
-            relationship,
-            label,
-            properties,
-            constraint_type.as_str().to_string(),
-            property_type,
-        )?;
+        create_constraint_core(graph, def, None)?;
     }
     Ok(())
 }
@@ -470,6 +301,70 @@ mod tests {
     use crate::exec::test_support::{exec_autocommit, exec_cypher};
     use crate::graph::Graph;
     use crate::overlay::ExecGraph;
+
+    /// The equivalence gate's two outcomes, pinned for the `exists` kind too:
+    /// a duplicate schema rule is rejected whatever the kind, and
+    /// `IF NOT EXISTS` accepts the existing rule unchanged.
+    #[test]
+    fn equivalent_constraint_schemas_are_rejected_and_if_not_exists_accepts() {
+        let g = Graph::default();
+        exec_autocommit(
+            &g,
+            "CREATE CONSTRAINT e1 FOR (n:P) REQUIRE n.name IS NOT NULL",
+        )
+        .unwrap();
+        let error = match exec_autocommit(
+            &g,
+            "CREATE CONSTRAINT e2 FOR (n:P) REQUIRE n.name IS NOT NULL",
+        ) {
+            Ok(_) => panic!("an equivalent exists rule must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "semantic error: EquivalentSchemaRuleAlreadyExists"
+        );
+        exec_autocommit(
+            &g,
+            "CREATE CONSTRAINT e3 IF NOT EXISTS FOR (n:P) REQUIRE n.name IS NOT NULL",
+        )
+        .unwrap();
+        assert_eq!(g.named_constraints().len(), 1);
+        exec_autocommit(&g, "CREATE CONSTRAINT u1 FOR (n:Q) REQUIRE n.id IS UNIQUE").unwrap();
+        let error =
+            match exec_autocommit(&g, "CREATE CONSTRAINT u2 FOR (n:Q) REQUIRE n.id IS UNIQUE") {
+                Ok(_) => panic!("a duplicate unique rule must be rejected"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error.to_string(),
+            "semantic error: EquivalentSchemaRuleAlreadyExists"
+        );
+    }
+
+    /// The one `CREATE CONSTRAINT` path: the front-end lowers the clause into
+    /// the `Clause::Catalog` passthrough (the IR has no constraint clause),
+    /// and the catalog handler creates it. Pins the path the removed dead IR
+    /// family could otherwise suggest exists.
+    #[test]
+    fn create_constraint_lowers_to_the_catalog_passthrough() {
+        let query = cypherlite_front::parse_and_lower(
+            "CREATE CONSTRAINT c FOR (n:P) REQUIRE n.id IS UNIQUE",
+        )
+        .expect("lowers");
+        let clauses = &query.parts[0].clauses;
+        assert!(matches!(
+            clauses.as_slice(),
+            [cypherlite_ir::Clause::Catalog(command)]
+                if matches!(
+                    command.as_ref(),
+                    cypherlite_parser::Clause::CreateConstraint(_)
+                )
+        ));
+        let g = Graph::default();
+        exec_autocommit(&g, "CREATE CONSTRAINT c FOR (n:P) REQUIRE n.id IS UNIQUE").unwrap();
+        assert!(g.named_constraints().iter().any(|def| def.name == "c"));
+    }
 
     /// LABS-328: an index-backed constraint's backing range index is
     /// materialized (present in the schema's `index_details`), not a
@@ -521,6 +416,36 @@ mod tests {
     /// notebook case, LABS-275): before, the constraint-first order failed
     /// with `IndexWithNameAlreadyExists` and the declared schema was less
     /// expressive than the data's real one.
+    /// CIP-266: two label-existence rules on one label with different
+    /// enforced labels are two schema rules (a multi-parent element type),
+    /// so both create cleanly; a repeat of one enforced label is the same
+    /// rule and is rejected. The catalog row carries the enforced label, so
+    /// the identity survives the round trip through the redo op.
+    #[test]
+    fn enforced_label_joins_the_constraint_identity() {
+        let g = Graph::default();
+        exec_autocommit(&g, "CREATE CONSTRAINT q FOR (n:P) REQUIRE n:Q").unwrap();
+        exec_autocommit(&g, "CREATE CONSTRAINT r FOR (n:P) REQUIRE n:R").unwrap();
+        let names: Vec<String> = g
+            .named_constraints()
+            .iter()
+            .map(|def| def.name.clone())
+            .collect();
+        assert_eq!(names, vec!["q", "r"]);
+        assert_eq!(
+            g.named_constraints()[0].enforced_label.as_deref(),
+            Some("Q")
+        );
+        let error = match exec_autocommit(&g, "CREATE CONSTRAINT q_again FOR (n:P) REQUIRE n:Q") {
+            Ok(_) => panic!("a repeat of one enforced label is the same schema rule"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "semantic error: EquivalentSchemaRuleAlreadyExists"
+        );
+    }
+
     #[test]
     fn fulltext_index_and_existence_constraint_coexist_both_orders() {
         assert_both_orders(

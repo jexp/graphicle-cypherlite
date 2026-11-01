@@ -1,11 +1,10 @@
 //! CypherLite GraphData snapshot (`graph.json` full rewrite). ADR-0050.
 
-use cypherlite_catalog::{ConstraintDef, IndexDef};
 use cypherlite_core::{Error, Node, Relationship, Result};
 use cypherlite_executor::{CheckpointTheater, Graph};
-use cypherlite_model::ConstraintType;
 use serde::{Deserialize, Serialize};
 
+use super::catalog::{self, CatalogWire, JsonConstraint, JsonIndex};
 use super::convert::{props_from_cypher_json, props_to_cypher_json};
 use super::{Envelope, SnapshotCodecKind};
 use crate::snapshot::{object_exists, put_object, LoadedSnapshot};
@@ -70,62 +69,6 @@ struct JsonRelationship {
     properties: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct JsonIndex {
-    name: String,
-    #[serde(default, alias = "label", deserialize_with = "deserialize_labels")]
-    labels: Vec<String>,
-    #[serde(default)]
-    properties: Vec<String>,
-    #[serde(rename = "type", default = "default_range")]
-    index_type: String,
-    #[serde(default)]
-    index_config: serde_json::Map<String, serde_json::Value>,
-    #[serde(default = "default_node_entity")]
-    entity_type: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct JsonConstraint {
-    name: String,
-    #[serde(default)]
-    label: String,
-    #[serde(default)]
-    properties: Vec<String>,
-    #[serde(rename = "type", default)]
-    constraint_type: String,
-    #[serde(default)]
-    property_type: Option<String>,
-    #[serde(default = "default_node_entity")]
-    entity_type: String,
-    #[serde(default)]
-    enforced_label: Option<String>,
-}
-
-fn default_range() -> String {
-    "range".into()
-}
-
-fn default_node_entity() -> String {
-    "NODE".into()
-}
-
-fn deserialize_labels<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum LabelsOrLabel {
-        Many(Vec<String>),
-        Single(String),
-    }
-    Ok(match LabelsOrLabel::deserialize(deserializer)? {
-        LabelsOrLabel::Many(v) => v,
-        LabelsOrLabel::Single(s) => vec![s],
-    })
-}
-
 pub fn dump(
     target: &StoreTarget,
     graph: &Graph,
@@ -171,6 +114,13 @@ fn graph_to_data(
     ontology: Option<&str>,
 ) -> Result<GraphData> {
     let contents = super::model::SnapshotContents::from_graph(graph, snapshot_ts)?;
+    // The graph type rides the one wire carrier (the catalog) rather
+    // than being re-specified from `contents` beside it.
+    let CatalogWire {
+        indexes,
+        constraints,
+        graph_type,
+    } = catalog::to_json(&contents, &theater);
     let mut nodes = Vec::new();
     for n in contents.nodes {
         let id = n.id;
@@ -193,46 +143,6 @@ fn graph_to_data(
                 .map_err(|e| storage_context(e, format_args!("relationship {id}")))?,
         });
     }
-    let indexes = contents
-        .indexes
-        .into_iter()
-        .map(|d| {
-            // The durable record tells the catalog truth when the theater
-            // knows it; indexes that predate the theater keep the
-            // historical defaults.
-            let detail = theater.index_detail(&d.name);
-            JsonIndex {
-                name: d.name,
-                labels: vec![d.label],
-                properties: vec![d.property],
-                index_type: detail
-                    .map(|detail| detail.kind.display_name().to_string())
-                    .unwrap_or_else(default_range),
-                index_config: serde_json::Map::new(),
-                entity_type: match detail {
-                    Some(detail) if detail.relationship => "RELATIONSHIP".into(),
-                    _ => default_node_entity(),
-                },
-            }
-        })
-        .collect();
-    let constraints = contents
-        .constraints
-        .into_iter()
-        .map(|d| JsonConstraint {
-            enforced_label: theater.enforced_label(&d.name).map(str::to_owned),
-            name: d.name,
-            label: d.label,
-            properties: d.properties,
-            constraint_type: d.kind,
-            property_type: d.property_type,
-            entity_type: if d.relationship {
-                "RELATIONSHIP".into()
-            } else {
-                default_node_entity()
-            },
-        })
-        .collect();
     Ok(GraphData {
         // The format follows the content (ADR-0120 §8): encoding 3 when the
         // inline ontology is present, 2 otherwise.
@@ -246,7 +156,7 @@ fn graph_to_data(
         theater: Some(theater),
         next_node_id: contents.next_node_id,
         next_rel_id: contents.next_rel_id,
-        graph_type: contents.graph_type,
+        graph_type,
         read_only: false,
         ontology: ontology.map(str::to_owned),
     })
@@ -302,6 +212,7 @@ pub(crate) fn load_with_checkpoint_lsn(target: &StoreTarget) -> Result<LoadedSna
         checkpoint_lsn,
         ontology,
         marker,
+        deferred: None,
     })
 }
 
@@ -388,66 +299,18 @@ fn graph_from_data(
     if let Some(ts) = envelope_commit_ts {
         graph.set_commit_ts(ts);
     }
-    if graph.commit_ts() == 0 && loaded > 0 {
-        graph.set_commit_ts(1);
-    }
-    let mut legacy_enforced = Vec::new();
-    for c in data.constraints {
-        if let Some(label) = &c.enforced_label {
-            let constraint_type = c
-                .constraint_type
-                .parse::<ConstraintType>()
-                .map_err(|e| Error::storage(format!("invalid JSON enforced constraint: {e}")))?;
-            legacy_enforced.push(cypherlite_model::Constraint {
-                name: c.name.clone(),
-                label: c.label.clone(),
-                properties: c.properties.clone(),
-                constraint_type,
-                property_type: c.property_type.clone(),
-                entity_type: c.entity_type.clone(),
-                enforced_label: Some(label.clone()),
-            });
-        }
-        graph.install_named_constraint(ConstraintDef {
-            name: c.name,
-            relationship: c.entity_type.eq_ignore_ascii_case("RELATIONSHIP"),
-            label: c.label,
-            properties: c.properties,
-            kind: c.constraint_type,
-            property_type: c.property_type,
-        })?;
-    }
-    for idx in data.indexes {
-        // An index record without labels/properties has no catalog keys to
-        // install under; skip it rather than fabricate an empty-string
-        // label/property (mirrors the empty-name guard).
-        let (Some(label), Some(property)) = (idx.labels.first(), idx.properties.first()) else {
-            continue;
-        };
-        if !idx.name.is_empty() {
-            graph.install_named_index(IndexDef {
-                name: idx.name,
-                label: label.clone(),
-                property: property.clone(),
-            })?;
-        }
-    }
-    if let Some(theater) = data.theater {
-        if legacy_enforced
-            .iter()
-            .any(|c| theater.enforced_label(&c.name) != c.enforced_label.as_deref())
-        {
-            return Err(Error::storage(
-                "JSON constraint enforced_label disagrees with checkpoint theater",
-            ));
-        }
-        graph.restore_checkpoint_theater(theater)?;
-    } else {
-        graph.restore_graph_type_spec(data.graph_type.as_deref())?;
-        graph.restore_legacy_enforced_constraints(legacy_enforced)?;
-        graph.mark_legacy_unenforced();
-    }
-    graph.finish_restore();
+    // The load-tail commit-timestamp floor, shared with the markdown
+    // codec (the one home of the policy, `snapshot::ensure_commit_ts`).
+    crate::snapshot::ensure_commit_ts(&graph, loaded);
+    catalog::restore(
+        &graph,
+        CatalogWire {
+            indexes: data.indexes,
+            constraints: data.constraints,
+            graph_type: data.graph_type,
+        },
+        data.theater,
+    )?;
     Ok((graph, ontology))
 }
 

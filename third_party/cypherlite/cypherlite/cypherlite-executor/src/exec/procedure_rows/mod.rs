@@ -35,17 +35,20 @@ const CYPHERLITE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// information sidebar (LABS-150). Must always be non-empty.
 const NEO4J_KERNEL_VERSION: &str = "2026.10-cypherlite";
 
-/// Builds the executable `Procedure` for a built-in name. Argument names/
-/// types and yield columns come from the single canonical signature
-/// registry (`crate::procedure_registry`) — only the graph-dependent *rows*
-/// are produced here. `principal` is the connection's authenticated
-/// principal (ADR-0273): only `dbms.showCurrentUser` reads it; `None` (a
-/// surface with no notion of identity, or `--auth none`) yields the
-/// documented placeholder.
+/// Builds the executable `Procedure` for a built-in name under one call's
+/// bound arguments. Argument names/types and yield columns come from the
+/// single canonical signature registry (`crate::procedure_registry`) — only
+/// the graph-dependent *rows* are produced here, and they are a function of
+/// `args` where the procedure's contract says so (`db.schema.visualization`
+/// with a null `options` map selects nothing). `principal` is the
+/// connection's authenticated principal (ADR-0273): only
+/// `dbms.showCurrentUser` reads it; `None` (a surface with no notion of
+/// identity, or `--auth none`) yields the documented placeholder.
 pub(crate) fn builtin_procedure(
     graph: &ExecGraph<'_>,
     name: &str,
     principal: Option<&str>,
+    args: &BTreeMap<String, Value>,
 ) -> Option<Procedure> {
     let signature = crate::procedure_registry::builtin_procedure_signature(name)
         .filter(|signature| signature.executable)?;
@@ -63,7 +66,7 @@ pub(crate) fn builtin_procedure(
         "dbms.licenseAgreementDetails" => dbms_license_agreement_rows(),
         "db.schema.nodeTypeProperties" => schema_node_type_rows(graph),
         "db.schema.relTypeProperties" => schema_rel_type_rows(graph),
-        "db.schema.visualization" => schema_visualization_rows(graph),
+        "db.schema.visualization" => schema_visualization_rows(graph, args.get("options")),
         // tx.setMetaData, db.createLabel, db.indexes, db.constraints,
         // db.awaitIndexes: unit (void) procedures with no rows. The vector
         // and fulltext query procedures never reach here — `exec_call`

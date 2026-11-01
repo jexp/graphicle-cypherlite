@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 description = "CypherLite parser front-end lowered to planner IR"
 publish = false
+license.workspace = true
 
 [dependencies]
 cypherlite-error = { workspace = true }

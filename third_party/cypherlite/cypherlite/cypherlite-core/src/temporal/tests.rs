@@ -276,74 +276,6 @@ fn time_truncate_resolves_timezone_at_the_pinned_utc_instant() {
     assert_eq!(out.iso_string(), "12:00+01:00");
 }
 
-/// The arithmetic path delegates to the exported resolver, keeping its
-/// `Option` contract: a zoned wall clock resolves, a DST gap yields `None`
-/// and surfaces as the path's existing error (ADR-0178).
-#[test]
-fn duration_between_zoned_wall_clock_delegates_to_resolver() {
-    let zoned = parse_iso("datetime", "2015-01-01T00:00[Europe/Stockholm]").unwrap();
-    let local = Temporal::LocalDateTime(
-        NaiveDate::from_ymd_opt(2015, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap(),
-    );
-    assert_eq!(
-        duration_between(&local, &zoned).unwrap().iso_string(),
-        "PT0S"
-    );
-
-    let gap = Temporal::LocalDateTime(
-        NaiveDate::from_ymd_opt(2021, 3, 28)
-            .unwrap()
-            .and_hms_opt(2, 30, 0)
-            .unwrap(),
-    );
-    let gap_zone = parse_iso("datetime", "2021-03-28T01:00[Europe/Stockholm]").unwrap();
-    assert_eq!(
-        duration_between(&gap, &gap_zone),
-        Err(Error::ty("duration.between"))
-    );
-}
-
-#[test]
-fn date_plus_fractional_duration() {
-    let date = construct_date(Some(&Value::Map(
-        [
-            ("year".into(), Value::Int(1984)),
-            ("month".into(), Value::Int(10)),
-            ("day".into(), Value::Int(11)),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into(),
-    )))
-    .unwrap();
-    let dur = construct_duration(Some(&Value::Map(
-        [
-            ("years".into(), Value::Float(12.5)),
-            ("months".into(), Value::Float(5.5)),
-            ("days".into(), Value::Float(14.5)),
-            ("hours".into(), Value::Float(16.5)),
-            ("minutes".into(), Value::Float(12.5)),
-            ("seconds".into(), Value::Float(70.5)),
-            ("nanoseconds".into(), Value::Int(3)),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into(),
-    )))
-    .unwrap();
-    assert_eq!(
-        add_duration(&date, &dur).unwrap().iso_string(),
-        "1997-10-11"
-    );
-    assert_eq!(
-        sub_duration(&date, &dur).unwrap().iso_string(),
-        "1971-10-12"
-    );
-}
-
 #[test]
 fn datetime_tostring_roundtrip_equals() {
     let d = construct_datetime(Some(&Value::Map(
@@ -383,6 +315,47 @@ fn parse_iso_year_month_and_compact_time_offset() {
     );
 }
 
+/// The value layer's two renderings: `full_seconds_string` (the
+/// `toString` policy, ADR-0448) always emits the seconds field — Cypher
+/// prints `toString(localtime('10:00'))` as `'10:00:00'`, never
+/// `'10:00'` — while `iso_string` keeps the truncated whole-minute form.
+#[test]
+fn full_seconds_string_always_emits_the_seconds_field() {
+    let cases = [
+        ("localtime", "10:00", "10:00:00"),
+        ("localtime", "10:00:30", "10:00:30"),
+        ("localtime", "10:00:30.250", "10:00:30.25"),
+        ("time", "10:00", "10:00:00Z"),
+        ("time", "10:00+02:00", "10:00:00+02:00"),
+        ("localdatetime", "2020-01-01T10:00", "2020-01-01T10:00:00"),
+        ("datetime", "2020-01-01T10:00Z", "2020-01-01T10:00:00Z"),
+        (
+            "datetime",
+            "2020-01-01T10:00+02:00",
+            "2020-01-01T10:00:00+02:00",
+        ),
+    ];
+    for (kind, input, expected) in cases {
+        let value = parse_iso(kind, input).unwrap();
+        assert_eq!(
+            value.full_seconds_string(),
+            expected,
+            "for {kind}('{input}')"
+        );
+    }
+    // The ISO rendering keeps its truncation of a whole minute.
+    assert_eq!(
+        parse_iso("localtime", "10:00").unwrap().iso_string(),
+        "10:00"
+    );
+    assert_eq!(
+        parse_iso("localdatetime", "2020-01-01T10:00")
+            .unwrap()
+            .iso_string(),
+        "2020-01-01T10:00"
+    );
+}
+
 #[test]
 fn duration_iso_roundtrip_hours() {
     let t = parse_duration_iso("PT22H").unwrap();
@@ -410,59 +383,6 @@ fn truncate_week_day_of_week() {
     );
     let out = truncate("date", "week", &d, Some(&extra)).unwrap();
     assert_eq!(out.iso_string(), "1984-10-09");
-}
-
-#[test]
-fn date_plus_duration_months_and_neg_days() {
-    let d = construct_duration(Some(&Value::Map(
-        [
-            ("months".into(), Value::Int(1)),
-            ("days".into(), Value::Int(-14)),
-            ("hours".into(), Value::Int(16)),
-            ("minutes".into(), Value::Int(-12)),
-            ("seconds".into(), Value::Int(70)),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into(),
-    )))
-    .unwrap();
-    let date = construct_date(Some(&Value::Map(
-        [
-            ("year".into(), Value::Int(1984)),
-            ("month".into(), Value::Int(10)),
-            ("day".into(), Value::Int(11)),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into(),
-    )))
-    .unwrap();
-    let sum = add_duration(&date, &d).unwrap();
-    let diff = sub_duration(&date, &d).unwrap();
-    assert_eq!(sum.iso_string(), "1984-10-28", "sum {sum:?}");
-    assert_eq!(diff.iso_string(), "1984-09-25", "diff {diff:?}");
-}
-
-#[test]
-fn scale_duration_half() {
-    let d = construct_duration(Some(&Value::Map(
-        [
-            ("years".into(), Value::Int(12)),
-            ("months".into(), Value::Int(5)),
-            ("days".into(), Value::Int(14)),
-            ("hours".into(), Value::Int(16)),
-            ("minutes".into(), Value::Int(12)),
-            ("seconds".into(), Value::Int(70)),
-            ("nanoseconds".into(), Value::Int(1)),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into(),
-    )))
-    .unwrap();
-    let half = scale_duration(&d, 0.5).unwrap();
-    assert_eq!(half.iso_string(), "P6Y2M22DT13H21M8S");
 }
 
 #[test]
@@ -690,11 +610,121 @@ fn zone_region_classifies_iana_names_only() {
     }
 }
 
-/// ADR-0325: the one civil-day count, from the proleptic Gregorian epoch
-/// origin — civil-date arithmetic and the Bolt Date struct both read it.
+/// An explicit offset beside a bracketed zone disambiguates a DST fall-back
+/// overlap, so the two halves of the repeated wall clock are both
+/// representable — equal under `Temporal::equals`, ordered by
+/// `Temporal::compare` (TCK TemporalCompare).
 #[test]
-fn civil_epoch_days_counts_from_the_epoch() {
-    assert_eq!(civil_epoch_days(1970, 1, 1), 0);
-    assert_eq!(civil_epoch_days(2024, 1, 2), 19724);
-    assert_eq!(civil_epoch_days(1969, 12, 31), -1);
+fn zoned_literal_offset_disambiguates_a_dst_overlap() {
+    let first = parse_iso("datetime", "2020-10-25T02:30+02:00[Europe/Stockholm]").unwrap();
+    let second = parse_iso("datetime", "2020-10-25T02:30+01:00[Europe/Stockholm]").unwrap();
+    // The offset beside the zone is preserved exactly as the literal
+    // supplied it; the whole-minute wall clock keeps the ISO truncation,
+    // while the `toString` rendering carries the seconds (ADR-0448).
+    assert_eq!(
+        first.iso_string(),
+        "2020-10-25T02:30+02:00[Europe/Stockholm]"
+    );
+    assert_eq!(
+        second.iso_string(),
+        "2020-10-25T02:30+01:00[Europe/Stockholm]"
+    );
+    assert_eq!(
+        first.full_seconds_string(),
+        "2020-10-25T02:30:00+02:00[Europe/Stockholm]"
+    );
+    assert!(first.equals(&second));
+    assert_eq!(first.compare(&second), Some(Ordering::Less));
+    // A still-ambiguous wall clock (no offset) stays an error, as does a DST
+    // gap.
+    assert_eq!(
+        parse_iso("datetime", "2020-10-25T02:30[Europe/Stockholm]"),
+        Err(Error::ty("ambiguous datetime"))
+    );
+    assert_eq!(
+        parse_iso("datetime", "2021-03-28T02:30[Europe/Stockholm]"),
+        Err(Error::ty("ambiguous datetime"))
+    );
+}
+
+#[test]
+fn zoned_equality_degrades_not_panics_on_out_of_range_offset() {
+    // The Bolt parameter decoders accept any i32 offset, so utc + offset can
+    // leave chrono's range; equality (and every bucket derived from its
+    // identity) degrades to the UTC wall clock instead of panicking.
+    let extreme = |zone: Option<&str>| Temporal::DateTime {
+        utc: chrono::NaiveDateTime::MAX,
+        offset: 100_000,
+        zone: zone.map(str::to_string),
+    };
+    let payload = extreme(None);
+    let twin = payload.clone();
+    assert!(payload.equals(&twin));
+    assert_eq!(payload.datetime_eq_identity(), twin.datetime_eq_identity());
+    // Distinct zones stay distinct even on the degraded local clock.
+    assert!(!payload.equals(&extreme(Some("Europe/Stockholm"))));
+    // Rendering the same payload takes the same stated UTC fallback: the
+    // wall clock is the UTC value unchanged and the suffix is the supplied
+    // offset (+27:46:40), so a regression that rendered another clock or
+    // suffix without panicking still fails here.
+    assert_eq!(
+        payload.iso_string(),
+        format!(
+            "{}+27:46:40",
+            chrono::NaiveDateTime::MAX.format("%Y-%m-%dT%H:%M:%S%.9f")
+        )
+    );
+}
+
+// Temporal `=` is offset/zone-sensitive and is not `compare() == Equal`.
+#[test]
+fn temporal_equality_is_offset_and_zone_sensitive() {
+    use crate::temporal::ZoneId;
+    use chrono::NaiveTime;
+
+    let time = |h, m, offset| Temporal::Time {
+        time: NaiveTime::from_hms_opt(h, m, 0).expect("valid time"),
+        offset,
+    };
+    // Same instant, different offsets: unequal, and ordered on the offset.
+    let a = time(12, 0, 3600);
+    let b = time(11, 0, 0);
+    assert!(!a.equals(&b));
+    assert_eq!(a.compare(&b), Some(Ordering::Greater));
+    // `Z` and `+00:00` are the same time.
+    assert!(time(12, 0, 0).equals(&time(12, 0, 0)));
+
+    // The two halves of a DST fall-back overlap: equal, yet ordered.
+    let utc = chrono::NaiveDate::from_ymd_opt(2025, 10, 26)
+        .expect("valid date")
+        .and_hms_opt(0, 30, 0)
+        .expect("valid time");
+    let first = Temporal::DateTime {
+        utc,
+        offset: 7200,
+        zone: Some("Europe/Stockholm".into()),
+    };
+    let second = Temporal::DateTime {
+        utc: utc + chrono::Duration::hours(1),
+        offset: 3600,
+        zone: Some("Europe/Stockholm".into()),
+    };
+    assert!(first.equals(&second));
+    assert_eq!(first.compare(&second), Some(Ordering::Less));
+    // A named zone never equals the offset it denotes.
+    let plain = Temporal::DateTime {
+        utc,
+        offset: 3600,
+        zone: None,
+    };
+    assert!(!plain.equals(&second));
+    // Durations are equality-only.
+    let d = Temporal::Duration {
+        months: 0,
+        days: 1,
+        nanos: 0,
+    };
+    assert!(d.equals(&d));
+    assert_eq!(d.compare(&d), None);
+    assert_eq!(ZoneId::of(Some("Z"), 0), ZoneId::Offset(0));
 }

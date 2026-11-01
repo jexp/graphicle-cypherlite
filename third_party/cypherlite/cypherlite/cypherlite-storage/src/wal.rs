@@ -678,6 +678,7 @@ impl Wal {
 
 mod rotation;
 mod scan;
+pub(crate) use scan::parse_seg_name;
 use scan::*;
 
 /// Segment count under `prefix` (ADR-0165). Checkpoint recycles every

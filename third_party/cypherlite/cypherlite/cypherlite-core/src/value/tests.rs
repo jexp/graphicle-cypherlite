@@ -63,6 +63,52 @@ fn to_display_string_matches_neo4j_2026_09() {
     }
 }
 
+// CIP-271: labels print alphabetically, and every name position whose
+// spelling is not a plain identifier is backticked — the labels/types/keys
+// of the spec's worked examples.
+#[test]
+fn to_display_string_quotes_special_names_and_sorts_labels() {
+    let node = |labels: &[&str]| {
+        Value::from_node(Node {
+            id: 1,
+            labels: Arc::new(labels.iter().map(|l| (*l).to_string()).collect()),
+            properties: crate::PropertyMap::share(BTreeMap::new()),
+        })
+    };
+    // A node created as (:B:A:`special label`) renders sorted, with only the
+    // name that needs escaping quoted.
+    assert_eq!(
+        node(&["B", "A", "special label"]).to_display_string(),
+        "(:A:B:`special label`)"
+    );
+    assert_eq!(node(&["X"]).to_display_string(), "(:X)");
+    let rel = Value::from_relationship(Relationship {
+        id: 2,
+        start: 1,
+        end: 3,
+        rel_type: "REL TYPE".into(),
+        properties: crate::PropertyMap::share(BTreeMap::new()),
+    });
+    assert_eq!(rel.to_display_string(), "[:`REL TYPE`]");
+    // A map prints sorted, and only the keys outside the plain identifier
+    // shape are backticked.
+    let map = Value::Map(
+        [
+            ("first name".to_string(), Value::String("Alice".into())),
+            ("123".to_string(), Value::String("digit key".into())),
+            ("a.b".to_string(), Value::String("dot".into())),
+            ("z".to_string(), Value::Int(1)),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into(),
+    );
+    assert_eq!(
+        map.to_display_string(),
+        "{`123`: digit key, `a.b`: dot, `first name`: Alice, z: 1}"
+    );
+}
+
 // ADR-0170: cloning a String, List, Map or Vector shares its payload.
 #[test]
 fn clone_shares_arc_payloads() {
@@ -352,15 +398,21 @@ fn order_by_type_rank() {
 
 #[test]
 fn uuid_compare_and_order() {
-    // CIP-246: distinct UUIDs must order by numeric value, not collapse
-    // to equal. These are the ids this regression was reported with.
+    // CIP-246: comparison operators do NOT order UUIDs -- only equality is
+    // defined, so a distinct pair is incomparable (NULL), while an equal
+    // pair is `Equal` (so `>=`/`<=` hold). ORDER BY / min / max DO order
+    // them by numeric value.
     let a = Value::Uuid(0x0000_0000_0000_0000_0000_0000_0000_000a);
     let b = Value::Uuid(0x0000_0000_0000_0000_0000_0000_0000_000b);
-    // Comparison operators (`<`, `>`): three-valued, so distinct UUIDs
-    // were NULL before the fix.
-    assert_eq!(a.compare(&b), Some(Ordering::Less));
-    assert_eq!(b.compare(&a), Some(Ordering::Greater));
+    assert_eq!(a.compare(&b), None);
+    assert_eq!(b.compare(&a), None);
     assert_eq!(a.compare(&a), Some(Ordering::Equal));
+    assert!(a.eq_non_null(&a));
+    // A list of incomparable UUIDs is incomparable too.
+    assert_eq!(
+        Value::List(vec![a.clone()].into()).compare(&Value::List(vec![b.clone()].into())),
+        None
+    );
     // ORDER BY uses order_by_cmp, which must not fall back to Equal.
     assert_eq!(a.order_by_cmp(&b), Ordering::Less);
     assert_eq!(b.order_by_cmp(&a), Ordering::Greater);
@@ -632,4 +684,45 @@ fn tagged_encoder_rejects_byte_arrays() {
     let err = serde_json::to_value(&value).expect_err("bytes must not encode");
     assert_eq!(err.to_string(), "byte array is not a persistence property");
     assert!(serde_json::to_value(Value::List(vec![value].into())).is_err());
+}
+
+// Maps have a total order (size, then sorted keys, then values), so the
+// comparison operators answer instead of every map pair being incomparable
+// (TCK TernaryComparisonAcceptance).
+#[test]
+fn maps_compare_by_size_then_sorted_keys_then_values() {
+    let m = |pairs: &[(&str, Value)]| {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into(),
+        )
+    };
+    assert_eq!(
+        m(&[("k", Value::Int(42))]).compare(&m(&[("k", Value::Int(43))])),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        m(&[("k", Value::Int(42))]).compare(&m(&[("k", Value::Int(42))])),
+        Some(Ordering::Equal)
+    );
+    // A differing key decides the order without inspecting values.
+    assert_eq!(
+        m(&[("k1", Value::Int(42))]).compare(&m(&[("k2", Value::Null)])),
+        Some(Ordering::Less)
+    );
+    // A null value under a shared key makes the comparison null.
+    assert_eq!(
+        m(&[("k", Value::Int(42))]).compare(&m(&[("k", Value::Null)])),
+        None
+    );
+    // Size first: one entry orders before two, whatever the keys.
+    assert_eq!(
+        m(&[("z", Value::Int(9))]).compare(&m(&[("a", Value::Int(1)), ("b", Value::Int(2))])),
+        Some(Ordering::Less)
+    );
+    // Across types a map stays incomparable.
+    assert_eq!(m(&[("k", Value::Int(1))]).compare(&Value::Int(1)), None);
 }

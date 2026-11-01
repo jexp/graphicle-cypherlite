@@ -14,8 +14,8 @@ use crate::overlay::{ExecGraph, MaterializeCache};
 
 use super::aggregate::aggregate_ex;
 use super::scope::{
-    has_star_item, is_internal_column, is_star_item, parked_key_name,
-    projection_collides_with_internal_names, return_columns, star_scope_names, visible_keys,
+    has_star_item, is_internal_column, is_star_item, projection_collides_with_internal_names,
+    return_columns, star_scope_names, visible_keys,
 };
 
 pub(crate) fn projection_names(items: &[Projection]) -> Vec<String> {
@@ -50,37 +50,182 @@ pub(crate) fn projection_result_columns(
 }
 
 /// A result column of a rectangular projection row: every projection path
-/// binds each result column name on every row by contract, so a missing
-/// name is a bug, not a null. The one place that invariant is asserted —
-/// shared by the result materialization ([`super::dispatch`]) and the
-/// DISTINCT key extraction in [`project_rows`].
+/// binds each result column name — and, at projection time, every parked
+/// `__ord*` sort key ([`park_order_keys`]) — on every row by contract, so a
+/// missing name is a bug, not a null. The one place that invariant is
+/// asserted: the result materialization ([`super::dispatch`]), the DISTINCT
+/// key extraction in [`project_rows`], the sink's output construction and
+/// the parked-key readback ([`parked_keys`]).
 pub(crate) fn result_column<'r>(row: &'r Row, name: &str) -> &'r Value {
     row.get(name)
         .expect("projection rows carry every result column")
 }
 
-pub(crate) fn order_value(
-    graph: &ExecGraph<'_>,
-    row: &Row,
-    expr: &Expr,
+/// Whether the projection produces `name` as one of its output columns.
+fn projects_name(items: &[Projection], name: &str) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .any(|(index, item)| !is_star_item(item) && item.output_name(index) == name)
+}
+
+/// Whether an `ORDER BY` key must read the projected row even when its
+/// expression is verbatim a projection item.
+///
+/// Every key is evaluated against the projected row (see
+/// [`park_order_keys`]); this decision names the shapes that may not fall
+/// back to the item they match: a bare variable naming a projected column is
+/// a reference to that column, a key with an aggregate call folds the group,
+/// and an explicit `GROUP BY` (including `GROUP BY ALL`) establishes the
+/// alias scope for every key (`GroupByAcceptance [73]`). Every other key
+/// keeps the deprecated implicit-grouping resolution — one that is exactly a
+/// projection item expression is answered from that item
+/// (`ProjectionSubclauseDeprecation`).
+fn order_key_alias_scoped(expr: &Expr, items: &[Projection], explicit_grouping: bool) -> bool {
+    explicit_grouping
+        || is_agg_expr(expr)
+        || matches!(expr, Expr::Variable(name) if projects_name(items, name))
+}
+
+/// A `__` column-name prefix no result column starts with, so a parked sort
+/// key can never overwrite — or be read back as — a user alias. The `__`
+/// namespace is where internal columns live, and a user alias is allowed to
+/// spell one (`AS __ord0`).
+fn parked_prefix(items: &[Projection]) -> String {
+    let names = projection_names(items);
+    let mut prefix = String::from("__ord");
+    while names.iter().any(|name| name.starts_with(&prefix)) {
+        prefix.push('_');
+    }
+    prefix
+}
+
+/// One projection's `ORDER BY` keys bundled with the projection items they
+/// resolve against, their alias-scope decisions and the parked column each
+/// key is written under. Every projection path parks its keys at projection
+/// time through [`park_order_keys`], so the one sort entry point reads them
+/// back instead of re-evaluating anything.
+pub(crate) struct OrderKeys<'a> {
+    keys: &'a [cypherlite_ir::OrderItem],
+    items: &'a [Projection],
+    alias_scoped: Vec<bool>,
+    parked_prefix: String,
+}
+
+impl<'a> OrderKeys<'a> {
+    /// The per-key scope depends only on the key expressions and the items,
+    /// never on a row, so every path takes the decision once here.
+    pub(crate) fn new(
+        keys: &'a [cypherlite_ir::OrderItem],
+        items: &'a [Projection],
+        explicit_grouping: bool,
+    ) -> Self {
+        Self {
+            keys,
+            items,
+            alias_scoped: keys
+                .iter()
+                .map(|item| order_key_alias_scoped(&item.expr, items, explicit_grouping))
+                .collect(),
+            parked_prefix: parked_prefix(items),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &'a cypherlite_ir::OrderItem> {
+        self.keys.iter()
+    }
+
+    pub(crate) fn is_alias_scoped(&self, index: usize) -> bool {
+        self.alias_scoped[index]
+    }
+
+    /// The parked column of key `index`.
+    pub(crate) fn name(&self, index: usize) -> String {
+        format!("{}{index}", self.parked_prefix)
+    }
+}
+
+/// Park every `ORDER BY` key of `keys` on `projected`, the row the
+/// projection produced, so the later sort reads the values back.
+///
+/// The projected row is the one evaluation scope: every key resolves names
+/// there, so a name the projection re-binds denotes the projected value. The
+/// one short-circuit is the deprecated implicit-grouping resolution — a key
+/// that is not alias-scoped and whose expression is exactly one of the items
+/// verbatim is answered from that item, whose value was computed against the
+/// incoming row (`ProjectionSubclauseDeprecation`: `ORDER BY a.p` beside
+/// `a.p AS k` keeps the incoming `a.p`, while `ORDER BY n + 2` beside
+/// `n.num AS n` reads the projected `n`, as the TCK pins).
+///
+/// `key_value` evaluates one key against the projected row. A key that
+/// cannot be evaluated is a null sort key, not a statement failure.
+pub(crate) fn park_order_keys(
+    keys: &OrderKeys<'_>,
+    projected: &mut Row,
+    key_value: impl Fn(&Expr, &Row) -> Value,
+) {
+    let mut parked = Vec::with_capacity(keys.len());
+    for (index, item) in keys.iter().enumerate() {
+        let value = match verbatim_item(keys.items, &item.expr, projected) {
+            Some(value) if !keys.is_alias_scoped(index) => value,
+            _ => key_value(&item.expr, projected),
+        };
+        parked.push(value);
+    }
+    for (index, value) in parked.into_iter().enumerate() {
+        projected.insert(keys.name(index), value);
+    }
+}
+
+/// Remove the parked `ORDER BY` columns from every row once the sort has
+/// consumed them — the one strip loop, shared by every projection path.
+pub(crate) fn unpark_order_keys(keys: &OrderKeys<'_>, rows: &mut [Row]) {
+    for row in rows {
+        for index in 0..keys.len() {
+            row.shift_remove(&keys.name(index));
+        }
+    }
+}
+
+/// The projected item whose expression is exactly `expr`, if any — the
+/// documented verbatim resolution for a non-alias-scoped key.
+fn verbatim_item(items: &[Projection], expr: &Expr, row: &Row) -> Option<Value> {
+    items.iter().enumerate().find_map(|(index, item)| {
+        if is_star_item(item) || item.expr != *expr {
+            return None;
+        }
+        row.get(&item.output_name(index)).cloned()
+    })
+}
+
+/// The projection item each folded `ORDER BY` key answers from, or `None`
+/// when a key needs more than the folded row. The fold keeps no input rows,
+/// so a key is answerable only when it is one of the projection's items
+/// verbatim (an aggregate item's folded value included) or a bare variable
+/// naming a projected column; any other key declines the fold and the
+/// grouping path answers it.
+pub(crate) fn folded_order_items(
+    order: &[cypherlite_ir::OrderItem],
     items: &[Projection],
-    params: &BTreeMap<String, Value>,
-    cypher_version: Option<u32>,
-) -> Value {
-    for (i, p) in items.iter().enumerate() {
-        if p.expr == *expr {
-            if let Some(v) = row.get(&p.output_name(i)) {
-                return v.clone();
-            }
-        }
-    }
-    let v = eval(graph, row, expr, params, cypher_version).unwrap_or(Value::Null);
-    if v.is_null() {
-        if let Expr::Variable(name) = expr {
-            return row.get(name).cloned().unwrap_or(Value::Null);
-        }
-    }
-    v
+) -> Option<Vec<usize>> {
+    order
+        .iter()
+        .map(|key| {
+            items.iter().enumerate().position(|(index, item)| {
+                !is_star_item(item)
+                    && (item.expr == key.expr
+                        || matches!(&key.expr, Expr::Variable(name) if *name == item.output_name(index)))
+            })
+        })
+        .collect()
 }
 
 /// A following `RETURN`/`WITH` the match sink can evaluate per path.
@@ -89,18 +234,19 @@ pub(crate) fn order_value(
 /// on the ordinary projection so a later row's error is not raised (CIP-27).
 pub(crate) struct SinkProjection<'a> {
     pub items: &'a [Projection],
-    pub order: &'a [cypherlite_ir::OrderItem],
+    /// The clause's `ORDER BY` keys, parked per row by
+    /// [`finish_match_row`]. The sink declines an explicit `GROUP BY` and an
+    /// aggregate item, so it only ever sees the implicit-grouping decision.
+    order: OrderKeys<'a>,
     names: RowNames,
 }
 
 impl<'a> SinkProjection<'a> {
     fn new(items: &'a [Projection], order: &'a [cypherlite_ir::OrderItem]) -> Self {
-        let mut names = Vec::with_capacity(items.len() + order.len());
-        for (index, item) in items.iter().enumerate() {
-            names.push(item.output_name(index));
-        }
+        let order = OrderKeys::new(order, items, false);
+        let mut names = projection_names(items);
         for index in 0..order.len() {
-            names.push(parked_key_name(index));
+            names.push(order.name(index));
         }
         Self {
             items,
@@ -154,9 +300,9 @@ pub(crate) fn sinkable_projection(clause: &Clause) -> Option<SinkProjection<'_>>
         || items
             .iter()
             .any(|item| is_star_item(item) || is_agg_expr(&item.expr))
-        // A user alias in the `__` namespace would collide with the parked
-        // `__ord*` sort keys `SinkProjection` writes — the sink declines and
-        // the ordinary projection (which parks nothing) keeps the column.
+        // The `__` namespace reservation: an alias the sink would park
+        // beside cannot be told apart from engine-internal state, so the
+        // sink declines and the ordinary projection keeps the column.
         || projection_collides_with_internal_names(items)
     {
         return None;
@@ -195,25 +341,24 @@ pub(crate) fn finish_match_row(
     params: &BTreeMap<String, Value>,
     cypher_version: Option<u32>,
 ) -> Result<Row> {
-    let mut values = Vec::with_capacity(projection.names_len());
-    // Order keys can name a projected alias (`ORDER BY answer.kind`), so
-    // they are read from a row that already holds those values. The clone
-    // dies with this call; the stored row is only the projected cells.
-    let mut visible = row.clone();
+    // The projected row: the incoming bindings with each item's value
+    // written over its output name. Order keys read it (`ORDER BY
+    // answer.kind`), and a key that is verbatim an item answers from that
+    // item's value here.
+    let mut projected = row.clone();
     for (index, item) in projection.items.iter().enumerate() {
         let value = eval(graph, row, &item.expr, params, cypher_version)?;
-        visible.insert(item.output_name(index), value.clone());
-        values.push(value);
+        projected.insert(item.output_name(index), value);
     }
-    for item in projection.order {
-        values.push(order_value(
-            graph,
-            &visible,
-            &item.expr,
-            projection.items,
-            params,
-            cypher_version,
-        ));
+    park_order_keys(&projection.order, &mut projected, |expr, scope| {
+        eval(graph, scope, expr, params, cypher_version).unwrap_or(Value::Null)
+    });
+    let mut values = Vec::with_capacity(projection.names_len());
+    for (index, item) in projection.items.iter().enumerate() {
+        values.push(result_column(&projected, &item.output_name(index)).clone());
+    }
+    for index in 0..projection.order.len() {
+        values.push(result_column(&projected, &projection.order.name(index)).clone());
     }
     Ok(Row::from_names(&projection.names, values))
 }
@@ -279,6 +424,9 @@ pub(crate) fn project_rows(
     // aggregate items (the non-aggregating case acts as DISTINCT).
     let has_agg = has_agg || group_by.is_some();
     let out_names = projection_names(items);
+    // The one per-key scope decision: every path below parks its keys with
+    // this decision, and the projection's own grouping mode sets it.
+    let order_keys = OrderKeys::new(order, items, group_by.is_some());
     // Without sorting, filtering, aggregation, or DISTINCT, paging may stop
     // row evaluation. In particular a LIMIT 1 must not evaluate a later row
     // whose projection raises an error (CIP-27).
@@ -358,14 +506,32 @@ pub(crate) fn project_rows(
                     let value = eval(graph, &r, &projection.expr, params, cypher_version)?;
                     n.insert(projection.output_name(index), refresh(value));
                 }
+                park_order_keys(&order_keys, &mut n, |expr, scope| {
+                    eval(graph, scope, expr, params, cypher_version).unwrap_or(Value::Null)
+                });
                 Ok(n)
             })
             .collect::<Result<Vec<_>>>()?
     } else if has_agg {
-        let mut agg = aggregate_ex(graph, rows, items, group_by, params, cypher_version)?;
+        let mut agg = aggregate_ex(
+            graph,
+            rows,
+            items,
+            group_by,
+            params,
+            cypher_version,
+            &order_keys,
+        )?;
         if inflate {
             for row in &mut agg {
-                let keys: Vec<_> = row.keys().cloned().collect();
+                // The parked `__ord*` sort keys keep the values the group
+                // produced: they are compared, not returned, so they are not
+                // inflation surface.
+                let keys: Vec<String> = row
+                    .keys()
+                    .filter(|key| !is_internal_column(key))
+                    .cloned()
+                    .collect();
                 for k in keys {
                     if let Some(v) = row.shift_remove(&k) {
                         row.insert(k, refresh(v));
@@ -384,7 +550,10 @@ pub(crate) fn project_rows(
         }
         let mut out = Vec::new();
         for mut row in rows {
-            let mut row2 = Row::new();
+            // The item values first, against the incoming row, then the kept
+            // bindings (a `WITH` filter or an `ORDER BY` key may name one the
+            // projection does not produce), then the items over them — the
+            // projected row a key is evaluated against.
             let projected: Vec<(String, Value)> = items
                 .iter()
                 .enumerate()
@@ -395,6 +564,7 @@ pub(crate) fn project_rows(
                     Ok((name, refresh(val)))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let mut row2 = Row::new();
             let kept: Vec<String> = row
                 .keys()
                 .filter(|name| keep.contains(name.as_str()))
@@ -408,6 +578,9 @@ pub(crate) fn project_rows(
             for (name, value) in projected {
                 row2.insert(name, value);
             }
+            park_order_keys(&order_keys, &mut row2, |expr, scope| {
+                eval(graph, scope, expr, params, cypher_version).unwrap_or(Value::Null)
+            });
             out.push(row2);
         }
         out
@@ -438,35 +611,12 @@ pub(crate) fn project_rows(
         None => None,
     };
 
-    if !order.is_empty() {
+    if !order_keys.is_empty() {
         let top_k = match (distinct, limit_n) {
             (false, Some(lim)) => skip_n.checked_add(lim),
             _ => None,
         };
-        if preprojected {
-            if let Some(keep) = top_k {
-                if keep == 0 {
-                    merged.clear();
-                } else if keep < merged.len() {
-                    merged = take_parked_top_k(order, merged, keep)?;
-                } else {
-                    sort_rows_by_parked_keys(order, &mut merged)?;
-                }
-            } else {
-                sort_rows_by_parked_keys(order, &mut merged)?;
-            }
-        } else if let Some(keep) = top_k {
-            if keep == 0 {
-                merged.clear();
-            } else if keep < merged.len() {
-                merged =
-                    take_ordered_top_k(graph, items, params, order, merged, keep, cypher_version)?;
-            } else {
-                sort_rows_by_order(graph, items, params, order, &mut merged, cypher_version)?;
-            }
-        } else {
-            sort_rows_by_order(graph, items, params, order, &mut merged, cypher_version)?;
-        }
+        sort_rows_by_parked_keys(&order_keys, &mut merged, top_k)?;
     }
 
     let mut retained_rows = cypherlite_core::tokens::WorkspaceCharge::empty();
@@ -523,6 +673,9 @@ pub(crate) fn project_rows(
     }
 
     if star {
+        // The parked keys were sort surface only; a `*` row keeps exactly
+        // the incoming bindings and the explicit items.
+        unpark_order_keys(&order_keys, &mut merged);
         drop(retained_rows);
         return Ok(merged);
     }
@@ -546,33 +699,19 @@ pub(crate) fn project_rows(
 }
 
 pub(crate) fn cmp_sort_keys(
-    order: &[cypherlite_ir::OrderItem],
+    keys: &OrderKeys<'_>,
     ka: &[Value],
     ia: usize,
     kb: &[Value],
     ib: usize,
 ) -> CmpOrdering {
-    for (i, o) in order.iter().enumerate() {
+    for (i, o) in keys.iter().enumerate() {
         match ka[i].order_by_cmp(&kb[i]) {
             CmpOrdering::Equal => {}
             ord => return if o.ascending { ord } else { ord.reverse() },
         }
     }
     ia.cmp(&ib)
-}
-
-pub(crate) fn row_sort_keys(
-    graph: &ExecGraph<'_>,
-    items: &[Projection],
-    params: &BTreeMap<String, Value>,
-    order: &[cypherlite_ir::OrderItem],
-    row: &Row,
-    cypher_version: Option<u32>,
-) -> Vec<Value> {
-    order
-        .iter()
-        .map(|o| order_value(graph, row, &o.expr, items, params, cypher_version))
-        .collect()
 }
 
 /// Apply a catalog clause's own `YIELD` paging stages (`ORDER BY`/`SKIP`/
@@ -599,14 +738,16 @@ pub(crate) fn apply_yield_page_stages(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                sort_rows_by_order(
-                    graph,
-                    &[],
-                    params,
-                    &order,
-                    output.as_mut_slice(),
-                    cypher_version,
-                )?;
+                // The catalog rows are their own scope: a `YIELD` key names
+                // an output column, so parking reads the row itself.
+                let keys = OrderKeys::new(&order, &[], false);
+                for row in output.iter_mut() {
+                    park_order_keys(&keys, row, |expr, scope| {
+                        eval(graph, scope, expr, params, cypher_version).unwrap_or(Value::Null)
+                    });
+                }
+                sort_rows_by_parked_keys(&keys, output, None)?;
+                unpark_order_keys(&keys, output);
             }
             cypherlite_parser::PageStage::Skip(expr) => {
                 let count = skip_limit_count(&eval(
@@ -633,34 +774,6 @@ pub(crate) fn apply_yield_page_stages(
     Ok(())
 }
 
-pub(crate) fn sort_rows_by_order(
-    graph: &ExecGraph<'_>,
-    items: &[Projection],
-    params: &BTreeMap<String, Value>,
-    order: &[cypherlite_ir::OrderItem],
-    rows: &mut [Row],
-    cypher_version: Option<u32>,
-) -> Result<()> {
-    let _rows = hold_sort_rows(rows)?;
-    let mut keyed: Vec<(Vec<Value>, usize)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            (
-                row_sort_keys(graph, items, params, order, r, cypher_version),
-                i,
-            )
-        })
-        .collect();
-    let _keys = hold_sort_keys(keyed.iter().map(|(keys, _)| keys.as_slice()))?;
-    keyed.sort_by(|a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
-    let mut slot: Vec<Option<Row>> = rows.iter_mut().map(|r| Some(std::mem::take(r))).collect();
-    for (dest, (_, src)) in keyed.into_iter().enumerate() {
-        rows[dest] = slot[src].take().expect("row");
-    }
-    Ok(())
-}
-
 /// Reserve the row buffer, then sample RSS while those rows are still the
 /// live workspace and before the key vector is built.
 fn hold_sort_rows(rows: &[Row]) -> Result<cypherlite_core::tokens::WorkspaceCharge> {
@@ -681,27 +794,46 @@ fn hold_sort_keys<'a>(
     Ok(charge)
 }
 
-fn parked_keys(row: &Row, order: &[cypherlite_ir::OrderItem]) -> Vec<Value> {
-    order
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            row.get(&parked_key_name(index))
-                .cloned()
-                .unwrap_or(Value::Null)
-        })
+/// The parked sort keys of one row, in key order. Every projection path
+/// parks them by contract ([`result_column`] asserts it).
+fn parked_keys(keys: &OrderKeys<'_>, row: &Row) -> Vec<Value> {
+    (0..keys.len())
+        .map(|index| result_column(row, &keys.name(index)).clone())
         .collect()
 }
 
-fn sort_rows_by_parked_keys(order: &[cypherlite_ir::OrderItem], rows: &mut [Row]) -> Result<()> {
+/// The one `ORDER BY` application. Every projection path parks its keys at
+/// projection time (see [`park_order_keys`]), so this reads them back and
+/// never evaluates an expression. `top_k` asks for the first `top_k` rows
+/// only (the `LIMIT` selection; `0` empties the table).
+pub(crate) fn sort_rows_by_parked_keys(
+    keys: &OrderKeys<'_>,
+    rows: &mut Vec<Row>,
+    top_k: Option<usize>,
+) -> Result<()> {
+    match top_k {
+        Some(0) => {
+            rows.clear();
+            Ok(())
+        }
+        Some(keep) if keep < rows.len() => {
+            *rows = take_parked_top_k(keys, std::mem::take(rows), keep)?;
+            Ok(())
+        }
+        _ => sort_all_rows(keys, rows),
+    }
+}
+
+/// The full sort behind [`sort_rows_by_parked_keys`]'s unsorted case.
+fn sort_all_rows(keys: &OrderKeys<'_>, rows: &mut [Row]) -> Result<()> {
     let _rows = hold_sort_rows(rows)?;
     let mut keyed: Vec<(Vec<Value>, usize)> = rows
         .iter()
         .enumerate()
-        .map(|(index, row)| (parked_keys(row, order), index))
+        .map(|(index, row)| (parked_keys(keys, row), index))
         .collect();
     let _keys = hold_sort_keys(keyed.iter().map(|(keys, _)| keys.as_slice()))?;
-    keyed.sort_by(|a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
+    keyed.sort_by(|a, b| cmp_sort_keys(keys, &a.0, a.1, &b.0, b.1));
     let mut slot: Vec<Option<Row>> = rows
         .iter_mut()
         .map(|row| Some(std::mem::take(row)))
@@ -712,56 +844,20 @@ fn sort_rows_by_parked_keys(order: &[cypherlite_ir::OrderItem], rows: &mut [Row]
     Ok(())
 }
 
-fn take_parked_top_k(
-    order: &[cypherlite_ir::OrderItem],
-    rows: Vec<Row>,
-    keep: usize,
-) -> Result<Vec<Row>> {
+fn take_parked_top_k(keys: &OrderKeys<'_>, rows: Vec<Row>, keep: usize) -> Result<Vec<Row>> {
     let mut rows_charge = hold_sort_rows(&rows)?;
     let mut keyed: Vec<(Vec<Value>, usize, Row)> = rows
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
-            let keys = parked_keys(&row, order);
-            (keys, index, row)
+            let row_keys = parked_keys(keys, &row);
+            (row_keys, index, row)
         })
         .collect();
     let mut keys_charge = hold_sort_keys(keyed.iter().map(|(keys, _, _)| keys.as_slice()))?;
-    keyed.select_nth_unstable_by(keep - 1, |a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
+    keyed.select_nth_unstable_by(keep - 1, |a, b| cmp_sort_keys(keys, &a.0, a.1, &b.0, b.1));
     keyed.truncate(keep);
-    keyed.sort_by(|a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
-    rows_charge
-        .resize_with(|| crate::workspace::row_refs_bytes(keyed.iter().map(|(_, _, row)| row)))?;
-    keys_charge.resize_with(|| {
-        crate::workspace::sort_key_columns(keyed.iter().map(|(keys, _, _)| keys.as_slice()))
-    })?;
-    drop(keys_charge);
-    drop(rows_charge);
-    Ok(keyed.into_iter().map(|(_, _, row)| row).collect())
-}
-
-pub(crate) fn take_ordered_top_k(
-    graph: &ExecGraph<'_>,
-    items: &[Projection],
-    params: &BTreeMap<String, Value>,
-    order: &[cypherlite_ir::OrderItem],
-    rows: Vec<Row>,
-    keep: usize,
-    cypher_version: Option<u32>,
-) -> Result<Vec<Row>> {
-    let mut rows_charge = hold_sort_rows(&rows)?;
-    let mut keyed: Vec<(Vec<Value>, usize, Row)> = rows
-        .into_iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let keys = row_sort_keys(graph, items, params, order, &r, cypher_version);
-            (keys, i, r)
-        })
-        .collect();
-    let mut keys_charge = hold_sort_keys(keyed.iter().map(|(keys, _, _)| keys.as_slice()))?;
-    keyed.select_nth_unstable_by(keep - 1, |a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
-    keyed.truncate(keep);
-    keyed.sort_by(|a, b| cmp_sort_keys(order, &a.0, a.1, &b.0, b.1));
+    keyed.sort_by(|a, b| cmp_sort_keys(keys, &a.0, a.1, &b.0, b.1));
     rows_charge
         .resize_with(|| crate::workspace::row_refs_bytes(keyed.iter().map(|(_, _, row)| row)))?;
     keys_charge.resize_with(|| {

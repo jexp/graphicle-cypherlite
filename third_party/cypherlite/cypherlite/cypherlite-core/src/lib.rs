@@ -15,7 +15,9 @@ mod value;
 pub use cancel::CancelToken;
 pub use convert::{column_type_name, cypher_to_value, value_to_cypher};
 pub use error::{uniqueness_violation_detail, ArithmeticFailure, Error, Result};
-pub use memory_limit::parse_memory_limit;
+pub use memory_limit::{
+    parse_memory_limit, parse_positive_memory_limit, require_positive_memory_limit,
+};
 pub use namespace::{
     is_graph_selector_function_name, node_element_id, parse_node_element_id, parse_rel_element_id,
     rel_element_id, ElementIdRef, Namespace, GRAPH_SELECTOR_FUNCTIONS,
@@ -32,6 +34,14 @@ pub use value::{
 
 pub type NodeId = i64;
 pub type RelId = i64;
+
+/// Whether `id` belongs to a CIP-257 **virtual** entity — a graph-type
+/// projection synthesized with a negative id and carried by its value alone
+/// (it has no store entry). Persisted ids are non-negative
+/// ([`validate_persisted_id`]), so the sign is the one virtual-entity test.
+pub const fn is_virtual_id(id: i64) -> bool {
+    id < 0
+}
 
 /// The single acceptance rule for a persisted local node or relationship ID.
 ///

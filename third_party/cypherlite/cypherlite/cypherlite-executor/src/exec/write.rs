@@ -331,7 +331,7 @@ pub(crate) fn delete_value(graph: &ExecGraph<'_>, v: &Value, detach: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::test_support::exec_write_uncommitted;
+    use crate::exec::test_support::{exec_write_uncommitted, Builder};
     use crate::graph::Graph;
 
     /// DELETE of a list bound in the row reads nested lists and paths in
@@ -350,6 +350,24 @@ mod tests {
         );
         assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
         assert_eq!(r.stats.nodes_deleted, 3);
+        assert_eq!(r.stats.relationships_deleted, 1);
+    }
+
+    /// A deleted-but-bound relationship is tombstoned like a node: the
+    /// `r {.*}` map projection reads an empty map, not the pre-delete
+    /// properties (`refresh_rows` strips them before the projection).
+    #[test]
+    fn deleted_relationship_all_properties_projection_is_empty() {
+        let b = Builder::new();
+        let a = b.anon(&["A"]);
+        let b_node = b.anon(&["B"]);
+        b.rel(a, b_node, "R", &[("since", Value::Int(2020))]);
+        let g = b.done();
+        let r = exec_write_uncommitted(
+            &g,
+            "MATCH (:A)-[r:R {since: 2020}]->(:B) DELETE r RETURN r {.*} AS p",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Map(BTreeMap::new().into())]]);
         assert_eq!(r.stats.relationships_deleted, 1);
     }
 }

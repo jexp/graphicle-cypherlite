@@ -332,14 +332,15 @@ fn direct_redo_rejects_incomplete_label_metadata_without_a_prefix() {
             labels: Arc::new(vec!["Person".into()]),
             properties: cypherlite_core::PropertyMap::share(BTreeMap::new()),
         },
-        RedoOp::CreateConstraint {
+        RedoOp::create_constraint(ConstraintDef {
             name: "rule".into(),
             relationship: false,
             label: "Person".into(),
             properties: vec![],
             kind: "nodeLabelExistence".into(),
             property_type: None,
-        },
+            enforced_label: None,
+        }),
     ];
     assert!(matches!(
         graph.apply_redo(ops, 1),
@@ -363,13 +364,16 @@ fn redo_preflight_catalog_duplicates_and_bad_options_are_atomic() {
         label: "L".into(),
         property: property.into(),
     };
-    let constraint = |name: &str, kind: &str| RedoOp::CreateConstraint {
-        name: name.into(),
-        relationship: false,
-        label: "L".into(),
-        properties: vec!["p".into()],
-        kind: kind.into(),
-        property_type: None,
+    let constraint = |name: &str, kind: &str| {
+        RedoOp::create_constraint(ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec!["p".into()],
+            kind: kind.into(),
+            property_type: None,
+            enforced_label: None,
+        })
     };
     let invalid = [
         vec![index("first", "p"), index("second", "p")],
@@ -457,43 +461,31 @@ fn redo_preflight_invalid_pull_local_id_keeps_prior_rows() {
 #[test]
 fn redo_preflight_accepts_ordered_detach_schema_and_pull_updates() {
     let g = Graph::default();
-    let node = |id| RedoOp::CreateNode {
-        id,
-        labels: Arc::new(vec![]),
-        properties: cypherlite_core::PropertyMap::share(BTreeMap::new()),
-    };
+    let node = |id| RedoOp::create_node(id, Vec::new(), BTreeMap::new());
+    let rel = |id| RedoOp::create_rel(id, 0, 1, "R".into(), BTreeMap::new());
     let index = |name: &str| RedoOp::CreateIndex {
         name: name.into(),
         label: "L".into(),
         property: "p".into(),
     };
-    let constraint = |name: &str| RedoOp::CreateConstraint {
-        name: name.into(),
-        relationship: false,
-        label: "L".into(),
-        properties: vec!["p".into()],
-        kind: "UNIQUE".into(),
-        property_type: None,
+    let constraint = |name: &str| {
+        RedoOp::create_constraint(ConstraintDef {
+            name: name.into(),
+            relationship: false,
+            label: "L".into(),
+            properties: vec!["p".into()],
+            kind: cypherlite_model::ConstraintType::Unique.as_str().into(),
+            property_type: None,
+            enforced_label: None,
+        })
     };
     let ops = vec![
         node(0),
         node(1),
-        RedoOp::CreateRel {
-            id: 0,
-            start: 0,
-            end: 1,
-            rel_type: "R".into(),
-            properties: cypherlite_core::PropertyMap::share(BTreeMap::new()),
-        },
+        rel(0),
         RedoOp::DeleteNode { id: 1 },
         node(1),
-        RedoOp::CreateRel {
-            id: 1,
-            start: 0,
-            end: 1,
-            rel_type: "R".into(),
-            properties: cypherlite_core::PropertyMap::share(BTreeMap::new()),
-        },
+        rel(1),
         index("i"),
         index("i"),
         RedoOp::DropIndex { name: "i".into() },

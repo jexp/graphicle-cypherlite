@@ -81,22 +81,23 @@ fn validate_slice(graph: &ExecGraph<'_>, slice: &ValidationSlice) -> Result<()> 
         return Ok(());
     }
     let show = graph.show_schema()?;
-    let enforced_labels: Vec<Option<String>> = constraints
-        .iter()
-        .map(|def| {
-            show.data
+    // Enforcement reads the theater's derived index — its historical source
+    // and the legacy-unenforced signal: a store whose theater holds no
+    // record for a row resolves `None` and stays unenforced (even when a
+    // newer row still names its label), so one resolved-def shape feeds
+    // both the drift comparison and the checks without a second channel.
+    let constraints: Vec<ConstraintDef> = constraints
+        .into_iter()
+        .map(|mut def| {
+            def.enforced_label = show
+                .data
                 .derived_constraints
                 .get(&def.name)
-                .and_then(|constraint| constraint.enforced_label.clone())
+                .and_then(|constraint| constraint.enforced_label.clone());
+            def
         })
         .collect();
-    let catalog = ValidatedCatalog::new(
-        constraints
-            .iter()
-            .cloned()
-            .zip(enforced_labels.iter().cloned())
-            .collect(),
-    );
+    let catalog = ValidatedCatalog::new(constraints.clone());
     // ADR-0174: a constraint new or changed in the committed catalog since
     // this scratch last validated joins the slice's recheck set. The first
     // validation of a scratch diffs nothing: its slice holds every write
@@ -110,8 +111,8 @@ fn validate_slice(graph: &ExecGraph<'_>, slice: &ValidationSlice) -> Result<()> 
         graph.remember_validated_catalog(catalog);
         return Ok(());
     }
-    for (def, enforced_label) in constraints.iter().zip(enforced_labels) {
-        let check = ConstraintCheck::new(def, enforced_label)?;
+    for def in &constraints {
+        let check = ConstraintCheck::new(def)?;
         if drifted.contains(&def.name) || slice.rechecks(&check) {
             check.recheck(graph)?;
         } else {
@@ -137,15 +138,8 @@ pub(crate) fn validate_derived_constraints(
 ) -> Result<()> {
     for derived_constraint in derived {
         let crate::graph_type::DerivedConstraint { constraint, entity } = derived_constraint;
-        let def = ConstraintDef {
-            name: constraint.name.clone(),
-            relationship: entity.is_relationship(),
-            label: constraint.label.clone(),
-            properties: constraint.properties.clone(),
-            kind: constraint.constraint_type.as_str().to_string(),
-            property_type: constraint.property_type.clone(),
-        };
-        let check = ConstraintCheck::new(&def, constraint.enforced_label.clone())?;
+        let def = ConstraintDef::from_model(constraint, *entity);
+        let check = ConstraintCheck::new(&def)?;
         check.recheck_naming_elements(graph)?;
     }
     Ok(())
@@ -341,7 +335,10 @@ impl<'c> ConstraintCheck<'c> {
     /// Parses the stored kind tag and property-type rendering up front, even
     /// when no entity is re-validated: either one failing to parse fails the
     /// validation closed.
-    fn new(def: &'c ConstraintDef, enforced_label: Option<String>) -> Result<Self> {
+    /// One input: the definition carries its effective (theater-resolved)
+    /// enforced label; callers fill a legacy row's label before building the
+    /// check (see [`resolve_enforced_labels`]).
+    fn new(def: &'c ConstraintDef) -> Result<Self> {
         let kind = ConstraintType::from_str(&def.kind)
             .map_err(|reason| unknown_kind_error(&def.name, &reason))?;
         let property_type = def
@@ -353,7 +350,11 @@ impl<'c> ConstraintCheck<'c> {
             def,
             kind,
             property_type,
-            target: Target::new(def.relationship, kind.enforced_label_site(), enforced_label),
+            target: Target::new(
+                def.relationship,
+                kind.enforced_label_site(),
+                def.enforced_label.clone(),
+            ),
         })
     }
 
@@ -769,7 +770,7 @@ fn endpoint_label_error(enforced: &str) -> Error {
 /// A stored kind tag `ConstraintType::from_str` rejects fails closed
 /// rather than leaving the constraint neither required nor unique.
 fn unknown_kind_error(name: &str, reason: &str) -> Error {
-    Error::semantic(format!("ConstraintValidationFailed: `{name}` {reason}"))
+    Error::semantic(ConstraintType::unknown_kind_message(name, reason))
 }
 
 #[cfg(test)]

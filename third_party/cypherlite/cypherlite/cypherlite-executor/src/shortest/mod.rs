@@ -87,7 +87,7 @@ impl Search<'_, '_> {
     }
 
     /// Every relationship followed out of `node`, with the node it reaches.
-    fn hops(&self, node: NodeId) -> Result<Vec<(NodeId, RelId)>> {
+    pub(crate) fn hops(&self, node: NodeId) -> Result<Vec<(NodeId, RelId)>> {
         let mut out = Vec::new();
         self.each_hop(node, |next, rid| {
             out.push((next, rid));

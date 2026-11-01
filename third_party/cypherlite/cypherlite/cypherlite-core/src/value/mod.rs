@@ -7,6 +7,8 @@ use std::sync::Arc;
 pub use cypherlite_model::value::PointValue;
 pub use cypherlite_model::VectorCoordKind;
 
+use cypherlite_model::identifier::quote_identifier_shaped;
+
 use crate::temporal::Temporal;
 use crate::{NodeId, RelId};
 
@@ -116,6 +118,69 @@ fn cypher_eq_pairs<'a>(pairs: impl Iterator<Item = (&'a Value, &'a Value)>) -> V
     } else {
         Value::Bool(true)
     }
+}
+
+/// The first elementwise comparison that is not `equal`, or `tie` when every
+/// zipped pair ties. Both iterators are zipped, so only the first `min(len)`
+/// pairs are compared; `tie` is where a caller states its length rule. A
+/// `None` result from `cmp` is terminal: a null operand decides the whole
+/// comparison as null. The one spelling of the hand-rolled
+/// first-non-equal loops ([`compare_maps`], [`Value::compare`]'s list arm,
+/// [`Value::order_by_cmp`]'s list/vector arms).
+fn lexicographic<A, B, C>(
+    a: impl Iterator<Item = A>,
+    b: impl Iterator<Item = B>,
+    equal: C,
+    tie: C,
+    mut cmp: impl FnMut(A, B) -> C,
+) -> C
+where
+    C: PartialEq,
+{
+    for (x, y) in a.zip(b) {
+        let result = cmp(x, y);
+        if result != equal {
+            return result;
+        }
+    }
+    tie
+}
+
+/// Elementwise [`Value::eq_non_null`] over two same-length sequences — the
+/// one list/vector element comparison in [`Value::eq_non_null`].
+fn elementwise_eq(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_non_null(y))
+}
+
+/// The map half of [`Value::compare`]: size first, then the sorted key lists
+/// element by element, then the values under those keys. Both operands are
+/// `BTreeMap`s, so iteration is already key order and equal lengths plus
+/// equal key lists mean the same key set.
+fn compare_maps(
+    a: &std::collections::BTreeMap<String, Value>,
+    b: &std::collections::BTreeMap<String, Value>,
+) -> Option<Ordering> {
+    match a.len().cmp(&b.len()) {
+        Ordering::Equal => {}
+        other => return Some(other),
+    }
+    let by_key = lexicographic(
+        a.keys(),
+        b.keys(),
+        Ordering::Equal,
+        Ordering::Equal,
+        |ka: &String, kb: &String| ka.cmp(kb),
+    );
+    if by_key != Ordering::Equal {
+        return Some(by_key);
+    }
+    lexicographic(
+        a.values(),
+        b.values(),
+        Some(Ordering::Equal),
+        Some(Ordering::Equal),
+        Value::compare,
+    )
 }
 
 fn add_bytes(acc: &mut u64, bytes: u64, budget: u64) -> ControlFlow<()> {
@@ -323,9 +388,7 @@ impl Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
-            (Value::List(a), Value::List(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_non_null(y))
-            }
+            (Value::List(a), Value::List(b)) => elementwise_eq(a, b),
             (Value::Map(a), Value::Map(b)) => {
                 a.len() == b.len()
                     && a.iter()
@@ -334,9 +397,10 @@ impl Value {
             (Value::Node(a), Value::Node(b)) => a.id == b.id,
             (Value::Relationship(a), Value::Relationship(b)) => a.id == b.id,
             (Value::Path(a), Value::Path(b)) => a == b,
-            (Value::Temporal(a), Value::Temporal(b)) => {
-                a.compare(b) == Some(std::cmp::Ordering::Equal)
-            }
+            // The spec's temporal equality is offset/zone-sensitive and is
+            // *not* `compare() == Equal`: a DST fall-back overlap is equal
+            // (`Temporal::equals`) yet ordered.
+            (Value::Temporal(a), Value::Temporal(b)) => a.equals(b),
             (Value::Point(a), Value::Point(b)) => a == b,
             (
                 Value::Vector {
@@ -352,14 +416,18 @@ impl Value {
                 // is variant-strict (`Int(1)` vs `Float(1.0)` differs), which
                 // disagreed with the equivalence keys' numeric normalization
                 // of vector elements.
-                ac == bc
-                    && av.len() == bv.len()
-                    && av.iter().zip(bv.iter()).all(|(x, y)| x.eq_non_null(y))
+                ac == bc && elementwise_eq(av, bv)
             }
             _ => false,
         }
     }
 
+    /// Cypher's three-valued ordering over one type-pair (`None` = null: the
+    /// pair is incomparable, or a `null` operand reached here). Orderable:
+    /// numbers, strings, bytes, booleans, lists, maps, and the temporal kinds
+    /// except durations. Not orderable despite having `=`: UUIDs, points,
+    /// durations, and any cross-type pair — the `<=`/`>=` arms of the
+    /// comparison operators still hold for equal operands (`cmp_bool`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
         if self.is_null() || other.is_null() {
             return None;
@@ -380,23 +448,30 @@ impl Value {
             // Byte-wise, like the List arm: element by element, then length.
             (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-            // CIP-246: UUIDs compare by their 128-bit numeric value so `<`/
-            // `>` agree with ORDER BY / min / max (the rank puts UUID
-            // between BOOLEAN and TEMPORAL). Without this arm `compare`
-            // returned None -- i.e. NULL for ordering operators and, via
-            // order_by_cmp's `unwrap_or(Equal)`, "all UUIDs equal" for
-            // ORDER BY, min, and max.
-            (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+            // CIP-246: UUIDs are NOT ordered by the comparison operators --
+            // only equality is defined, so a distinct pair is incomparable
+            // (NULL for `<`/`>`), while an equal pair still yields `Equal`
+            // and so `>=`/`<=` are true (`UUID(x) >= UUID(x)` is true). The
+            // numeric order lives in `order_by_cmp` (UUID ranks between
+            // BOOLEAN and TEMPORAL), so ORDER BY / min / max still sort.
+            (Value::Uuid(a), Value::Uuid(b)) => (*a == *b).then_some(Ordering::Equal),
             (Value::Temporal(a), Value::Temporal(b)) => a.compare(b),
-            (Value::List(a), Value::List(b)) => {
-                for (x, y) in a.iter().zip(b.iter()) {
-                    match x.compare(y) {
-                        Some(Ordering::Equal) => {}
-                        other => return other,
-                    }
-                }
-                Some(a.len().cmp(&b.len()))
-            }
+            (Value::List(a), Value::List(b)) => lexicographic(
+                a.iter(),
+                b.iter(),
+                Some(Ordering::Equal),
+                Some(a.len().cmp(&b.len())),
+                Value::compare,
+            ),
+            // Maps have a total order: size, then the sorted keys, then the
+            // values under them. A null value makes the comparison null
+            // while a differing key decides the order on its own, which is
+            // why `{k1: 42} < {k2: null}` is true but `{k: 42} < {k: null}`
+            // is null.
+            (Value::Map(a), Value::Map(b)) => compare_maps(a, b),
+            // Everything left has no ordering arm: UUIDs and points (only `=`
+            // is defined for them — `ORDER BY` still ranks them, see
+            // `order_by_cmp`), paths, entities, and every cross-type pair.
             _ => None,
         }
     }
@@ -411,15 +486,17 @@ impl Value {
         }
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::List(a), Value::List(b)) => {
-                for (x, y) in a.iter().zip(b.iter()) {
-                    match x.order_by_cmp(y) {
-                        Ordering::Equal => {}
-                        other => return other,
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
+            // Not orderable by `compare` (no comparison operators), but
+            // ORDER BY / min / max still rank them.
+            (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+            (Value::Temporal(a), Value::Temporal(b)) => a.total_cmp(b),
+            (Value::List(a), Value::List(b)) => lexicographic(
+                a.iter(),
+                b.iter(),
+                Ordering::Equal,
+                a.len().cmp(&b.len()),
+                Value::order_by_cmp,
+            ),
             (
                 Value::Vector {
                     coord: ac,
@@ -437,13 +514,13 @@ impl Value {
                 if type_order != Ordering::Equal {
                     return type_order;
                 }
-                for (a, b) in av.iter().zip(bv.iter()) {
-                    let order = a.order_by_cmp(b);
-                    if order != Ordering::Equal {
-                        return order;
-                    }
-                }
-                Ordering::Equal
+                lexicographic(
+                    av.iter(),
+                    bv.iter(),
+                    Ordering::Equal,
+                    Ordering::Equal,
+                    Value::order_by_cmp,
+                )
             }
             _ => self.compare(other).unwrap_or(Ordering::Equal),
         }
@@ -536,8 +613,9 @@ impl Value {
 
     /// The CIP-271 `toString()` rendering: the cypher-shell display form
     /// rather than the round-trippable literal form — strings are unquoted,
-    /// temporals are bare ISO strings, and maps/lists render recursively
-    /// with `, ` separators (verified against Neo4j 2026.09.0).
+    /// temporals are bare full-precision ISO strings (ADR-0448), and
+    /// maps/lists render recursively with `, ` separators (verified
+    /// against Neo4j 2026.09.0).
     pub fn to_display_string(&self) -> String {
         match self {
             Value::Null => "null".into(),
@@ -552,22 +630,34 @@ impl Value {
                 let inner: Vec<_> = xs.iter().map(Value::to_display_string).collect();
                 format!("[{}]", inner.join(", "))
             }
+            // A key outside the plain identifier shape is backticked
+            // (CIP-271: `{`123`: digit key, `a.b`: dot, `first name`:
+            // Alice}`); the map's own iteration order is already the
+            // sorted one.
             Value::Map(m) => {
                 let inner: Vec<_> = m
                     .iter()
-                    .map(|(k, v)| format!("{k}: {}", v.to_display_string()))
+                    .map(|(k, v)| {
+                        format!("{}: {}", quote_identifier_shaped(k), v.to_display_string())
+                    })
                     .collect();
                 format!("{{{}}}", inner.join(", "))
             }
-            // Labels only, no properties: Neo4j 2026.09.0 renders
-            // toString(node-with-props) as "(:X)".
+            // Labels only, no properties, alphabetically (CIP-271): Neo4j
+            // 2026.09.0 renders toString(node-with-props) as "(:X)" and a
+            // multi-label node as "(:A:B:C)" whatever the creation order.
             Value::Node(n) => {
-                let labels: String = n.labels.iter().map(|l| format!(":{l}")).collect();
+                let mut labels: Vec<&str> = n.labels.iter().map(String::as_str).collect();
+                labels.sort_unstable();
+                let labels: String = labels
+                    .iter()
+                    .map(|l| format!(":{}", quote_identifier_shaped(l)))
+                    .collect();
                 format!("({labels})")
             }
-            Value::Relationship(r) => format!("[:{}]", r.rel_type),
+            Value::Relationship(r) => format!("[:{}]", quote_identifier_shaped(&r.rel_type)),
             Value::Path(p) => p.to_cypher_literal(),
-            Value::Temporal(t) => t.iso_string(),
+            Value::Temporal(t) => t.full_seconds_string(),
             // Bare hyphenated string (verified on 2026.09.0).
             Value::Uuid(u) => uuid_hyphenated(*u),
             Value::Point(pt) => pt.to_string(),

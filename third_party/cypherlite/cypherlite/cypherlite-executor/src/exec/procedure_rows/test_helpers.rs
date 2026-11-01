@@ -30,8 +30,17 @@ pub(super) fn rows_with_principal(
     name: &str,
     principal: Option<&str>,
 ) -> Vec<BTreeMap<String, Value>> {
+    rows_with_args(graph, name, principal, &BTreeMap::new())
+}
+
+pub(super) fn rows_with_args(
+    graph: &Graph,
+    name: &str,
+    principal: Option<&str>,
+    args: &BTreeMap<String, Value>,
+) -> Vec<BTreeMap<String, Value>> {
     let view = ExecGraph::read(graph);
-    builtin_procedure(&view, name, principal)
+    builtin_procedure(&view, name, principal, args)
         .expect("schema procedure is executable")
         .rows
 }

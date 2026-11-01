@@ -1,7 +1,7 @@
 //! SumAcc / agg_eval tests (F-1-19: the test module outgrew the
 //! implementation file).
 
-use super::aggregate::{agg_eval, desugar_star_keys};
+use super::aggregate::{agg_eval, desugar_star_keys, AggScope};
 use super::test_support::duration;
 use crate::eval::Row;
 use crate::graph::Graph;
@@ -44,7 +44,13 @@ fn agg_fn(name: &str) -> Expr {
 fn run_result(group: &[Row], expr: &Expr) -> cypherlite_core::Result<Value> {
     let g = Graph::default();
     let graph = ExecGraph::read(&g);
-    agg_eval(&graph, group, expr, &BTreeMap::new(), None)
+    agg_eval(
+        &graph,
+        AggScope::of_group(group),
+        expr,
+        &BTreeMap::new(),
+        None,
+    )
 }
 
 fn run(group: &[Row], expr: &Expr) -> Value {
@@ -111,6 +117,87 @@ fn sum_and_avg_reject_mixed_numbers_and_durations() {
     // Order does not matter: number first or duration first.
     let group = group_with_vals(&[duration(0, 0, 1), Value::Int(1)]);
     assert!(run_result(&group, &agg_fn("sum")).is_err());
+}
+
+/// The float a `stDev`/`stDevP` call yields, panicking on null or a
+/// non-float: these tests pin the numeric cases only (the null cases
+/// assert `Value::Null` directly).
+fn stddev_of(vals: &[Value], name: &str) -> f64 {
+    match run(&group_with_vals(vals), &agg_fn(name)) {
+        Value::Float(f) => f,
+        other => panic!("{name} over {vals:?}: expected a float, got {other:?}"),
+    }
+}
+
+// StandardDeviation.feature: `[]` and `[null]` (and a null argument with no
+// row at all) are the empty sample, and the empty sample is null — not the
+// old 0.0.
+#[test]
+fn stdev_empty_or_null_only_sample_is_null() {
+    for name in ["stdev", "stdevp"] {
+        assert_eq!(
+            run(&[], &agg_fn(name)),
+            Value::Null,
+            "{name} over a zero-row group"
+        );
+        assert_eq!(
+            run(&group_with_vals(&[Value::Null, Value::Null]), &agg_fn(name)),
+            Value::Null,
+            "{name} over an all-null sample"
+        );
+    }
+}
+
+// StandardDeviation.feature pins `[5]` at 0.0 for both forms: one value has
+// zero spread, and the sample divisor (0) must not turn that 0/0 into NaN.
+#[test]
+fn stdev_single_value_is_zero() {
+    for name in ["stdev", "stdevp"] {
+        assert_eq!(
+            run(&group_with_xs(&[5]), &agg_fn(name)),
+            Value::Float(0.0),
+            "{name} over a single value"
+        );
+    }
+}
+
+// StandardDeviation.feature "over large floats": a naive sum of squared
+// deviations squares values near f64::MAX, overflows to +Inf and reports Inf
+// where the expected result is NaN.
+#[test]
+fn stdev_large_floats_do_not_overflow_to_infinity() {
+    let max = f64::MAX;
+    for name in ["stdev", "stdevp"] {
+        let opposite = [Value::Float(max), Value::Float(-max)];
+        let reversed = [Value::Float(-max), Value::Float(max)];
+        let same = [Value::Float(max), Value::Float(max)];
+        assert!(
+            stddev_of(&opposite, name).is_nan(),
+            "{name} over [MAX, -MAX]"
+        );
+        assert!(
+            stddev_of(&reversed, name).is_nan(),
+            "{name} over [-MAX, MAX]"
+        );
+        assert_eq!(stddev_of(&same, name), 0.0, "{name} over [MAX, MAX]");
+    }
+}
+
+// StandardDeviation.feature "over NaN and infinities": any infinite or NaN
+// input propagates to NaN, never to a finite number or +Inf.
+#[test]
+fn stdev_nan_and_infinite_inputs_are_nan() {
+    let samples = [
+        [Value::Float(1.0), Value::Float(f64::NAN)],
+        [Value::Float(1.0), Value::Float(f64::INFINITY)],
+        [Value::Float(f64::INFINITY), Value::Float(f64::NEG_INFINITY)],
+        [Value::Float(f64::INFINITY), Value::Float(f64::INFINITY)],
+    ];
+    for name in ["stdev", "stdevp"] {
+        for sample in &samples {
+            assert!(stddev_of(sample, name).is_nan(), "{name} over {sample:?}");
+        }
+    }
 }
 
 #[test]

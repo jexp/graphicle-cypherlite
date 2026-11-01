@@ -1,14 +1,16 @@
 //! Parsing of temporal values: ISO-8601 forms, CIP-228 patterns, and durations.
 
 use chrono::{
-    Datelike, Duration as ChronoDur, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Weekday,
+    Datelike, Duration as ChronoDur, NaiveDate, NaiveDateTime, NaiveTime, Offset, Weekday,
 };
 use chrono_tz::Tz;
 
 use crate::{Error, Result};
 
 use super::construct::date_from_week;
-use super::zone::sub_offset;
+use super::zone::{
+    ambiguous_datetime_err, resolve_local, sub_offset, zone_kind, LocalResolution, ZoneSpec,
+};
 use super::{
     f64_to_i128_range, f64_to_i64_range, range_err, weekday_from_i, Temporal, AVG_DAYS_PER_MONTH,
     NANOS_PER_DAY,
@@ -659,16 +661,27 @@ fn parse_zoned_dt(s: &str) -> Result<Temporal> {
         let (b, o) = split_offset(s);
         (b, o)
     };
+    // An offset written beside a bracketed zone disambiguates the wall clock
+    // inside a DST overlap: `datetime('2020-10-25T02:30+01:00[Europe/Stockholm]')`
+    // is the post-transition 02:30, not an error.
+    let (body, body_offset) = split_offset(body);
     let local = parse_naive_dt(body)?;
     if let Some(z) = zone_part {
-        if z.contains('/') {
-            let tz: Tz = z
-                .parse()
-                .map_err(|_| Error::ty(format!("unknown timezone '{z}'")))?;
-            let dt = tz
-                .from_local_datetime(&local)
-                .single()
-                .ok_or_else(|| Error::ty("ambiguous datetime"))?;
+        if matches!(zone_kind(z), ZoneSpec::Iana(_)) {
+            let tz: Tz = z.parse().map_err(|_| super::zone::unknown_zone_err(z))?;
+            let dt = match resolve_local(tz, local) {
+                LocalResolution::Unique(dt) => dt,
+                LocalResolution::Ambiguous { earlier, later } => {
+                    let want = body_offset.map(parse_offset).transpose()?;
+                    let offset_of = |dt: &chrono::DateTime<Tz>| dt.offset().fix().local_minus_utc();
+                    match want {
+                        Some(want) if offset_of(&earlier) == want => earlier,
+                        Some(want) if offset_of(&later) == want => later,
+                        _ => return Err(ambiguous_datetime_err()),
+                    }
+                }
+                LocalResolution::None => return Err(ambiguous_datetime_err()),
+            };
             return Ok(Temporal::DateTime {
                 utc: dt.naive_utc(),
                 offset: dt.offset().fix().local_minus_utc(),

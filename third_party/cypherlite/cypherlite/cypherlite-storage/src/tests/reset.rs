@@ -4,6 +4,10 @@
 //! rather than deleted.
 
 use super::*;
+// The reset-admission trio's home (moved from the crate root into the
+// ownership layer, beside the identity vocabulary it shares).
+#[cfg(windows)]
+use crate::native_ownership::verify_reset_identity;
 #[cfg(windows)]
 use cypherlite_core::file_identity;
 

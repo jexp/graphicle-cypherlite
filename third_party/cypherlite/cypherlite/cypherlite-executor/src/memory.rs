@@ -262,7 +262,7 @@ pub(crate) fn payload_form_account(form: &PayloadForm) -> u64 {
         PayloadForm::Triple { id, amount, .. } => {
             (str_logical_bytes(id) + amount.logical_bytes() + 8, 0)
         }
-        PayloadForm::Props(props) => (
+        PayloadForm::Other(props) => (
             props.values().map(Value::logical_bytes).sum(),
             prop_vec_heap(props.len()),
         ),
@@ -364,6 +364,7 @@ fn version_edit(
 /// A set on a committed node copies the version and adds the new record;
 /// a set on a node this batch already created edits that record in place.
 pub fn estimate_redo_delta(
+    interner: &Interner,
     ops: &[RedoOp],
     lookup_node: impl Fn(NodeId) -> Option<Node>,
     lookup_rel: impl Fn(RelId) -> Option<PayloadForm>,
@@ -410,7 +411,7 @@ pub fn estimate_redo_delta(
                 rel_type: _,
                 properties,
             } => {
-                let form = PayloadForm::from_map((**properties).clone().into());
+                let form = PayloadForm::from_map(interner, (**properties).clone().into());
                 delta += payload_form_account(&form) as i64 + rel_chain_bytes(1) as i64;
                 rels.insert(*id, Some(form));
             }
@@ -465,7 +466,7 @@ pub fn estimate_redo_delta(
                     None => continue,
                 };
                 let before = payload_form_account(&form);
-                form.set(key, value.clone());
+                form.set(interner, key, value.clone());
                 let after = payload_form_account(&form);
                 delta += version_edit(in_batch, before, after, rel_versions(*id), rel_chain_bytes);
                 rels.insert(*id, Some(form));
@@ -477,7 +478,7 @@ pub fn estimate_redo_delta(
                     None => continue,
                 };
                 let before = payload_form_account(&form);
-                form.remove(key);
+                form.remove(interner, key);
                 let after = payload_form_account(&form);
                 delta += version_edit(in_batch, before, after, rel_versions(*id), rel_chain_bytes);
                 rels.insert(*id, Some(form));
@@ -557,15 +558,16 @@ mod tests {
 
     #[test]
     fn other_that_gains_the_triple_keys_keeps_its_vectors() {
+        let interner = Interner::default();
         let partial = BTreeMap::from([
             ("id".into(), Value::String("a".into())),
             ("amount".into(), Value::Int(1)),
         ]);
-        let mut form = PayloadForm::from_map(partial.clone());
+        let mut form = PayloadForm::from_map(&interner, partial.clone());
         let created = payload_form_account(&form);
-        form.set("ts", Value::Int(5));
+        form.set(&interner, "ts", Value::Int(5));
         let grown = payload_form_account(&form);
-        assert!(matches!(form, PayloadForm::Props(_)));
+        assert!(matches!(form, PayloadForm::Other(_)));
         assert_eq!(
             grown,
             created + (prop_vec_heap(3) - prop_vec_heap(2)) + Value::Int(5).logical_bytes()
@@ -576,11 +578,10 @@ mod tests {
             ("amount".into(), Value::Int(1)),
         ]);
         triple.insert("ts".into(), Value::Int(5));
-        let as_created = PayloadForm::from_map(triple);
+        let as_created = PayloadForm::from_map(&interner, triple);
         assert!(matches!(as_created, PayloadForm::Triple { .. }));
         assert_eq!(payload_form_account(&as_created) + prop_vec_heap(3), grown);
 
-        let interner = Interner::default();
         let mut stored = RelPayload::from_map(&interner, partial);
         stored.set(&interner, "ts", Value::Int(5));
         assert_eq!(stored.form(&interner), form);
@@ -592,12 +593,12 @@ mod tests {
             ("ts".into(), Value::Int(9)),
         ]);
         let mut stored_triple = RelPayload::from_map(&interner, triple_map.clone());
-        let mut form_triple = PayloadForm::from_map(triple_map);
+        let mut form_triple = PayloadForm::from_map(&interner, triple_map);
         stored_triple.set(&interner, "note", Value::String("x".into()));
-        form_triple.set("note", Value::String("x".into()));
+        form_triple.set(&interner, "note", Value::String("x".into()));
         assert_eq!(stored_triple.form(&interner), form_triple);
         assert!(matches!(stored_triple, RelPayload::Other(_)));
-        assert!(matches!(form_triple, PayloadForm::Props(_)));
+        assert!(matches!(form_triple, PayloadForm::Other(_)));
     }
 
     #[test]

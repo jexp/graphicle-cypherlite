@@ -233,15 +233,12 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
 /// source): a user-written call with one of these spellings is still an
 /// UnknownFunction error at parse time. Members:
 ///
-/// - `tostring_full` -- the lowering's internal rename of
-///   `toString(local_time(...))` & friends (`lower.rs`); never written by
-///   users.
 /// - `graph.byname` -- valid only as a `USE` graph selector; it is listed
 ///   by `SHOW FUNCTIONS` through the executor's catalog-only entries, not
 ///   through `KNOWN_FUNCTIONS`.
 /// - `string.interp` -- the CIP-261 interpolated string literal's lowered
 ///   form (`s'...{expr}...'`); users write the literal, never the call.
-pub const UNADVERTISED_FUNCTIONS: &[&str] = &["tostring_full", "graph.byname", "string.interp"];
+pub const UNADVERTISED_FUNCTIONS: &[&str] = &["graph.byname", "string.interp"];
 
 /// True when `name` (any casing) is a function the engine accepts: every
 /// advertised built-in (`KNOWN_FUNCTIONS`, which includes the aggregate

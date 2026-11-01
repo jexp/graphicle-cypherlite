@@ -1,5 +1,3 @@
-use crate::unicode_identifier::{is_identifier_part, is_identifier_start};
-
 /// Token types for the Cypher lexer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenType {
@@ -472,31 +470,11 @@ pub fn lookup_keyword(ident: &str) -> TokenType {
     }
 }
 
-/// True when `name` has the plain ASCII identifier shape
-/// `[A-Za-z_][A-Za-z0-9_]*` — the shape-only half of the quoting policy.
-///
-/// Reads the lexer's canonical ASCII predicates (`is_identifier_start` /
-/// `is_identifier_part`, ADR-0182) behind an explicit `is_ascii()` gate. That
-/// gate is deliberately narrower than what the lexer accepts: unquoted
-/// identifiers may use the Unicode 13.0.0 classes (so `café` parses bare),
-/// but rendering quotes every non-ASCII name. Backticks keep generated Cypher
-/// ASCII — readable by older CypherLite versions that predate Unicode
-/// identifiers, and independent of the pinned Unicode table version — and the
-/// quoted form round-trips exactly in every name position, so the narrower
-/// gate is a rendering choice, not a dialect claim.
-fn has_plain_identifier_shape(name: &str) -> bool {
-    let mut chars = name.chars();
-    // ASCII-only: see the doc comment. The predicates accept non-ASCII too.
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii() && is_identifier_start(c))
-        && chars.all(|c| c.is_ascii() && is_identifier_part(c))
-}
-
 /// True when `name` must be backtick-quoted to round-trip as a Cypher name.
 ///
 /// The DDL / canonical identifier-quoting policy: a name is bare only when it
-/// has the plain identifier shape ([`has_plain_identifier_shape`]) **and**
+/// has the plain identifier shape
+/// ([`cypherlite_model::identifier::has_plain_identifier_shape`]) **and**
 /// [`lookup_keyword`] does not classify it as a keyword.
 ///
 /// Keyword names need quotes even in positions that accept them bare (a
@@ -507,52 +485,26 @@ fn has_plain_identifier_shape(name: &str) -> bool {
 /// would not parse everywhere. Quoting every keyword keeps one rendered
 /// statement runnable in every position instead of deciding per site.
 pub fn identifier_needs_quotes(name: &str) -> bool {
-    !has_plain_identifier_shape(name) || lookup_keyword(name).is_keyword()
+    !cypherlite_model::identifier::has_plain_identifier_shape(name)
+        || lookup_keyword(name).is_keyword()
 }
 
 /// Renders `name` as a Cypher identifier for generated Cypher text: bare
 /// when [`identifier_needs_quotes`] is false, otherwise through
-/// [`quote_identifier_always`].
+/// [`cypherlite_model::identifier::quote_identifier_always`] (the one
+/// spelling of the quoting escape).
 pub fn quote_identifier(name: &str) -> String {
     if identifier_needs_quotes(name) {
-        quote_identifier_always(name)
+        cypherlite_model::identifier::quote_identifier_always(name)
     } else {
         name.to_string()
     }
-}
-
-/// Renders `name` as a Cypher identifier for **display** text (CIP-257's
-/// `SHOW CURRENT GRAPH TYPE AS GRAPH` node/relationship properties and
-/// constraints): bare when [`has_plain_identifier_shape`] holds, otherwise
-/// through [`quote_identifier_always`].
-///
-/// This is the shape-only half of the policy: keyword spellings stay bare
-/// (`when`, `order`), matching CypherLite's CIP-257 display corpus (a
-/// hyphenated `` `prop-3` `` is quoted, a keyword `when` is not). Display text
-/// is not re-parsed as a statement, so it owes no keyword-position guarantee;
-/// a name that must round-trip as generated Cypher goes through
-/// [`quote_identifier`] instead.
-pub fn quote_identifier_shaped(name: &str) -> String {
-    if has_plain_identifier_shape(name) {
-        name.to_string()
-    } else {
-        quote_identifier_always(name)
-    }
-}
-
-/// Renders `name` in the always-backtick-quoted form: wrapped in backticks
-/// with every embedded backtick doubled (the Cypher escape rule), whatever
-/// [`identifier_needs_quotes`] would say. The one spelling of the quoting
-/// escape: [`quote_identifier`]'s quoting arm, [`quote_identifier_shaped`]'s
-/// quoting arm, and every caller that needs a forced-quoted name
-/// (SHOW-rendered Cypher, canonical graph-type text) call it instead of
-/// re-spelling the `format!`/`replace`.
-pub fn quote_identifier_always(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }
 
 #[cfg(test)]
 mod tests {
+    use cypherlite_model::identifier::{quote_identifier_always, quote_identifier_shaped};
+
     use super::*;
 
     #[test]

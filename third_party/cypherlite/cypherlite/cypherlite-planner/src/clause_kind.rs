@@ -75,18 +75,17 @@ pub(crate) fn ir_clause_keyword(clause: &cypherlite_ir::Clause) -> &'static str 
         Ir::Conditional { .. } => "WHEN",
         Ir::Foreach { .. } => "FOREACH",
         Ir::Use { .. } => "USE",
-        Ir::CreateConstraint { .. } => "CREATE CONSTRAINT",
-        Ir::DropConstraint { .. } => "DROP CONSTRAINT",
     }
 }
 
 /// The read/write/schema class of a planner IR clause — the ONE home of
 /// the schema-vs-write split the namespace gates ([`crate::namespaces`])
 /// and the query-type classifier ([`crate::query_type`]) share through the
-/// access fold ([`crate::access`]). Index/constraint DDL is
-/// [`ClauseClass::Schema`] in either its IR or `Catalog` form; the
-/// remaining catalog DDL (database / graph-type commands) and the plain
-/// data-write variants are [`ClauseClass::Write`]. CALL, CALL { … } and
+/// access fold ([`crate::access`]). Catalog DDL — index, constraint and
+/// graph-type commands — is [`ClauseClass::Schema`] in either its IR or
+/// `Catalog` form; `ALTER DATABASE` and the plain data-write variants are
+/// [`ClauseClass::Write`] (ADR-0447: a graph type is schema, so a read tool
+/// refuses it and a DDL tool admits it). CALL, CALL { … } and
 /// WHEN/ELSE are [`ClauseClass::Read`] here: the consumers classify those
 /// differently by design — `validate.rs` rejects writes in subquery
 /// expressions (inspecting CALL bodies), the access fold classifies a
@@ -110,13 +109,15 @@ pub(crate) enum ClauseClass {
 fn catalog_command_class(command: &cypherlite_parser::Clause) -> ClauseClass {
     use cypherlite_parser::Clause as C;
     match command {
-        C::CreateIndex(_) | C::DropIndex(_) | C::CreateConstraint(_) | C::DropConstraint(_) => {
-            ClauseClass::Schema
-        }
-        // Catalog writes the namespace gate already treats as writes.
-        C::AlterDatabase(_) | C::CreateGraphType(_) | C::AlterCurrentGraphType(_) => {
-            ClauseClass::Write
-        }
+        C::CreateIndex(_)
+        | C::DropIndex(_)
+        | C::CreateConstraint(_)
+        | C::DropConstraint(_)
+        | C::CreateGraphType(_)
+        | C::AlterCurrentGraphType(_) => ClauseClass::Schema,
+        // Catalog writes the namespace gate already treats as writes; a
+        // database command is administration, not a schema definition.
+        C::AlterDatabase(_) => ClauseClass::Write,
         // The SHOW family and the other read-only commands. The plain
         // data-write variants (Create/Merge/Delete/Set/Remove/Foreach/
         // LoadCSV) are Read in `Catalog` form: the front-end lowers them
@@ -167,10 +168,7 @@ pub(crate) fn clause_class(clause: &cypherlite_ir::Clause) -> ClauseClass {
     use cypherlite_ir::Clause as Ir;
     match clause {
         Ir::Catalog(command) => catalog_command_class(command.as_ref()),
-        Ir::CreateIndex { .. }
-        | Ir::DropIndex { .. }
-        | Ir::CreateConstraint { .. }
-        | Ir::DropConstraint { .. } => ClauseClass::Schema,
+        Ir::CreateIndex { .. } | Ir::DropIndex { .. } => ClauseClass::Schema,
         Ir::Create { .. }
         | Ir::Merge { .. }
         | Ir::Delete { .. }
@@ -194,6 +192,47 @@ pub(crate) fn clause_class(clause: &cypherlite_ir::Clause) -> ClauseClass {
         | Ir::CallSubquery { .. }
         | Ir::Conditional { .. }
         | Ir::Use { .. } => ClauseClass::Read,
+    }
+}
+
+/// Whether `clause` projects statement rows of its own: a `RETURN`, a
+/// row-producing catalog command (the SHOW family and
+/// `TERMINATE TRANSACTIONS`), `MATCH`/`WITH`/`UNWIND`/`CALL { … }`/`WHEN`
+/// and every other read clause do; a data write, `FINISH` and schema/admin
+/// DDL do not. The one published per-clause answer to "does this clause
+/// produce rows?", beside [`clause_mutates_store`] and read by the
+/// executor's `CALL { … }` merge policy and NEXT-stage seeding policy, so
+/// no consumer keeps a second list of write clauses.
+///
+/// The catalog arm delegates to `cypherlite_front`'s
+/// [`catalog_produces_rows`](cypherlite_front::show_columns::catalog_produces_rows)
+/// — the catalog command table's one row answer — rather than re-listing
+/// the SHOW family here.
+pub fn clause_projects_rows(clause: &cypherlite_ir::Clause) -> bool {
+    use cypherlite_ir::Clause as Ir;
+    match clause {
+        Ir::Catalog(command) => {
+            cypherlite_front::show_columns::catalog_produces_rows(command.as_ref())
+        }
+        Ir::Finish
+        | Ir::Create { .. }
+        | Ir::Merge { .. }
+        | Ir::Delete { .. }
+        | Ir::Set { .. }
+        | Ir::Remove { .. }
+        | Ir::Foreach { .. }
+        | Ir::CreateIndex { .. }
+        | Ir::DropIndex { .. } => false,
+        Ir::Match { .. }
+        | Ir::Call { .. }
+        | Ir::With { .. }
+        | Ir::Unwind { .. }
+        | Ir::Return { .. }
+        | Ir::ShowIndexes
+        | Ir::LoadCsv { .. }
+        | Ir::CallSubquery { .. }
+        | Ir::Conditional { .. }
+        | Ir::Use { .. } => true,
     }
 }
 

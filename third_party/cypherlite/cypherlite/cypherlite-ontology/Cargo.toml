@@ -2,6 +2,7 @@
 name = "cypherlite-ontology"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 cypherlite-core = { workspace = true }

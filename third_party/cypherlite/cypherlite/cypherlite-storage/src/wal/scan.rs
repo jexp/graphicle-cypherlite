@@ -23,7 +23,7 @@ pub(super) fn list_segment_ids(vfs: &dyn Vfs, prefix: &str) -> Result<Vec<u32>> 
     Ok(ids)
 }
 
-pub(super) fn parse_seg_name(name: &str) -> Option<u32> {
+pub(crate) fn parse_seg_name(name: &str) -> Option<u32> {
     let s = name.strip_suffix(".log")?;
     if s.len() != 8 || !s.chars().all(|c| c.is_ascii_digit()) {
         return None;

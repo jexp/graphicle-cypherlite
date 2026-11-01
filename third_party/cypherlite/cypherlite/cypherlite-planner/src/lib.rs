@@ -17,8 +17,8 @@
 //! - [`order`] — cardinality estimates and MATCH pattern order
 //! - [`clause_kind`] — the Cypher keyword for a parser / planner-IR clause,
 //!   the one read/write/schema clause classification behind
-//!   [`clause_mutates_store`](crate::clause_mutates_store) (its published
-//!   per-clause answer)
+//!   [`clause_mutates_store`] and [`clause_projects_rows`] (its published
+//!   per-clause answers)
 //! - [`access`] — the one read/write/schema clause fold over a statement,
 //!   shared by [`namespaces`] and [`query_type`]
 //! - [`namespaces`] — the ADR-0116 namespace classifiers (§2
@@ -45,7 +45,8 @@ mod stats;
 mod use_target;
 mod validate;
 
-pub use crate::clause_kind::{clause_keyword, clause_mutates_store};
+pub use crate::clause_kind::{clause_keyword, clause_mutates_store, clause_projects_rows};
+pub use crate::names::query_with_persistent_imports;
 pub use crate::namespaces::{
     is_database_admin_command, is_show_databases_with_next, is_write, plan_calls_write_procedure,
     unsupported_system_clause_names,

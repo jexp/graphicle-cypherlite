@@ -5,23 +5,16 @@ pub(super) fn map_exprs(xs: &[cl::Expr]) -> Result<Vec<mdb::Expr>> {
 }
 
 /// One GQL function alias (CIP-245): the snake_case GQL/SQL spelling the
-/// parser accepts, the Cypher-canonical function name it lowers to, and
-/// whether the spelling is a temporal constructor — the vocabulary the
-/// `tostring_full` precision policy matches (see the table below).
+/// parser accepts and the Cypher-canonical function name it lowers to.
 struct GqlFunctionAlias {
     gql: &'static str,
     cypher: &'static str,
-    temporal_constructor: bool,
 }
 
 /// GQL function aliases (CIP-245): the snake_case GQL/SQL spellings the
 /// parser accepts, each lowered to its Cypher-canonical function name.
-/// The `temporal_constructor` markers are the `toString` rendering
-/// vocabulary: `toString(<temporal constructor call>)` renders full
-/// precision, so the lowering renames such a call to the internal
-/// `tostring_full` function (an `UNADVERTISED_FUNCTIONS` name, never
-/// written by users). One table carries both policies — the rename and
-/// the rendering — so a new spelling updates both together.
+/// (`toString` rendering is not a spelling policy: the executor's value
+/// layer renders temporals at full precision by runtime type, ADR-0448.)
 ///
 /// This is the scalar-function alias table. It is a second table beside
 /// [`crate::agg::AGGREGATE_ALIASES`] (which names itself "the single alias
@@ -34,32 +27,26 @@ const GQL_FUNCTION_ALIASES: &[GqlFunctionAlias] = &[
     GqlFunctionAlias {
         gql: "path_length",
         cypher: "length",
-        temporal_constructor: false,
     },
     GqlFunctionAlias {
         gql: "duration_between",
         cypher: "duration.between",
-        temporal_constructor: false,
     },
     GqlFunctionAlias {
         gql: "local_time",
         cypher: "localtime",
-        temporal_constructor: true,
     },
     GqlFunctionAlias {
         gql: "local_datetime",
         cypher: "localdatetime",
-        temporal_constructor: true,
     },
     GqlFunctionAlias {
         gql: "zoned_time",
         cypher: "time",
-        temporal_constructor: true,
     },
     GqlFunctionAlias {
         gql: "zoned_datetime",
         cypher: "datetime",
-        temporal_constructor: true,
     },
 ];
 
@@ -84,14 +71,12 @@ fn resolve_vector_metric_arg(lowered_name: &str, args: &mut [mdb::Expr]) {
 }
 
 /// The IR name for a parsed function call, applying the lowering's
-/// three name policies in order: the `tostring_full` precision rename,
-/// the aggregate alias display spelling (CIP-128, resolved from the
-/// single alias table in `agg`), and the GQL scalar alias table
-/// (CIP-245). A name matching no policy keeps its parsed spelling.
+/// two name policies in order: the aggregate alias display spelling
+/// (CIP-128, resolved from the single alias table in `agg`) and the GQL
+/// scalar alias table (CIP-245). A name matching no policy keeps its
+/// parsed spelling.
 fn lower_function_name(f: &cl::FunctionCallExpr, lowered_name: &str) -> String {
-    if is_tostring_of_gql_temporal(f, lowered_name) {
-        "tostring_full".into()
-    } else if let Some(display) = crate::agg::display_agg_alias(lowered_name) {
+    if let Some(display) = crate::agg::display_agg_alias(lowered_name) {
         display.into()
     } else if let Some(alias) = GQL_FUNCTION_ALIASES
         .iter()
@@ -101,30 +86,6 @@ fn lower_function_name(f: &cl::FunctionCallExpr, lowered_name: &str) -> String {
     } else {
         f.name.clone()
     }
-}
-
-/// True when the call is `toString(<GQL temporal constructor call>)`
-/// (case-insensitive on both names): the caller whose argument names one
-/// of the temporal-constructor entries of `GQL_FUNCTION_ALIASES`,
-/// lowering to the full-precision `tostring_full` function. The match is
-/// name-based — the lower layer has no typed view of the argument call;
-/// a parser-level typing is out of scope here (noted on the PR).
-fn is_tostring_of_gql_temporal(f: &cl::FunctionCallExpr, lowered_name: &str) -> bool {
-    lowered_name == "tostring"
-        && matches!(
-            f.args.first(),
-            Some(cl::Expr::FunctionCall(inner))
-                if is_gql_temporal_constructor(&inner.name.to_ascii_lowercase())
-        )
-}
-
-/// True when `lowered_name` is one of the temporal-constructor entries of
-/// `GQL_FUNCTION_ALIASES` — the spellings whose `toString(<call>)`
-/// renders full precision.
-fn is_gql_temporal_constructor(lowered_name: &str) -> bool {
-    GQL_FUNCTION_ALIASES
-        .iter()
-        .any(|alias| alias.temporal_constructor && alias.gql == lowered_name)
 }
 
 pub fn lower_expr(e: &cl::Expr) -> Result<mdb::Expr> {

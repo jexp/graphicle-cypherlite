@@ -12,19 +12,21 @@ use super::collect_non_agg_variables;
 use crate::agg::contains_aggregation;
 use crate::ast::collect::{collect_expr_variables, interp_embeds};
 
-/// The grouping keys of a projection clause, bundled with the two facts the
-/// ambiguity checks need about them: the variables the key expressions
-/// mention, and whether a `*` item is among the keys. Bundling them keeps
-/// the ADR-0198 ruling-1 policy in one place and collapses the per-leaf
-/// pass-through plumbing to a single `&GroupingKeys` parameter.
-struct GroupingKeys<'a> {
+/// The grouping keys of a projection clause, bundled with the derived
+/// facts the ambiguity checks need about them: the variables the key
+/// expressions mention (extended by [`GroupingKeys::with_aliases`] with
+/// projected-alias names), and whether a `*` item is among the keys.
+/// Bundling them keeps the ADR-0198 ruling-1 policy in one place and
+/// collapses the per-leaf pass-through plumbing to a single
+/// `&GroupingKeys` parameter.
+pub(super) struct GroupingKeys<'a> {
     exprs: &'a [&'a Expr],
     vars: HashSet<String>,
     star: bool,
 }
 
 impl<'a> GroupingKeys<'a> {
-    fn new(exprs: &'a [&'a Expr]) -> Self {
+    pub(super) fn new(exprs: &'a [&'a Expr]) -> Self {
         Self {
             exprs,
             vars: grouping_key_vars(exprs),
@@ -34,15 +36,30 @@ impl<'a> GroupingKeys<'a> {
         }
     }
 
-    /// ADR-0198 ruling 1: a `*` item covers every in-scope variable;
-    /// otherwise the variable must appear in a grouping key expression.
-    fn covers_variable(&self, v: &str) -> bool {
-        self.star || self.vars.contains(v)
+    /// "A projected alias counts as a grouping reference" (e.g.
+    /// `me.age AS age` makes `age` a valid grouping reference): the alias
+    /// NAMES extend the model's key variables — an alias behaves exactly
+    /// like a key variable (coverage and property-target rule).
+    pub(super) fn with_aliases(&self, aliases: impl IntoIterator<Item = String>) -> Self {
+        let mut vars = self.vars.clone();
+        vars.extend(aliases);
+        Self {
+            exprs: self.exprs,
+            vars,
+            star: self.star,
+        }
     }
 
-    /// The variable appears in a grouping key expression — `*` coverage
-    /// does NOT apply here: `*` projects the variables, not their property
-    /// expressions, so property targets keep the exact-variable rule.
+    /// ADR-0198 ruling 1: a `*` item covers every in-scope variable;
+    /// otherwise the exact-variable rule decides.
+    pub(super) fn covers_variable(&self, v: &str) -> bool {
+        self.star || self.key_variable(v)
+    }
+
+    /// The variable appears in a grouping key expression (or is an
+    /// extended alias) — `*` coverage does NOT apply here: `*` projects
+    /// the variables, not their property expressions, so property
+    /// targets keep the exact-variable rule.
     fn key_variable(&self, v: &str) -> bool {
         self.vars.contains(v)
     }
@@ -55,10 +72,8 @@ impl<'a> GroupingKeys<'a> {
 }
 
 /// Collect every variable mentioned by the grouping key expressions into
-/// one set. Runs once per [`GroupingKeys`] construction, plus once per
-/// aggregating WITH ... ORDER BY section in the driver; the result is passed
-/// down by reference, so the per-leaf checks below never rebuild it.
-pub(super) fn grouping_key_vars(grouping_key_exprs: &[&Expr]) -> HashSet<String> {
+/// one set. Runs once per [`GroupingKeys::new`].
+fn grouping_key_vars(grouping_key_exprs: &[&Expr]) -> HashSet<String> {
     let mut vars = HashSet::new();
     for key in grouping_key_exprs {
         collect_expr_variables(key, &mut vars);
@@ -79,8 +94,17 @@ pub(super) fn grouping_key_vars(grouping_key_exprs: &[&Expr]) -> HashSet<String>
 /// - Parameters mixed with aggregation
 /// - Simple variables that are grouping keys (e.g., n + count(*) when n is grouped)
 /// - Property accesses on grouping key variables (e.g., n.age + count(*) when n.age is grouped)
-pub(super) fn is_ambiguous_aggregation(expr: &Expr, grouping_key_exprs: &[&Expr]) -> bool {
-    let keys = GroupingKeys::new(grouping_key_exprs);
+///
+/// The caller constructs the [`GroupingKeys`] model once per clause
+/// (base keys for the projection-item check, alias-extended for the
+/// WITH ORDER BY check) and passes it here. The precondition set is
+/// this predicate's own: the expression must actually mix aggregation
+/// with non-aggregation (a non-aggregating expression is never
+/// ambiguous), and a bare aggregate is never ambiguous either.
+pub(super) fn is_ambiguous_aggregation(expr: &Expr, keys: &GroupingKeys) -> bool {
+    if !contains_aggregation(expr) {
+        return false;
+    }
 
     // Collect non-aggregation variables from the expression
     let mut non_agg_vars = HashSet::new();
@@ -100,7 +124,7 @@ pub(super) fn is_ambiguous_aggregation(expr: &Expr, grouping_key_exprs: &[&Expr]
     // is more complex than what the grouping keys provide.
     // The non-agg parts must structurally match a grouping key expression
     // or be a simple expression built from grouping key variables.
-    check_non_agg_parts_match_keys(expr, &keys)
+    check_non_agg_parts_match_keys(expr, keys)
 }
 
 /// Check if non-aggregation sub-expressions in a mixed aggregation expression
