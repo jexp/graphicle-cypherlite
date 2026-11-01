@@ -494,9 +494,14 @@ const EPISODE: &str = "ep-1";
 /// store, and the job's recorded report. No `:Project` node exists, so the
 /// view is answered without the supernode.
 fn conformance_graph() -> (GraphStore, crate::arch_rules::EnrichReport) {
+    conformance_of(CONFORMANCE_RULES)
+}
+
+/// [`conformance_graph`] over the rule document `rules`.
+fn conformance_of(rules: &str) -> (GraphStore, crate::arch_rules::EnrichReport) {
     use crate::store_graph;
     let graph = GraphStore::open_in_memory().unwrap();
-    let document = crate::arch_rules::parse(CONFORMANCE_RULES).unwrap();
+    let document = crate::arch_rules::parse(rules).unwrap();
     crate::arch_rules::store(&graph, REPO, "docs/architecture/viz.md", &document).unwrap();
     graph
         .transaction(|db| {
@@ -547,7 +552,7 @@ fn conformance_graph() -> (GraphStore, crate::arch_rules::EnrichReport) {
             store_graph::write(
                 db,
                 "CREATE (:Job {repository_id: $repo, kind: 'enrich', state: 'complete', \
-                   id: 'job-1', input_hash: $hash, result: $result})",
+                   id: 'job-1', input_hash: $hash, updated_at: '2026-01-01T00:00:00Z', result: $result})",
                 store_graph::params(&json!({"repo": REPO,
                     "hash": crate::jobs::enrich_input_hash(&report.rule_set, EPISODE),
                     "result": report.to_value().to_string()})),
@@ -701,4 +706,21 @@ fn an_empty_store_reads_as_an_empty_conformance_view() {
     assert_eq!(view.model["totals"]["violations"], 0);
     assert!(view.mermaid.is_none());
     assert!(view.sections.iter().all(|(_, rows)| rows.is_empty()));
+}
+
+/// A rule set of one constraint and no concept: the call edges from the api
+/// folder into the db folder, the three the code graph holds.
+const CONSTRAINT_ONLY_RULES: &str = "````constraint\nid: arch:Viz/CrossLayerCall\nseverity: BLOCKER\n```cypher\nMATCH (a:Symbol {repository_id: $repo})-[:CALLS]->(b:Symbol {repository_id: $repo}) WHERE a.relpath STARTS WITH 'src/api/' AND b.relpath STARTS WITH 'src/db/' RETURN a, b\n```\n````\n";
+
+#[test]
+fn a_constraint_only_rule_set_shows_its_recorded_results_and_violations() {
+    let (graph, _) = conformance_of(CONSTRAINT_ONLY_RULES);
+    let view = super::arch_conformance::view(&graph, REPO, &Params::default()).unwrap();
+    assert_eq!(view.model["episode"], EPISODE);
+    let row = row_of(&view.model["constraints"], "arch:Viz/CrossLayerCall");
+    assert_eq!(row["status"], "violations");
+    assert_eq!(row["violations"], 3);
+    assert_eq!(view.model["violations"].as_array().unwrap().len(), 3);
+    assert_eq!(view.model["totals"]["violations"], 3);
+    assert_eq!(view.model["concepts"], json!([]));
 }

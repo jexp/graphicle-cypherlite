@@ -6,9 +6,11 @@
 //! enrich job's recorded report ([`EnrichReport`]) for each constraint's
 //! status.
 //!
-//! The episode is the one the latest concept application was recorded for
-//! (its `applied_at`, ties by episode name). A rule set of constraints with
-//! no concept has no application and reads as an empty view.
+//! The episode and the report are the latest enrich run recorded under the
+//! rule set the store holds now (the job's `updated_at`, ties by id), so a
+//! constraint-only rule set is served like any other. With no recorded run,
+//! the declared rules still list (their status reads `unrecorded`) and no
+//! observed rows are shown: declared without actual, said plainly.
 //!
 //! `focus` scopes the view to a folder: the violations, the coverage and the
 //! rollup beneath it. Every section is ranked and cut to `cap`; the totals
@@ -55,9 +57,11 @@ struct Facts {
 /// The conformance view of `repository`: the sections of its text report
 /// and the model its json form serves.
 pub fn view(graph: &GraphStore, repository: &str, params: &Params) -> Result<View> {
-    let episode = current_episode(graph, repository)?.unwrap_or_default();
+    let (episode, recorded) = latest_run(graph, repository)?.map_or_else(
+        || (String::new(), None),
+        |(episode, report)| (episode, Some(report)),
+    );
     let facts = facts(graph, repository, &episode)?;
-    let recorded = recorded(graph, repository, &episode)?;
     let within = |location: Option<&str>| {
         params.focus.as_deref().is_none_or(|focus| {
             focus == "."
@@ -233,57 +237,40 @@ pub fn view(graph: &GraphStore, repository: &str, params: &Params) -> Result<Vie
     })
 }
 
-/// The episode the latest concept application was recorded for, `None`
-/// when no concept has applied.
-fn current_episode(graph: &GraphStore, repository: &str) -> Result<Option<String>> {
-    let rows = graph.read(|db| {
-        store_graph::rows(
-            db,
-            "MATCH (a:RuleApplication {repository_id: $repo}) \
-             RETURN a.episode AS episode, a.applied_at AS applied",
-            store_graph::params(&json!({"repo": repository})),
-        )
-    })?;
-    Ok(rows
-        .iter()
-        .map(|row| {
-            (
-                store_graph::s(row, "applied").to_string(),
-                store_graph::s(row, "episode").to_string(),
-            )
-        })
-        .max()
-        .map(|(_, episode)| episode))
-}
-
-/// The enrich job's recorded report for `episode` under the rule set the
-/// store holds now, the latest such job when more than one was recorded.
-fn recorded(graph: &GraphStore, repository: &str, episode: &str) -> Result<Option<EnrichReport>> {
-    if episode.is_empty() {
-        return Ok(None);
-    }
+/// The latest enrich run recorded under the rule set the store holds now:
+/// its episode and its report. Recency is the job's `updated_at` (set when it
+/// completes), ties by id. A job that skipped its episode carries no report
+/// of its own, so it is not a record.
+fn latest_run(graph: &GraphStore, repository: &str) -> Result<Option<(String, EnrichReport)>> {
     let rule_set = rule_set_hash(graph, repository)?;
     let rows = graph.read(|db| {
         store_graph::rows(
             db,
             "MATCH (j:Job {repository_id: $repo, kind: 'enrich', state: 'complete'}) \
-             RETURN j.id AS id, j.result AS result",
+             RETURN j.id AS id, j.updated_at AS updated, j.result AS result",
             store_graph::params(&json!({"repo": repository})),
         )
     })?;
-    let mut found: Vec<(String, EnrichReport)> = rows
+    let mut found: Vec<((String, String), EnrichReport)> = rows
         .iter()
         .filter_map(|row| {
             let value = serde_json::from_str::<Value>(store_graph::s(row, "result")).ok()?;
             let report = EnrichReport::from_value(value).ok()?;
-            (report.episode == episode
-                && report.rule_set == rule_set
-                && report.constraints.is_some())
-            .then(|| (store_graph::s(row, "id").to_string(), report))
+            (report.rule_set == rule_set && report.constraints.is_some()).then(|| {
+                (
+                    (
+                        store_graph::s(row, "updated").to_string(),
+                        store_graph::s(row, "id").to_string(),
+                    ),
+                    report,
+                )
+            })
         })
         .collect();
     found.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(found.pop().map(|(_, report)| report))
+    Ok(found
+        .pop()
+        .map(|(_, report)| (report.episode.clone(), report)))
 }
 
 /// The status each recorded constraint reached, by rule id.
