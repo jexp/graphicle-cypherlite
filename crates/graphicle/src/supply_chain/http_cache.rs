@@ -365,19 +365,19 @@ fn write_disk(dir: &Path, path: &Path, key: &str, entry: &Entry) -> std::io::Res
 /// A fake transport for tests: canned responses by URL, and a call count.
 /// An unknown URL answers 404.
 #[cfg(test)]
-pub(crate) mod test_transport {
+pub mod test_transport {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    pub(crate) struct FixtureTransport {
+    pub struct FixtureTransport {
         routes: HashMap<String, HttpResponse>,
         calls: AtomicUsize,
         posted: Mutex<Vec<String>>,
     }
 
     impl FixtureTransport {
-        pub(crate) fn new(routes: impl IntoIterator<Item = (String, HttpResponse)>) -> Self {
+        pub fn new(routes: impl IntoIterator<Item = (String, HttpResponse)>) -> Self {
             Self {
                 routes: routes.into_iter().collect(),
                 calls: AtomicUsize::new(0),
@@ -386,12 +386,12 @@ pub(crate) mod test_transport {
         }
 
         /// The number of requests that reached this transport.
-        pub(crate) fn calls(&self) -> usize {
+        pub fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
 
         /// The bodies POSTed to this transport, in order.
-        pub(crate) fn posted(&self) -> Vec<String> {
+        pub fn posted(&self) -> Vec<String> {
             self.posted
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -409,7 +409,7 @@ pub(crate) mod test_transport {
     }
 
     /// A 200 response carrying `body`, with `max-age=3600`.
-    pub(crate) fn json(body: &str) -> HttpResponse {
+    pub fn json(body: &str) -> HttpResponse {
         HttpResponse {
             status: 200,
             cache_control: Some("public, max-age=3600".to_owned()),
