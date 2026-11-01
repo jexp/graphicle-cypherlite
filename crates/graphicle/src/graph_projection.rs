@@ -2123,8 +2123,21 @@ use graphicle_memory::graph::cross_repo_imports::{self as xrepo, ExportIndex, Pa
 
 /// `via` marker on cross-repository report items.
 pub const VIA_CROSS_REPO_IMPORT: &str = "cross_repo_import";
-const MANIFEST_FILES: &[&str] = &["pyproject.toml", "setup.cfg", "package.json", "go.mod"];
-const MANIFEST_SKIP_DIRS: &[&str] = &["node_modules/", "vendor/", ".venv/", "dist/", "build/"];
+const MANIFEST_FILES: &[&str] = &[
+    "pyproject.toml",
+    "setup.cfg",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+];
+const MANIFEST_SKIP_DIRS: &[&str] = &[
+    "node_modules/",
+    "vendor/",
+    ".venv/",
+    "dist/",
+    "build/",
+    "target/",
+];
 
 /// Repository-level read access. Workspace membership grants access to every
 /// repository unless an explicit `revoked` row in `gf_repo_access` names the
@@ -2600,9 +2613,12 @@ fn record_packages(g: &mut GraphConnection, workspace: &str, repo: &Linkable) ->
         .collect();
     let stamp = now();
     for chunk in rows.chunks(BATCH) {
+        // `CrossPackage`, the deletion catalog's label for these nodes — not
+        // `Package`, which the supply-chain lockfile ingest owns (purl-keyed,
+        // repository-scoped).
         g.query_with_params(
             "UNWIND $rows AS row \
-             MERGE (p:Package {workspace_id:$w, repository_id:$r, episode: row.episode, \
+             MERGE (p:CrossPackage {workspace_id:$w, repository_id:$r, episode: row.episode, \
                 ecosystem: row.ecosystem, name: row.name}) \
              SET p.version = row.version, p.created_at = $stamp",
             gparams([
@@ -3345,7 +3361,7 @@ pub fn cross_unresolved_toward(
         .read(|g| {
             store_graph::rows(
                 g,
-                "MATCH (pk:Package {repository_id:$r}) \
+                "MATCH (pk:CrossPackage {repository_id:$r}) \
                  WHERE $he IS NULL OR pk.episode = $he RETURN DISTINCT pk.name AS name",
                 gparams([
                     ("r", gs(repository)),
