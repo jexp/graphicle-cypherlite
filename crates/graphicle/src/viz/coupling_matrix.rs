@@ -22,10 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use super::{Params, View, Window};
+use super::{Params, View, Window, folder_of, int, mermaid_label, run, text};
 use crate::Result;
 use crate::git_history::queries::{STRUCTURAL, Section};
-use crate::store_graph::{self, GraphStore};
+use crate::store_graph::GraphStore;
 
 /// The co-change count at which a cell is hot: the history pack's reporting
 /// threshold (`co-change` keeps pairs of more than two).
@@ -306,18 +306,20 @@ fn diagram(input: &str, focus: &str, cells: &[&Cell], window: Window) -> String 
     }
 
     let mut lines = vec!["graph LR".to_owned()];
-    lines.push(format!(
-        "  N0[{}]:::focus",
-        quote(&format!("{focus}<br/>{input}"))
-    ));
+    let focus_label = format!("\"{}<br/>{}\"", mermaid_label(focus), mermaid_label(input));
+    lines.push(format!("  N0[{focus_label}]:::focus"));
     let mut drawn = BTreeSet::new();
     for cell in cells {
         let folder = other(cell);
         if folder != focus && drawn.insert(folder.clone()) {
+            let folder_label = format!(
+                "\"{}<br/>{}\"",
+                mermaid_label(&folder),
+                mermaid_label(cell.evidence())
+            );
             lines.push(format!(
-                "  {}[{}]:::{}",
+                "  {}[{folder_label}]:::{}",
                 ids[&folder],
-                quote(&format!("{folder}<br/>{}", cell.evidence())),
                 cell.trend()
             ));
         }
@@ -335,7 +337,8 @@ fn diagram(input: &str, focus: &str, cells: &[&Cell], window: Window) -> String 
             cell.dependencies,
             cell.trend()
         );
-        lines.push(format!("  N0 ---|{}| {}", quote(&label), ids[&other(cell)]));
+        let edge_label = format!("\"{}\"", mermaid_label(&label));
+        lines.push(format!("  N0 ---|{edge_label}| {}", ids[&other(cell)]));
     }
     lines.push("  classDef focus stroke-width:3px".to_owned());
     lines.push("  classDef rising fill:#f4c7c3,stroke:#b03a2e".to_owned());
@@ -345,17 +348,6 @@ fn diagram(input: &str, focus: &str, cells: &[&Cell], window: Window) -> String 
     lines.join("\n") + "\n"
 }
 
-/// A mermaid label: double-quoted, with its own quotes entity-encoded.
-fn quote(text: &str) -> String {
-    format!("\"{}\"", text.replace('"', "#quot;"))
-}
-
-/// The folder of a file: its directory, `.` for a file at the root.
-fn folder_of(path: &str) -> String {
-    path.rsplit_once('/')
-        .map_or_else(|| ".".to_owned(), |(dir, _)| dir.to_owned())
-}
-
 /// The citation of a file pair: both paths, in the canonical order.
 fn pair(a: &str, b: &str) -> String {
     format!("{a} + {b}")
@@ -363,18 +355,6 @@ fn pair(a: &str, b: &str) -> String {
 
 fn ordered(a: String, b: String) -> (String, String) {
     if a <= b { (a, b) } else { (b, a) }
-}
-
-fn run(graph: &GraphStore, cypher: &str, args: &Value) -> Result<Vec<Value>> {
-    graph.read(|db| store_graph::rows(db, cypher, store_graph::params(args)))
-}
-
-fn text(row: &Value, key: &str) -> String {
-    store_graph::s(row, key).to_string()
-}
-
-fn int(row: &Value, key: &str) -> i64 {
-    row[key].as_i64().unwrap_or(0)
 }
 
 #[cfg(test)]

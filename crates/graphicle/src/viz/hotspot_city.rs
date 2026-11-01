@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 
-use super::{Overlay, Params, View, Window};
+use super::{Overlay, Params, View, Window, evidence, folder_of, int};
 use crate::Result;
 use crate::store_graph::{self, GraphStore};
 
@@ -49,8 +49,6 @@ const CANVAS: f64 = 1000.0;
 /// The days the `90d` window trails the repository's newest commit (the
 /// coupling windows' key, no new ones).
 const WINDOW_DAYS: i64 = 90;
-/// The district of a path with no folder in it: the repository root.
-const ROOT: &str = ".";
 /// The height channel's name: churn-count, the size proxy this family
 /// states (line count is not stored).
 const HEIGHT: &str = "churn-count";
@@ -271,7 +269,7 @@ fn read(graph: &GraphStore, repository: &str, window: Window) -> Result<Vec<Memb
     for row in &rows {
         let path = store_graph::s(row, "file").to_string();
         let member = files.entry(path.clone()).or_insert_with(|| Member {
-            district: district(&path),
+            district: folder_of(&path),
             path,
             height: 0,
             windowed: 0,
@@ -293,15 +291,6 @@ fn date(row: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(store_graph::s(row, "at"))
         .ok()
         .map(|at| at.with_timezone(&Utc))
-}
-
-/// A path's district: its folder prefix — `src` for `src/lib.rs` — the
-/// repository root for a path with no folder.
-fn district(path: &str) -> String {
-    match path.rfind('/') {
-        Some(at) if !path[..at].is_empty() => path[..at].to_string(),
-        _ => ROOT.to_string(),
-    }
 }
 
 /// The window's basis, as the model states it.
@@ -450,14 +439,4 @@ fn round(value: f64) -> f64 {
 /// A cell's bounds, as the model carries them.
 fn cell_json(cell: Rect) -> Value {
     json!({"x": round(cell.x), "y": round(cell.y), "w": round(cell.w), "h": round(cell.h)})
-}
-
-/// A row's integer field (the history pack's `int`).
-fn int(row: &Value, key: &str) -> i64 {
-    row[key].as_i64().unwrap_or(0)
-}
-
-/// A row's evidence (the history pack's tie key).
-fn evidence(row: &Value) -> &str {
-    row["evidence"].as_str().unwrap_or_default()
 }

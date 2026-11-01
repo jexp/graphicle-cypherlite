@@ -16,7 +16,7 @@
 //! rollup beneath it. Every section is ranked and cut to `cap`; the totals
 //! in the model are the uncut counts.
 
-use super::{Params, View};
+use super::{Params, View, folder_of, text};
 use crate::Result;
 use crate::arch_rules::report::{self, Violation};
 use crate::arch_rules::{EnrichReport, rule_set_hash};
@@ -357,8 +357,12 @@ fn facts(graph: &GraphStore, repository: &str, episode: &str) -> Result<Facts> {
 /// A row's sort key and the row: the rank is larger-first, then the
 /// evidence, the rule and the row's own text ascending.
 fn ranked(rank: i64, row: Value) -> Ranked {
-    let text = |key: &str| row[key].as_str().unwrap_or_default().to_string();
-    let key = (-rank, text("evidence"), text("rule"), row.to_string());
+    let key = (
+        -rank,
+        text(&row, "evidence"),
+        text(&row, "rule"),
+        row.to_string(),
+    );
     (key, row)
 }
 
@@ -375,10 +379,4 @@ fn cut(mut rows: Vec<Ranked>, cap: usize) -> (usize, Vec<Value>) {
 /// A rule document location, `source:line`.
 fn cite(source: &str, line: i64) -> String {
     format!("{source}:{line}")
-}
-
-/// The folder a relpath lies in; a file at the root is in `.`.
-fn folder_of(path: &str) -> String {
-    path.rsplit_once('/')
-        .map_or_else(|| ".".to_string(), |(folder, _)| folder.to_string())
 }

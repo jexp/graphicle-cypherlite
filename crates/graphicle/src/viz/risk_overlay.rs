@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use super::{Params, View};
+use super::{Params, View, mermaid_label, text};
 use crate::Result;
 use crate::store_graph::GraphStore;
 use crate::supply_chain::tools::{self, Site};
@@ -393,7 +393,7 @@ fn diagram(
         .collect();
     let mut lines = vec!["graph LR".to_owned()];
     for (key, label) in &nodes {
-        lines.push(format!("  {}[\"{}\"]", ids[key], quote(label)));
+        lines.push(format!("  {}[\"{}\"]", ids[key], mermaid_label(label)));
     }
     for (from, to) in &edges {
         lines.push(format!("  {} --> {}", ids[from], ids[to]));
@@ -410,15 +410,6 @@ fn node(
 ) -> (u8, String) {
     nodes.entry((kind, key.clone())).or_insert(label);
     (kind, key)
-}
-
-/// A mermaid label inside its double quotes: a quote is its entity.
-fn quote(label: &str) -> String {
-    label.replace('"', "#quot;").replace(['\n', '\r'], " ")
-}
-
-fn text(row: &Value, key: &str) -> String {
-    row[key].as_str().unwrap_or_default().to_owned()
 }
 
 fn join<'a>(items: impl Iterator<Item = &'a str>) -> String {
