@@ -695,6 +695,16 @@ of `AGENTS.md` and `CLAUDE.md`, which reads as blank lines. The output of
 `sync.tracked_ignored` set to `false`, tracked paths too), or any path in an
 `.ignore` file.
 
+`graphicle sync` queues one OSV query per lockfile digest: a bulk query of the
+lockfile's crates.io packages (`querybatch`), then one advisory detail per
+advisory it names, which `vuln_impact` answers from. A lockfile that has not
+changed queues nothing new. The query is on by default. A store that must stay
+offline sets `sync.osv` to `false` (`"sync": {"osv": false}` in `models.json`,
+or `graphicle config set sync.osv false`), and the environment variable
+`GRAPHICLE_SYNC_OSV` (`0` or `1`) overrides the setting. With it off the
+lockfile is still read, nothing is sent, and `vuln_impact` says OSV has not
+scanned the project.
+
 The code graph has no such limits.
 
 ## The passage index

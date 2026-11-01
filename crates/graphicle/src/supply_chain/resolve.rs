@@ -57,7 +57,7 @@ use serde_json::{Value, json};
 use crate::Result;
 use crate::store_graph::{self, GraphStore};
 
-use super::lock;
+use super::{batches, lock};
 
 /// Provenance on every edge and node this module writes: the package side
 /// of the match is the lockfile's, so it carries lock.rs's tag.
@@ -65,9 +65,6 @@ pub const ORIGIN: &str = lock::ORIGIN;
 
 /// The use-path heads that name Rust's standard library, never a crate.
 const STDLIB: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
-
-/// Rows per transaction (lock.rs's `BATCH`).
-const BATCH: usize = 1000;
 
 /// One live Rust import edge as the store holds it.
 struct Import {
@@ -182,7 +179,7 @@ fn locked_packages(graph: &GraphStore, repository_id: &str) -> Result<BTreeMap<S
                 db,
                 "MATCH (pk:Package {repository_id: $repo, system: 'cargo'}) \
                  RETURN pk.name AS name, pk.purl AS purl",
-                params(&json!({"repo": repository_id})),
+                store_graph::params(&json!({"repo": repository_id})),
             )
         })?
         .into_iter()
@@ -205,7 +202,7 @@ fn workspace_members(graph: &GraphStore, repository_id: &str) -> Result<BTreeSet
                 db,
                 "MATCH (pv:PackageVersion {repository_id: $repo, source_kind: 'path'}) \
                  RETURN DISTINCT pv.name AS name",
-                params(&json!({"repo": repository_id})),
+                store_graph::params(&json!({"repo": repository_id})),
             )
         })?
         .into_iter()
@@ -226,7 +223,7 @@ fn imports(graph: &GraphStore, repository_id: &str) -> Result<Imports> {
              RETURN b.stable_id AS symbol, r.data AS data, r.relpath AS relpath, \
                     r.source_location AS location \
              ORDER BY symbol, relpath, location",
-            params(&json!({"repo": repository_id})),
+            store_graph::params(&json!({"repo": repository_id})),
         )
     })?;
     let mut out = Imports {
@@ -323,12 +320,12 @@ fn write(
         store_graph::write(
             db,
             "MATCH (:Symbol {repository_id: $repo})-[r:RESOLVES_TO {origin: $origin}]->() DELETE r",
-            params(&json!({"repo": repository_id, "origin": ORIGIN})),
+            store_graph::params(&json!({"repo": repository_id, "origin": ORIGIN})),
         )?;
         store_graph::write(
             db,
             "MATCH (u:UnresolvedPackage {repository_id: $repo, origin: $origin}) DETACH DELETE u",
-            params(&json!({"repo": repository_id, "origin": ORIGIN})),
+            store_graph::params(&json!({"repo": repository_id, "origin": ORIGIN})),
         )?;
         Ok(())
     })?;
@@ -355,25 +352,4 @@ fn write(
          SET u += row",
     )?;
     Ok(())
-}
-
-/// Run `query` once per [`BATCH`]-row chunk of `rows`, one transaction per
-/// chunk (lock.rs's `batches`).
-fn batches(graph: &GraphStore, repository_id: &str, rows: &[Value], query: &str) -> Result<()> {
-    for chunk in rows.chunks(BATCH) {
-        graph.transaction(|db| {
-            store_graph::write(
-                db,
-                query,
-                params(&json!({"repo": repository_id, "rows": chunk})),
-            )?;
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-/// lock.rs's parameter helper: the same shape, one module over.
-fn params(value: &Value) -> store_graph::Params {
-    store_graph::params(value)
 }
