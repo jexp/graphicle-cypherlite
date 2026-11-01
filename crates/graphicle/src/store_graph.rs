@@ -460,6 +460,18 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     (vi:Violation => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
                       episode IS STRING NOT NULL, severity IS STRING NOT NULL,
                       rule_sha IS STRING NOT NULL}),
+    // Git history (git-to-graph plan §2; written by git_history::writer).
+    // :Commit stays undeclared on purpose: the migration carried commits
+    // over (migrate/04) without the writer's properties, and a promoted
+    // type must not reject them. The new labels have no legacy rows.
+    (pe:Person => {repository_id IS STRING NOT NULL, email IS STRING NOT NULL,
+                   name IS STRING}),
+    (ch:Change => {repository_id IS STRING NOT NULL, commit IS STRING NOT NULL,
+                   path IS STRING NOT NULL, kind IS STRING, old_path IS STRING,
+                   similarity IS INTEGER}),
+    (br:Branch => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL,
+                   ref IS STRING}),
+    (tg:Tag => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -473,6 +485,10 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (rg:RuleGroup) REQUIRE (rg.repository_id, rg.id) IS KEY,
     CONSTRAINT FOR (rs:RuleSource) REQUIRE (rs.repository_id, rs.source) IS KEY,
     CONSTRAINT FOR (ra:RuleApplication) REQUIRE (ra.repository_id, ra.rule, ra.episode) IS KEY,
+    CONSTRAINT FOR (pe:Person) REQUIRE (pe.repository_id, pe.email) IS KEY,
+    CONSTRAINT FOR (ch:Change) REQUIRE (ch.repository_id, ch.commit, ch.path) IS KEY,
+    CONSTRAINT FOR (br:Branch) REQUIRE (br.repository_id, br.name) IS KEY,
+    CONSTRAINT FOR (tg:Tag) REQUIRE (tg.repository_id, tg.name) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -530,6 +546,16 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX backend_repo IF NOT EXISTS FOR (b:Backend) ON (b.repository_id)",
     "CREATE INDEX cleanup_state IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.state)",
     "CREATE INDEX cleanup_ws IF NOT EXISTS FOR (c:ProjectionCleanup) ON (c.workspace_id)",
+    // Git history (git_history::writer): the MERGE anchors of the history
+    // batches and the repository-scoped lookups the anchored-lookup rule
+    // runs (plan §2 — scope by repository_id + index, never across the
+    // project supernode). :Commit's key matches the migration's
+    // (migrate/04) MERGE, so old and new writes share it.
+    "CREATE INDEX commit_key IF NOT EXISTS FOR (c:Commit) ON (c.repository_id, c.oid)",
+    "CREATE INDEX change_key IF NOT EXISTS FOR (c:Change) ON (c.repository_id, c.commit, c.path)",
+    "CREATE INDEX person_key IF NOT EXISTS FOR (a:Person) ON (a.repository_id, a.email)",
+    "CREATE INDEX branch_key IF NOT EXISTS FOR (b:Branch) ON (b.repository_id, b.name)",
+    "CREATE INDEX tag_key IF NOT EXISTS FOR (t:Tag) ON (t.repository_id, t.name)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:

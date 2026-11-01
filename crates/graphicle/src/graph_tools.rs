@@ -673,7 +673,11 @@ pub fn pull_request(
 /// The resources of the engine's server (`graphicle-graph://report`, stats,
 /// god-nodes, surprises, audit and questions), for the connection's project.
 pub fn resources() -> Value {
-    graphicle::serve::resources_list()
+    let mut list = graphicle::serve::resources_list();
+    if let Some(list) = list.as_array_mut() {
+        list.extend(crate::git_history::queries::resources());
+    }
+    list
 }
 
 /// Read one of [`resources`] on the project's current code graph, as the
@@ -686,6 +690,14 @@ pub fn read_resource(
     repository: &str,
     uri: &str,
 ) -> Result<String> {
+    // The history pack reads the git history, not an episode: no code graph
+    // resident, so it is answered before the episode is read.
+    if let Some(family) = crate::git_history::queries::family(uri) {
+        return store.authorized_read(workspace, token, "read", |db, p| {
+            let repository = repo(db, p, repository)?;
+            crate::git_history::queries::render(&store.graph(), s(&repository, "id"), family)
+        });
+    }
     store.authorized_read(workspace, token, "read", |db, p| {
         let repository = repo(db, p, repository)?;
         let identifier = s(&repository, "id");

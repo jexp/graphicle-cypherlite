@@ -29,6 +29,7 @@ pub mod extension;
 pub mod fix;
 pub mod folders;
 pub mod fresh;
+pub mod git_history;
 pub mod git_hooks;
 pub mod graph;
 pub mod graph_command;

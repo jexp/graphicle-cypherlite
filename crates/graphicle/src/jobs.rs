@@ -196,6 +196,42 @@ fn insert_job(db: &mut GConnection, spec: &JobSpec<'_>) -> Result<String> {
     Ok(job_id)
 }
 
+/// Requeue a job with a fresh budget: back to `queued`, its attempt count
+/// and `not_before` reset, its error and lease fields cleared. The replay
+/// branch every keyed enqueue shares when it finds a failed or cancelled
+/// job under its key — the one place that reset lives.
+pub(crate) fn requeue_job(graph: &GraphStore, job_id: &str) -> Result<()> {
+    requeue_job_as(graph, job_id, None)
+}
+
+/// [`requeue_job`] that also re-binds the job to `principal`. The replayed
+/// projection is the one member of the family that does this — a restarted
+/// projection runs as the principal whose sync re-requested the head set,
+/// not the one that queued it — so the difference is an argument here,
+/// never a silent drop.
+fn requeue_job_as(graph: &GraphStore, job_id: &str, principal: Option<&str>) -> Result<()> {
+    graph.transaction(|db| {
+        let mut params = json!({"id": job_id, "now": now()});
+        let bind = match principal {
+            Some(hash) => {
+                params["principal"] = json!(hash);
+                ", j.principal_hash=$principal"
+            }
+            None => "",
+        };
+        graph::rows(
+            db,
+            &format!(
+                "MATCH (j:Job {{id: $id}}) SET j.state='queued', j.attempt=0, \
+                 j.not_before=$now, j.updated_at=$now, j.error=NULL, \
+                 j.lease_token=NULL, j.lease_until=NULL{bind}"
+            ),
+            graph::params(&params),
+        )?;
+        Ok(())
+    })
+}
+
 /// Digest of the code job results depend on, recorded in job payloads (a
 /// queued workflow's replay key includes it). Only files of this crate and
 /// the memory engine are hashed, never an extension's, so every edition
@@ -290,6 +326,8 @@ const KINDS: &[(&str, &str)] = &[
     ("project", "read"),
     ("link", "read"),
     ("enrich", "read"),
+    (crate::git_history::KIND, "read"),
+    (crate::git_history::coupling::KIND, "read"),
     (crate::observer::KIND, "propose"),
 ];
 /// Whether `kind` is a job kind of the core.
@@ -488,14 +526,7 @@ pub fn enqueue_projection(
                 // moved on before it ran) runs again, with every label, now the
                 // tree is current again. It runs as this sync's principal.
                 "failed" | "cancelled" | "complete" => {
-                    graph.transaction(|db| {
-                        graph::rows(
-                            db,
-                            "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL, j.principal_hash=$principal",
-                            graph::params(&json!({"id": s(&existing, "id"), "now": now(), "principal": p.hash})),
-                        )?;
-                        Ok(())
-                    })?;
+                    requeue_job_as(&graph, s(&existing, "id"), Some(p.hash.as_str()))?;
                     state = json!("queued");
                 }
                 // One that waits to retry may run at once.
@@ -691,6 +722,14 @@ fn project_job(store: &Store, job: &Job) -> Result<Value> {
         // job (architecture-concepts.md §1.5); a failure to queue it must
         // not fail the projection itself.
         out["enrich"] = match enqueue_enrich(store, db, identifier, &p, &info.episode) {
+            Ok(queued) => queued,
+            Err(error) => json!({"error": error.message}),
+        };
+        // Git history follows a completed projection for a project whose
+        // folder is a git repository (git-to-graph plan §4); a failure to
+        // queue it — or a folder that is not a repository — must not fail
+        // the projection itself.
+        out["history"] = match enqueue_history(store, db, identifier, &p) {
             Ok(queued) => queued,
             Err(error) => json!({"error": error.message}),
         };
@@ -961,60 +1000,19 @@ pub fn enqueue_enrich(
     }
     let rule_set = crate::arch_rules::rule_set_hash(&graph, repository)?;
     let input_hash = enrich_input_hash(&rule_set, episode);
-    if let Some(existing) = graph.read(|db| {
-        graph::one(
-            db,
-            "MATCH (j:Job {repository_id: $repo, kind: 'enrich', input_hash: $hash}) \
-             RETURN j.id AS id, j.state AS state",
-            graph::params(&json!({"repo": repository, "hash": input_hash})),
-        )
-    })? {
-        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
-            graph.transaction(|db| {
-                graph::rows(
-                    db,
-                    "MATCH (j:Job {id: $id}) SET j.state='queued', j.attempt=0, j.not_before=$now, \
-                     j.updated_at=$now, j.error=NULL, j.lease_token=NULL, j.lease_until=NULL",
-                    graph::params(&json!({"id": s(&existing, "id"), "now": now()})),
-                )?;
-                Ok(())
-            })?;
-            return Ok(
-                json!({"id": existing["id"], "state": "queued", "kind": "enrich",
-                "episode": episode, "replayed": true, "queued": true}),
-            );
-        }
-        return Ok(
-            json!({"id": existing["id"], "state": existing["state"], "kind": "enrich",
-            "episode": episode, "replayed": true, "queued": true}),
-        );
-    }
     let payload = json!({"kind": "enrich", "episode": episode, "rule_set": rule_set,
         "runtime_revision": runtime_revision()});
-    let job_id = graph.transaction(|db| {
-        insert_job(
-            db,
-            &JobSpec {
-                repository,
-                workspace: &p.workspace,
-                kind: "enrich",
-                input_hash: &input_hash,
-                payload: &payload,
-                principal_hash: &p.hash,
-                priority: -1,
-                max_attempts: 3,
-            },
-        )
-    })?;
-    store::event(
+    enqueue_keyed(
+        store,
         db,
         repository,
-        "workflow_queued",
-        json!({"id": job_id, "kind": "enrich", "episode": episode}),
-    )?;
-    Ok(
-        json!({"id": job_id, "state": "queued", "kind": "enrich", "episode": episode,
-        "replayed": false, "queued": true}),
+        p,
+        Keyed {
+            kind: "enrich",
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({"episode": episode}),
+        },
     )
 }
 
@@ -1061,6 +1059,266 @@ fn enrich_job(store: &Store, job: &Job) -> Result<Value> {
         })?;
     report.constraints = Some(constraints);
     Ok(report.to_value())
+}
+
+/// One keyed enqueue (see [`enqueue_keyed`]): the job's kind, input hash and
+/// payload, and the kind-specific `fields` its result and `workflow_queued`
+/// event carry beside `id`, `kind` and the replay flags.
+struct Keyed<'a> {
+    kind: &'a str,
+    input_hash: &'a str,
+    payload: &'a Value,
+    fields: Value,
+}
+
+/// Queue a keyed job, or replay the one already under its key. The shared
+/// core of the keyed enqueues (`enrich`, `history`, `coupling`): a job under
+/// (repository, kind, input hash) is replayed, and requeued with a fresh
+/// budget when it failed or was cancelled; otherwise one job is inserted and
+/// announced by a `workflow_queued` event.
+fn enqueue_keyed(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    keyed: Keyed,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    let Keyed {
+        kind,
+        input_hash,
+        payload,
+        fields,
+    } = keyed;
+    let reply = |id: Value, state: Value, replayed: bool| {
+        let mut out = fields.clone();
+        out["id"] = id;
+        out["state"] = state;
+        out["kind"] = json!(kind);
+        out["replayed"] = json!(replayed);
+        out["queued"] = json!(true);
+        out
+    };
+    if let Some(existing) = graph.read(|db| {
+        graph::one(
+            db,
+            "MATCH (j:Job {repository_id: $repo, kind: $kind, input_hash: $hash}) \
+             RETURN j.id AS id, j.state AS state",
+            graph::params(&json!({"repo": repository, "kind": kind, "hash": input_hash})),
+        )
+    })? {
+        if ["failed", "cancelled"].contains(&s(&existing, "state")) {
+            requeue_job(&graph, s(&existing, "id"))?;
+            return Ok(reply(existing["id"].clone(), json!("queued"), true));
+        }
+        return Ok(reply(
+            existing["id"].clone(),
+            existing["state"].clone(),
+            true,
+        ));
+    }
+    let job_id = graph.transaction(|db| {
+        insert_job(
+            db,
+            &JobSpec {
+                repository,
+                workspace: &p.workspace,
+                kind,
+                input_hash,
+                payload,
+                principal_hash: &p.hash,
+                priority: -1,
+                max_attempts: 3,
+            },
+        )
+    })?;
+    let mut event = fields.clone();
+    event["id"] = json!(job_id);
+    event["kind"] = json!(kind);
+    store::event(db, repository, "workflow_queued", event)?;
+    Ok(reply(json!(job_id), json!("queued"), false))
+}
+
+/// Queue the git history ingestion of a project whose folder is a git
+/// repository, after its projection recorded the episode (git-to-graph plan
+/// §4): one `history` job per (repository, `HEAD` sha, window), so a
+/// repeated sync of an unchanged checkout replays it. A folder that is not
+/// a git repository — or a repository with no commits — queues nothing and
+/// never fails the sync; a stale-marked history changes the input hash, so
+/// the rescan runs even though `HEAD` did not move. A failed or cancelled
+/// job starts again with a fresh budget.
+pub fn enqueue_history(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+) -> Result<Value> {
+    let graph = store.graph().clone();
+    let skipped = |reason: &str| {
+        Ok(json!({"kind": crate::git_history::KIND, "queued": false, "reason": reason}))
+    };
+    let Some(folder) = crate::folders::current_folder(&graph, repository)? else {
+        return skipped("the project has no recorded folder");
+    };
+    if !folder.join(".git").exists() {
+        return skipped("not a git repository");
+    }
+    // A folder that is a repository but unreadable to git (or with git not
+    // installed) queues nothing either; the sync it follows must succeed.
+    let Some(head) = crate::git_history::reader::current_head(&folder)? else {
+        return skipped("the repository has no commits");
+    };
+    // The episode of the current head set is correlated with HEAD here too,
+    // not only by the history job: an unchanged HEAD replays that job rather
+    // than re-running it, and a commit ingested earlier needs no job at all.
+    if let Err(error) = crate::git_history::correlation::correlate_head(&graph, repository, &folder)
+    {
+        eprintln!(
+            "graphicle: could not correlate the episode with HEAD: {}",
+            error.message
+        );
+    }
+    let window = crate::git_history::Window::default();
+    let stale = crate::git_history::writer::marked_stale(&graph, repository)?;
+    let input_hash = crate::git_history::writer::input_hash(&head, &window, stale);
+    let payload = json!({"kind": crate::git_history::KIND, "head": head,
+        "window": {"max_commits": window.max_commits, "since": window.since},
+        "format": crate::git_history::writer::FORMAT});
+    enqueue_keyed(
+        store,
+        db,
+        repository,
+        p,
+        Keyed {
+            kind: crate::git_history::KIND,
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({}),
+        },
+    )
+}
+
+/// Queue the co-change derivation of a repository once its history is
+/// complete at `head` (git-to-graph plan §5): one `coupling` job per
+/// (repository, `HEAD` sha, window configuration), so a repeated history job
+/// over an unchanged head and configuration replays it. A failed or cancelled
+/// job starts again with a fresh budget.
+pub fn enqueue_coupling(
+    store: &Store,
+    db: &Connection,
+    repository: &str,
+    p: &Principal,
+    head: &str,
+    config: &crate::git_history::coupling::Config,
+) -> Result<Value> {
+    let kind = crate::git_history::coupling::KIND;
+    let input_hash = crate::git_history::coupling::input_hash(head, config);
+    let payload = json!({"kind": kind, "head": head, "config": config.to_json(),
+        "format": crate::git_history::coupling::FORMAT});
+    enqueue_keyed(
+        store,
+        db,
+        repository,
+        p,
+        Keyed {
+            kind,
+            input_hash: &input_hash,
+            payload: &payload,
+            fields: json!({}),
+        },
+    )
+}
+
+/// Execute a `history` job: ingest the project folder's git history into
+/// the store (git-to-graph plan §2–§4 and §6), resuming from the recorded
+/// head or rescanning when it went stale. The job's lease is renewed while
+/// it runs.
+pub fn run_history(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || history_job(store, job))
+}
+
+fn history_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let (identifier, folder, p) = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission(crate::git_history::KIND)?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok((
+            s(&repository, "id").to_string(),
+            crate::folders::current_folder(&graph, s(&repository, "id"))?,
+            p,
+        ))
+    })?;
+    let Some(folder) = folder else {
+        return Ok(json!({"kind": crate::git_history::KIND, "skipped": true,
+            "reason": "the project has no recorded folder"}));
+    };
+    let window = crate::git_history::Window {
+        max_commits: job.payload["window"]["max_commits"]
+            .as_u64()
+            .map(|max| max as usize),
+        since: job.payload["window"]["since"].as_str().map(str::to_string),
+        range: None,
+    };
+    let mut ingested =
+        crate::git_history::writer::ingest(&graph, &identifier, &folder, &window, &|| {
+            leased(&graph, job)
+        })?;
+    // The commits this run ingested may be the ones the episode's head set
+    // is the tree of (episode correlation).
+    crate::git_history::correlation::correlate_head(&graph, &identifier, &folder)?;
+    // Changes resolve against the episodes correlation just recorded
+    // (change resolution, episode-lagged by design).
+    ingested["resolution"] =
+        crate::git_history::resolution::resolve(&graph, &identifier, &folder, &|| {
+            leased(&graph, job)
+        })?;
+    // The history is complete at this head: its co-change derivation waits
+    // on it (git-to-graph plan §5). A result without a head queued nothing.
+    if let Some(head) = ingested["head"].as_str().map(str::to_string) {
+        store.transaction(|db| {
+            enqueue_coupling(
+                store,
+                db,
+                &identifier,
+                &p,
+                &head,
+                &crate::git_history::coupling::Config::default(),
+            )
+        })?;
+    }
+    Ok(ingested)
+}
+
+/// Execute a `coupling` job: recompute the co-change edges of the project's
+/// history for each configured window (git-to-graph plan §5). The job's
+/// lease is renewed while it runs.
+pub fn run_coupling(store: &Store, job: &Job) -> Result<Value> {
+    with_lease_heartbeat(store, job, LEASE_HEARTBEAT, || coupling_job(store, job))
+}
+
+fn coupling_job(store: &Store, job: &Job) -> Result<Value> {
+    let graph = store.graph().clone();
+    let identifier = store.read(|db| {
+        leased(&graph, job)?;
+        let p = authorize_hash(
+            db,
+            &job.workspace,
+            &job.principal_hash,
+            permission(crate::git_history::coupling::KIND)?,
+        )?;
+        let repository = repo(db, &p, &job.repository)?;
+        Ok(s(&repository, "id").to_string())
+    })?;
+    let config = crate::git_history::coupling::Config::from_json(&job.payload["config"]);
+    crate::git_history::coupling::derive(&graph, &identifier, chrono::Utc::now(), &config, &|| {
+        leased(&graph, job)
+    })
 }
 
 /// Run `repository`'s waiting graph work in this
@@ -1145,37 +1403,98 @@ pub fn drain_projection_until(
     // (architecture-concepts.md §1.5): one job per (rule set, episode), so
     // the drain leaves the episode fully post-processed. A failing rule is
     // part of the job's result; the job itself only fails on store errors.
-    while !stopped() {
-        let Some(job) = store.lease_job_of_kind(repository, "enrich")? else {
-            break;
-        };
-        let result = crate::phase::phase("job_enrich", || run_enrich(store, &job));
-        results.push(match &result {
+    results.extend(drain_kind(
+        store,
+        repository,
+        "enrich",
+        &stopped,
+        &|store, job| crate::phase::phase("job_enrich", || run_enrich(store, job)),
+        &|job, result| match result {
             Ok(value) => json!({"job": job.id, "kind": "enrich", "ok": true,
                 "applied": value["applied"], "failed": value["failed"], "skipped": value["skipped"]}),
             Err(error) => json!({"job": job.id, "kind": "enrich", "ok": false, "error": error.message}),
-        });
-        store.finish_job(&job, result)?;
-    }
+        },
+    )?);
+    // The git history ingestion each completed projection queued
+    // (git-to-graph plan §4): one job per (repository, HEAD, window), so
+    // the drain leaves the project's history current. Background
+    // derivation, like the enrichment before it.
+    results.extend(drain_kind(
+        store,
+        repository,
+        crate::git_history::KIND,
+        &stopped,
+        &|store, job| crate::phase::phase("job_history", || run_history(store, job)),
+        &|job, result| match result {
+            Ok(value) => json!({"job": job.id, "kind": crate::git_history::KIND, "ok": true,
+                "mode": value["mode"], "commits": value["commits"]}),
+            Err(error) => {
+                json!({"job": job.id, "kind": crate::git_history::KIND, "ok": false, "error": error.message})
+            }
+        },
+    )?);
+    // The co-change derivation each completed history queued (plan §5).
+    results.extend(drain_kind(
+        store,
+        repository,
+        crate::git_history::coupling::KIND,
+        &stopped,
+        &|store, job| crate::phase::phase("job_coupling", || run_coupling(store, job)),
+        &|job, result| match result {
+            Ok(value) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
+                "ok": true, "windows": value["windows"]}),
+            Err(error) => json!({"job": job.id, "kind": crate::git_history::coupling::KIND,
+                "ok": false, "error": error.message}),
+        },
+    )?);
     let kinds = crate::extension::installed().post_projection_kinds();
     if !kinds.is_empty() && !stopped() {
         // Post-projection kinds make no model call (`JobKind::after_projection`).
         let worker = Worker::new(store.clone(), model::Config::default())?;
         for kind in kinds {
-            while !stopped() {
-                let Some(job) = store.lease_job_of_kind(repository, kind)? else {
-                    break;
-                };
-                let result = run_on_own_runtime(&worker, &job);
-                results.push(match &result {
-                    Ok(_) => json!({"job":job.id,"kind":kind,"ok":true}),
+            results.extend(drain_kind(
+                store,
+                repository,
+                kind,
+                &stopped,
+                &|_store, job| run_on_own_runtime(&worker, job),
+                &|job, result| match result {
+                    Ok(_) => json!({"job": job.id, "kind": kind, "ok": true}),
                     Err(error) => {
-                        json!({"job":job.id,"kind":kind,"ok":false,"error":error.message})
+                        json!({"job": job.id, "kind": kind, "ok": false, "error": error.message})
                     }
-                });
-                store.finish_job(&job, result)?;
-            }
+                },
+            )?);
         }
+    }
+    Ok(results)
+}
+
+/// Lease, run and finish every job of one `kind` for `repository` until none
+/// is left or `stopped` is set, collecting one summary per job run. This is
+/// the one loop behind the drain's post-projection phases — the enrichment,
+/// the history ingestion, the co-change derivation, and each installed
+/// extension kind — which differ only in kind, runner and the fields of a
+/// successful run's summary. `run` is the job's body (its phase wrapper, or
+/// the extension's own runtime); the job is finished before anything else
+/// can fail, so its lease is released rather than left to expire.
+fn drain_kind(
+    store: &Store,
+    repository: &str,
+    kind: &str,
+    stopped: &dyn Fn() -> bool,
+    run: &dyn Fn(&Store, &Job) -> Result<Value>,
+    summary: &dyn Fn(&Job, &Result<Value>) -> Value,
+) -> Result<Vec<Value>> {
+    let mut results = Vec::new();
+    while !stopped() {
+        let Some(job) = store.lease_job_of_kind(repository, kind)? else {
+            break;
+        };
+        let result = run(store, &job);
+        let summary = summary(&job, &result);
+        store.finish_job(&job, result)?;
+        results.push(summary);
     }
     Ok(results)
 }
@@ -2355,4 +2674,328 @@ fn validate_output(schema: &Value, value: &Value) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_history::fixture::{DAY_1, Repo, ada};
+    use crate::git_history::{Window, writer};
+
+    /// A store whose project folder is a git repository, as a sync would
+    /// have left it: the project node, the folder alias and one commit.
+    fn git_project() -> (tempfile::TempDir, Store, Repo) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = Repo::init(&root);
+        repo.write("src/lib.rs", "pub fn run() {}\n");
+        repo.commit(ada(DAY_1), "first", "");
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let graph = store.graph().clone();
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "CREATE (p:Project {id: $id, workspace_id: $ws, project_key: $key})",
+                    graph::params(&json!({"id": "repo-git", "ws": "ws", "key": "repo-git"})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        crate::folders::record(&graph, "ws", "repo-git", &root).unwrap();
+        (dir, store, repo)
+    }
+
+    fn principal() -> Principal {
+        Principal {
+            workspace: "ws".into(),
+            credential: "cred".into(),
+            hash: "hash".into(),
+            role: "owner".into(),
+        }
+    }
+
+    fn enqueue(store: &Store, p: &Principal) -> Value {
+        store
+            .transaction(|db| enqueue_history(store, db, "repo-git", p))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_stale_history_requeues_even_with_an_unmoved_head() {
+        let (dir, store, repo) = git_project();
+        let p = principal();
+        let graph = store.graph().clone();
+
+        // The first enqueue finds nothing under its key.
+        let first = enqueue(&store, &p);
+        assert_eq!(first["queued"], json!(true), "{first:#}");
+        assert_eq!(first["replayed"], json!(false), "{first:#}");
+
+        // The history lands, so the head record exists; HEAD never moves
+        // again in this test.
+        writer::ingest(&graph, "repo-git", repo.root(), &Window::default(), &|| {
+            Ok(())
+        })
+        .unwrap();
+
+        // The same key replays the waiting job — this is the unmoved,
+        // unstale case.
+        let replay = enqueue(&store, &p);
+        assert_eq!(replay["replayed"], json!(true), "{replay:#}");
+
+        // The head record goes stale the way the detecting run leaves it
+        // (a rewrite was found; the rescan was deferred). The stale flag
+        // folds into the input hash, so the next enqueue queues a NEW job
+        // instead of replaying the finished one.
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "MATCH (b:Branch {repository_id: $repo, name: 'HEAD'}) \
+                     SET b:Stale, b.stale_since = $now",
+                    graph::params(&json!({"repo": "repo-git", "now": now()})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let rescan = enqueue(&store, &p);
+        assert_eq!(rescan["queued"], json!(true), "{rescan:#}");
+        assert_eq!(
+            rescan["replayed"],
+            json!(false),
+            "a stale history is a new job even though HEAD did not move"
+        );
+        assert_eq!(
+            graph
+                .read(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.id AS id",
+                        graph::params(&json!({
+                            "repo": "repo-git", "kind": crate::git_history::KIND,
+                        })),
+                    )
+                })
+                .unwrap()
+                .len(),
+            2,
+            "one job per input hash: the original and the rescan"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_project_without_a_git_folder_or_head_queues_no_history() {
+        let (dir, store, _repo) = git_project();
+        let p = principal();
+        let graph = store.graph().clone();
+
+        // A folder that is not a git repository at all.
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("plain.txt"), "not a repository\n").unwrap();
+        crate::folders::record(&graph, "ws", "repo-plain", plain.path()).unwrap();
+        let skipped = store
+            .transaction(|db| enqueue_history(&store, db, "repo-plain", &p))
+            .unwrap();
+        assert_eq!(skipped["queued"], json!(false), "{skipped:#}");
+        assert_eq!(skipped["reason"], json!("not a git repository"));
+
+        // A git repository whose HEAD is unborn (no commits yet).
+        let unborn = tempfile::tempdir().unwrap();
+        Repo::init(unborn.path());
+        crate::folders::record(&graph, "ws", "repo-unborn", unborn.path()).unwrap();
+        let empty = store
+            .transaction(|db| enqueue_history(&store, db, "repo-unborn", &p))
+            .unwrap();
+        assert_eq!(empty["queued"], json!(false), "{empty:#}");
+        assert_eq!(empty["reason"], json!("the repository has no commits"));
+
+        // And a project with no recorded folder at all.
+        let folderless = store
+            .transaction(|db| enqueue_history(&store, db, "repo-none", &p))
+            .unwrap();
+        assert_eq!(folderless["queued"], json!(false), "{folderless:#}");
+        assert_eq!(
+            folderless["reason"],
+            json!("the project has no recorded folder")
+        );
+        drop(dir);
+    }
+
+    /// [`git_project`] under a real workspace, so a leased job authorizes:
+    /// the owner's principal is the workspace's capability hash. The commit
+    /// changes two files together, so the derivation has a pair to write.
+    fn coupled_project() -> (tempfile::TempDir, Store, Repo, Principal) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = Repo::init(&root);
+        repo.write("src/a.rs", "a\n");
+        repo.write("src/b.rs", "b\n");
+        repo.commit(ada(DAY_1), "first", "");
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let created = store.create_workspace("coupling").unwrap();
+        let workspace = created["id"].as_str().unwrap().to_string();
+        let token = created["capability"].as_str().unwrap();
+        let graph = store.graph().clone();
+        graph
+            .transaction(|db| {
+                graph::rows(
+                    db,
+                    "CREATE (p:Project {id: $id, workspace_id: $ws, project_key: $key})",
+                    graph::params(&json!({"id": "repo-git", "ws": workspace, "key": "repo-git"})),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // The relational row `store::repo` authorizes a job's repository by.
+        store
+            .transaction(|db| {
+                db.execute(
+                    "INSERT INTO repo_projects(id,workspace_id,project_key,name,created_at,updated_at) \
+                     VALUES(?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "repo-git", workspace, "repo-git", "repo-git",
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        crate::folders::record(&graph, &workspace, "repo-git", &root).unwrap();
+        let p = Principal {
+            workspace,
+            credential: "owner".into(),
+            hash: graphicle_memory::text::sha256(token.as_bytes()),
+            role: "owner".into(),
+        };
+        (dir, store, repo, p)
+    }
+
+    #[test]
+    fn a_history_job_queues_a_coupling_job_keyed_on_window_config_and_head() {
+        use crate::git_history::coupling::{Config, CoupledWindow, input_hash};
+        let (dir, store, repo, p) = coupled_project();
+        let graph = store.graph().clone();
+        let head = repo.rev("HEAD");
+        let enqueue = |config: &Config, head: &str| {
+            store
+                .transaction(|db| enqueue_coupling(&store, db, "repo-git", &p, head, config))
+                .unwrap()
+        };
+        let default = Config::default();
+
+        // The first enqueue finds nothing under its key.
+        let first = enqueue(&default, &head);
+        assert_eq!(first["queued"], json!(true), "{first:#}");
+        assert_eq!(first["replayed"], json!(false), "{first:#}");
+        // The same window configuration and head replay the waiting job.
+        let replay = enqueue(&default, &head);
+        assert_eq!(replay["replayed"], json!(true), "{replay:#}");
+        assert_eq!(replay["id"], first["id"], "{replay:#}");
+        // A changed window configuration is a new job.
+        let narrower = Config {
+            windows: vec![CoupledWindow {
+                key: "all".into(),
+                days: None,
+            }],
+            ..Config::default()
+        };
+        let changed_config = enqueue(&narrower, &head);
+        assert_eq!(
+            changed_config["replayed"],
+            json!(false),
+            "{changed_config:#}"
+        );
+        // A new head is a new job too.
+        let new_head = enqueue(&default, "1111111111111111111111111111111111111111");
+        assert_eq!(new_head["replayed"], json!(false), "{new_head:#}");
+        assert_ne!(new_head["id"], first["id"]);
+        assert_eq!(
+            graph
+                .read(|db| {
+                    graph::rows(
+                        db,
+                        "MATCH (j:Job {repository_id: $repo, kind: $kind}) RETURN j.id AS id",
+                        graph::params(&json!({
+                            "repo": "repo-git",
+                            "kind": crate::git_history::coupling::KIND,
+                        })),
+                    )
+                })
+                .unwrap()
+                .len(),
+            3,
+            "one job per input hash"
+        );
+        assert_eq!(first["kind"], json!("coupling"));
+        assert_eq!(
+            input_hash(&head, &default),
+            input_hash(&head, &Config::from_json(&default.to_json())),
+            "the payload form keys the same job"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn the_history_job_completes_into_a_coupling_job_that_drains_after_it() {
+        let (dir, store, repo, p) = coupled_project();
+        let graph = store.graph().clone();
+        let queued = store
+            .transaction(|db| enqueue_history(&store, db, "repo-git", &p))
+            .unwrap();
+        assert_eq!(queued["queued"], json!(true), "{queued:#}");
+
+        // The drain runs the history job, then the coupling job it queued.
+        let results = drain_projection(&store, "repo-git").unwrap();
+        let kinds: Vec<&str> = results
+            .iter()
+            .map(|result| result["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["history", "coupling"], "{results:#?}");
+        assert!(
+            results.iter().all(|result| result["ok"] == json!(true)),
+            "{results:#?}"
+        );
+
+        // The coupling job is keyed on the head the history job ingested.
+        let head = repo.rev("HEAD");
+        let job = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (j:Job {repository_id: $repo, kind: $kind}) \
+                     RETURN j.state AS state, j.input_hash AS hash",
+                    graph::params(&json!({
+                        "repo": "repo-git",
+                        "kind": crate::git_history::coupling::KIND,
+                    })),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job["state"], json!("complete"), "{job:#}");
+        assert_eq!(
+            job["hash"],
+            json!(crate::git_history::coupling::input_hash(
+                &head,
+                &crate::git_history::coupling::Config::default()
+            )),
+        );
+        // And it wrote the pair the commit made.
+        let pair = graph
+            .read(|db| {
+                graph::one(
+                    db,
+                    "MATCH (a:File {repository_id: $repo, path: 'src/a.rs'})\
+                     -[r:CO_CHANGED {window: 'all'}]->(b:File {repository_id: $repo, path: 'src/b.rs'}) \
+                     RETURN r.count AS count",
+                    graph::params(&json!({"repo": "repo-git"})),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair["count"], json!(1), "{pair:#}");
+        drop(dir);
+    }
 }

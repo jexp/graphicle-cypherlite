@@ -108,6 +108,8 @@ mod graph_history;
 mod graph_projection;
 mod grounded_v2;
 mod grounded_v3;
+mod history_job;
+mod history_queries;
 mod invalidation;
 mod jobs_bounds;
 mod lean_replies;
