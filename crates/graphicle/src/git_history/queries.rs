@@ -100,7 +100,7 @@ const SYMBOL_DEGREE: &str = "MATCH (s:Symbol {repository_id: $repo})-[r]-(:Symbo
      RETURN s.stable_id AS symbol, count(r) AS degree";
 
 /// Live `CALLS` and `IMPORTS` edges between files, by their symbols' paths.
-const STRUCTURAL: &str = "MATCH (a:Symbol {repository_id: $repo})-[r]->(b:Symbol {repository_id: $repo}) \
+pub(crate) const STRUCTURAL: &str = "MATCH (a:Symbol {repository_id: $repo})-[r]->(b:Symbol {repository_id: $repo}) \
      WHERE type(r) IN ['CALLS', 'IMPORTS', 'IMPORTS_FROM'] AND r.valid_from_episode IS NOT NULL \
      AND r.valid_to_episode IS NULL \
      RETURN DISTINCT a.relpath AS from, b.relpath AS to, type(r) AS relation";
@@ -241,30 +241,54 @@ fn hotspots(graph: &GraphStore, repository_id: &str) -> Result<Vec<Section>> {
     ])
 }
 
-fn ownership(graph: &GraphStore, repository_id: &str) -> Result<Vec<Value>> {
-    let mut per_file: BTreeMap<String, Vec<(String, String, i64)>> = BTreeMap::new();
+/// One author's modifications of one file (the ownership read's row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Author {
+    pub email: String,
+    pub name: String,
+    pub touches: i64,
+}
+
+/// The dominant author of a file: the most touches wins; a tie goes to the
+/// smaller email, so the answer is stable across runs.
+pub(crate) fn dominant(authors: &[Author]) -> Option<&Author> {
+    authors
+        .iter()
+        .max_by(|a, b| a.touches.cmp(&b.touches).then(b.email.cmp(&a.email)))
+}
+
+/// Each file's authors with their modification counts, by path (ported 10:
+/// kind `M`, so renames and additions do not inflate ownership). The
+/// ownership family and the knowledge-map view both read it.
+pub(crate) fn file_authors(
+    graph: &GraphStore,
+    repository_id: &str,
+) -> Result<BTreeMap<String, Vec<Author>>> {
+    let mut per_file: BTreeMap<String, Vec<Author>> = BTreeMap::new();
     for row in run(graph, OWNERSHIP, &json!({"repo": repository_id}))? {
-        per_file.entry(text(&row, "file")).or_default().push((
-            text(&row, "email"),
-            text(&row, "name"),
-            int(&row, "touches"),
-        ));
+        per_file
+            .entry(text(&row, "file"))
+            .or_default()
+            .push(Author {
+                email: text(&row, "email"),
+                name: text(&row, "name"),
+                touches: int(&row, "touches"),
+            });
     }
-    let mut rows: Vec<Value> = per_file
+    Ok(per_file)
+}
+
+fn ownership(graph: &GraphStore, repository_id: &str) -> Result<Vec<Value>> {
+    let mut rows: Vec<Value> = file_authors(graph, repository_id)?
         .into_iter()
-        .map(|(file, authors)| {
-            let total: i64 = authors.iter().map(|author| author.2).sum();
-            // The most touches wins; a tie goes to the smaller email, so the
-            // answer is stable across runs.
-            let (email, name, top) = authors
-                .iter()
-                .max_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)))
-                .cloned()
-                .unwrap_or_default();
-            let ownership = top as f64 / total as f64;
-            json!({"evidence": file, "file": file, "owner": name, "owner_email": email,
-                "ownership": ownership, "touches": top, "total": total,
-                "contributors": authors.len(), "sole_owner": ownership > SOLE_OWNER})
+        .filter_map(|(file, authors)| {
+            let total: i64 = authors.iter().map(|author| author.touches).sum();
+            let top = dominant(&authors)?;
+            let ownership = top.touches as f64 / total as f64;
+            Some(json!({"evidence": file, "file": file, "owner": top.name,
+                "owner_email": top.email, "ownership": ownership,
+                "touches": top.touches, "total": total,
+                "contributors": authors.len(), "sole_owner": ownership > SOLE_OWNER}))
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -406,7 +430,10 @@ fn pairs(
 }
 
 /// The changes of each file, by path: `(path, changes)`.
-fn file_churn(graph: &GraphStore, repository_id: &str) -> Result<HashMap<String, (String, i64)>> {
+pub(crate) fn file_churn(
+    graph: &GraphStore,
+    repository_id: &str,
+) -> Result<HashMap<String, (String, i64)>> {
     Ok(run(graph, FILE_CHURN, &json!({"repo": repository_id}))?
         .iter()
         .map(|row| {
@@ -461,8 +488,10 @@ fn parse_date(text: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(text).ok()
 }
 
-/// One report line: the evidence, then the row's other fields by name.
-fn line(row: &Value) -> String {
+/// One report line: the evidence, then the row's other fields by name. The
+/// viz pack prints its rows through the same line, so both packs report
+/// identically.
+pub(crate) fn line(row: &Value) -> String {
     let fields: Vec<String> = row
         .as_object()
         .into_iter()

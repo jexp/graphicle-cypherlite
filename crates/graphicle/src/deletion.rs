@@ -198,6 +198,11 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     // forgotten project loses its pins and a store that never pinned any
     // digests the same way.
     ("License", "License", Scoped::Repository),
+    // Viz pins (viz::pin): the reference a cited view was pinned by. Scoped
+    // like the derived content it re-renders from, and not history: a pin is
+    // a reproducible pointer into facts the project already holds, so a
+    // forgotten project loses its pins with them.
+    ("ViewPin", "ViewPin", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),
