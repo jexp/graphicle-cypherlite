@@ -1,0 +1,14 @@
+{
+  "_note": "Key structure matches the live deps.dev v3 response (checked by anonymous curl, 2026-11-01); values are trimmed or synthetic, so this is not a verbatim recording.",
+  "nodes": [
+    {"versionKey": {"system": "CARGO", "name": "time", "version": "0.2.22"}, "bundled": false, "relation": "SELF", "errors": []},
+    {"versionKey": {"system": "CARGO", "name": "const_fn", "version": "0.4.12"}, "bundled": false, "relation": "DIRECT", "errors": []},
+    {"versionKey": {"system": "CARGO", "name": "libc", "version": "0.2.191"}, "bundled": false, "relation": "DIRECT", "errors": []},
+    {"versionKey": {"system": "CARGO", "name": "cfg-if", "version": "1.0.5"}, "bundled": false, "relation": "INDIRECT", "errors": []}
+  ],
+  "edges": [
+    {"fromNode": 0, "toNode": 1, "requirement": "^0.4.2"},
+    {"fromNode": 0, "toNode": 2, "requirement": "^0.2"}
+  ],
+  "error": ""
+}

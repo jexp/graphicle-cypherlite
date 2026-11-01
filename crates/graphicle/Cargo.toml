@@ -54,6 +54,8 @@ jsonschema = { version = "0.33", default-features = false }
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+lru = "0.18"
+percent-encoding = "2"
 sha1 = "0.10"
 ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "load-dynamic"] }
 # Exact token counts for `graphicle pack --tokenizer`, in every build: pure Rust
