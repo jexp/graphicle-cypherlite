@@ -51,6 +51,7 @@ tests. The sections, each with its share of the budget:
 | Focus | The ranked files: small ones whole, large ones as excerpts of the symbols around the ranked passages, with overlapping ranges merged | 50% or more |
 | Call paths | Callers and callees of the focus symbols, two steps along call edges, as `a (path:line) -> b (path:line)`, then the bodies of the key ones | up to 10% |
 | Tests | Tests that call or reference the focus symbols, from the code graph, else the test files that go with the top files by name | up to 10% |
+| Dependencies | For each top-ranked code file, the locked packages its imports resolve to: each locked version with what it depends on, the import's line and its OSV advisories. Empty without a `Cargo.lock` | up to 5% |
 | Docs | Ranked documentation passages and the nearest README of the top files | up to 5% |
 | Breadth | The next ranked files, then files in the same folders as the top files, then the rest of the repository by connections in the code graph; a file too large to go in whole goes in as an outline (the first line of each symbol) | the rest |
 
@@ -87,9 +88,9 @@ and in XML:
 | `--format` | `markdown` | `markdown`, `xml`, or `json` (below) |
 | `--tokenizer PATH` | none | Count tokens exactly with a Hugging Face `tokenizer.json`, for example the tokenizer of the model you will send the pack to |
 | `--bytes-per-token N` | none | Estimate tokens as UTF-8 bytes divided by N for all text alike, without a margin, to match another tool that sizes text that way |
-| `--order` | `relevant-last` | `relevant-last`: header, manifest, architecture, breadth, docs, tests, call paths, then focus, so the most relevant code is next to the question that follows the pack. `relevant-first` puts focus first |
+| `--order` | `relevant-last` | `relevant-last`: header, manifest, architecture, breadth, docs, tests, dependencies, call paths, then focus, so the most relevant code is next to the question that follows the pack. `relevant-first` puts focus first |
 | `--line-numbers` | `focus` | Which chunks start each line with its number and a tab: `focus`, `all` or `none` |
-| `--sections LIST` | all | Comma-separated: `arch`, `map`, `focus`, `paths`, `tests`, `docs`, `breadth`, `manifest` (`map` is the cache layout's) |
+| `--sections LIST` | all | Comma-separated: `arch`, `map`, `focus`, `paths`, `tests`, `dependencies`, `docs`, `breadth`, `manifest` (`map` is the cache layout's) |
 | `--layout` | `standard` | `standard`, or `cache`: a repository part that is the same for every question at a commit, then a question part ([below](#layouts-and-the-prompt-cache)) |
 | `--prefix-share F` | 0.9 | With the cache layout, the share of the budget the repository part takes at most, from 0.1 to 1; 1.0 makes a stable pack. Alone, it chooses the cache layout |
 | `--out FILE` | standard output | Write the pack to a file |

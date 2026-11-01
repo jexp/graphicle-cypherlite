@@ -46,18 +46,14 @@
 
 use crate::store_graph::{self, GraphStore};
 use crate::supply_chain::deps_dev::{self, Client};
-use crate::supply_chain::http_cache::{FetchError, HttpCache, HttpResponse, Transport};
+#[cfg(test)]
+use crate::supply_chain::http_cache::wire::PanicTransport;
+use crate::supply_chain::http_cache::wire::{self, Fallback};
+use crate::supply_chain::http_cache::{HttpCache, Transport};
 use crate::{Error, Result};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::Path;
-
-#[cfg(not(test))]
-use crate::supply_chain::http_cache::ReqwestTransport;
-#[cfg(test)]
-use crate::supply_chain::http_cache::test_transport::FixtureTransport;
-#[cfg(test)]
-use std::cell::RefCell;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -751,76 +747,24 @@ pub fn pinned_requirements(
     }))
 }
 
-/// The transport an on-demand read runs over: the network in production, a
-/// fixture (or a stub that panics on any request, to prove a path never
-/// fetches) in tests. The osv job's wire pattern; [`on`] is the entry that
-/// builds a layer on it.
-pub enum Wire {
-    #[cfg(not(test))]
-    Network(ReqwestTransport),
-    #[cfg(test)]
-    Fixture(Arc<FixtureTransport>),
-    #[cfg(test)]
-    Panic(Arc<PanicTransport>),
-    /// A store with no network: every request fails to connect.
-    #[cfg(test)]
-    Refused,
-}
+/// The wire of the read-through layer, built on the wire module: the network
+/// in production, a fixture in tests. [`on`] is the entry that builds a layer
+/// on it.
+pub(crate) use crate::supply_chain::http_cache::wire::Wire;
 
-impl Clone for Wire {
-    fn clone(&self) -> Self {
-        match self {
-            #[cfg(not(test))]
-            Self::Network(transport) => Self::Network(transport.clone()),
-            #[cfg(test)]
-            Self::Fixture(transport) => Self::Fixture(transport.clone()),
-            #[cfg(test)]
-            Self::Panic(transport) => Self::Panic(transport.clone()),
-            #[cfg(test)]
-            Self::Refused => Self::Refused,
-        }
-    }
-}
+/// The OFFLINE message: what a path that must stay offline reports when it
+/// fetches anyway.
+const OFFLINE: &str = "deps.dev was fetched on a path that must stay offline";
 
-impl Transport for Wire {
-    async fn get(&self, url: &str) -> std::result::Result<HttpResponse, FetchError> {
-        match self {
-            #[cfg(not(test))]
-            Self::Network(transport) => transport.get(url).await,
-            #[cfg(test)]
-            Self::Fixture(transport) => transport.get(url).await,
-            #[cfg(test)]
-            Self::Panic(transport) => transport.get(url).await,
-            #[cfg(test)]
-            Self::Refused => Err(refused()),
-        }
-    }
-
-    async fn post(&self, url: &str, body: &str) -> std::result::Result<HttpResponse, FetchError> {
-        match self {
-            #[cfg(not(test))]
-            Self::Network(transport) => transport.post(url, body).await,
-            #[cfg(test)]
-            Self::Fixture(transport) => transport.post(url, body).await,
-            #[cfg(test)]
-            Self::Panic(transport) => transport.post(url, body).await,
-            #[cfg(test)]
-            Self::Refused => Err(refused()),
-        }
-    }
+/// The wire of the next on-demand read: the installed one in tests, else a
+/// stub that panics — a test that forgot its fixture fails loudly instead of
+/// reaching the network.
+pub(crate) fn wire() -> Result<Wire> {
+    wire::wire(Fallback::Panic(OFFLINE))
 }
 
 #[cfg(test)]
-thread_local! {
-    static INSTALLED: RefCell<Option<Wire>> = const { RefCell::new(None) };
-}
-
-/// Serve this thread's on-demand reads from `fixture` (the osv fixture
-/// pattern).
-#[cfg(test)]
-pub(crate) fn install_fixture(fixture: Arc<FixtureTransport>) {
-    INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Fixture(fixture)));
-}
+pub(crate) use crate::supply_chain::http_cache::wire::install_fixture;
 
 /// Fail this thread's on-demand reads by panicking, and return the counter
 /// that reads how many requests reached the stub: the tool for a test that
@@ -828,37 +772,14 @@ pub(crate) fn install_fixture(fixture: Arc<FixtureTransport>) {
 /// already panicked.
 #[cfg(test)]
 pub(crate) fn install_panic() -> Arc<PanicTransport> {
-    let transport = Arc::new(PanicTransport::default());
-    INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Panic(transport.clone())));
-    transport
+    wire::install_panic(OFFLINE)
 }
 
 /// Fail this thread's on-demand reads as a store with no network does: each
 /// request is a connection failure, and none reaches a transport.
 #[cfg(test)]
 pub(crate) fn install_refused() {
-    INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Refused));
-}
-
-#[cfg(test)]
-fn refused() -> FetchError {
-    FetchError::Transport("the store has no network".to_owned())
-}
-
-/// The wire of the next on-demand read, built on the calling thread: the
-/// installed one, else a stub that panics — a test that forgot its fixture
-/// fails loudly instead of reaching the network.
-#[cfg(test)]
-pub(crate) fn wire() -> Result<Wire> {
-    Ok(INSTALLED
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(|| Wire::Panic(Arc::new(PanicTransport::default()))))
-}
-
-/// The wire of the next on-demand read: the shared reqwest client.
-#[cfg(not(test))]
-pub(crate) fn wire() -> Result<Wire> {
-    Ok(Wire::Network(ReqwestTransport(crate::model::client()?)))
+    wire::install_refused("the store has no network");
 }
 
 /// The cache of the read-through layer: disk under the store, the deps.dev
@@ -872,36 +793,4 @@ pub fn cache(store_dir: &Path) -> HttpCache {
 /// built on the sync path — that is the offline guarantee.
 pub fn on(store_dir: &Path) -> Result<OnDemand<Wire>> {
     Ok(OnDemand::new(wire()?, cache(store_dir)))
-}
-
-/// A transport that panics on any request. It names the URL it was asked
-/// for, and counts the requests that reached it, so a test can assert zero.
-#[cfg(test)]
-#[derive(Default)]
-pub struct PanicTransport {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-#[cfg(test)]
-impl PanicTransport {
-    /// The number of requests that reached this stub.
-    pub fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn refuse(&self, url: &str) -> ! {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        panic!("deps.dev was fetched on a path that must stay offline: {url}")
-    }
-}
-
-#[cfg(test)]
-impl Transport for PanicTransport {
-    async fn get(&self, url: &str) -> std::result::Result<HttpResponse, FetchError> {
-        self.refuse(url)
-    }
-
-    async fn post(&self, url: &str, _body: &str) -> std::result::Result<HttpResponse, FetchError> {
-        self.refuse(url)
-    }
 }

@@ -50,6 +50,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with(LOCK, QUERYBATCH)
+    }
+
+    /// A project locking `lock_text`, whose OSV scan is `querybatch`.
+    fn with(lock_text: &str, querybatch: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let created = store.create_workspace("Supply chain").unwrap();
@@ -64,12 +69,12 @@ impl Fixture {
             .unwrap();
         let repo = s(&registered, "id").to_string();
         let graph = store.graph();
-        lock::write(&graph, &repo, &lock::parse(LOCK).unwrap()).unwrap();
+        lock::write(&graph, &repo, &lock::parse(lock_text).unwrap()).unwrap();
         // `use time::OffsetDateTime;` on line 3 of app.rs, and `use serde::Serialize;` on line 1.
         import(&graph, &repo, APP, 3, "time::OffsetDateTime");
         import(&graph, &repo, APP, 1, "serde::Serialize");
         resolve::resolve(&graph, &repo).unwrap().unwrap();
-        scan(&graph, &repo);
+        scan(&graph, &repo, querybatch);
         let app = App::new(store.clone(), model::Config::default(), vec![]).unwrap();
         Self {
             _dir: dir,
@@ -138,9 +143,9 @@ fn import(graph: &GraphStore, repository: &str, path: &str, line: u64, use_path:
 
 /// OSV's answers for the lockfile, from the golden fixtures, written as the
 /// sync writes them.
-fn scan(graph: &GraphStore, repository: &str) {
+fn scan(graph: &GraphStore, repository: &str, querybatch: &str) {
     let transport = Arc::new(FixtureTransport::new([
-        (format!("{}/querybatch", osv::BASE_URL), body(QUERYBATCH)),
+        (format!("{}/querybatch", osv::BASE_URL), body(querybatch)),
         (
             format!("{}/vulns/RUSTSEC-2020-0071", osv::BASE_URL),
             body(RUSTSEC),
@@ -252,6 +257,63 @@ fn vuln_impact_on_an_advisory_cites_the_import_line_of_the_using_file() {
     assert_eq!(answer["summary"]["citations"], 1);
     assert_eq!(answer["summary"]["affected"], 1);
     assert_eq!(answer["not_known"], json!([]));
+}
+
+/// A lockfile that locks `time` twice, 0.1.45 and 0.2.22, beside serde.
+const TWO_TIMES: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "time 0.1.45",
+ "time 0.2.22",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "time"
+version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[package]]
+name = "time"
+version = "0.2.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+"#;
+
+/// OSV's answer for [`TWO_TIMES`]: serde clean, then both `time` versions
+/// affected by RUSTSEC-2020-0071 (queries are sorted by purl_at_version).
+const QUERYBATCH_TWO_TIMES: &str = r#"{"results": [{}, {"vulns": [
+    {"id": "RUSTSEC-2020-0071", "modified": "2026-02-04T02:31:56.682937Z"}]},
+    {"vulns": [{"id": "RUSTSEC-2020-0071", "modified": "2026-02-04T02:31:56.682937Z"}]}]}"#;
+
+#[test]
+fn an_advisory_hitting_two_locked_versions_of_one_package_cites_each_file_once() {
+    let fixture = Fixture::with(TWO_TIMES, QUERYBATCH_TWO_TIMES);
+    let answer = fixture
+        .call("vuln_impact", json!({"advisory": RUSTSEC_ID}))
+        .unwrap();
+    assert_eq!(answer["summary"]["affected"], 2, "{answer}");
+    // The file is reached through one package, so it is listed and cited once.
+    let files = answer["files"].as_array().unwrap();
+    assert_eq!(
+        files.iter().filter(|f| f["path"] == APP).count(),
+        1,
+        "{answer}"
+    );
+    assert_eq!(file(&answer, APP)["lines"], json!([3]));
+    assert_eq!(file(&answer, APP)["citation"], "src/app.rs:3");
+    assert_eq!(answer["summary"]["files"], 1);
+    assert_eq!(answer["summary"]["citations"], 1);
 }
 
 #[test]

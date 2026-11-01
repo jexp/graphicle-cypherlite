@@ -362,6 +362,174 @@ fn write_disk(dir: &Path, path: &Path, key: &str, entry: &Entry) -> std::io::Res
     std::fs::rename(temp, path)
 }
 
+/// The wire the supply-chain reads run over (the osv bulk query and the
+/// deps.dev read-through layer): the network in production; in tests a
+/// fixture, a stub that panics on any request, or a store with no network.
+/// One thread-local slot holds the wire a test installed, so every reader
+/// shares one install and one fallback mechanism.
+pub(crate) mod wire {
+    #[cfg(not(test))]
+    use super::ReqwestTransport;
+    #[cfg(test)]
+    use super::test_transport::FixtureTransport;
+    use super::{FetchError, HttpResponse, Transport};
+    use crate::Result;
+    #[cfg(test)]
+    use std::cell::RefCell;
+    #[cfg(test)]
+    use std::sync::Arc;
+
+    /// The transport a query runs over.
+    #[derive(Clone)]
+    pub enum Wire {
+        #[cfg(not(test))]
+        Network(ReqwestTransport),
+        #[cfg(test)]
+        Fixture(Arc<FixtureTransport>),
+        #[cfg(test)]
+        Panic(Arc<PanicTransport>),
+        /// A store with no network: every request fails with this message.
+        #[cfg(test)]
+        Refused(&'static str),
+    }
+
+    /// What a test thread gets when it installed no wire: a stub that panics
+    /// with the message, or a store with no network that refuses with it.
+    /// Production never reads the message, so the lint is allowed there.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[derive(Clone, Copy)]
+    pub(crate) enum Fallback {
+        Panic(&'static str),
+        Refused(&'static str),
+    }
+
+    impl Transport for Wire {
+        async fn get(&self, url: &str) -> std::result::Result<HttpResponse, FetchError> {
+            match self {
+                #[cfg(not(test))]
+                Self::Network(transport) => transport.get(url).await,
+                #[cfg(test)]
+                Self::Fixture(transport) => transport.get(url).await,
+                #[cfg(test)]
+                Self::Panic(transport) => transport.get(url).await,
+                #[cfg(test)]
+                Self::Refused(message) => Err(refused(message)),
+            }
+        }
+
+        async fn post(
+            &self,
+            url: &str,
+            body: &str,
+        ) -> std::result::Result<HttpResponse, FetchError> {
+            match self {
+                #[cfg(not(test))]
+                Self::Network(transport) => transport.post(url, body).await,
+                #[cfg(test)]
+                Self::Fixture(transport) => transport.post(url, body).await,
+                #[cfg(test)]
+                Self::Panic(transport) => transport.post(url, body).await,
+                #[cfg(test)]
+                Self::Refused(message) => Err(refused(message)),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn refused(message: &str) -> FetchError {
+        FetchError::Transport(message.to_owned())
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static INSTALLED: RefCell<Option<Wire>> = const { RefCell::new(None) };
+    }
+
+    /// Serve this thread's queries from `fixture`.
+    #[cfg(test)]
+    pub(crate) fn install_fixture(fixture: Arc<FixtureTransport>) {
+        INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Fixture(fixture)));
+    }
+
+    /// Fail this thread's queries by panicking with `message`, and return the
+    /// counter that reads how many requests reached the stub.
+    #[cfg(test)]
+    pub(crate) fn install_panic(message: &'static str) -> Arc<PanicTransport> {
+        let transport = Arc::new(PanicTransport::new(message));
+        INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Panic(transport.clone())));
+        transport
+    }
+
+    /// Fail this thread's queries as a store with no network does: each
+    /// request is a connection failure carrying `message`.
+    #[cfg(test)]
+    pub(crate) fn install_refused(message: &'static str) {
+        INSTALLED.with(|slot| *slot.borrow_mut() = Some(Wire::Refused(message)));
+    }
+
+    /// The wire of the next query, built on the calling thread: in tests the
+    /// installed one, else the fallback; in production the shared reqwest
+    /// client.
+    #[cfg(test)]
+    pub(crate) fn wire(fallback: Fallback) -> Result<Wire> {
+        Ok(INSTALLED
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or(match fallback {
+                Fallback::Panic(message) => Wire::Panic(Arc::new(PanicTransport::new(message))),
+                Fallback::Refused(message) => Wire::Refused(message),
+            }))
+    }
+
+    /// The wire of the next query: the shared reqwest client.
+    #[cfg(not(test))]
+    pub(crate) fn wire(_fallback: Fallback) -> Result<Wire> {
+        Ok(Wire::Network(ReqwestTransport(crate::model::client()?)))
+    }
+
+    /// A transport that panics on any request. It names the URL it was asked
+    /// for, and counts the requests that reached it, so a test can assert zero.
+    #[cfg(test)]
+    pub struct PanicTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        message: &'static str,
+    }
+
+    #[cfg(test)]
+    impl PanicTransport {
+        fn new(message: &'static str) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                message,
+            }
+        }
+
+        /// The number of requests that reached this stub.
+        pub fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn refuse(&self, url: &str) -> ! {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("{}: {url}", self.message)
+        }
+    }
+
+    #[cfg(test)]
+    impl Transport for PanicTransport {
+        async fn get(&self, url: &str) -> std::result::Result<HttpResponse, FetchError> {
+            self.refuse(url)
+        }
+
+        async fn post(
+            &self,
+            url: &str,
+            _body: &str,
+        ) -> std::result::Result<HttpResponse, FetchError> {
+            self.refuse(url)
+        }
+    }
+}
+
 /// A fake transport for tests: canned responses by URL, and a call count.
 /// An unknown URL answers 404.
 #[cfg(test)]

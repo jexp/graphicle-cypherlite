@@ -46,7 +46,7 @@
 //! offline sets `sync.osv` to `false` (or `GRAPHICLE_SYNC_OSV=0`), and then
 //! nothing is queued and nothing is sent. The lockfile is still read.
 use crate::store_graph::{self, GraphStore};
-use crate::supply_chain::http_cache::{FetchError, HttpCache, HttpResponse, Transport};
+use crate::supply_chain::http_cache::{FetchError, HttpCache, Transport};
 use crate::supply_chain::lock::FILE;
 use crate::{Error, Result};
 use cargo_lock::Version;
@@ -56,14 +56,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-#[cfg(not(test))]
-use crate::supply_chain::http_cache::ReqwestTransport;
 #[cfg(test)]
-use crate::supply_chain::http_cache::test_transport::FixtureTransport;
-#[cfg(test)]
-use std::cell::RefCell;
-#[cfg(test)]
-use std::sync::Arc;
+pub(crate) use crate::supply_chain::http_cache::wire::install_fixture;
+use crate::supply_chain::http_cache::wire::{self, Fallback, Wire};
 
 /// The OSV v1 API root.
 pub const BASE_URL: &str = "https://api.osv.dev/v1";
@@ -568,70 +563,11 @@ pub fn write(
     }))
 }
 
-/// The transport a query runs over: the network in production, a fixture in
-/// tests. The tests never reach the network: a test without a fixture gets
-/// [`Wire::Refused`].
-pub(crate) enum Wire {
-    #[cfg(not(test))]
-    Network(ReqwestTransport),
-    #[cfg(test)]
-    Fixture(Arc<FixtureTransport>),
-    #[cfg(test)]
-    Refused,
-}
-
-impl Transport for Wire {
-    async fn get(&self, url: &str) -> std::result::Result<HttpResponse, FetchError> {
-        match self {
-            #[cfg(not(test))]
-            Self::Network(transport) => transport.get(url).await,
-            #[cfg(test)]
-            Self::Fixture(transport) => transport.get(url).await,
-            #[cfg(test)]
-            Self::Refused => Err(refused()),
-        }
-    }
-
-    async fn post(&self, url: &str, body: &str) -> std::result::Result<HttpResponse, FetchError> {
-        match self {
-            #[cfg(not(test))]
-            Self::Network(transport) => transport.post(url, body).await,
-            #[cfg(test)]
-            Self::Fixture(transport) => transport.post(url, body).await,
-            #[cfg(test)]
-            Self::Refused => Err(refused()),
-        }
-    }
-}
-
-#[cfg(test)]
-fn refused() -> FetchError {
-    FetchError::Transport("the tests do not reach the network".to_owned())
-}
-
-#[cfg(test)]
-thread_local! {
-    static FIXTURE: RefCell<Option<Arc<FixtureTransport>>> = const { RefCell::new(None) };
-}
-
-/// Serve this thread's OSV queries from `fixture`.
-#[cfg(test)]
-pub(crate) fn install_fixture(fixture: Arc<FixtureTransport>) {
-    FIXTURE.with(|slot| *slot.borrow_mut() = Some(fixture));
-}
-
-/// The wire of the next query, built on the calling thread.
-#[cfg(test)]
+/// The wire of the next query: the network in production, a fixture in tests.
+/// The tests never reach the network: a test without a fixture gets a refused
+/// wire.
 pub(crate) fn wire() -> Result<Wire> {
-    Ok(FIXTURE
-        .with(|slot| slot.borrow().clone())
-        .map_or(Wire::Refused, Wire::Fixture))
-}
-
-/// The wire of the next query: the shared reqwest client.
-#[cfg(not(test))]
-pub(crate) fn wire() -> Result<Wire> {
-    Ok(Wire::Network(ReqwestTransport(crate::model::client()?)))
+    wire::wire(Fallback::Refused("the tests do not reach the network"))
 }
 
 /// The cache of the client: disk under the store, the shared namespace.

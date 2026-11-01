@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use super::lock;
 use super::on_demand::{self, Fact, OnDemand, Wire};
+use super::resolve::line_of;
 use crate::store::{Store, repo, s};
 use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result, string};
@@ -172,11 +173,6 @@ fn sites(graph: &GraphStore, repository: &str, scope: Option<(&str, &str)>) -> R
     // By line as a number: the query orders the location text.
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     Ok(found)
-}
-
-/// The line of a `source_location` (`L12`).
-fn line_of(location: &str) -> Option<i64> {
-    location.strip_prefix('L')?.parse().ok()
 }
 
 /// One locked version of a package with the facts the lockfile and OSV hold
@@ -488,13 +484,18 @@ pub fn vuln_impact(store: &Store, workspace: &str, token: &str, args: &Value) ->
             AFFECTED,
             json!({"repo": repository, "file": lock::FILE, "key": value}),
         )?;
-        let mut found = Vec::new();
         let mut versions_json = Vec::new();
+        // Sites are per package, not per version: two locked versions of one
+        // package share their import sites, so each distinct purl is read once.
+        let mut purls = BTreeSet::new();
         for row in &affected {
-            let purl = lock::purl(&text(row, "name"));
-            found.extend(sites(&graph, &repository, Some((FROM_PACKAGE, &purl)))?);
+            purls.insert(lock::purl(&text(row, "name")));
             versions_json.push(json!({"purl_at_version": text(row, "key"),
                 "version": text(row, "version"), "status": "affected", "advisory": value}));
+        }
+        let mut found = Vec::new();
+        for purl in &purls {
+            found.extend(sites(&graph, &repository, Some((FROM_PACKAGE, purl)))?);
         }
         if affected.is_empty() && advisory != Value::Null {
             not_known.push(format!(
