@@ -1259,8 +1259,8 @@ fn the_known_coupled_pair_is_a_hot_cell_and_the_two_mismatches_are_flagged() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|row| !(row["a"] == "src/api" && row["b"] == "src/render")
-                && !(row["a"] == "src/graph" && row["b"] == "src/graph"))
+            .all(|row| !(row["a"] == "src/api" && row["b"] == "src/render"
+                || row["a"] == "src/graph" && row["b"] == "src/graph"))
     );
 }
 
