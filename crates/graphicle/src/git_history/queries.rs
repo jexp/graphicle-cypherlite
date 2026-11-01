@@ -100,7 +100,7 @@ const SYMBOL_DEGREE: &str = "MATCH (s:Symbol {repository_id: $repo})-[r]-(:Symbo
      RETURN s.stable_id AS symbol, count(r) AS degree";
 
 /// Live `CALLS` and `IMPORTS` edges between files, by their symbols' paths.
-const STRUCTURAL: &str = "MATCH (a:Symbol {repository_id: $repo})-[r]->(b:Symbol {repository_id: $repo}) \
+pub(crate) const STRUCTURAL: &str = "MATCH (a:Symbol {repository_id: $repo})-[r]->(b:Symbol {repository_id: $repo}) \
      WHERE type(r) IN ['CALLS', 'IMPORTS', 'IMPORTS_FROM'] AND r.valid_from_episode IS NOT NULL \
      AND r.valid_to_episode IS NULL \
      RETURN DISTINCT a.relpath AS from, b.relpath AS to, type(r) AS relation";
