@@ -43,6 +43,9 @@ const GRAPH_HISTORY: [&str; 4] = [
 ];
 /// An edition's code-graph tools, also in the graph half.
 const EDITION_GRAPH_TOOLS: [&str; 2] = ["change_impact", "overlay_status"];
+/// The supply-chain tools, which read the code graph's imports and the
+/// store's package facts (plan §4 P3): in the graph half, after the engine's.
+const SUPPLY_CHAIN: [&str; 3] = ["deps_of", "vuln_impact", "license_of"];
 
 const A: &str = "def alpha():\n    return 1\n\ndef beta():\n    return 2\n";
 const A_EDITED: &str = "def alpha():\n    return 10\n\ndef beta():\n    return 2\n";
@@ -288,16 +291,22 @@ fn every_flag_combination_lists_each_tool_once() {
     // `graph_stats` is the engine's (Graphify's), once.
     assert_eq!(listed.iter().filter(|n| *n == "graph_stats").count(), 1);
     // A project connection's core tools: `list_projects` is a workspace
-    // connection's, the other 23 as the one server lists them, `pack` last.
+    // connection's, the other 23 as the one server lists them, `pack` last,
+    // then the supply-chain tools.
     let core: Vec<String> = api::core_mcp_tools(false, false)
         .into_iter()
         .filter_map(McpTool::confined)
         .map(|tool| tool.name().to_string())
         .collect();
-    assert_eq!(core.len(), 23, "{core:?}");
+    assert_eq!(core.len(), 26, "{core:?}");
     assert_eq!(core[15..22], graph_tools::NAVIGATION.map(String::from));
     assert_eq!(core[22], "pack");
-    assert_eq!(listed[..23], core[..], "the core tools lead the list");
+    assert_eq!(core[23..], SUPPLY_CHAIN.map(String::from));
+    assert_eq!(
+        listed[..core.len()],
+        core[..],
+        "the core tools lead the list"
+    );
     assert!(!listed.contains(&"list_projects".to_string()));
     let pull = api::mcp_tools_for(
         false,
@@ -950,6 +959,7 @@ fn a_tool_set_serves_one_half_of_the_server() {
     let expected: Vec<String> = GRAPH_HISTORY
         .iter()
         .chain(&graph_tools::NAVIGATION)
+        .chain(&SUPPLY_CHAIN)
         .map(|name| name.to_string())
         .collect();
     assert_eq!(listed[..expected.len()], expected[..], "{listed:?}");
@@ -970,6 +980,7 @@ fn a_tool_set_serves_one_half_of_the_server() {
     for name in graph_tools::NAVIGATION
         .iter()
         .chain(&GRAPH_HISTORY)
+        .chain(&SUPPLY_CHAIN)
         .chain(&EDITION_GRAPH_TOOLS)
     {
         assert!(!listed.contains(&name.to_string()), "{name}: {listed:?}");

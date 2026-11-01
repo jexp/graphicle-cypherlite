@@ -307,7 +307,7 @@ fn head_of(use_path: &str) -> String {
 }
 
 /// The line of a `source_location` (`L12`), when it holds one.
-fn line_of(location: &str) -> Option<i64> {
+pub(crate) fn line_of(location: &str) -> Option<i64> {
     location.strip_prefix('L')?.parse().ok()
 }
 

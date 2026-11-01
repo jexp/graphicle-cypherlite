@@ -59,6 +59,9 @@ pub(crate) mod osv_tests;
 pub mod resolve;
 #[cfg(test)]
 mod tests;
+pub mod tools;
+#[cfg(test)]
+pub(crate) mod tools_tests;
 
 /// Rows per transaction (git_history/writer.rs's `BATCH`).
 const BATCH: usize = 1000;
