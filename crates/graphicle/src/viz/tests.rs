@@ -2632,3 +2632,180 @@ fn a_constraint_only_rule_set_shows_its_recorded_results_and_violations() {
     assert_eq!(view.model["concepts"], json!([]));
 }
 
+
+// -- The viz pin (`pin.rs`) ---------------------------------------------------
+
+/// The stamp the first pin is taken at, and a later one.
+const PINNED_AT: &str = "2026-11-01T00:00:00Z";
+const LATER: &str = "2026-12-01T00:00:00Z";
+
+/// The parameters the pin tests pin: the 90-day window, a small cap.
+fn pinned_params() -> Params {
+    Params::parse(&json!({"window": "90d", "cap": 10})).unwrap()
+}
+
+/// The `:ViewPin` nodes of a store snapshot.
+fn view_pins(state: &Value) -> Vec<Value> {
+    state["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|node| node["labels"].to_string().contains(pin::LABEL))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_pinned_view_replays_byte_identically_after_the_clock_advances() {
+    let graph = city();
+    let params = pinned_params();
+    let created = pin::pin(
+        &graph,
+        REPO,
+        "hotspot-city",
+        &params,
+        "ci-verdict",
+        PINNED_AT,
+    )
+    .unwrap();
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(created["as_of"], json!(PINNED_AT));
+    assert_eq!(created["window_keys"], json!("[\"90d\"]"));
+    let hash = created["input_hash"].as_str().unwrap().to_owned();
+    let fresh = render(&graph, REPO, "hotspot-city", &params, Format::Json).unwrap();
+    // The re-run: the pinned family at the pinned parameters. It reads no
+    // clock, so a replay at a later wall time is the same replay.
+    let first = pin::replay(&graph, REPO, &hash).unwrap();
+    let again = pin::replay(&graph, REPO, &hash).unwrap();
+    assert_eq!(first["verified"], json!(true));
+    assert_eq!(first["pin"]["output_sha256"], created["output_sha256"]);
+    assert_eq!(first["pin"]["as_of"], json!(PINNED_AT));
+    assert_eq!(
+        serde_json::to_string(&first["view"]).unwrap(),
+        serde_json::to_string(&fresh["view"]).unwrap(),
+        "the replayed view is the pinned render, byte for byte"
+    );
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&again).unwrap()
+    );
+    // Advancing the clock to LATER names a new input tuple: a new pin, a new
+    // node. The earlier reference still replays.
+    let later = pin::pin(&graph, REPO, "hotspot-city", &params, "ci-verdict", LATER).unwrap();
+    assert_eq!(later["created"], json!(true));
+    assert_ne!(later["input_hash"], created["input_hash"]);
+    assert_eq!(later["output_sha256"], created["output_sha256"]);
+    assert_eq!(
+        pin::replay(&graph, REPO, &hash).unwrap()["verified"],
+        json!(true)
+    );
+    // An unknown pin is a refusal, and so is an unknown family.
+    assert!(pin::replay(&graph, REPO, "not-a-pin").is_err());
+    assert!(pin::pin(&graph, REPO, "no-such-family", &params, "x", PINNED_AT).is_err());
+}
+
+#[test]
+fn a_changed_world_fails_the_verification_and_names_the_divergence() {
+    let graph = city();
+    let params = pinned_params();
+    let created = pin::pin(
+        &graph,
+        REPO,
+        "hotspot-city",
+        &params,
+        "ci-verdict",
+        PINNED_AT,
+    )
+    .unwrap();
+    let hash = created["input_hash"].as_str().unwrap().to_owned();
+    let recorded = created["output_sha256"].as_str().unwrap().to_owned();
+    // More history lands under the pinned view: the facts it reads changed.
+    // A commit that modifies the file, as the history writer stores it.
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "MERGE (c:Commit {repository_id: $repo, oid: $oid}) \
+                     SET c.commit_date = $date \
+                 MERGE (ch:Change {repository_id: $repo, commit: $oid, path: $path}) \
+                     SET ch.kind = 'M' \
+                 MERGE (f:File {repository_id: $repo, path: $path}) \
+                 MERGE (c)-[:CONTAINS_CHANGE]->(ch) MERGE (ch)-[:MODIFIES]->(f)",
+                store_graph::params(&json!({"repo": REPO,
+                    "oid": "0000000000000000000000000000000000000099",
+                    "path": "src/hot/engine.rs", "date": "2026-10-15T00:00:00Z"})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let error = pin::replay(&graph, REPO, &hash).unwrap_err();
+    assert_eq!(error.status.as_u16(), 409);
+    assert!(error.message.contains("diverged"), "{}", error.message);
+    assert!(error.message.contains(&hash), "{}", error.message);
+    assert!(error.message.contains(&recorded), "{}", error.message);
+    // The same tuple is not silently re-pinned over the void reference.
+    let repin = pin::pin(
+        &graph,
+        REPO,
+        "hotspot-city",
+        &params,
+        "ci-verdict",
+        PINNED_AT,
+    );
+    assert!(repin.unwrap_err().message.contains("diverged"));
+    // The changed world is cited by pinning it anew at its own stamp.
+    let anew = pin::pin(&graph, REPO, "hotspot-city", &params, "ci-verdict", LATER).unwrap();
+    assert_eq!(anew["created"], json!(true));
+    assert_eq!(
+        pin::replay(&graph, REPO, anew["input_hash"].as_str().unwrap()).unwrap()["verified"],
+        json!(true)
+    );
+}
+
+#[test]
+fn unpinned_renders_write_nothing_and_a_pin_writes_only_its_node() {
+    let graph = city();
+    let params = pinned_params();
+    let before = store_graph::test_state(&graph);
+    let focused =
+        Params::parse(&json!({"window": "90d", "cap": 10, "focus": "src/hot/engine.rs"})).unwrap();
+    for family in FAMILIES.iter() {
+        for format in [Format::Text, Format::Json] {
+            render(&graph, REPO, family.slug, &focused, format).unwrap();
+        }
+        if family.mermaid {
+            render(&graph, REPO, family.slug, &focused, Format::Mermaid).unwrap();
+        }
+        // The default report of a focus family is its refusal, a read too.
+        let _ = report(&graph, REPO, family.slug);
+    }
+    assert_eq!(store_graph::test_state(&graph), before, "renders are reads");
+    assert!(view_pins(&before).is_empty());
+    pin::pin(
+        &graph,
+        REPO,
+        "hotspot-city",
+        &params,
+        "ci-verdict",
+        PINNED_AT,
+    )
+    .unwrap();
+    let after = store_graph::test_state(&graph);
+    assert_eq!(view_pins(&after).len(), 1);
+    let without_pins = |state: &Value| {
+        let nodes: Vec<Value> = state["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| !node["labels"].to_string().contains(pin::LABEL))
+            .cloned()
+            .collect();
+        json!({"nodes": nodes, "rels": state["rels"]})
+    };
+    assert_eq!(
+        without_pins(&after),
+        without_pins(&before),
+        "a pin writes its one node and nothing else"
+    );
+}
+

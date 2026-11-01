@@ -536,6 +536,7 @@ fn stub(mermaid: bool) -> View {
 mod arch_conformance;
 mod coupling_matrix;
 mod impact_neighborhood;
+pub mod pin;
 mod risk_overlay;
 #[cfg(test)]
 mod tests;
