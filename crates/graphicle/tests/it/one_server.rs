@@ -1110,7 +1110,9 @@ fn the_engines_resources_answer_on_the_episode() {
         .iter()
         .map(|resource| s(resource, "uri").to_string())
         .collect();
-    assert_eq!(uris.len(), 6, "{listed}");
+    // The engine's six resources, then the five history families the pack
+    // appends to the shared list (`git_history::queries`).
+    assert_eq!(uris.len(), 11, "{listed}");
     for uri in &uris {
         let read = rpc(&f, &app, &f.key, "resources/read", json!({"uri":uri}));
         let content = &read["result"]["contents"][0];
@@ -1128,6 +1130,15 @@ fn the_engines_resources_answer_on_the_episode() {
         "{stats}"
     );
     assert!(read("graphicle-graph://audit").starts_with("Total edges: "));
+    // The fixture has no git history: each history family answers its
+    // sections empty, not as an error.
+    let hotspots = read("graphicle-graph://history/hotspots");
+    assert!(hotspots.contains("files by churn:\n  none"), "{hotspots}");
+    let ownership = read("graphicle-graph://history/ownership");
+    assert!(
+        ownership.contains("sole owners and dominant authors:\n  none"),
+        "{ownership}"
+    );
     let unknown = rpc(
         &f,
         &app,
