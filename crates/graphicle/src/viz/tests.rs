@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::api::{self, App};
+use crate::git_history::queries;
 use crate::model;
 use crate::store::s;
 use serde_json::{Value, json};
@@ -138,6 +139,10 @@ fn every_family_is_listed_as_a_resource_and_reads_as_a_stub() {
     for family in &FAMILIES {
         let uri = format!("{PREFIX}{}", family.slug);
         assert_eq!(super::family(&uri), Some(family.slug), "{uri}");
+        // The knowledge map has its own view, tested below.
+        if family.slug == "knowledge-map" {
+            continue;
+        }
         let spec = specs
             .iter()
             .find(|spec| spec["uri"] == uri.as_str())
@@ -468,5 +473,163 @@ fn viz_view_answers_on_the_tool_surface_read_only() {
         error.message.starts_with("Unknown viz family: city"),
         "{}",
         error.message
+    );
+}
+
+/// Seeds one commit per `(author email, author name, path)` change, with the
+/// history writer's labels: the author's `Person` and `AUTHORED` edge, a
+/// kind-`M` change, the file it modifies. The ownership statements read these.
+fn seed_history(graph: &GraphStore, repository: &str, changes: &[(&str, &str, &str)]) {
+    graph
+        .transaction(|db| {
+            for (index, (email, name, path)) in changes.iter().enumerate() {
+                crate::store_graph::write(
+                    db,
+                    "MERGE (a:Person {repository_id: $repo, email: $email}) SET a.name = $name \
+                     MERGE (c:Commit {repository_id: $repo, oid: $oid}) \
+                     MERGE (a)-[:AUTHORED]->(c) \
+                     MERGE (ch:Change {repository_id: $repo, commit: $oid, path: $path}) \
+                     SET ch.kind = 'M' \
+                     MERGE (f:File {repository_id: $repo, path: $path}) \
+                     MERGE (c)-[:CONTAINS_CHANGE]->(ch) MERGE (ch)-[:MODIFIES]->(f)",
+                    crate::store_graph::params(&json!({"repo": repository,
+                        "oid": format!("{:040}", index + 1), "email": email,
+                        "name": name, "path": path})),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The knowledge fixture: Ada owns `src/core/auth.rs` alone (four changes),
+/// Ada and Bob share `src/core/util.rs` (one each), Bob alone changes
+/// `docs/readme.md` (one). Churn: 4, 2, 1; bus factor: 1, 2, 1.
+fn knowledge_graph() -> GraphStore {
+    let graph = GraphStore::open_in_memory().unwrap();
+    let ada = ("ada@example.com", "Ada", "src/core/auth.rs");
+    let mut changes = vec![ada; 4];
+    changes.push(("ada@example.com", "Ada", "src/core/util.rs"));
+    changes.push(("bob@example.com", "Bob", "src/core/util.rs"));
+    changes.push(("bob@example.com", "Bob", "docs/readme.md"));
+    seed_history(&graph, REPO, &changes);
+    graph
+}
+
+/// The knowledge-map answer for `params`, its view-model.
+fn knowledge_view(graph: &GraphStore, params: &Params) -> Value {
+    render(graph, REPO, "knowledge-map", params, Format::Json).unwrap()["view"].clone()
+}
+
+#[test]
+fn a_sole_owner_high_churn_file_lands_in_the_loss_risk_quadrant() {
+    let view = knowledge_view(&knowledge_graph(), &Params::default());
+    // The median split: churn at or above the median churn (2) is high,
+    // bus factor at or below the median bus factor (1) is low knowledge.
+    assert_eq!(
+        view["thresholds"],
+        json!({"churn_median": 2.0, "bus_factor_median": 1.0})
+    );
+    let files = view["files"].as_array().unwrap();
+    assert_eq!(files[0]["evidence"], "src/core/auth.rs");
+    assert_eq!(files[0]["churn"], 4);
+    assert_eq!(files[0]["bus_factor"], 1);
+    assert_eq!(files[0]["quadrant"], "loss-risk");
+    // Two authors split one file: high churn, high knowledge.
+    assert_eq!(files[1]["evidence"], "src/core/util.rs");
+    assert_eq!(files[1]["bus_factor"], 2);
+    assert_eq!(files[1]["quadrant"], "shared-hot");
+    // One author, few changes: low churn, low knowledge.
+    assert_eq!(files[2]["evidence"], "docs/readme.md");
+    assert_eq!(files[2]["quadrant"], "dormant");
+    assert_eq!(
+        view["quadrants"],
+        json!({"loss-risk": 1, "shared-hot": 1, "dormant": 1})
+    );
+    // The cap cuts the list, never the quadrant counts.
+    let capped = knowledge_view(
+        &knowledge_graph(),
+        &Params::parse(&json!({"cap": 1})).unwrap(),
+    );
+    assert_eq!(capped["files"].as_array().unwrap().len(), 1);
+    assert_eq!(capped["quadrants"], view["quadrants"]);
+}
+
+#[test]
+fn the_bus_factor_agrees_with_the_history_ownership_family() {
+    let graph = knowledge_graph();
+    let view = knowledge_view(&graph, &Params::default());
+    let history = queries::sections(&graph, REPO, "ownership").unwrap();
+    let theirs = &history[0].1;
+    for file in view["files"].as_array().unwrap() {
+        let row = theirs
+            .iter()
+            .find(|row| row["evidence"] == file["evidence"])
+            .unwrap_or_else(|| panic!("no ownership row for {}", file["evidence"]));
+        assert_eq!(file["owner_email"], row["owner_email"]);
+        assert_eq!(file["ownership"], row["ownership"]);
+        assert_eq!(file["total"], row["total"]);
+        assert_eq!(file["contributors"], row["contributors"]);
+        // A bus factor of one is exactly the history family's sole owner.
+        assert_eq!(file["bus_factor"] == 1, row["sole_owner"], "{}", row);
+    }
+    // The folder bus factor: Ada holds 5 of the 6 touches in src/core.
+    let folders = view["folders"].as_array().unwrap();
+    assert_eq!(folders[0]["evidence"], "src/core");
+    assert_eq!(folders[0]["bus_factor"], 1);
+    assert_eq!(folders[0]["total"], 6);
+    assert_eq!(folders[1]["evidence"], "docs");
+    assert_eq!(folders[1]["bus_factor"], 1);
+}
+
+#[test]
+fn the_knowledge_map_is_byte_identical_and_anchored_on_its_repository() {
+    let graph = knowledge_graph();
+    let params = Params::parse(&json!({"overlay": "knowledge", "cap": 5})).unwrap();
+    let reordered = Params::parse(&json!({"cap": 5, "overlay": "knowledge"})).unwrap();
+    let first = serde_json::to_string(
+        &render(&graph, REPO, "knowledge-map", &params, Format::Json).unwrap(),
+    )
+    .unwrap();
+    let second = serde_json::to_string(
+        &render(&graph, REPO, "knowledge-map", &reordered, Format::Json).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let text_first = render(&graph, REPO, "knowledge-map", &params, Format::Text).unwrap();
+    let text_again = render(&graph, REPO, "knowledge-map", &reordered, Format::Text).unwrap();
+    assert_eq!(text_first, text_again);
+    // The citation rule: every row is cited by its path, and the report
+    // names the row's path first.
+    let report = text_first["text"].as_str().unwrap();
+    assert!(
+        report.contains("  src/core/auth.rs  quadrant=loss-risk"),
+        "{report}"
+    );
+    // The overlay adds the per-author breakdown.
+    let view = knowledge_view(&graph, &params);
+    assert_eq!(view["files"][1]["authors"].as_array().unwrap().len(), 2);
+    // The supernode rule: another repository's history never reaches the
+    // join, so its changes leave this repository's numbers alone.
+    let before = knowledge_view(&graph, &Params::default());
+    seed_history(
+        &graph,
+        "other",
+        &[("bob@example.com", "Bob", "src/core/auth.rs"); 5],
+    );
+    assert_eq!(knowledge_view(&graph, &Params::default()), before);
+    // A risk overlay is the risk-overlay family's column, refused by name.
+    let refused = render(
+        &graph,
+        REPO,
+        "knowledge-map",
+        &Params::parse(&json!({"overlay": "risk"})).unwrap(),
+        Format::Json,
+    )
+    .unwrap_err();
+    assert!(
+        refused.message.contains("risk-overlay"),
+        "{}",
+        refused.message
     );
 }

@@ -65,6 +65,8 @@ use crate::store_graph::GraphStore;
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
+mod knowledge_map;
+
 /// The resource URI prefix of the pack: `graphicle-graph://viz/<family>`.
 pub const PREFIX: &str = "graphicle-graph://viz/";
 /// The operation of `viz_view`, the code-graph half of the server.
@@ -130,7 +132,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Knowledge Map",
         description: "Per-file author knowledge against churn: the 2x2 quadrant and per-folder bus factor",
         mermaid: false,
-        render: knowledge_map,
+        render: knowledge_map::view,
     },
     Family {
         slug: "impact-neighborhood",
@@ -535,10 +537,6 @@ fn hotspot_city(_graph: &GraphStore, _repository: &str, _params: &Params) -> Res
 
 fn coupling_matrix(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(true))
-}
-
-fn knowledge_map(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
 }
 
 fn impact_neighborhood(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
