@@ -86,6 +86,7 @@ pub mod store_compat;
 pub mod store_content;
 pub mod store_graph;
 pub mod structured_memory;
+pub mod supply_chain;
 pub mod symbol_links;
 pub mod symbols;
 pub mod temporal_graph;

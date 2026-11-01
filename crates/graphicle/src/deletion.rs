@@ -116,6 +116,11 @@ const HISTORY: &[&str] = &[
     "Change",
     "Branch",
     "Tag",
+    // Not history, on purpose: a Package or PackageVersion is the project's
+    // current lockfile content, rewritten by every sync (a re-lock moves the
+    // DESCRIBES and the REQUIRES of the versions it names). It is in the
+    // state digest like a Symbol is, so a forgotten project loses it and a
+    // store that never ingested the lockfile digests the same way.
     TOMBSTONES,
     "OAuthPending",
 ];
@@ -173,6 +178,10 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     ("Change", "Change", Scoped::Repository),
     ("Person", "Person", Scoped::Repository),
     ("Tag", "Tag", Scoped::Repository),
+    // Cargo.lock package facts (supply_chain::lock). Scoped like the rest of
+    // the project's derived content; they are not history (see HISTORY).
+    ("Package", "Package", Scoped::Repository),
+    ("PackageVersion", "PackageVersion", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),

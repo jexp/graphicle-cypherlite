@@ -978,6 +978,13 @@ fn sync_folder_with(
         Ok(None) => {}
         Err(error) => result["rules"] = json!({"error": error.message}),
     }
+    // The project's own Cargo.lock becomes package facts (supply-chain plan
+    // §4 P1): offline, idempotent, and never a failed sync.
+    match crate::supply_chain::lock::ingest(&store.graph(), &repository, &root) {
+        Ok(Some(lock)) => result["cargo_lock"] = lock,
+        Ok(None) => {}
+        Err(error) => result["cargo_lock"] = json!({"error": error.message}),
+    }
     Ok(result)
 }
 

@@ -449,6 +449,15 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     (br:Branch => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL,
                    ref IS STRING}),
     (tg:Tag => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL}),
+    // Cargo.lock package facts (supply-chain plan §2; written by supply_chain::lock).
+    // A version's source fields are present for registry, git and other
+    // sources; a path package carries none.
+    (pk:Package => {repository_id IS STRING NOT NULL, purl IS STRING NOT NULL,
+                    system IS STRING, name IS STRING}),
+    (pv:PackageVersion => {repository_id IS STRING NOT NULL, purl_at_version IS STRING NOT NULL,
+                           purl IS STRING, name IS STRING, version IS STRING,
+                           source_kind IS STRING, source IS STRING, source_url IS STRING,
+                           source_rev IS STRING}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -466,6 +475,8 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (ch:Change) REQUIRE (ch.repository_id, ch.commit, ch.path) IS KEY,
     CONSTRAINT FOR (br:Branch) REQUIRE (br.repository_id, br.name) IS KEY,
     CONSTRAINT FOR (tg:Tag) REQUIRE (tg.repository_id, tg.name) IS KEY,
+    CONSTRAINT FOR (pk:Package) REQUIRE (pk.repository_id, pk.purl) IS KEY,
+    CONSTRAINT FOR (pv:PackageVersion) REQUIRE (pv.repository_id, pv.purl_at_version) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -533,6 +544,10 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX person_key IF NOT EXISTS FOR (a:Person) ON (a.repository_id, a.email)",
     "CREATE INDEX branch_key IF NOT EXISTS FOR (b:Branch) ON (b.repository_id, b.name)",
     "CREATE INDEX tag_key IF NOT EXISTS FOR (t:Tag) ON (t.repository_id, t.name)",
+    // Cargo.lock package facts (supply_chain::lock): the MERGE anchors and the
+    // MATCH lookups of the lockfile writer, scoped by repository_id.
+    "CREATE INDEX package_key IF NOT EXISTS FOR (pk:Package) ON (pk.repository_id, pk.purl)",
+    "CREATE INDEX package_version_key IF NOT EXISTS FOR (pv:PackageVersion) ON (pv.repository_id, pv.purl_at_version)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:
