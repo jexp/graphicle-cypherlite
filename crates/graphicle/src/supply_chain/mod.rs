@@ -13,6 +13,15 @@
 //! under its own namespace. Neither writes to the graph store; the store
 //! integration is the supply-chain job's business.
 //!
+//! [`resolve`] is the seam of plan §3: the Rust imports the code graph
+//! holds (`imports_from` edges carrying their use paths) resolve to the
+//! packages the lockfile wrote, as `(:Symbol)-[:RESOLVES_TO]->(:Package)`
+//! edges, and an import that matches no local path, member or locked crate
+//! lands as `:UnresolvedPackage` negative evidence with the reason. The
+//! sync runs it after the lock ingest and the projection job after it
+//! persists, so whichever fact arrived last re-runs it; it is a full
+//! recompute, so neither order leaves it stale.
+
 //! [`lock::ingest`] is the sync's body for the lockfile: it runs after the
 //! folder is read, reports its counts under the sync's `cargo_lock` key, and
 //! a failure is reported there, never as a failed sync.
@@ -32,6 +41,7 @@ pub mod lock;
 pub mod osv;
 #[cfg(test)]
 pub(crate) mod osv_tests;
+pub mod resolve;
 #[cfg(test)]
 mod tests;
 
