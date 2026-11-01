@@ -293,6 +293,109 @@ fn linking_persists_edges_with_both_episodes_and_relinks_after_a_new_episode() {
     assert!(s(&unresolved[0], "candidates").contains(&f.a));
 }
 
+const RUST_A_CARGO: &str = "[package]\nname = \"alib-rs\"\nversion = \"1.2.0\"\n";
+const RUST_A_LIB: &str = "pub mod core;\n";
+const RUST_A_CORE: &str = "pub fn process(items: &[i64]) -> i64 {\n    items.iter().sum()\n}\n";
+const RUST_B_CARGO: &str =
+    "[package]\nname = \"bapp\"\nversion = \"0.1.0\"\n\n[dependencies]\nalib-rs = \"1.2\"\n";
+const RUST_B_MAIN: &str = "use alib_rs::core::process;\n\nfn main() {\n    let total = process(&[1, 2, 3]);\n    println!(\"{total}\");\n}\n";
+const RUST_A_SHA: &str = "aaar1100000000000000000000000000000000a";
+const RUST_B_SHA: &str = "bbbr1100000000000000000000000000000000b";
+
+fn rust_a_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Cargo.toml", RUST_A_CARGO),
+        ("src/lib.rs", RUST_A_LIB),
+        ("src/core.rs", RUST_A_CORE),
+    ]
+}
+fn rust_b_files() -> Vec<(&'static str, &'static str)> {
+    vec![("Cargo.toml", RUST_B_CARGO), ("src/main.rs", RUST_B_MAIN)]
+}
+
+/// The Cargo side of the linker: a crate's manifest builds the same package
+/// facts the other ecosystems' manifests do, and a `use` of its library in
+/// another repository becomes the same cross-repository edge they do —
+/// provenance, version constraint and link counts included.
+#[test]
+fn linking_rust_repositories_resolves_use_statements_across_repos() {
+    let f = Fixture::new();
+    f.commit(&f.a, &rust_a_files(), RUST_A_SHA);
+    f.commit(&f.b, &rust_b_files(), RUST_B_SHA);
+    let results = f.drain_jobs();
+    let kinds: Vec<&str> = results.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, vec!["project", "project", "link"], "{kinds:?}");
+    let link = &results[2].1;
+    assert!(link["edges"].as_u64().unwrap() >= 1, "{link}");
+    assert_eq!(link["repositories"], 2);
+
+    let a1 = f.episode(&f.a);
+    let b1 = f.episode(&f.b);
+    let edges = f
+        .store
+        .graph_cross_edges(&f.workspace, &f.key, &f.a)
+        .unwrap();
+    let incoming = edges["incoming"].as_array().unwrap();
+    assert_eq!(incoming.len(), 1, "{edges}");
+    let edge = &incoming[0];
+    assert_eq!(s(edge, "source_repository_id"), f.b);
+    assert_eq!(s(edge, "source_episode"), b1);
+    assert_eq!(s(edge, "target_episode"), a1);
+    // The importer's `use` statement: its file node, named by the projection.
+    assert_eq!(s(edge, "source_node_id"), "src_main");
+    assert_eq!(s(edge, "target_node_id"), "src_core_process");
+    assert_eq!(s(edge, "relation"), "imports");
+    assert_eq!(s(edge, "confidence"), "EXTRACTED");
+    assert_eq!(s(edge, "derivation"), "import_statement:path:symbol");
+    assert_eq!(s(edge, "module_path"), "alib_rs::core");
+    assert_eq!(s(edge, "symbol"), "process");
+    assert_eq!(edge["line"], 1);
+    assert_eq!(s(edge, "version_constraint"), "1.2");
+    assert_eq!(s(edge, "exporter_version"), "1.2.0");
+    assert_eq!(s(edge, "version_status"), "satisfied");
+    assert!(
+        edges["unresolved"].as_array().unwrap().is_empty(),
+        "{edges}"
+    );
+
+    // Re-running on unchanged episodes is idempotent, the counts unchanged —
+    // and its summary reports the manifest facts the projection built from
+    // Cargo.toml, like the other ecosystems': a typed, versioned cargo
+    // package.
+    let again = f.store.graph_link(&f.workspace, &f.key).unwrap();
+    assert!(
+        again["pairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["unchanged"] == true),
+        "{again}"
+    );
+    let packages = |repo: &str| {
+        again["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == json!(repo))
+            .unwrap()["packages"]
+            .clone()
+    };
+    assert_eq!(
+        packages(&f.a),
+        json!([{"ecosystem": "cargo", "name": "alib-rs", "version": "1.2.0"}]),
+        "{again}"
+    );
+    let db = f.store.connect().unwrap();
+    let counted: i64 = db
+        .query_row(
+            "SELECT edges FROM gf_cross_link_state WHERE repository_id=?1",
+            [&f.b],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counted, 1, "link_counts counted the Rust cross edge");
+}
+
 #[test]
 fn repository_revocation_blocks_direct_reads_and_outgoing_links() {
     let f = Fixture::new();
@@ -497,7 +600,7 @@ fn linking_a_single_repository_workspace_is_skipped_and_records_nothing() {
     assert_eq!(direct["repositories"].as_array().unwrap().len(), 1);
     let db = f.store.connect().unwrap();
     // The cross-repository state is graph-native now: CROSS_CALL
-    // relationships, Package and UnresolvedCross nodes.
+    // relationships, CrossPackage and UnresolvedCross nodes.
     for (label, cypher) in [
         (
             "gf_cross_edges",
@@ -505,7 +608,7 @@ fn linking_a_single_repository_workspace_is_skipped_and_records_nothing() {
         ),
         (
             "gf_cross_packages",
-            "MATCH (p:Package {workspace_id:$w}) RETURN count(p) AS n",
+            "MATCH (p:CrossPackage {workspace_id:$w}) RETURN count(p) AS n",
         ),
         (
             "gf_cross_unresolved",
