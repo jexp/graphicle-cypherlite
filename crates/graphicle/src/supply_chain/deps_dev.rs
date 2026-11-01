@@ -283,7 +283,7 @@ pub struct PackageVersion {
     #[serde(default)]
     pub is_deprecated: bool,
     #[serde(default)]
-    pub deprecation_reason: Option<String>,
+    pub deprecated_reason: Option<String>,
 }
 
 /// `GET .../versions/{version}`.
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(default.version_key.version, "0.3.36");
         let deprecated = package.versions.iter().find(|v| v.is_deprecated).unwrap();
         assert_eq!(deprecated.version_key.version, "0.1.45");
-        assert!(deprecated.deprecation_reason.is_some());
+        assert!(deprecated.deprecated_reason.is_some());
     }
 
     #[tokio::test]
