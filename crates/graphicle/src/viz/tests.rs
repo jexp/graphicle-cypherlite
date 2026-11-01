@@ -22,7 +22,7 @@ const REPO: &str = "viz";
 const COUPLING: &str = "coupling-matrix";
 
 /// The families whose nodes have landed: their views are no longer stubs.
-const LANDED: [&str; 4] = ["risk-overlay", "coupling-matrix", "hotspot-city", "impact-neighborhood"];
+const LANDED: [&str; 5] = ["risk-overlay", "coupling-matrix", "hotspot-city", "impact-neighborhood", "drift-timeline"];
 
 /// The impact-neighborhood family's slug.
 const IMPACT: &str = "impact-neighborhood";
@@ -512,7 +512,10 @@ fn viz_view_answers_on_the_tool_surface_read_only() {
         .call(json!({"family":"drift-timeline","format":"text"}))
         .unwrap();
     assert_eq!(text["structuredContent"]["format"], "text");
-    assert_eq!(text["content"][0]["text"], format!("{NOT_YET}:\n  none"));
+    assert_eq!(
+        text["content"][0]["text"],
+        "drift by month (commit author_date, UTC):\n  none"
+    );
     // Every mermaid-declared family has landed; the tool surface answers
     // the focus contract for them (their own tests cover the diagram).
     let needs_focus = project
@@ -589,6 +592,50 @@ fn seed_history(graph: &GraphStore, repository: &str, changes: &[(&str, &str, &s
                     crate::store_graph::params(&json!({"repo": repository,
                         "oid": format!("{:040}", index + 1), "email": email,
                         "name": name, "path": path})),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+// -- The drift timeline (`drift_timeline.rs`) ---------------------------------
+
+use crate::git_history::fixture::{Repo, ada, bob};
+use crate::git_history::{coupling, writer};
+
+/// A repository of `graph` with its `:Project`, as the writer's tests seed one.
+fn project_node(graph: &GraphStore, repository: &str) {
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "CREATE (p:Project {id: $id, workspace_id: 'ws', project_key: $id})",
+                store_graph::params(&json!({"id": repository})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Seed one commit of `repository` at `date` that changed `paths` (kind `M`).
+fn seed_commit(graph: &GraphStore, repository: &str, oid: &str, date: &str, paths: &[&str]) {
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "MERGE (c:Commit {repository_id: $repo, oid: $oid}) \
+                 SET c.subject = $oid, c.author_date = $date",
+                store_graph::params(&json!({"repo": repository, "oid": oid, "date": date})),
+            )?;
+            for path in paths {
+                store_graph::write(
+                    db,
+                    "MATCH (c:Commit {repository_id: $repo, oid: $oid}) \
+                     MERGE (ch:Change {repository_id: $repo, commit: $oid, path: $path}) \
+                     SET ch.kind = 'M' \
+                     MERGE (c)-[:CONTAINS_CHANGE]->(ch)",
+                    store_graph::params(&json!({"repo": repository, "oid": oid, "path": path})),
                 )?;
             }
             Ok(())
@@ -1107,6 +1154,27 @@ fn edge(
                     "from": format!("id-{from}"), "to": format!("id-{to}"),
                     "path": path, "loc": format!("L{line}"),
                     "relation": relation.to_lowercase()})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Seed one episode of `repository`, projected at `created_at`.
+fn seed_episode(
+    graph: &GraphStore,
+    repository: &str,
+    episode: &str,
+    sequence: i64,
+    created_at: &str,
+) {
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "CREATE (e:Episode {repository_id: $repo, episode: $episode, sequence: $sequence, created_at: $at})",
+                store_graph::params(&json!({"repo": repository, "episode": episode,
+                    "sequence": sequence, "at": created_at})),
             )?;
             Ok(())
         })
@@ -1977,4 +2045,338 @@ fn the_same_inputs_render_byte_identical_output_and_every_row_is_cited() {
     }
     let text = render(&graph, REPO, IMPACT, &params, Format::Text).unwrap();
     assert!(text["text"].as_str().unwrap().contains("src/m1.rs:11"));
+}
+
+/// Seed one violation of `episode`; an empty `path` names no location.
+fn seed_violation(
+    graph: &GraphStore,
+    repository: &str,
+    episode: &str,
+    rule: &str,
+    path: &str,
+    line: i64,
+) {
+    graph
+        .transaction(|db| {
+            store_graph::write(
+                db,
+                "CREATE (v:Violation {repository_id: $repo, episode: $episode, rule: $rule, \
+                 severity: 'error', rule_sha: 'sha', path: $path, line: $line})",
+                store_graph::params(&json!({"repo": repository, "episode": episode,
+                    "rule": rule, "path": path, "line": line})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The drift timeline of `repository` at the default parameters, with the
+/// bucket named.
+fn timeline(graph: &GraphStore, repository: &str, bucket: &str) -> Value {
+    let params = Params::parse(&json!({"bucket": bucket})).unwrap();
+    let view = drift_timeline::view(graph, repository, &params).unwrap();
+    let rows = view.sections[0].1.clone();
+    json!({"model": view.model, "rows": rows})
+}
+
+/// The series entries of a timeline answer.
+fn entries(answer: &Value) -> Vec<Value> {
+    answer["model"]["series"].as_array().unwrap().clone()
+}
+
+/// A timeline's entry for `label` (`2026-02`, `2026-Q1`).
+fn bucket_of<'a>(series: &'a [Value], label: &str) -> &'a Value {
+    series
+        .iter()
+        .find(|entry| entry["bucket"] == label)
+        .unwrap_or_else(|| panic!("no bucket {label} in {series:?}"))
+}
+
+/// Three months with a gap: January two commits, March one, April one.
+fn seeded_months() -> GraphStore {
+    let graph = GraphStore::open_in_memory().unwrap();
+    seed_commit(
+        &graph,
+        REPO,
+        "a1",
+        "2026-01-05T10:00:00+00:00",
+        &["a.rs", "b.rs"],
+    );
+    seed_commit(&graph, REPO, "a2", "2026-01-20T10:00:00+00:00", &["a.rs"]);
+    seed_commit(
+        &graph,
+        REPO,
+        "a3",
+        "2026-03-10T10:00:00+00:00",
+        &["c.rs", "d.rs", "e.rs"],
+    );
+    seed_commit(
+        &graph,
+        REPO,
+        "a4",
+        "2026-04-02T10:00:00+00:00",
+        &["a.rs", "b.rs"],
+    );
+    graph
+}
+
+#[test]
+fn drift_timeline_buckets_are_monotone_and_empty_months_are_zeros() {
+    let graph = seeded_months();
+    let answer = timeline(&graph, REPO, "month");
+    let series = entries(&answer);
+    let labels: Vec<&str> = series
+        .iter()
+        .map(|e| e["bucket"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["2026-01", "2026-02", "2026-03", "2026-04"]);
+    // Sorted, each bucket's end is the next one's start, start < end.
+    for pair in series.windows(2) {
+        assert_eq!(pair[0]["end"], pair[1]["start"]);
+    }
+    for entry in &series {
+        assert!(entry["start"].as_str().unwrap() < entry["end"].as_str().unwrap());
+    }
+    // February has no commit: it is in the series, as a zero with its label.
+    let february = bucket_of(&series, "2026-02");
+    assert_eq!(february["commits"], 0);
+    assert_eq!(february["churn"], 0);
+    assert_eq!(february["co_change"], 0);
+    assert_eq!(february["violations"], 0);
+    assert_eq!(february["evidence"], "2026-02");
+    assert!(february["first_commit"].is_null());
+    assert!(february["top_commits"].as_array().unwrap().is_empty());
+    // The rows of the text report match the series one for one.
+    assert_eq!(answer["rows"].as_array().unwrap().len(), series.len());
+    // The quarter bucket: January to April is two quarters, both populated.
+    let quarters = timeline(&graph, REPO, "quarter");
+    let quarter_entries = entries(&quarters);
+    let labels: Vec<&str> = quarter_entries
+        .iter()
+        .map(|e| e["bucket"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["2026-Q1", "2026-Q2"]);
+    assert_eq!(bucket_of(&entries(&quarters), "2026-Q1")["commits"], 3);
+    assert_eq!(bucket_of(&entries(&quarters), "2026-Q2")["commits"], 1);
+}
+
+#[test]
+fn drift_timeline_counts_match_git_log_on_a_real_repository() {
+    // A real fixture repository: the commits are dated, the gap month is real.
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = Repo::init(dir.path());
+    repo.write("a.rs", "a one\n");
+    repo.write("b.rs", "b one\n");
+    repo.commit(ada("2026-01-05T10:00:00+00:00"), "jan one", "");
+    repo.write("a.rs", "a two\n");
+    repo.commit(bob("2026-01-20T10:00:00+00:00"), "jan two", "");
+    for path in ["c.rs", "d.rs", "e.rs"] {
+        repo.write(path, "new\n");
+    }
+    repo.commit(ada("2026-03-10T10:00:00+00:00"), "mar one", "");
+    repo.remove("d.rs");
+    repo.write("e.rs", "e two\n");
+    repo.commit(bob("2026-03-28T10:00:00+00:00"), "mar two", "");
+    repo.write("a.rs", "a three\n");
+    repo.write("b.rs", "b two\n");
+    repo.commit(bob("2026-04-02T10:00:00+00:00"), "apr one", "");
+
+    let graph = GraphStore::open_in_memory().unwrap();
+    project_node(&graph, "git");
+    writer::ingest(
+        &graph,
+        "git",
+        repo.root(),
+        &crate::git_history::Window::default(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let answer = timeline(&graph, "git", "month");
+    let series = entries(&answer);
+    assert_eq!(series.len(), 4, "{answer:#}");
+
+    // The ground truth: git log over each bucket's own boundaries, the end
+    // inclusive by its last second.
+    for entry in &series {
+        let start = entry["start"].as_str().unwrap();
+        let end = chrono::NaiveDate::parse_from_str(entry["end"].as_str().unwrap(), "%Y-%m-%d")
+            .unwrap()
+            .pred_opt()
+            .unwrap();
+        let since = format!("{start}T00:00:00Z");
+        let until = format!("{end}T23:59:59Z");
+        let commits = git_log(repo.root(), &since, &until, &["--format=%H"]);
+        let names = git_log(repo.root(), &since, &until, &["--name-only", "--format="]);
+        let label = entry["bucket"].as_str().unwrap();
+        assert_eq!(entry["commits"], commits.len(), "{label} commits");
+        assert_eq!(entry["churn"], names.len(), "{label} churn");
+    }
+    // The buckets, pinned: January two commits and three changes, February
+    // empty, March two commits and five changes (the deletion counts), April
+    // one commit and two changes.
+    let churn: Vec<&Value> = series.iter().map(|e| &e["churn"]).collect();
+    assert_eq!(churn, [&json!(3), &json!(0), &json!(5), &json!(2)]);
+    // Co-change: the pairs of each commit's distinct files — one in January
+    // (a.rs with b.rs), three in March's first commit and one in its second
+    // (d.rs deleted, e.rs modified), one in April.
+    let co: Vec<&Value> = series.iter().map(|e| &e["co_change"]).collect();
+    assert_eq!(co, [&json!(1), &json!(0), &json!(4), &json!(1)]);
+    // The whole-history co-change total is the stored `all` window's.
+    coupling::derive(
+        &graph,
+        "git",
+        chrono::Utc::now(),
+        &coupling::Config::default(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let stored: i64 = graph
+        .read(|db| {
+            store_graph::rows(
+                db,
+                "MATCH (:File {repository_id: $repo})-[r:CO_CHANGED {window: 'all'}]->\
+                 (:File {repository_id: $repo}) RETURN r.count AS n",
+                store_graph::params(&json!({"repo": "git"})),
+            )
+        })
+        .unwrap()
+        .iter()
+        .map(|row| row["n"].as_i64().unwrap())
+        .sum();
+    assert_eq!(stored, co.iter().map(|v| v.as_i64().unwrap()).sum::<i64>());
+    // The quarter is the sum of its months.
+    let quarters = timeline(&graph, "git", "quarter");
+    let q1 = bucket_of(&entries(&quarters), "2026-Q1").clone();
+    assert_eq!(q1["churn"], 8);
+    assert_eq!(q1["commits"], 4);
+    assert_eq!(q1["co_change"], 5);
+    assert_eq!(q1["evidence"], series[0]["evidence"]);
+}
+
+/// The output lines of `git log` over `[since, until]`, with `args`.
+fn git_log(root: &std::path::Path, since: &str, until: &str, args: &[&str]) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "--since", since, "--until", until])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn violations_sit_on_their_episodes_stamp_and_focus_narrows_them() {
+    let graph = seeded_months();
+    seed_episode(&graph, REPO, "ep-feb", 1, "2026-02-15T00:00:00Z");
+    seed_episode(&graph, REPO, "ep-mar", 2, "2026-03-02T00:00:00Z");
+    seed_violation(&graph, REPO, "ep-feb", "R1", "a.rs", 3);
+    seed_violation(&graph, REPO, "ep-feb", "R2", "", 0);
+    seed_violation(&graph, REPO, "ep-mar", "R1", "b.rs", 9);
+    // An episode with no stamp: its violations are outside the series.
+    seed_violation(&graph, REPO, "ep-gone", "R1", "a.rs", 1);
+    let answer = timeline(&graph, REPO, "month");
+    let series = entries(&answer);
+    assert_eq!(bucket_of(&series, "2026-02")["violations"], 2);
+    assert_eq!(bucket_of(&series, "2026-03")["violations"], 1);
+    assert_eq!(answer["model"]["totals"]["violations"], 3);
+    assert_eq!(answer["model"]["totals"]["unplaced_violations"], 1);
+    // The cited violations: by rule, then location; a row with no path is
+    // cited by its rule.
+    let cited: Vec<&Value> = bucket_of(&series, "2026-02")["top_violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| &v["evidence"])
+        .collect();
+    assert_eq!(cited, [&json!("a.rs:3"), &json!("R2")]);
+    // Focus on a.rs: the February violation on it, and the commits touching it.
+    let params = Params::parse(&json!({"bucket": "month", "focus": "a.rs"})).unwrap();
+    let view = drift_timeline::view(&graph, REPO, &params).unwrap();
+    let focused = view.model["series"].as_array().unwrap().clone();
+    assert_eq!(bucket_of(&focused, "2026-02")["violations"], 1);
+    assert_eq!(bucket_of(&focused, "2026-03")["violations"], 0);
+    assert_eq!(bucket_of(&focused, "2026-03")["commits"], 0);
+    assert_eq!(bucket_of(&focused, "2026-01")["commits"], 2);
+    // The focus keeps the full span: the gaps stay visible.
+    assert_eq!(focused.len(), series.len());
+}
+
+#[test]
+fn drift_timeline_is_deterministic_capped_and_cites_its_commits() {
+    let graph = seeded_months();
+    seed_episode(&graph, REPO, "ep-feb", 1, "2026-02-15T00:00:00Z");
+    seed_violation(&graph, REPO, "ep-feb", "R1", "a.rs", 3);
+    // Another repository's history and its episodes never reach this one.
+    seed_commit(
+        &graph,
+        "other",
+        "z1",
+        "2026-01-07T10:00:00+00:00",
+        &["x.rs", "y.rs"],
+    );
+    project_node(&graph, REPO);
+    let before = timeline(&graph, REPO, "month");
+    seed_commit(
+        &graph,
+        "other",
+        "z2",
+        "2026-02-07T10:00:00+00:00",
+        &["x.rs"],
+    );
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&timeline(&graph, REPO, "month")).unwrap()
+    );
+    // The same parameters render byte-identically, in each bucket.
+    for bucket in ["month", "quarter"] {
+        let first = serde_json::to_string(&timeline(&graph, REPO, bucket)).unwrap();
+        let second = serde_json::to_string(&timeline(&graph, REPO, bucket)).unwrap();
+        assert_eq!(first, second);
+    }
+    // The cap bounds the detail lists; the series and its totals stay whole.
+    let capped =
+        drift_timeline::view(&graph, REPO, &Params::parse(&json!({"cap": 1})).unwrap()).unwrap();
+    let full = drift_timeline::view(&graph, REPO, &Params::default()).unwrap();
+    assert_eq!(capped.model["totals"], full.model["totals"]);
+    assert_eq!(capped.model["series"].as_array().unwrap().len(), 4);
+    let january = bucket_of(capped.model["series"].as_array().unwrap(), "2026-01");
+    assert_eq!(january["top_commits"].as_array().unwrap().len(), 1);
+    assert_eq!(january["commits"], 2);
+    let full_january = bucket_of(full.model["series"].as_array().unwrap(), "2026-01");
+    assert_eq!(full_january["top_commits"].as_array().unwrap().len(), 2);
+    // The citation rule: every row names a commit of the history, or its label
+    // when the bucket has none; a boundary commit is one of its own commits.
+    let oids = ["a1", "a2", "a3", "a4"];
+    for row in &full.sections[0].1 {
+        let evidence = row["evidence"].as_str().unwrap();
+        if row["commits"] == 0 {
+            assert_eq!(evidence, row["bucket"].as_str().unwrap());
+        } else {
+            assert!(oids.contains(&evidence), "{evidence}");
+            assert_eq!(row["first_commit"], evidence);
+        }
+    }
+    // Empty history: no buckets, zero totals, no panic.
+    let empty = drift_timeline::view(
+        &GraphStore::open_in_memory().unwrap(),
+        REPO,
+        &Params::default(),
+    )
+    .unwrap();
+    assert!(empty.sections[0].1.is_empty());
+    assert_eq!(empty.model["series"], json!([]));
+    assert_eq!(empty.model["totals"]["commits"], 0);
 }

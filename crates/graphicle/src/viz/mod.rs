@@ -65,6 +65,7 @@ use crate::store_graph::GraphStore;
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
+mod drift_timeline;
 mod hotspot_city;
 mod knowledge_map;
 
@@ -161,7 +162,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Drift Timeline",
         description: "Time-bucketed churn, co-change totals and violation counts over commit dates",
         mermaid: false,
-        render: drift_timeline,
+        render: drift_timeline::view,
     },
 ];
 
@@ -536,13 +537,8 @@ fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) ->
     Ok(stub(false))
 }
 
-fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
-}
-
 mod coupling_matrix;
 mod impact_neighborhood;
 mod risk_overlay;
-
 #[cfg(test)]
 mod tests;
