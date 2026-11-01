@@ -1,0 +1,9 @@
+{
+  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "advisoryKey": {"id": "RUSTSEC-2020-0071"},
+  "url": "https://rustsec.org/advisories/RUSTSEC-2020-0071.html",
+  "title": "Potential segfault in the time crate",
+  "aliases": ["CVE-2020-26235", "GHSA-wcg3-cvx6-7396"],
+  "cvss3Score": 6.2,
+  "cvss3Vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H"
+}

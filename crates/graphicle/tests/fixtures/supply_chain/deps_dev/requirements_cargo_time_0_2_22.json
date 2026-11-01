@@ -1,0 +1,10 @@
+{
+  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "cargo": {
+    "requirements": [
+      {"name": "libc", "requirement": "^0.2", "kind": "NORMAL", "optional": true, "features": [], "target": ""},
+      {"name": "serde", "requirement": "^1.0", "kind": "NORMAL", "optional": true, "features": ["derive"], "target": ""},
+      {"name": "winapi", "requirement": "^0.3", "kind": "NORMAL", "optional": false, "features": ["minwindef"], "target": "cfg(windows)"}
+    ]
+  }
+}

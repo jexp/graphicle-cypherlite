@@ -1,0 +1,14 @@
+{
+  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "resolvedAt": "2024-05-01T12:00:00Z",
+  "nodes": [
+    {"versionKey": {"system": "CARGO", "name": "time", "version": "0.2.22"}, "bundled": false, "relation": "SELF", "errors": []},
+    {"versionKey": {"system": "CARGO", "name": "libc", "version": "0.2.155"}, "bundled": false, "relation": "DIRECT", "errors": []},
+    {"versionKey": {"system": "CARGO", "name": "cfg-if", "version": "1.0.0"}, "bundled": false, "relation": "INDIRECT", "errors": []}
+  ],
+  "edges": [
+    {"fromNode": 0, "toNode": 1, "requirement": "^0.2"},
+    {"fromNode": 1, "toNode": 2, "requirement": "^1.0"}
+  ],
+  "error": ""
+}

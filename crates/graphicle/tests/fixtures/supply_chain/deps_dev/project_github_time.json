@@ -1,0 +1,18 @@
+{
+  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "projectKey": {"id": "github.com/time-rs/time"},
+  "openIssuesCount": 220,
+  "starsCount": 1100,
+  "forksCount": 180,
+  "license": "MIT OR Apache-2.0",
+  "description": "Date and time library for Rust",
+  "homepage": "https://time-rs.github.io",
+  "scorecard": {
+    "date": "2026-09-01T00:00:00Z",
+    "overall": 6.1,
+    "checks": [
+      {"name": "Maintained", "score": 10, "reason": "30 commits in the last 90 days"},
+      {"name": "Vulnerabilities", "score": 0, "reason": "2 existing vulnerabilities"}
+    ]
+  }
+}
