@@ -643,6 +643,9 @@ fn the_knowledge_map_is_byte_identical_and_anchored_on_its_repository() {
         refused.message.contains("risk-overlay"),
         "{}",
         refused.message
+    );
+}
+
 // The `risk-overlay` family, on the supply-chain facts the tools fixture
 // seeds: `src/app.rs` imports `time` on line 3 (locked at 0.2.22, which
 // GHSA-wcg3-cvx6-7396 and RUSTSEC-2020-0071 affect; the fix is 0.2.23 for
