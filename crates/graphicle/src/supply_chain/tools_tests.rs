@@ -32,12 +32,12 @@ const GHSA: &str =
 const REQUIREMENTS: &str =
     include_str!("../../tests/fixtures/supply_chain/deps_dev/requirements_cargo_time_0_2_22.json");
 
-const APP: &str = "src/app.rs";
+pub(crate) const APP: &str = "src/app.rs";
 const TIME_KEY: &str = "pkg:cargo/time@0.2.22";
 const SERDE_KEY: &str = "pkg:cargo/serde@1.0.200";
 const KNOWN_AT: &str = "2026-11-01T04:00:00Z";
 const AS_OF: &str = "2026-10-01T00:00:00Z";
-const RUSTSEC_ID: &str = "RUSTSEC-2020-0071";
+pub(crate) const RUSTSEC_ID: &str = "RUSTSEC-2020-0071";
 
 /// An `as_of` no pin in this file matches.
 const UNPINNED_AS_OF: &str = "2026-12-01T00:00:00Z";
@@ -46,22 +46,22 @@ const UNPINNED_AS_OF: &str = "2026-12-01T00:00:00Z";
 const QUERYBATCH_CLEAN: &str = r#"{"results": [{}, {}, {}, {}]}"#;
 
 /// A project with the lockfile, the import facts and the OSV scan written.
-struct Fixture {
+pub(crate) struct Fixture {
     _dir: TempDir,
-    store: Store,
-    workspace: String,
-    key: String,
-    repo: String,
+    pub(crate) store: Store,
+    pub(crate) workspace: String,
+    pub(crate) key: String,
+    pub(crate) repo: String,
     app: App,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with(LOCK, QUERYBATCH)
     }
 
     /// A project locking `lock_text`, whose OSV scan is `querybatch`.
-    fn with(lock_text: &str, querybatch: &str) -> Self {
+    pub(crate) fn with(lock_text: &str, querybatch: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let created = store.create_workspace("Supply chain").unwrap();
@@ -93,13 +93,13 @@ impl Fixture {
         }
     }
 
-    fn graph(&self) -> Arc<GraphStore> {
+    pub(crate) fn graph(&self) -> Arc<GraphStore> {
         self.store.graph()
     }
 
     /// One `tools/call` of `name`, as the server answers it: the reply's
     /// `structuredContent`, or the message of the error it carries.
-    fn call(&self, name: &str, arguments: Value) -> Result<Value, String> {
+    pub(crate) fn call(&self, name: &str, arguments: Value) -> Result<Value, String> {
         let reply = api::mcp(
             &self.app,
             &self.workspace,
@@ -125,7 +125,7 @@ impl Fixture {
 
 /// One Rust import as the projection writes it: the file's symbol, the
 /// imported name's symbol, and the edge's facts (resolve.rs reads them).
-fn import(graph: &GraphStore, repository: &str, path: &str, line: u64, use_path: &str) {
+pub(crate) fn import(graph: &GraphStore, repository: &str, path: &str, line: u64, use_path: &str) {
     let symbol = use_path.to_owned();
     let data = json!({
         "relation": "imports_from", "context": "import", "confidence": "EXTRACTED",

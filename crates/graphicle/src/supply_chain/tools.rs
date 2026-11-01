@@ -42,10 +42,10 @@ const SITES: &str = "MATCH (i:Symbol {repository_id: $repo})-[r:IMPORTS_FROM]->\
     s.qualified_name AS qualified_name, r.relpath AS relpath, \
     r.source_location AS location ORDER BY relpath, location";
 /// The file or symbol filters of [`SITES`].
-const FROM_FILE: &str = " AND r.relpath = $key";
-const FROM_SYMBOL: &str =
+pub(crate) const FROM_FILE: &str = " AND r.relpath = $key";
+pub(crate) const FROM_SYMBOL: &str =
     " AND (s.stable_id = $key OR s.qualified_name = $key OR i.stable_id = $key)";
-const FROM_PACKAGE: &str = " AND pk.purl = $key";
+pub(crate) const FROM_PACKAGE: &str = " AND pk.purl = $key";
 /// The imports of a file or symbol that name no locked crate.
 const UNRESOLVED: &str = "MATCH (u:UnresolvedPackage {repository_id: $repo}) \
     WHERE u.relpath = $key OR u.symbol = $key \
@@ -66,7 +66,7 @@ const REQUIRES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_
     RETURN t.name AS name, t.version AS version ORDER BY name, version";
 /// The advisories OSV reported for one locked version, with the fixed version
 /// each names for it.
-const ADVISORIES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
+pub(crate) const ADVISORIES: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_version: $key})\
     -[r:AFFECTED_BY]->(a:Advisory {repository_id: $repo}) \
     RETURN a.osv_id AS osv_id, a.title AS title, a.url AS url, r.fixed_in AS fixed_in \
     ORDER BY osv_id";
@@ -75,7 +75,7 @@ const CLEAN: &str = "MATCH (pv:PackageVersion {repository_id: $repo, purl_at_ver
     -[r:SCANNED_CLEAN]->(:AdvisoryCorpus {repository_id: $repo}) \
     RETURN r.as_of AS as_of, r.source AS source";
 /// Whether OSV has scanned this project's lockfile at all.
-const SCANNED: &str = "MATCH (c:AdvisoryCorpus {repository_id: $repo, source: 'osv'}) \
+pub(crate) const SCANNED: &str = "MATCH (c:AdvisoryCorpus {repository_id: $repo, source: 'osv'}) \
     RETURN count(*) AS n";
 /// One advisory the project's OSV scans hold.
 const ADVISORY: &str = "MATCH (a:Advisory {repository_id: $repo, osv_id: $key}) \
@@ -153,7 +153,11 @@ pub fn citation(path: &str, line: Option<i64>) -> String {
 
 /// The import sites in `scope` (a filter of [`SITES`] and its key), or all
 /// of them when `scope` is `None`.
-fn sites(graph: &GraphStore, repository: &str, scope: Option<(&str, &str)>) -> Result<Vec<Site>> {
+pub(crate) fn sites(
+    graph: &GraphStore,
+    repository: &str,
+    scope: Option<(&str, &str)>,
+) -> Result<Vec<Site>> {
     let (filter, key) = scope.unwrap_or(("", ""));
     let cypher = SITES.replace("{filter}", filter);
     let mut params = json!({"repo": repository});
@@ -193,7 +197,7 @@ pub struct VersionFacts {
     pub advisories: Vec<String>,
 }
 
-fn rows(graph: &GraphStore, cypher: &str, params: Value) -> Result<Vec<Value>> {
+pub(crate) fn rows(graph: &GraphStore, cypher: &str, params: Value) -> Result<Vec<Value>> {
     graph.read(|db| store_graph::rows(db, cypher, store_graph::params(&params)))
 }
 
@@ -203,7 +207,11 @@ fn text(row: &Value, field: &str) -> String {
 
 /// The locked versions of `purl` in `repository`, with their resolved
 /// dependencies and advisories.
-fn versions(graph: &GraphStore, repository: &str, purl: &str) -> Result<Vec<VersionFacts>> {
+pub(crate) fn versions(
+    graph: &GraphStore,
+    repository: &str,
+    purl: &str,
+) -> Result<Vec<VersionFacts>> {
     let locked = rows(
         graph,
         VERSIONS,
@@ -231,7 +239,11 @@ fn versions(graph: &GraphStore, repository: &str, purl: &str) -> Result<Vec<Vers
 }
 
 /// The package purls a lockfile name or purl stands for.
-fn packages_named(graph: &GraphStore, repository: &str, name: &str) -> Result<Vec<String>> {
+pub(crate) fn packages_named(
+    graph: &GraphStore,
+    repository: &str,
+    name: &str,
+) -> Result<Vec<String>> {
     Ok(
         rows(graph, PACKAGES, json!({"repo": repository, "key": name}))?
             .iter()
@@ -250,7 +262,7 @@ fn by_package(sites: &[Site]) -> BTreeMap<String, Vec<&Site>> {
 }
 
 /// The sites of a file as JSON, one entry per file with its citations.
-fn files_json(sites: &[&Site]) -> Vec<Value> {
+pub(crate) fn files_json(sites: &[&Site]) -> Vec<Value> {
     let mut files: BTreeMap<&str, Vec<&Site>> = BTreeMap::new();
     for site in sites {
         files.entry(site.path.as_str()).or_default().push(site);
