@@ -357,12 +357,12 @@ fn symbol_candidates(
         spans,
         moved: Vec::new(),
     };
-    if candidates.spans.is_empty() {
-        if let Some(old) = &change.old_path {
-            candidates.moved = follow_moves(graph, repository_id, old)?
-                .into_iter()
-                .collect();
-        }
+    if candidates.spans.is_empty()
+        && let Some(old) = &change.old_path
+    {
+        candidates.moved = follow_moves(graph, repository_id, old)?
+            .into_iter()
+            .collect();
     }
     Ok(candidates)
 }
@@ -499,14 +499,12 @@ fn parse_hunk_log(log: &str) -> HunkMap {
                     .or_default()
                     .push(range);
             }
-        } else if in_header {
-            if let Some(rest) = line.strip_prefix("+++ ") {
-                path = rest
-                    .strip_prefix("b/")
-                    .map(|new| new.trim_end_matches('\t').to_string());
-                if let (Some(commit), Some(path)) = (&commit, &path) {
-                    map.entry((commit.clone(), path.clone())).or_default();
-                }
+        } else if in_header && let Some(rest) = line.strip_prefix("+++ ") {
+            path = rest
+                .strip_prefix("b/")
+                .map(|new| new.trim_end_matches('\t').to_string());
+            if let (Some(commit), Some(path)) = (&commit, &path) {
+                map.entry((commit.clone(), path.clone())).or_default();
             }
         }
     }

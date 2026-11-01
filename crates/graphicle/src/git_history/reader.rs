@@ -527,10 +527,10 @@ fn parse_record(record: usize, bytes: &[u8]) -> Result<CommitRecord, ParseError>
     if !is_oid(fields[1]) {
         return Err(at(format!("tree is not an object id: {:?}", fields[1])));
     }
-    let parents = parse_parents(fields[2]).map_err(&at)?;
-    let author_date = parse_git_date(fields[5]).map_err(&at)?;
-    let committer_date = parse_git_date(fields[8]).map_err(&at)?;
-    let changes = parse_changes(&bytes[header_end + 1..]).map_err(&at)?;
+    let parents = parse_parents(fields[2]).map_err(at)?;
+    let author_date = parse_git_date(fields[5]).map_err(at)?;
+    let committer_date = parse_git_date(fields[8]).map_err(at)?;
+    let changes = parse_changes(&bytes[header_end + 1..]).map_err(at)?;
 
     Ok(CommitRecord {
         oid: sha.to_string(),
