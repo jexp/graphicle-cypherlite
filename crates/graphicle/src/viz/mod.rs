@@ -65,6 +65,7 @@ use crate::store_graph::GraphStore;
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
+mod hotspot_city;
 mod knowledge_map;
 
 /// The resource URI prefix of the pack: `graphicle-graph://viz/<family>`.
@@ -118,7 +119,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Hotspot City",
         description: "A city-shaped view of churn: files as buildings over folder rollup, colored by windowed churn, the hot list beside it",
         mermaid: false,
-        render: hotspot_city,
+        render: hotspot_city::view,
     },
     Family {
         slug: "coupling-matrix",
@@ -529,10 +530,6 @@ fn stub(mermaid: bool) -> View {
         model: json!({}),
         mermaid: mermaid.then(|| format!("%% {NOT_YET}\n")),
     }
-}
-
-fn hotspot_city(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
 }
 
 fn impact_neighborhood(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
