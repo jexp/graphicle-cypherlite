@@ -4,9 +4,9 @@
 //!
 //! * [`exports`] builds an [`ExportIndex`] for one repository graph: package
 //!   identity from its manifests (`pyproject.toml` / `setup.cfg`,
-//!   `package.json`, `go.mod`) and a map from importable module paths
-//!   (`pkg.sub.mod`, `@scope/pkg/sub`, `example.com/mod/pkg`) to the graph's
-//!   module and symbol nodes.
+//!   `package.json`, `go.mod`, `Cargo.toml`) and a map from importable module
+//!   paths (`pkg.sub.mod`, `@scope/pkg/sub`, `example.com/mod/pkg`,
+//!   `crate::mod::item`) to the graph's module and symbol nodes.
 //! * [`link`] walks every import edge of an importing graph whose target is an
 //!   external stub, recovers the import statements from the importing file
 //!   (when its text is available) and matches them against the export indexes
@@ -45,6 +45,7 @@ const PY_EXTS: &[&str] = &[".py", ".pyi"];
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 const JS_STRIP_DIRS: &[&str] = &["src", "lib"];
 const JS_BUILD_DIRS: &[&str] = &["dist", "lib", "build", "out", "esm", "cjs"];
+const RS_EXTS: &[&str] = &[".rs"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +53,8 @@ pub enum Ecosystem {
     Python,
     Node,
     Go,
+    /// The Cargo (Rust) ecosystem.
+    Cargo,
 }
 
 impl Ecosystem {
@@ -60,6 +63,7 @@ impl Ecosystem {
             Ecosystem::Python => "python",
             Ecosystem::Node => "node",
             Ecosystem::Go => "go",
+            Ecosystem::Cargo => "cargo",
         }
     }
     /// The ecosystem of an importing file, by its extension.
@@ -71,6 +75,8 @@ impl Ecosystem {
             Some(Ecosystem::Node)
         } else if lower.ends_with(".go") {
             Some(Ecosystem::Go)
+        } else if RS_EXTS.iter().any(|e| lower.ends_with(e)) {
+            Some(Ecosystem::Cargo)
         } else {
             None
         }
@@ -96,7 +102,7 @@ impl PackageManifest {
     pub fn recognised(relpath: &str) -> bool {
         matches!(
             file_name(relpath),
-            "pyproject.toml" | "setup.cfg" | "package.json" | "go.mod"
+            "pyproject.toml" | "setup.cfg" | "package.json" | "go.mod" | "Cargo.toml"
         )
     }
 }
@@ -189,6 +195,7 @@ fn owns(ecosystem: Ecosystem, root: &str, module_path: &str) -> bool {
         Ecosystem::Node | Ecosystem::Go => {
             module_path == root || module_path.starts_with(&format!("{root}/"))
         }
+        Ecosystem::Cargo => module_path == root || module_path.starts_with(&format!("{root}::")),
     }
 }
 
@@ -460,6 +467,11 @@ const NODE_BUILTINS: &[&str] = &[
     "zlib",
 ];
 
+/// Rust's standard library crates: the same five the supply-chain resolver
+/// excludes (`graphicle`'s `supply_chain::resolve`), never a locked crate and
+/// never an exporter candidate.
+const RUST_STDLIB: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
+
 /// Whether `module_path` names the language's standard library. Go's rule
 /// (first segment without a dot) is applied while parsing import blocks.
 fn is_stdlib(ecosystem: Ecosystem, module_path: &str) -> bool {
@@ -478,6 +490,10 @@ fn is_stdlib(ecosystem: Ecosystem, module_path: &str) -> bool {
             .next()
             .unwrap_or(module_path)
             .contains('.'),
+        Ecosystem::Cargo => {
+            let head = module_path.split("::").next().unwrap_or(module_path);
+            RUST_STDLIB.contains(&head)
+        }
     }
 }
 
@@ -1091,6 +1107,68 @@ fn parse_go_mod(relpath: &str, text: &str) -> Option<PackageIdentity> {
     })
 }
 
+/// One `Cargo.toml` ([package] name and version, every dependency table as
+/// `manifest_ingest::parse_cargo` reads them, per target included). The
+/// import root is the crate name another repository `use`s: the `[lib]`
+/// name or the package name, hyphens folded to the underscores code spells
+/// them with — the crate `alib-rs` is `use alib_rs::…`, and a dependency
+/// written either way declares it. A virtual workspace root declares no
+/// package of its own and is skipped.
+fn parse_cargo_toml(relpath: &str, text: &str) -> Option<PackageIdentity> {
+    let doc: toml::Value = toml::from_str(text).ok()?;
+    let package = doc.get("package")?;
+    let name = package.get("name").and_then(toml::Value::as_str)?;
+    let version = package
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
+    let lib = doc
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
+    let crate_name = lib.unwrap_or_else(|| name.replace('-', "_"));
+    let mut dependencies = BTreeMap::new();
+    for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        // The same table per target (`[target.'cfg(unix)'.dependencies]`).
+        let tables = doc
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values().filter_map(toml::Value::as_table))
+            .filter_map(|cfg| cfg.get(table))
+            .chain(doc.get(table));
+        for entries in tables.filter_map(toml::Value::as_table) {
+            for (dep, value) in entries {
+                let requirement = match value {
+                    toml::Value::String(s) => s.clone(),
+                    toml::Value::Table(t) => t
+                        .get("version")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    _ => String::new(),
+                };
+                dependencies
+                    .entry(dep.replace('-', "_"))
+                    .or_insert(requirement);
+            }
+        }
+    }
+    Some(PackageIdentity {
+        ecosystem: Ecosystem::Cargo,
+        name: name.to_string(),
+        version,
+        root: dir_of(relpath),
+        manifest: relpath.to_string(),
+        import_roots: vec![crate_name],
+        dependencies,
+        exports_map: BTreeMap::new(),
+        main: None,
+        source_prefix: None,
+    })
+}
+
 /// Parse the manifests the caller supplied; unreadable or unknown files are skipped.
 pub fn package_identities(manifests: &[PackageManifest]) -> Vec<PackageIdentity> {
     let mut out = Vec::new();
@@ -1101,6 +1179,7 @@ pub fn package_identities(manifests: &[PackageManifest]) -> Vec<PackageIdentity>
             "setup.cfg" => parse_setup_cfg(&relpath, &manifest.text),
             "package.json" => parse_package_json(&relpath, &manifest.text),
             "go.mod" => parse_go_mod(&relpath, &manifest.text),
+            "Cargo.toml" => parse_cargo_toml(&relpath, &manifest.text),
             _ => None,
         };
         if let Some(identity) = parsed {
@@ -1200,6 +1279,10 @@ fn symbols_of(graph: &Graph, file: &FileNode, ecosystem: Ecosystem) -> BTreeMap<
         if ecosystem == Ecosystem::Python && name.starts_with('_') {
             continue;
         }
+        // Cargo has no signal here (the extractor records no visibility), so
+        // every module-level item is offered and a private one simply never
+        // matches an import; Rust methods are labels like `.save()` and never
+        // pass `symbol_name`.
         let id = node_id_text(&node.id);
         out.entry(name.clone()).or_insert(SymbolRef {
             name,
@@ -1431,6 +1514,35 @@ pub fn exports(
                         package.name.clone()
                     } else {
                         format!("{}/{dir}", package.name)
+                    };
+                    paths.push((module_path, "path"));
+                }
+                Ecosystem::Cargo => {
+                    // Only the library target is importable: `src/lib.rs`
+                    // (or a root `lib.rs`) is the crate root, `src/a/b.rs`
+                    // and `src/a/mod.rs` the module `crate::a::b` /
+                    // `crate::a`. Binaries (`src/main.rs`, `src/bin/**`) and
+                    // files outside `src/` (tests, benches, examples) are
+                    // not importable at all.
+                    let library = rel == "lib.rs"
+                        || (rel.starts_with("src/")
+                            && rel != "src/main.rs"
+                            && !rel.starts_with("src/bin/"));
+                    if !library {
+                        continue;
+                    }
+                    let Some(name) = package.import_roots.first() else {
+                        continue;
+                    };
+                    let Some(stem) = strip_ext(&rel, RS_EXTS) else {
+                        continue;
+                    };
+                    let stem = stem.strip_prefix("src/").unwrap_or(stem);
+                    let stem = stem.strip_suffix("/mod").unwrap_or(stem);
+                    let module_path = if stem == "lib" {
+                        name.clone()
+                    } else {
+                        format!("{name}::{}", stem.replace('/', "::"))
                     };
                     paths.push((module_path, "path"));
                 }
@@ -1761,11 +1873,166 @@ fn go_imports(text: &str) -> Vec<ImportSpec> {
     out
 }
 
+fn rust_use_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // A `use` item, `pub` and `pub(…)` included; the argument runs to the
+        // terminating `;`, so a group may span lines.
+        Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);").unwrap()
+    })
+}
+
+/// Each `use` statement of a Rust file. `use a::b::c;` names the symbol `c`
+/// of the module `a::b` — the extractor's import edge targets that name —
+/// `use a;` imports a whole crate, a group `use a::{b, c as d};` names `b`
+/// and `c`, `*` is a wildcard and `a::{self}` the crate itself. Paths rooted
+/// in this crate (`crate`, `self`, `super` heads) import nothing external.
+fn rust_imports(text: &str) -> Vec<ImportSpec> {
+    let mut out = Vec::new();
+    for captures in rust_use_regex().captures_iter(text) {
+        let written = captures[1].trim();
+        let line = line_of(text, captures.get(0).unwrap().start());
+        if let Some(spec) = rust_use(written, line) {
+            out.push(spec);
+        }
+    }
+    out
+}
+
+/// One `use` argument as an import spec.
+fn rust_use(written: &str, line: usize) -> Option<ImportSpec> {
+    // A leading `::` (the 2018 uniform-path crate form) always names a crate.
+    let written = written.strip_prefix("::").unwrap_or(written);
+    if let Some((head, list)) = split_rust_group(written) {
+        let module = head.trim().trim_end_matches(':').trim().to_string();
+        if module.is_empty() || rust_local_head(&module) {
+            return None;
+        }
+        let (names, whole, wildcard) = rust_group_bindings(list, None);
+        let shape = if wildcard {
+            ImportShape::Wildcard
+        } else if whole || names.is_empty() {
+            ImportShape::Whole
+        } else {
+            ImportShape::Named(names)
+        };
+        return Some(ImportSpec {
+            module,
+            shape,
+            line,
+            alias: None,
+        });
+    }
+    let path = written.split(" as ").next().unwrap_or("").trim();
+    let mut segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+    let wildcard = segments.last() == Some(&"*");
+    if wildcard {
+        segments.pop();
+    }
+    let head = segments.first().copied()?;
+    if rust_local_head(head) {
+        return None;
+    }
+    let (module, shape) = if wildcard {
+        (segments.join("::"), ImportShape::Wildcard)
+    } else if segments.len() == 1 {
+        (segments[0].to_string(), ImportShape::Whole)
+    } else {
+        (
+            segments[..segments.len() - 1].join("::"),
+            ImportShape::Named(vec![segments.last().unwrap().to_string()]),
+        )
+    };
+    Some(ImportSpec {
+        module,
+        shape,
+        line,
+        alias: None,
+    })
+}
+
+/// `head::{…}` split into its head and the group's content; `None` when the
+/// argument is no group. The group's closing brace is the last one.
+fn split_rust_group(written: &str) -> Option<(&str, &str)> {
+    let open = written.find('{')?;
+    let close = written.rfind('}')?;
+    (close > open).then(|| (&written[..open], &written[open + 1..close]))
+}
+
+/// The names a `use` group binds — each binding's leaf (`b as c` binds `b`),
+/// a nested group's leaves, `self` the path it sits on — plus whether the
+/// group bound its own path (`a::{self}`) or everything (`*`). `own` is the
+/// path a nested `self` names.
+fn rust_group_bindings(list: &str, own: Option<&str>) -> (Vec<String>, bool, bool) {
+    let mut names = Vec::new();
+    let mut whole = false;
+    let mut wildcard = false;
+    for item in split_rust_list(list) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item == "self" {
+            // `a::{self}` binds `a`; nested, `a::{b::{self}}` binds `a::b`.
+            match own {
+                Some(name) => names.push(name.to_string()),
+                None => whole = true,
+            }
+        } else if item == "*" {
+            wildcard = true;
+        } else if let Some((head, inner)) = split_rust_group(item) {
+            let head = head.trim().trim_end_matches(':');
+            let nested = head.rsplit("::").next().unwrap_or(head);
+            // A nested `self` is `own` inside; the group's `whole` never
+            // crosses a nesting level.
+            let (inner_names, _, inner_wildcard) = rust_group_bindings(inner, Some(nested));
+            wildcard = wildcard || inner_wildcard;
+            names.extend(inner_names);
+        } else {
+            let name = item.split(" as ").next().unwrap_or("").trim();
+            let name = name.rsplit("::").next().unwrap_or(name);
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    (names, whole, wildcard)
+}
+
+/// The top-level comma-separated items of a `use` group; braces nest.
+fn split_rust_list(list: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (at, c) in list.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&list[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&list[start..]);
+    out
+}
+
+/// Whether a use path is rooted in this crate (`crate`, `self`, `super`
+/// first segment): never an external import.
+fn rust_local_head(path: &str) -> bool {
+    path.split("::")
+        .next()
+        .is_some_and(|head| matches!(head, "crate" | "self" | "super"))
+}
+
 fn imports_of(ecosystem: Ecosystem, text: &str) -> Vec<ImportSpec> {
     match ecosystem {
         Ecosystem::Python => python_imports(text),
         Ecosystem::Node => js_imports(text),
         Ecosystem::Go => go_imports(text),
+        Ecosystem::Cargo => rust_imports(text),
     }
 }
 
@@ -1791,6 +2058,16 @@ fn spec_matches_target(
         Ecosystem::Go => {
             format!("go_pkg_{}", sanitize_go_id(&spec.module)) == target_id
                 || target_label == spec.module
+        }
+        Ecosystem::Cargo => {
+            // The Rust extractor's import edge targets the imported name —
+            // the use path's last segment or a group binding — as a
+            // normalized id (`Deserialize` is the stub `deserialize`).
+            let id = |name: &str| graphicle::ids::normalize_id(name);
+            let last = spec.module.rsplit("::").next().unwrap_or(&spec.module);
+            target_id == id(last)
+                || matches!(&spec.shape, ImportShape::Named(names) if
+                    names.iter().any(|name| target_id == id(name)))
         }
     }
 }
@@ -2007,6 +2284,28 @@ fn node_satisfies(constraint: &str, version: &Version) -> VersionCheck {
     }
 }
 
+/// A Cargo requirement: a bare version is a caret range (`1.2` is `^1.2`,
+/// where npm would read it as the partial `1.2.x`), `,` separates
+/// requirements the way npm ranges use spaces, `*` accepts anything. A
+/// `git`, `path` or `workspace` dependency carries no version to check.
+fn cargo_satisfies(requirement: &str, version: &Version) -> VersionCheck {
+    let requirement = requirement.trim();
+    if requirement.is_empty() || requirement == "*" {
+        return VersionCheck::Satisfied;
+    }
+    let npm: String = requirement
+        .split(',')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(|clause| match clause.as_bytes().first() {
+            Some(b'=' | b'>' | b'<' | b'^' | b'~' | b'!') => clause.to_string(),
+            _ => format!("^{clause}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    node_satisfies(&npm, version)
+}
+
 fn go_satisfies(required: &str, version: &Version) -> VersionCheck {
     // Minimal version selection: the built module is at least the required
     // version within the same major (module paths carry /vN for v2+).
@@ -2042,6 +2341,7 @@ fn check_version(
         Ecosystem::Python => python_satisfies(constraint, &exporter),
         Ecosystem::Node => node_satisfies(constraint, &exporter),
         Ecosystem::Go => go_satisfies(constraint, &exporter),
+        Ecosystem::Cargo => cargo_satisfies(constraint, &exporter),
     };
     match check {
         VersionCheck::Satisfied => (check, "satisfied"),
@@ -2099,6 +2399,9 @@ impl Importer<'_> {
     fn constraint(&self, ecosystem: Ecosystem, package: &str) -> Option<String> {
         let key = match ecosystem {
             Ecosystem::Python => normalize_py_name(package),
+            // A dependency is written as the crate it names, hyphens and all
+            // (`alib-rs`), while code spells it with underscores.
+            Ecosystem::Cargo => package.replace('-', "_"),
             _ => package.to_string(),
         };
         self.packages
@@ -2148,6 +2451,11 @@ fn package_name_of(ecosystem: Ecosystem, module_path: &str) -> String {
             .to_string(),
         Ecosystem::Node => node_package_of(module_path),
         Ecosystem::Go => module_path.to_string(),
+        Ecosystem::Cargo => module_path
+            .split("::")
+            .next()
+            .unwrap_or(module_path)
+            .to_string(),
     }
 }
 
@@ -2266,6 +2574,13 @@ fn recover_specs(
                 Ecosystem::Python => module_path.replace('.', "_") == target_id,
                 Ecosystem::Node => module_path == target_label,
                 Ecosystem::Go => format!("go_pkg_{}", sanitize_go_id(module_path)) == target_id,
+                // The stub names the imported item, so only a module path
+                // that ends in it (`use alib_rs;`) recovers without sources.
+                Ecosystem::Cargo => {
+                    graphicle::ids::normalize_id(
+                        module_path.rsplit("::").next().unwrap_or(module_path),
+                    ) == target_id
+                }
             };
             if hit {
                 matches.insert(module_path.clone());
@@ -2513,9 +2828,11 @@ fn resolve_spec(
                     );
                     continue;
                 }
-                // `from pkg.sub import mod` names a submodule, not a symbol.
+                // `from pkg.sub import mod` / `use pkg::sub::mod;` names a
+                // submodule, not a symbol.
                 let submodule_path = match ecosystem {
                     Ecosystem::Python => format!("{}.{name}", spec.module),
+                    Ecosystem::Cargo => format!("{}::{name}", spec.module),
                     _ => format!("{}/{name}", spec.module),
                 };
                 if let Some(sub) = index.modules.get(&submodule_path) {
@@ -3362,6 +3679,231 @@ mod tests {
         );
     }
 
+    // ── Rust ──
+    fn rust_lib() -> (Graph, Vec<PackageManifest>) {
+        let g = graph(
+            vec![
+                node("src_lib", "lib.rs", "src/lib.rs", json!({})),
+                node(
+                    "src_lib_run",
+                    "run()",
+                    "src/lib.rs",
+                    json!({"_callable": true}),
+                ),
+                node("src_core", "core.rs", "src/core.rs", json!({})),
+                node(
+                    "src_core_process",
+                    "process()",
+                    "src/core.rs",
+                    json!({"_callable": true}),
+                ),
+                node(
+                    "src_core_store",
+                    "Store",
+                    "src/core.rs",
+                    json!({"_callable": true, "_callable_class": true}),
+                ),
+                node(
+                    "src_core_save",
+                    ".save()",
+                    "src/core.rs",
+                    json!({"_callable": true}),
+                ),
+                node("src_sub_mod", "mod.rs", "src/sub/mod.rs", json!({})),
+                node("src_sub_deep", "deep.rs", "src/sub/deep.rs", json!({})),
+                node("src_main", "main.rs", "src/main.rs", json!({})),
+                node("src_bin_tool", "tool.rs", "src/bin/tool.rs", json!({})),
+            ],
+            vec![],
+        );
+        (
+            g,
+            vec![PackageManifest::new(
+                "Cargo.toml",
+                "[package]\nname = \"alib-rs\"\nversion = \"1.2.0\"\n\n[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\ntempfile = \"3\"\n",
+            )],
+        )
+    }
+    fn rust_app(requirement: &str) -> (Graph, Vec<PackageManifest>, BTreeMap<String, String>) {
+        let g = graph(
+            vec![
+                node("src_main", "main.rs", "src/main.rs", json!({})),
+                external("process", "process"),
+                external("core", "core"),
+                external("fmt", "fmt"),
+                external("deserialize", "deserialize"),
+            ],
+            vec![
+                edge("src_main", "process", "imports_from"),
+                edge("src_main", "core", "imports_from"),
+                edge("src_main", "fmt", "imports_from"),
+                edge("src_main", "deserialize", "imports_from"),
+            ],
+        );
+        let manifest = PackageManifest::new(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"bapp\"\nversion = \"0.1.0\"\n\n[dependencies]\nalib-rs = \"{requirement}\"\nserde = \"1\"\n"
+            ),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "src/main.rs".to_string(),
+            "use alib_rs::core::process;\nuse alib_rs::core;\nuse std::fmt;\nuse serde::Deserialize;\n\nfn main() {\n    process([]);\n}\n"
+                .to_string(),
+        );
+        (g, vec![manifest], sources)
+    }
+
+    #[test]
+    fn cargo_exports_map_the_crate_modules_and_symbols() {
+        let (g, manifests) = rust_lib();
+        let index = exports(&g, "rs-a", Some("ep-rs-a"), &manifests);
+        let package = &index.packages[0];
+        assert_eq!(package.ecosystem, Ecosystem::Cargo);
+        assert_eq!(package.name, "alib-rs");
+        // The crate name as code spells it: hyphens fold to underscores.
+        assert_eq!(package.import_roots, vec!["alib_rs".to_string()]);
+        assert_eq!(package.version.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            package.dependencies.keys().collect::<Vec<_>>(),
+            vec!["serde", "tempfile"]
+        );
+        let root = &index.modules["alib_rs"];
+        assert_eq!(root.node_id, "src_lib");
+        assert!(root.symbols.contains_key("run"));
+        let core = &index.modules["alib_rs::core"];
+        assert_eq!(core.node_id, "src_core");
+        assert!(core.symbols.contains_key("process"));
+        assert!(core.symbols.contains_key("Store"));
+        assert!(
+            !core.symbols.contains_key("save"),
+            "methods are not exports"
+        );
+        assert!(index.modules.contains_key("alib_rs::sub"));
+        assert!(index.modules.contains_key("alib_rs::sub::deep"));
+        // Binaries are not importable.
+        assert!(
+            !index
+                .modules
+                .keys()
+                .any(|m| m.ends_with("::main") || m.ends_with("::tool"))
+        );
+    }
+
+    #[test]
+    fn cargo_lib_name_and_hyphenated_dependencies() {
+        let manifests = vec![PackageManifest::new(
+            "Cargo.toml",
+            "[package]\nname = \"alib-rs\"\nversion = \"0.1\"\n\n[lib]\nname = \"alib\"\n\n[target.'cfg(unix)'.dependencies]\nserde = { version = \"1\", optional = true }\n\n[dependencies]\ncargo-lock = \"1\"\n",
+        )];
+        let ids = package_identities(&manifests);
+        assert_eq!(ids.len(), 1);
+        // The `[lib]` name is the import root.
+        assert_eq!(ids[0].import_roots, vec!["alib".to_string()]);
+        // Both spellings of a hyphenated crate declare it, keyed as code
+        // spells it (`cargo-lock` is `use cargo_lock::…`).
+        assert_eq!(ids[0].dependencies["cargo_lock"], "1");
+        assert_eq!(ids[0].dependencies["serde"], "1");
+        // A virtual workspace root declares no package of its own.
+        let workspace = package_identities(&[PackageManifest::new(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )]);
+        assert!(workspace.is_empty());
+    }
+
+    #[test]
+    fn cargo_links_use_statements_and_skips_the_standard_library() {
+        let (a, a_manifests) = rust_lib();
+        let index = exports(&a, "rs-a", Some("ep-rs-a"), &a_manifests);
+        let (b, b_manifests, sources) = rust_app("1.2");
+        let report = link(
+            &b,
+            "rs-b",
+            Some("ep-rs-b"),
+            &b_manifests,
+            &[index],
+            &loader(&sources),
+        );
+        let find = |tgt: &str| report.edges.iter().find(|e| e.target.node_id == tgt);
+        // `use alib_rs::core::process;`: a symbol of the module.
+        let process = find("src_core_process").expect("symbol edge");
+        assert_eq!(process.relation, RELATION_SYMBOL);
+        assert_eq!(process.confidence, EXTRACTED);
+        assert_eq!(process.symbol.as_deref(), Some("process"));
+        assert_eq!(process.module_path, "alib_rs::core");
+        // The dependency is declared with the package's hyphenated name.
+        assert_eq!(process.version_constraint.as_deref(), Some("1.2"));
+        assert_eq!(process.exporter_version.as_deref(), Some("1.2.0"));
+        assert_eq!(process.version_status, "satisfied");
+        assert_eq!(process.line, Some(1));
+        assert_eq!(process.source.episode.as_deref(), Some("ep-rs-b"));
+        assert_eq!(process.target.episode.as_deref(), Some("ep-rs-a"));
+        // `use alib_rs::core;` names the submodule.
+        let core = find("src_core").expect("submodule edge");
+        assert_eq!(core.relation, RELATION_MODULE);
+        assert_eq!(core.confidence, EXTRACTED);
+        assert_eq!(core.symbol.as_deref(), Some("core"));
+        assert_eq!(core.derivation, "import_statement:path:submodule");
+        // `use std::fmt;`: standard library, not an exporter candidate.
+        assert_eq!(
+            report.skipped_stdlib, 1,
+            "`use std::fmt;` is standard library"
+        );
+        assert!(
+            !report
+                .unresolved
+                .iter()
+                .any(|u| u.module_path == "std::fmt")
+        );
+        // `serde` is declared but no index exports it.
+        assert!(
+            report
+                .unresolved
+                .iter()
+                .any(|u| u.reason == REASON_DECLARED_NOT_INDEXED && u.package == "serde")
+        );
+        assert!(report.edges.iter().all(|e| e.target.repo == "rs-a"));
+        assert_eq!(report.files_with_source, 1);
+    }
+
+    #[test]
+    fn cargo_semver_mismatch_is_unresolved() {
+        let (a, a_manifests) = rust_lib();
+        let index = exports(&a, "rs-a", None, &a_manifests);
+        let (b, b_manifests, sources) = rust_app("2");
+        let report = link(&b, "rs-b", None, &b_manifests, &[index], &loader(&sources));
+        assert!(report.edges.iter().all(|e| e.target.repo != "rs-a"));
+        let miss = report
+            .unresolved
+            .iter()
+            .find(|u| u.reason == REASON_VERSION)
+            .unwrap();
+        assert_eq!(miss.candidates, vec!["rs-a".to_string()]);
+        assert_eq!(miss.exporter_version.as_deref(), Some("1.2.0"));
+        assert_eq!(miss.version_constraint.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn cargo_without_sources_recovers_module_paths_only() {
+        let (a, a_manifests) = rust_lib();
+        let index = exports(&a, "rs-a", None, &a_manifests);
+        let (b, b_manifests, _) = rust_app("1.2");
+        let report = link(&b, "rs-b", None, &b_manifests, &[index], &no_sources);
+        // The `core` stub is a module path's last segment; the `process` stub
+        // names an item, and without the use statement it cannot be
+        // attributed to a module.
+        let core = report
+            .edges
+            .iter()
+            .find(|e| e.target.node_id == "src_core")
+            .unwrap();
+        assert_eq!(core.confidence, INFERRED);
+        assert!(core.derivation.starts_with("id_match"));
+        assert!(!report.edges.iter().any(|e| e.relation == RELATION_SYMBOL));
+    }
+
     // ── versions ──
     #[test]
     fn version_constraints() {
@@ -3456,6 +3998,29 @@ mod tests {
             go_satisfies("v1.2.0", &v("v2.0.0")),
             VersionCheck::Unsatisfied
         );
+        assert_eq!(cargo_satisfies("1.2", &v("1.9.3")), VersionCheck::Satisfied);
+        assert_eq!(
+            cargo_satisfies("1.2", &v("2.0.0")),
+            VersionCheck::Unsatisfied
+        );
+        assert_eq!(
+            cargo_satisfies("^1.2", &v("1.9.0")),
+            VersionCheck::Satisfied
+        );
+        assert_eq!(
+            cargo_satisfies("~1.2", &v("1.3.0")),
+            VersionCheck::Unsatisfied
+        );
+        assert_eq!(
+            cargo_satisfies(">=1.0, <2.0", &v("1.5.0")),
+            VersionCheck::Satisfied
+        );
+        assert_eq!(
+            cargo_satisfies(">=1.0, <2.0", &v("2.0.0")),
+            VersionCheck::Unsatisfied
+        );
+        assert_eq!(cargo_satisfies("", &v("1.0.0")), VersionCheck::Satisfied);
+        assert_eq!(cargo_satisfies("*", &v("0.9.0")), VersionCheck::Satisfied);
     }
 
     #[test]
@@ -3518,6 +4083,28 @@ mod tests {
         assert_eq!(go[1].module, "github.com/o/r/v2");
         assert_eq!(go[1].alias.as_deref(), Some("r"));
         assert_eq!(go[1].shape, ImportShape::Named(vec!["New".into()]));
+        let rust = rust_imports(
+            "use a::b;\nuse c::{d, e as f, g::{self, h}};\npub use i::j::*;\nuse crate::k;\nuse self::l;\nuse super::m::n;\nuse ::o::p;\nuse q as r;\nuse s::*;\n",
+        );
+        assert_eq!(rust[0].module, "a");
+        assert_eq!(rust[0].shape, ImportShape::Named(vec!["b".into()]));
+        assert_eq!(rust[0].line, 1);
+        // A group names each binding's leaf; `g::{self}` binds `g`.
+        assert_eq!(rust[1].module, "c");
+        assert_eq!(
+            rust[1].shape,
+            ImportShape::Named(vec!["d".into(), "e".into(), "g".into(), "h".into()])
+        );
+        assert_eq!(rust[2].module, "i::j");
+        assert_eq!(rust[2].shape, ImportShape::Wildcard);
+        // `crate`/`self`/`super` roots import nothing external.
+        assert_eq!(rust.len(), 6);
+        assert_eq!(rust[3].module, "o");
+        assert_eq!(rust[3].shape, ImportShape::Named(vec!["p".into()]));
+        assert_eq!(rust[4].module, "q");
+        assert_eq!(rust[4].shape, ImportShape::Whole);
+        assert_eq!(rust[5].module, "s");
+        assert_eq!(rust[5].shape, ImportShape::Wildcard);
     }
 
     #[test]

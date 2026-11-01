@@ -137,6 +137,10 @@ the count, the limit and the setting. You can also extend `.gitignore` (for
 files Git does not track; `graphicle config set sync.tracked_ignored false`
 applies it to tracked files too) or sync a subfolder.
 
+A store that must make no network calls sets `sync.osv` to `false` (or
+`GRAPHICLE_SYNC_OSV=0`): the sync then queues no OSV advisory query, and the
+lockfile is still read.
+
 One large or unusual file never stops a sync. A file over 4 MiB, or with more
 than 50,000 calls or 2,000,000 syntax nodes, is analysed as far as the limit
 allows and stays searchable. A text file over 8 MiB, or one that cannot be

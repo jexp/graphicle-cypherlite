@@ -1,0 +1,256 @@
+%%{init: {"theme":"neutral"}}%%
+classDiagram
+%% GUAC (guacsec/guac v1.1.0) - generated from guac.graphspec.yaml; keep in sync.
+%% 29 node types (12 software-tree, 17 evidence), 56 relationship types.
+%% GUAC quirk: evidence (attestations) are NODES carrying their own provenance
+%% (origin, collector, documentRef); subject links run software -> evidence,
+%% object links run evidence -> software. "?" marks optional properties.
+%% Cardinalities are UML: label near a class = instances of that class per
+%% instance of the other end (e.g. each IsDependency has exactly 1 subject
+%% PackageVersion, and each PackageVersion has many IsDependency attestations).
+  class PackageType {
+    +String type
+  }
+  class PackageNamespace {
+    +String type
+    +String namespace
+  }
+  class PackageName {
+    +String type
+    +String namespace
+    +String name
+  }
+  class PackageVersion {
+    +String purl
+    +String version
+    +List~String~ qualifiers
+    +String subpath
+  }
+  class SourceType {
+    +String type
+  }
+  class SourceNamespace {
+    +String type
+    +String namespace
+  }
+  class SourceName {
+    +String type
+    +String namespace
+    +String name
+    +String? tag
+    +String? commit
+  }
+  class Artifact {
+    +String algorithm
+    +String digest
+  }
+  class Builder {
+    +String uri
+  }
+  class VulnerabilityType {
+    +String type
+  }
+  class VulnerabilityID {
+    +String type
+    +String vulnerabilityId
+  }
+  class License {
+    +String name
+    +String? inline
+    +String listVersion
+  }
+  class IsDependency {
+    +String dependencyType
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class IsOccurrence {
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class HasSourceAt {
+    +Datetime knownSince
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class HashEqual {
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class PkgEqual {
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class VulnEqual {
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class HasSBOM {
+    +String uri
+    +String algorithm
+    +String digest
+    +String downloadLocation
+    +Datetime knownSince
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class HasSLSA {
+    +String buildType
+    +String slsaVersion
+    +Datetime? startedOn
+    +Datetime? finishedOn
+    +List~String~ slsaPredicates
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class HasMetadata {
+    +String key
+    +String value
+    +Datetime timestamp
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class PointOfContact {
+    +String email
+    +String info
+    +Datetime since
+    +String justification
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyVuln {
+    +Datetime timeScanned
+    +String dbUri
+    +String dbVersion
+    +String scannerUri
+    +String scannerVersion
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class VulnerabilityMetadata {
+    +String scoreType
+    +Float scoreValue
+    +Datetime timestamp
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyVEXStatement {
+    +String status
+    +String vexJustification
+    +String statement
+    +String statusNotes
+    +Datetime knownSince
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyGood {
+    +String justification
+    +Datetime knownSince
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyBad {
+    +String justification
+    +Datetime knownSince
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyLegal {
+    +String declaredLicense
+    +String discoveredLicense
+    +String attribution
+    +String justification
+    +Datetime timeScanned
+    +String origin
+    +String collector
+    +String documentRef
+  }
+  class CertifyScorecard {
+    +Float aggregateScore
+    +List~String~ checks
+    +Datetime timeScanned
+    +String scorecardVersion
+    +String scorecardCommit
+    +String origin
+    +String collector
+    +String documentRef
+  }
+
+  PackageType "1" --> "0..*" PackageNamespace : PKG_HAS_NAMESPACE
+  PackageNamespace "1" --> "0..*" PackageName : PKG_HAS_NAME
+  PackageName "1" --> "0..*" PackageVersion : PKG_HAS_VERSION
+  SourceType "1" --> "0..*" SourceNamespace : SRC_HAS_NAMESPACE
+  SourceNamespace "1" --> "0..*" SourceName : SRC_HAS_NAME
+  VulnerabilityType "1" --> "0..*" VulnerabilityID : VULN_HAS_VULNERABILITY_ID
+  PackageVersion "1" --> "0..*" IsDependency : PACKAGE_IS_DEPENDENCY
+  PackageVersion "1" --> "0..*" IsOccurrence : PACKAGE_IS_OCCURRENCE
+  SourceName "1" --> "0..*" IsOccurrence : SOURCE_IS_OCCURRENCE
+  PackageName "1" --> "0..*" HasSourceAt : PACKAGE_NAME_HAS_SOURCE_AT
+  PackageVersion "1" --> "0..*" HasSourceAt : PACKAGE_VERSION_HAS_SOURCE_AT
+  PackageVersion "1" --> "0..*" HasSBOM : PACKAGE_HAS_SBOM
+  Artifact "1" --> "0..*" HasSBOM : ARTIFACT_HAS_SBOM
+  Artifact "1" --> "0..*" HasSLSA : ARTIFACT_HAS_SLSA
+  PackageVersion "1" --> "0..*" CertifyVuln : PACKAGE_CERTIFY_VULN
+  PackageVersion "1" --> "0..*" CertifyVEXStatement : PACKAGE_CERTIFY_VEX_STATEMENT
+  Artifact "1" --> "0..*" CertifyVEXStatement : ARTIFACT_CERTIFY_VEX_STATEMENT
+  PackageVersion "1" --> "0..*" CertifyLegal : PACKAGE_CERTIFY_LEGAL
+  SourceName "1" --> "0..*" CertifyLegal : SOURCE_CERTIFY_LEGAL
+  SourceName "1" --> "0..*" CertifyScorecard : SOURCE_CERTIFY_SCORECARD
+  PackageName "1" --> "0..*" CertifyGood : PACKAGE_NAME_CERTIFY_GOOD
+  PackageVersion "1" --> "0..*" CertifyGood : PACKAGE_VERSION_CERTIFY_GOOD
+  SourceName "1" --> "0..*" CertifyGood : SOURCE_CERTIFY_GOOD
+  Artifact "1" --> "0..*" CertifyGood : ARTIFACT_CERTIFY_GOOD
+  PackageName "1" --> "0..*" CertifyBad : PACKAGE_NAME_CERTIFY_BAD
+  PackageVersion "1" --> "0..*" CertifyBad : PACKAGE_VERSION_CERTIFY_BAD
+  SourceName "1" --> "0..*" CertifyBad : SOURCE_CERTIFY_BAD
+  Artifact "1" --> "0..*" CertifyBad : ARTIFACT_CERTIFY_BAD
+  PackageName "1" --> "0..*" HasMetadata : PACKAGE_NAME_HAS_METADATA
+  PackageVersion "1" --> "0..*" HasMetadata : PACKAGE_VERSION_HAS_METADATA
+  SourceName "1" --> "0..*" HasMetadata : SOURCE_HAS_METADATA
+  Artifact "1" --> "0..*" HasMetadata : ARTIFACT_HAS_METADATA
+  PackageName "1" --> "0..*" PointOfContact : PACKAGE_NAME_POINT_OF_CONTACT
+  PackageVersion "1" --> "0..*" PointOfContact : PACKAGE_VERSION_POINT_OF_CONTACT
+  SourceName "1" --> "0..*" PointOfContact : SOURCE_POINT_OF_CONTACT
+  Artifact "1" --> "0..*" PointOfContact : ARTIFACT_POINT_OF_CONTACT
+  PackageVersion "1" --> "0..*" PkgEqual : PKG_EQUAL
+  VulnerabilityID "1" --> "0..*" VulnEqual : VULN_EQUAL
+  Artifact "1" --> "0..*" HashEqual : HASH_EQUAL
+  VulnerabilityID "1" --> "0..*" VulnerabilityMetadata : VULNERABILITY_VULN_METADATA
+  IsDependency "0..*" --> "1" PackageVersion : IS_DEPENDENCY_PACKAGE
+  IsOccurrence "0..*" --> "1" Artifact : IS_OCCURRENCE_ARTIFACT
+  HasSourceAt "0..*" --> "1" SourceName : HAS_SOURCE_AT_SOURCE
+  HasSBOM "0..*" --> "0..*" PackageVersion : HAS_SBOM_INCLUDED_SOFTWARE_PACKAGE
+  HasSBOM "0..*" --> "0..*" Artifact : HAS_SBOM_INCLUDED_SOFTWARE_ARTIFACT
+  HasSBOM "0..*" --> "0..*" IsDependency : HAS_SBOM_INCLUDED_DEPENDENCIES
+  HasSBOM "0..*" --> "0..*" IsOccurrence : HAS_SBOM_INCLUDED_OCCURRENCES
+  HasSLSA "0..*" --> "1" Builder : HAS_SLSA_BUILT_BY
+  HasSLSA "0..*" --> "0..*" Artifact : HAS_SLSA_MATERIALS
+  CertifyVuln "0..*" --> "1" VulnerabilityID : CERTIFY_VULN_VULNERABILITY
+  CertifyVEXStatement "0..*" --> "1" VulnerabilityID : CERTIFY_VEX_STATEMENT_VULNERABILITY
+  CertifyLegal "0..*" --> "0..*" License : CERTIFY_LEGAL_DECLARED_LICENSE
+  CertifyLegal "0..*" --> "0..*" License : CERTIFY_LEGAL_DISCOVERED_LICENSE
+  PkgEqual "0..*" --> "1" PackageVersion : PKG_EQUAL_PACKAGE
+  VulnEqual "0..*" --> "1" VulnerabilityID : VULN_EQUAL_VULNERABILITY
+  HashEqual "0..*" --> "1" Artifact : HASH_EQUAL_ARTIFACT

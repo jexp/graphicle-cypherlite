@@ -803,26 +803,6 @@ mod tests {
         found(graph, &query, json!({"repo": repository_id}))
     }
 
-    /// The store as one comparable value: every node's labels and
-    /// properties, every relationship's type and properties.
-    fn state(graph: &GraphStore) -> Value {
-        graph
-            .read(|db| {
-                let nodes = store_graph::rows(
-                    db,
-                    "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props",
-                    p(&json!({})),
-                )?;
-                let rels = store_graph::rows(
-                    db,
-                    "MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS props",
-                    p(&json!({})),
-                )?;
-                Ok(json!({"nodes": nodes, "rels": rels}))
-            })
-            .unwrap()
-    }
-
     /// Node and edge counts per label and per relationship type, the
     /// interrupted-run comparison.
     fn tally(graph: &GraphStore) -> Value {
@@ -1121,12 +1101,16 @@ mod tests {
         let (dir, repo, _scenario) = history_fixture();
         let graph = graph_for("repo-git");
         run(&graph, "repo-git", repo.root());
-        let before = state(&graph);
+        let before = store_graph::test_state(&graph);
 
         let again = run(&graph, "repo-git", repo.root());
         assert_eq!(again["mode"], json!("unchanged"), "{again:#}");
         assert_eq!(again["ingested"], json!(0));
-        assert_eq!(state(&graph), before, "the second run must write nothing");
+        assert_eq!(
+            store_graph::test_state(&graph),
+            before,
+            "the second run must write nothing"
+        );
         drop(dir);
     }
 

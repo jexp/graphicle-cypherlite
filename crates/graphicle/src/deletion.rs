@@ -116,6 +116,11 @@ const HISTORY: &[&str] = &[
     "Change",
     "Branch",
     "Tag",
+    // Not history, on purpose: a Package or PackageVersion is the project's
+    // current lockfile content, rewritten by every sync (a re-lock moves the
+    // DESCRIBES and the REQUIRES of the versions it names). It is in the
+    // state digest like a Symbol is, so a forgotten project loses it and a
+    // store that never ingested the lockfile digests the same way.
     TOMBSTONES,
     "OAuthPending",
 ];
@@ -173,6 +178,26 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     ("Change", "Change", Scoped::Repository),
     ("Person", "Person", Scoped::Repository),
     ("Tag", "Tag", Scoped::Repository),
+    // Cargo.lock package facts (supply_chain::lock). Scoped like the rest of
+    // the project's derived content; they are not history (see HISTORY).
+    ("Package", "Package", Scoped::Repository),
+    ("PackageVersion", "PackageVersion", Scoped::Repository),
+    // OSV advisories (supply_chain::osv): current facts about the lockfile, like
+    // the packages they name, so they walk with the project and are not history.
+    ("Advisory", "Advisory", Scoped::Repository),
+    ("AdvisoryCorpus", "AdvisoryCorpus", Scoped::Repository),
+    // An import that resolved to no local path, member or locked crate
+    // (supply_chain::resolve): negative evidence, recomputed by every
+    // resolution run, so it walks with its project's derived content the
+    // same way.
+    ("UnresolvedPackage", "UnresolvedPackage", Scoped::Repository),
+    // deps.dev license facts (supply_chain::on_demand): pinned evidence a
+    // cited analysis consumed, written only when an answer must outlive the
+    // question. It is scoped like the packages it names and is not history
+    // (see HISTORY): it is part of the project's derived content, so a
+    // forgotten project loses its pins and a store that never pinned any
+    // digests the same way.
+    ("License", "License", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),

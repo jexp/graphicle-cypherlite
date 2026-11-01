@@ -1190,6 +1190,9 @@ pub const CORE_OPERATIONS: &[&str] = &[
     "graph.query",
     "graph.source",
     "graph.stats",
+    "graph.deps_of",
+    "graph.license_of",
+    "graph.vuln_impact",
     "history",
     "impact.report",
     "interpretation.prepare",
@@ -1373,6 +1376,16 @@ pub(crate) fn dispatch(
         }
         // The engine's navigation tools on a recorded episode.
         "graph.navigate" => crate::graph_tools::call(store, workspace, capability, args),
+        // The supply-chain tools: what a symbol's or a file's imports resolve
+        // to, which code a vulnerable package reaches, and each package's
+        // license (plan §4 P3).
+        "graph.deps_of" => crate::supply_chain::tools::deps_of(store, workspace, capability, args),
+        "graph.vuln_impact" => {
+            crate::supply_chain::tools::vuln_impact(store, workspace, capability, args)
+        }
+        "graph.license_of" => {
+            crate::supply_chain::tools::license_of(store, workspace, capability, args)
+        }
         "retention.preview" => store.retention_preview(workspace, capability, args),
         // Captured agent sessions (connector documents): browse and forget.
         "session.timeline" => store.session_timeline(workspace, capability, args),
@@ -1813,6 +1826,49 @@ pub fn core_mcp_tools(learning: bool, work_state: bool) -> Vec<McpTool> {
         )
         .workspace_only(),
     );
+    // The supply-chain tools: what the code imports from its locked packages,
+    // the advisories that reach it, and the packages' licenses (plan §4 P3).
+    tools.push(McpTool::new(
+        tool(
+            "deps_of",
+            "Find the packages a symbol or a file's imports resolve to: the locked versions of each, what each version depends on, and its manifest requirements (a pinned fact first, else deps.dev); cited by the importing file: path and line, as query_graph cites. Use it to see which crates a file uses before changing a dependency.",
+            json!({"symbol":{"type":"string","description":"a symbol's stable_id or qualified name"},
+            "file":{"type":"string","description":"a file's path in the project"},
+            "repo":{"type":"string","description":REPO_DESCRIPTION}}),
+            &[],
+            false,
+        ),
+        crate::supply_chain::tools::DEPS_OF,
+        true,
+    ));
+    tools.push(McpTool::new(
+        tool(
+            "vuln_impact",
+            "Find where a vulnerable package is used: for an advisory (its OSV id, such as RUSTSEC-2020-0071) the locked versions it affects and the files that import them, or for a package its locked versions' advisories, or the clean scan that found none; cited by file: path and line of each import. Use it to see what a RustSec or OSV advisory reaches in this project.",
+            json!({"advisory":{"type":"string","description":"an OSV or RustSec advisory id"},
+            "package":{"type":"string","description":"a locked crate's name or purl"},
+            "repo":{"type":"string","description":REPO_DESCRIPTION}}),
+            &[],
+            false,
+        ),
+        crate::supply_chain::tools::VULN_IMPACT,
+        true,
+    ));
+    tools.push(McpTool::new(
+        tool(
+            "license_of",
+            "Find the license of the package a symbol, a file or a package maps to, per locked version: a pinned fact first, else deps.dev; a version neither answers is named as not known. Use it to check a dependency's license before adopting or upgrading it.",
+            json!({"symbol":{"type":"string","description":"a symbol's stable_id or qualified name"},
+            "file":{"type":"string","description":"a file's path in the project"},
+            "package":{"type":"string","description":"a locked crate's name or purl"},
+            "as_of":{"type":"string","description":"the pinned facts of this date, as an analysis recorded them; without it, the newest pin"},
+            "repo":{"type":"string","description":REPO_DESCRIPTION}}),
+            &[],
+            false,
+        ),
+        crate::supply_chain::tools::LICENSE_OF,
+        true,
+    ));
     tools
 }
 /// `identifier_route` when a call to `recall_project` leaves it out: on in

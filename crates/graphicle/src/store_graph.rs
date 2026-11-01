@@ -472,6 +472,48 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     (br:Branch => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL,
                    ref IS STRING}),
     (tg:Tag => {repository_id IS STRING NOT NULL, name IS STRING NOT NULL}),
+    // Cargo.lock package facts (supply-chain plan §2; written by supply_chain::lock).
+    // A version's source fields are present for registry, git and other
+    // sources; a path package carries none.
+    (pk:Package => {repository_id IS STRING NOT NULL, purl IS STRING NOT NULL,
+                    system IS STRING, name IS STRING}),
+    // The pin path's deps.dev facts (supply_chain::on_demand) ride the same
+    // nodes: deprecation, source repository and Scorecard as origin-tagged
+    // properties, each family with its own known_at/as_of/analysis because
+    // families pin at different times. Present only when an analysis pinned
+    // them; a version the lockfile alone describes carries none.
+    (pv:PackageVersion => {repository_id IS STRING NOT NULL, purl_at_version IS STRING NOT NULL,
+                           purl IS STRING, name IS STRING, version IS STRING,
+                           source_kind IS STRING, source IS STRING, source_url IS STRING,
+                           source_rev IS STRING,
+                           is_deprecated IS BOOLEAN, deprecated_reason IS STRING,
+                           deprecation_origin IS STRING, deprecation_known_at IS STRING,
+                           deprecation_as_of IS STRING, deprecation_analysis IS STRING,
+                           source_repo IS STRING, source_repo_origin IS STRING,
+                           source_repo_known_at IS STRING, source_repo_as_of IS STRING,
+                           source_repo_analysis IS STRING,
+                           scorecard_project IS STRING, scorecard_stars IS INTEGER,
+                           scorecard_overall IS FLOAT, scorecard_date IS STRING,
+                           scorecard_origin IS STRING, scorecard_known_at IS STRING,
+                           scorecard_as_of IS STRING, scorecard_analysis IS STRING}),
+    // OSV advisories (supply-chain plan §2; written by supply_chain::osv). Scoped
+    // to the repository like every label: one advisory in two projects is two
+    // nodes. `aliases` is the JSON array the advisory reports.
+    (ad:Advisory => {repository_id IS STRING NOT NULL, osv_id IS STRING NOT NULL,
+                     title IS STRING, aliases IS STRING, url IS STRING}),
+    (ac:AdvisoryCorpus => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL}),
+    // The unresolved imports of the resolution (supply-chain plan §3; written
+    // by supply_chain::resolve): one node per (symbol, crate) that matched no
+    // local path, member or locked crate — negative evidence with the reason.
+    (up:UnresolvedPackage => {repository_id IS STRING NOT NULL, origin IS STRING NOT NULL,
+                              symbol IS STRING NOT NULL, package IS STRING NOT NULL,
+                              use_path IS STRING, relpath IS STRING, line IS INTEGER,
+                              reason IS STRING}),
+    // deps.dev license facts (supply-chain plan §2; written only by the pin
+    // path of supply_chain::on_demand): one node per distinct SPDX
+    // expression, NOASSERTION when deps.dev lists none, so the licenses of
+    // many versions dedupe onto shared nodes.
+    (lc:License => {repository_id IS STRING NOT NULL, spdx IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -489,6 +531,13 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (ch:Change) REQUIRE (ch.repository_id, ch.commit, ch.path) IS KEY,
     CONSTRAINT FOR (br:Branch) REQUIRE (br.repository_id, br.name) IS KEY,
     CONSTRAINT FOR (tg:Tag) REQUIRE (tg.repository_id, tg.name) IS KEY,
+    CONSTRAINT FOR (pk:Package) REQUIRE (pk.repository_id, pk.purl) IS KEY,
+    CONSTRAINT FOR (pv:PackageVersion) REQUIRE (pv.repository_id, pv.purl_at_version) IS KEY,
+    CONSTRAINT FOR (ad:Advisory) REQUIRE (ad.repository_id, ad.osv_id) IS KEY,
+    CONSTRAINT FOR (ac:AdvisoryCorpus) REQUIRE (ac.repository_id, ac.source) IS KEY,
+    CONSTRAINT FOR (up:UnresolvedPackage) REQUIRE (up.repository_id, up.origin, up.symbol,
+                                                   up.package) IS KEY,
+    CONSTRAINT FOR (lc:License) REQUIRE (lc.repository_id, lc.spdx) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -556,6 +605,19 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX person_key IF NOT EXISTS FOR (a:Person) ON (a.repository_id, a.email)",
     "CREATE INDEX branch_key IF NOT EXISTS FOR (b:Branch) ON (b.repository_id, b.name)",
     "CREATE INDEX tag_key IF NOT EXISTS FOR (t:Tag) ON (t.repository_id, t.name)",
+    // Cargo.lock package facts (supply_chain::lock): the MERGE anchors and the
+    // MATCH lookups of the lockfile writer, scoped by repository_id.
+    "CREATE INDEX package_key IF NOT EXISTS FOR (pk:Package) ON (pk.repository_id, pk.purl)",
+    "CREATE INDEX package_version_key IF NOT EXISTS FOR (pv:PackageVersion) ON (pv.repository_id, pv.purl_at_version)",
+    // OSV advisories (supply_chain::osv): the MERGE anchor of the advisory batches.
+    "CREATE INDEX advisory_key IF NOT EXISTS FOR (ad:Advisory) ON (ad.repository_id, ad.osv_id)",
+    // The unresolved imports of the resolution (supply_chain::resolve): the
+    // MERGE anchor of the unresolved batches.
+    "CREATE INDEX unresolved_key IF NOT EXISTS FOR (u:UnresolvedPackage) \
+     ON (u.repository_id, u.origin, u.symbol, u.package)",
+    // deps.dev license facts (supply_chain::on_demand): the MERGE anchor of
+    // the license pin batches.
+    "CREATE INDEX license_key IF NOT EXISTS FOR (lc:License) ON (lc.repository_id, lc.spdx)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:
@@ -734,6 +796,30 @@ fn crate_relative(file: &str) -> &str {
 /// Run a write statement, returning the engine's counters.
 pub fn write(db: &mut Connection, cypher: &str, params: Params) -> Result<cypherlite::QueryStats> {
     Ok(db.query_with_params(cypher, params)?.stats)
+}
+
+/// The store as one comparable value: every node's labels and properties,
+/// every relationship's type and properties. The idempotence tests' shared
+/// snapshot (git_history's writer, the lockfile ingest, the pin path): two
+/// runs over the same facts produce equal values, so a test compares these
+/// for equality. Test-only; the production surface never snapshots a store.
+#[cfg(test)]
+pub(crate) fn test_state(graph: &GraphStore) -> Json {
+    graph
+        .read(|db| {
+            let nodes = rows(
+                db,
+                "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props",
+                params(&serde_json::json!({})),
+            )?;
+            let rels = rows(
+                db,
+                "MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS props",
+                params(&serde_json::json!({})),
+            )?;
+            Ok(serde_json::json!({"nodes": nodes, "rels": rels}))
+        })
+        .unwrap()
 }
 
 /// Bytes as a base64 string: the engine's `Value` has no byte-string

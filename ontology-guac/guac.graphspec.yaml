@@ -1,0 +1,1139 @@
+# GUAC (Graph for Understanding Artifact Composition) as a Neo4j Ontology
+# Graph Spec 1.0.0 model.
+#
+# Extracted from guacsec/guac v1.1.0 (Apache-2.0):
+#   - pkg/assembler/graphql/schema/*.graphql  (authoritative node/evidence types)
+#   - pkg/assembler/assembler.go              (IngestPredicates, the ingestion vocabulary)
+#   - pkg/assembler/backends/arangodb/edgeCollections.go (how the graph is actually stored)
+#   - pkg/assembler/graphql/schema/path.graphql (the Edge enum, the authoritative link list)
+#
+# Modeling notes (GUAC -> property graph):
+#   1. GUAC's package/source/vulnerability tries become one node type per trie
+#      level. The trie path components are denormalized onto child levels so
+#      every node carries a node-local key (GUAC itself keys trie documents by
+#      the full path; PackageVersion additionally carries the precomposed purl).
+#   2. GUAC's evidence (attestation) records are NODES, not relationships:
+#      every isDependency/certifyVuln/hasSLSA/... is a node that carries its
+#      own provenance (origin, collector, documentRef) and is linked to its
+#      subject and object by separate relationships. This mirrors GUAC's own
+#      Node union in path.graphql and its ArangoDB evidence collections.
+#   3. Subject links run software -> evidence, object links run evidence ->
+#      software, matching GUAC's ArangoDB edge directions.
+#   4. Where GUAC's PkgMatchFlag lets an attestation attach at the package-name
+#      level (ALL_VERSIONS) or the package-version level (SPECIFIC_VERSION),
+#      the subject link gets two distinct relationship types, one per level,
+#      mirroring GUAC's separate ArangoDB edge collections (e.g.
+#      hasSourceAtPkgNameEdges vs hasSourceAtPkgVersionEdges).
+#   5. Enum-valued GUAC fields are STRING properties constrained by one_of
+#      (descriptive in the spec; not enforced by the graph type).
+schema: https://neo4j.com/docs/ontology-graph-spec/1.0.0/schema.json
+version: "1.0.0"
+id: guac
+name: GUAC
+description: >-
+  The GUAC supply-chain ontology (guacsec/guac v1.1.0). A software tree of
+  package, source, artifact and builder identities (purl-derived tries) plus
+  an evidence tree of attestation nodes, each carrying its own provenance
+  (origin, collector, documentRef), linked to subjects and objects by typed
+  relationships. NoVuln is negative evidence inside the vulnerability trie.
+
+nodes:
+
+  # ---- software tree: package trie ------------------------------------
+
+  package-type:
+    label: PackageType
+    aliases: [Package]
+    description: Root of the package trie, matching the pkg:<type> partial purl; also "guac" when no purl representation exists.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/package.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        key: true
+        description: purl type, e.g. npm, pypi, cargo, maven, guac.
+
+  package-namespace:
+    label: PackageNamespace
+    description: Namespace level of the package trie, matching pkg:<type>/<namespace>/; empty string denotes a missing namespace.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/package.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie parent (the purl type), part of the node key.
+      namespace:
+        type: STRING
+        must_exist: true
+        description: purl namespace, e.g. the npm scope or maven group; empty string when the type has none.
+    constraints:
+      key:
+        type: KEY
+        properties: [type, namespace]
+        name: package_namespace_key
+
+  package-name:
+    label: PackageName
+    description: Name level of the package trie, matching pkg:<type>/<namespace>/<name>; the first level other GUAC parts can reference.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/package.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie path component (the purl type).
+      namespace:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie path component (the purl namespace).
+      name:
+        type: STRING
+        must_exist: true
+        description: Package name; always mandatory in a purl.
+    constraints:
+      key:
+        type: KEY
+        properties: [type, namespace, name]
+        name: package_name_key
+
+  package-version:
+    label: PackageVersion
+    description: Version level of the package trie, matching pkg:<type>/<namespace>/<name>@<version>?<qualifiers>#<subpath>; the identity other GUAC parts reference.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/package.graphql
+    properties:
+      purl:
+        type: STRING
+        must_exist: true
+        key: true
+        description: Precomposed package URL (purl) for this exact version, GUAC's canonical package identity.
+      version:
+        type: STRING
+        must_exist: true
+        description: Opaque version string; rules are type-specific and empty string is allowed.
+      qualifiers:
+        type: LIST<STRING>
+        description: purl qualifiers as key=value strings; empty list when none. Different qualifier sets mean different packages.
+      subpath:
+        type: STRING
+        must_exist: true
+        description: purl subpath; empty string when absent.
+
+  # ---- software tree: source trie --------------------------------------
+
+  source-type:
+    label: SourceType
+    aliases: [Source]
+    description: Root of the source trie; the version control system type, e.g. git.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/source.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        key: true
+        description: VCS type, e.g. git.
+
+  source-namespace:
+    label: SourceNamespace
+    description: Namespace level of the source trie; the repository host, e.g. github, gitlab, bitbucket.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/source.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie parent (the VCS type), part of the node key.
+      namespace:
+        type: STRING
+        must_exist: true
+        description: Repository host namespace, e.g. github.
+    constraints:
+      key:
+        type: KEY
+        properties: [type, namespace]
+        name: source_namespace_key
+
+  source-name:
+    label: SourceName
+    description: Name level of the source trie; the repository name with an optional tag or commit (mutually exclusive). The only source node other GUAC parts reference.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/source.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie path component (the VCS type).
+      namespace:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie path component (the repository host).
+      name:
+        type: STRING
+        must_exist: true
+        description: Repository name or URL.
+      tag:
+        type: STRING
+        description: Optional tag; it is an error in GUAC to set both tag and commit.
+      commit:
+        type: STRING
+        description: Optional commit hash; it is an error in GUAC to set both tag and commit.
+    constraints:
+      key:
+        type: KEY
+        properties: [type, namespace, name]
+        name: source_name_key
+
+  # ---- software tree: leaf identities ----------------------------------
+
+  artifact:
+    label: Artifact
+    description: An artifact identified by a checksum; algorithm and digest are canonicalized to lowercase.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/artifact.graphql
+    properties:
+      algorithm:
+        type: STRING
+        must_exist: true
+        description: Checksum algorithm, lowercased, e.g. sha256.
+      digest:
+        type: STRING
+        must_exist: true
+        description: Checksum digest, lowercased hex.
+    constraints:
+      key:
+        type: KEY
+        properties: [algorithm, digest]
+        name: artifact_key
+
+  builder:
+    label: Builder
+    description: A build system (e.g. FRSCA, GitHub Actions) identified by URI.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/builder.graphql
+    properties:
+      uri:
+        type: STRING
+        must_exist: true
+        key: true
+        description: Builder identity URI.
+
+  # ---- software tree: vulnerability trie --------------------------------
+
+  vulnerability-type:
+    label: VulnerabilityType
+    aliases: [Vulnerability]
+    description: Root of the vulnerability trie, vuln://<type>/<vulnerability-id>; the type is cve, ghsa, osv, a vendor scheme, or the special novuln negative-evidence type.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/vulnerability.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        key: true
+        description: Vulnerability type, lowercase; novuln marks a scan that found nothing.
+
+  vulnerability-id:
+    label: VulnerabilityID
+    description: A specific vulnerability identifier under its type, e.g. cve-2023-20753 or ghsa-205hk; enforced lowercase. The NoVuln node is type novuln with an empty id.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/vulnerability.graphql
+    properties:
+      type:
+        type: STRING
+        must_exist: true
+        description: Denormalized trie parent (the vulnerability type), part of the node key.
+      vulnerabilityId:
+        type: STRING
+        must_exist: true
+        description: The vulnerability identifier under its type, lowercase; empty string only for NoVuln.
+    constraints:
+      key:
+        type: KEY
+        properties: [type, vulnerabilityId]
+        name: vulnerability_id_key
+
+  license:
+    label: License
+    description: A license; either an SPDX identifier with the SPDX list version, or a LicenseRef-<guid> name with the full text inline.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/license.graphql
+    properties:
+      name:
+        type: STRING
+        must_exist: true
+        description: SPDX identifier (e.g. Apache-2.0) or LicenseRef-<guid> for off-list licenses.
+      inline:
+        type: STRING
+        description: Full license text; only set for LicenseRef-* names.
+      listVersion:
+        type: STRING
+        must_exist: true
+        description: SPDX license list version, e.g. "3.21 2023-06-18"; empty string for off-list licenses.
+    constraints:
+      key:
+        type: KEY
+        properties: [name, listVersion]
+        name: license_key
+
+  # ---- evidence tree: dependency and occurrence --------------------------
+
+  is-dependency:
+    label: IsDependency
+    description: Evidence that a package version depends on another package version (GUAC isDependency).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/isDependency.graphql
+    properties:
+      dependencyType:
+        type: STRING
+        must_exist: true
+        one_of: [DIRECT, INDIRECT, UNKNOWN]
+        description: Kind of dependency.
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the attested dependency.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  is-occurrence:
+    label: IsOccurrence
+    description: Evidence that an artifact is the artifact of a package version or source (GUAC isOccurrence).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/isOccurrence.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the attested occurrence.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  # ---- evidence tree: links between software nodes ------------------------
+
+  has-source-at:
+    label: HasSourceAt
+    description: Evidence that a package is built from a source repository (GUAC hasSourceAt); the subject is at the name or version level per GUAC's match flag.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/hasSourceAt.graphql
+    properties:
+      knownSince:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp since the package-source link was certified (RFC 3339).
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the attested relationship.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  hash-equal:
+    label: HashEqual
+    description: Evidence that two artifacts with different digests are the same artifact (GUAC hashEqual).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/hashEqual.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the claim that the artifacts are similar.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  pkg-equal:
+    label: PkgEqual
+    description: Evidence that two packages (e.g. the same library in two ecosystems) are the same software (GUAC pkgEqual).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/pkgEqual.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the claim that the packages are similar.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  vuln-equal:
+    label: VulnEqual
+    description: Evidence that two vulnerability records (e.g. a CVE and its GHSA) are the same vulnerability (GUAC vulnEqual).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/vulnEqual.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the claim that the vulnerabilities are similar.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  # ---- evidence tree: SBOM, SLSA and metadata ----------------------------
+
+  has-sbom:
+    label: HasSBOM
+    description: Evidence that a package version or artifact has an SBOM document, plus the software the SBOM includes (GUAC hasSBOM).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/hasSBOM.graphql
+    properties:
+      uri:
+        type: STRING
+        must_exist: true
+        description: Identifier for the SBOM document.
+      algorithm:
+        type: STRING
+        must_exist: true
+        description: Algorithm by which the SBOM digest was computed.
+      digest:
+        type: STRING
+        must_exist: true
+        description: Digest of the SBOM.
+      downloadLocation:
+        type: STRING
+        must_exist: true
+        description: Location from which the SBOM can be downloaded.
+      knownSince:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp for SBOM creation (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  has-slsa:
+    label: HasSLSA
+    description: Evidence of a SLSA provenance attestation for an artifact, including its build materials and builder (GUAC hasSLSA).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/hasSLSA.graphql
+    properties:
+      buildType:
+        type: STRING
+        must_exist: true
+        description: Type of the builder.
+      slsaVersion:
+        type: STRING
+        must_exist: true
+        description: Version of the SLSA predicate.
+      startedOn:
+        type: ZONED DATETIME
+        description: Build start time (RFC3339Nano), when known.
+      finishedOn:
+        type: ZONED DATETIME
+        description: Build end time (RFC3339Nano), when known.
+      slsaPredicates:
+        type: LIST<STRING>
+        description: Individual SLSA predicates as key=value strings.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  has-metadata:
+    label: HasMetadata
+    description: Arbitrary key-value evidence attached to a package, source or artifact (GUAC hasMetadata).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/metadata.graphql
+    properties:
+      key:
+        type: STRING
+        must_exist: true
+        description: Key in the key-value pair.
+      value:
+        type: STRING
+        must_exist: true
+        description: Value in the key-value pair.
+      timestamp:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the metadata was certified (RFC 3339).
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the metadata.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  point-of-contact:
+    label: PointOfContact
+    description: Evidence of who to contact about a package, source or artifact (GUAC pointOfContact / contact).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/contact.graphql
+    properties:
+      email:
+        type: STRING
+        must_exist: true
+        description: Email for the point of contact.
+      info:
+        type: STRING
+        must_exist: true
+        description: Generic info for the point of contact.
+      since:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the contact certification was created (RFC 3339).
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the point-of-contact attestation.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  # ---- evidence tree: security attestations ------------------------------
+
+  certify-vuln:
+    label: CertifyVuln
+    description: Evidence from a vulnerability scan that a package version is affected by (or, via NoVuln, free of) a vulnerability (GUAC certifyVuln).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyVuln.graphql
+    properties:
+      timeScanned:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Time of scan (RFC 3339).
+      dbUri:
+        type: STRING
+        must_exist: true
+        description: URI of the vulnerability database used by the scanner.
+      dbVersion:
+        type: STRING
+        must_exist: true
+        description: Version of the vulnerability database used by the scanner.
+      scannerUri:
+        type: STRING
+        must_exist: true
+        description: URI of the scanner.
+      scannerVersion:
+        type: STRING
+        must_exist: true
+        description: Version of the scanner.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  vulnerability-metadata:
+    label: VulnerabilityMetadata
+    description: Scoring evidence for a vulnerability, one score type per node (GUAC vulnMetadata).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/vulnMetadata.graphql
+    properties:
+      scoreType:
+        type: STRING
+        must_exist: true
+        one_of: [CVSSv2, CVSSv3, CVSSv31, CVSSv4, EPSSv1, EPSSv2]
+        description: The scoring system the score value is expressed in.
+      scoreValue:
+        type: FLOAT
+        must_exist: true
+        description: The score value in the given score type.
+      timestamp:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the certification was created (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  certify-vex-statement:
+    label: CertifyVEXStatement
+    description: A VEX statement about whether a subject is affected by a vulnerability (GUAC certifyVEXStatement).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyVEXStatement.graphql
+    properties:
+      status:
+        type: STRING
+        must_exist: true
+        one_of: [NOT_AFFECTED, AFFECTED, FIXED, UNDER_INVESTIGATION]
+        description: Status of the vulnerability with respect to the subject.
+      vexJustification:
+        type: STRING
+        must_exist: true
+        one_of: [COMPONENT_NOT_PRESENT, VULNERABLE_CODE_NOT_PRESENT, VULNERABLE_CODE_NOT_IN_EXECUTE_PATH, VULNERABLE_CODE_CANNOT_BE_CONTROLLED_BY_ADVERSARY, INLINE_MITIGATIONS_ALREADY_EXIST, NOT_PROVIDED]
+        description: Justification from the VEX statement.
+      statement:
+        type: STRING
+        must_exist: true
+        description: Impact statement or action statement, depending on status.
+      statusNotes:
+        type: STRING
+        must_exist: true
+        description: Notes on how the status was determined.
+      knownSince:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp for the VEX statement (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  certify-good:
+    label: CertifyGood
+    description: A policy verdict that a package, source or artifact is good (GUAC certifyGood).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyGood.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the subject being certified good.
+      knownSince:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the certification was created (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  certify-bad:
+    label: CertifyBad
+    description: A policy verdict that a package, source or artifact is bad (GUAC certifyBad).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyBad.graphql
+    properties:
+      justification:
+        type: STRING
+        must_exist: true
+        description: Justification for the subject being certified bad.
+      knownSince:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the certification was created (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  # ---- evidence tree: legal and scorecard --------------------------------
+
+  certify-legal:
+    label: CertifyLegal
+    description: Evidence of the declared and discovered licenses of a package version or source (GUAC certifyLegal).
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyLegal.graphql
+    properties:
+      declaredLicense:
+        type: STRING
+        must_exist: true
+        description: Declared license expression, e.g. from a manifest.
+      discoveredLicense:
+        type: STRING
+        must_exist: true
+        description: License expression as discovered by scan.
+      attribution:
+        type: STRING
+        must_exist: true
+        description: Attribution text of the subject.
+      justification:
+        type: STRING
+        must_exist: true
+        description: Extra justification for the certification.
+      timeScanned:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Time of scan (RFC 3339).
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+  certify-scorecard:
+    label: CertifyScorecard
+    description: An OpenSSF Scorecard scan of a source repository (GUAC certifyScorecard); the scorecard is the embedded attestation object.
+    reference: https://github.com/guacsec/guac/blob/main/pkg/assembler/graphql/schema/certifyScorecard.graphql
+    properties:
+      aggregateScore:
+        type: FLOAT
+        must_exist: true
+        description: Overall Scorecard score for the source.
+      checks:
+        type: LIST<STRING>
+        description: Individual Scorecard check results as check=score strings (Branch-Protection, Code-Review, ...).
+      timeScanned:
+        type: ZONED DATETIME
+        must_exist: true
+        description: Timestamp when the source was last scanned (RFC 3339).
+      scorecardVersion:
+        type: STRING
+        must_exist: true
+        description: Version of the Scorecard scanner used.
+      scorecardCommit:
+        type: STRING
+        must_exist: true
+        description: Commit of the Scorecards repository at scan time.
+      origin:
+        type: STRING
+        must_exist: true
+        description: Document from which this attestation was generated.
+      collector:
+        type: STRING
+        must_exist: true
+        description: GUAC collector for the document.
+      documentRef:
+        type: STRING
+        must_exist: true
+        description: Reference location of the document in the persistent blob store, if configured.
+
+relationships:
+
+  # ---- trie structure (parent to child) -----------------------------------
+
+  package-has-namespace:
+    type: PKG_HAS_NAMESPACE
+    description: Parent-child link of the package trie, from the type level to the namespace level.
+    from: { node: package-type }
+    to: { node: package-namespace, count: 1 }
+
+  package-has-name:
+    type: PKG_HAS_NAME
+    description: Parent-child link of the package trie, from the namespace level to the name level.
+    from: { node: package-namespace }
+    to: { node: package-name, count: 1 }
+
+  package-has-version:
+    type: PKG_HAS_VERSION
+    description: Parent-child link of the package trie, from the name level to the version level.
+    from: { node: package-name }
+    to: { node: package-version, count: 1 }
+
+  source-has-namespace:
+    type: SRC_HAS_NAMESPACE
+    description: Parent-child link of the source trie, from the VCS type level to the host namespace level.
+    from: { node: source-type }
+    to: { node: source-namespace, count: 1 }
+
+  source-has-name:
+    type: SRC_HAS_NAME
+    description: Parent-child link of the source trie, from the namespace level to the repository name level.
+    from: { node: source-namespace }
+    to: { node: source-name, count: 1 }
+
+  vulnerability-has-vulnerability-id:
+    type: VULN_HAS_VULNERABILITY_ID
+    description: Parent-child link of the vulnerability trie, from the type level to the vulnerability ID level.
+    from: { node: vulnerability-type }
+    to: { node: vulnerability-id, count: 1 }
+
+  # ---- evidence subject links (software to evidence) -----------------------
+
+  package-is-dependency:
+    type: PACKAGE_IS_DEPENDENCY
+    description: Subject link; the dependent package (always a PackageVersion) of an isDependency evidence node.
+    from: { node: package-version }
+    to: { node: is-dependency, count: 1 }
+
+  package-is-occurrence:
+    type: PACKAGE_IS_OCCURRENCE
+    description: Subject link; the package version an isOccurrence evidence node is about.
+    from: { node: package-version }
+    to: { node: is-occurrence, count: 1 }
+
+  source-is-occurrence:
+    type: SOURCE_IS_OCCURRENCE
+    description: Subject link; the source an isOccurrence evidence node is about.
+    from: { node: source-name }
+    to: { node: is-occurrence, count: 1 }
+
+  package-name-has-source-at:
+    type: PACKAGE_NAME_HAS_SOURCE_AT
+    description: Subject link at the package-name level (GUAC match flag ALL_VERSIONS); the attestation covers every version of the name.
+    from: { node: package-name }
+    to: { node: has-source-at, count: 1 }
+
+  package-version-has-source-at:
+    type: PACKAGE_VERSION_HAS_SOURCE_AT
+    description: Subject link at the package-version level (GUAC match flag SPECIFIC_VERSION).
+    from: { node: package-version }
+    to: { node: has-source-at, count: 1 }
+
+  package-has-sbom:
+    type: PACKAGE_HAS_SBOM
+    description: Subject link; the package version an SBOM attestation is about.
+    from: { node: package-version }
+    to: { node: has-sbom, count: 1 }
+
+  artifact-has-sbom:
+    type: ARTIFACT_HAS_SBOM
+    description: Subject link; the artifact an SBOM attestation is about.
+    from: { node: artifact }
+    to: { node: has-sbom, count: 1 }
+
+  artifact-has-slsa:
+    type: ARTIFACT_HAS_SLSA
+    description: Subject link; the artifact a SLSA attestation is about.
+    from: { node: artifact }
+    to: { node: has-slsa, count: 1 }
+
+  package-certify-vuln:
+    type: PACKAGE_CERTIFY_VULN
+    description: Subject link; the package version a vulnerability scan attestation is about.
+    from: { node: package-version }
+    to: { node: certify-vuln, count: 1 }
+
+  package-certify-vex-statement:
+    type: PACKAGE_CERTIFY_VEX_STATEMENT
+    description: Subject link; the package version a VEX statement is about.
+    from: { node: package-version }
+    to: { node: certify-vex-statement, count: 1 }
+
+  artifact-certify-vex-statement:
+    type: ARTIFACT_CERTIFY_VEX_STATEMENT
+    description: Subject link; the artifact a VEX statement is about.
+    from: { node: artifact }
+    to: { node: certify-vex-statement, count: 1 }
+
+  package-certify-legal:
+    type: PACKAGE_CERTIFY_LEGAL
+    description: Subject link; the package version a legal certification is about.
+    from: { node: package-version }
+    to: { node: certify-legal, count: 1 }
+
+  source-certify-legal:
+    type: SOURCE_CERTIFY_LEGAL
+    description: Subject link; the source a legal certification is about.
+    from: { node: source-name }
+    to: { node: certify-legal, count: 1 }
+
+  source-certify-scorecard:
+    type: SOURCE_CERTIFY_SCORECARD
+    description: Subject link; the source repository a Scorecard attestation scanned.
+    from: { node: source-name }
+    to: { node: certify-scorecard, count: 1 }
+
+  package-name-certify-good:
+    type: PACKAGE_NAME_CERTIFY_GOOD
+    description: Subject link at the package-name level (match flag ALL_VERSIONS); a good verdict covering every version of the name.
+    from: { node: package-name }
+    to: { node: certify-good, count: 1 }
+
+  package-version-certify-good:
+    type: PACKAGE_VERSION_CERTIFY_GOOD
+    description: Subject link at the package-version level (match flag SPECIFIC_VERSION); a good verdict for one version.
+    from: { node: package-version }
+    to: { node: certify-good, count: 1 }
+
+  source-certify-good:
+    type: SOURCE_CERTIFY_GOOD
+    description: Subject link; the source a good verdict is about.
+    from: { node: source-name }
+    to: { node: certify-good, count: 1 }
+
+  artifact-certify-good:
+    type: ARTIFACT_CERTIFY_GOOD
+    description: Subject link; the artifact a good verdict is about.
+    from: { node: artifact }
+    to: { node: certify-good, count: 1 }
+
+  package-name-certify-bad:
+    type: PACKAGE_NAME_CERTIFY_BAD
+    description: Subject link at the package-name level (match flag ALL_VERSIONS); a bad verdict covering every version of the name.
+    from: { node: package-name }
+    to: { node: certify-bad, count: 1 }
+
+  package-version-certify-bad:
+    type: PACKAGE_VERSION_CERTIFY_BAD
+    description: Subject link at the package-version level (match flag SPECIFIC_VERSION); a bad verdict for one version.
+    from: { node: package-version }
+    to: { node: certify-bad, count: 1 }
+
+  source-certify-bad:
+    type: SOURCE_CERTIFY_BAD
+    description: Subject link; the source a bad verdict is about.
+    from: { node: source-name }
+    to: { node: certify-bad, count: 1 }
+
+  artifact-certify-bad:
+    type: ARTIFACT_CERTIFY_BAD
+    description: Subject link; the artifact a bad verdict is about.
+    from: { node: artifact }
+    to: { node: certify-bad, count: 1 }
+
+  package-name-has-metadata:
+    type: PACKAGE_NAME_HAS_METADATA
+    description: Subject link at the package-name level (match flag ALL_VERSIONS); metadata covering every version of the name.
+    from: { node: package-name }
+    to: { node: has-metadata, count: 1 }
+
+  package-version-has-metadata:
+    type: PACKAGE_VERSION_HAS_METADATA
+    description: Subject link at the package-version level (match flag SPECIFIC_VERSION).
+    from: { node: package-version }
+    to: { node: has-metadata, count: 1 }
+
+  source-has-metadata:
+    type: SOURCE_HAS_METADATA
+    description: Subject link; the source the metadata is about.
+    from: { node: source-name }
+    to: { node: has-metadata, count: 1 }
+
+  artifact-has-metadata:
+    type: ARTIFACT_HAS_METADATA
+    description: Subject link; the artifact the metadata is about.
+    from: { node: artifact }
+    to: { node: has-metadata, count: 1 }
+
+  package-name-point-of-contact:
+    type: PACKAGE_NAME_POINT_OF_CONTACT
+    description: Subject link at the package-name level (match flag ALL_VERSIONS).
+    from: { node: package-name }
+    to: { node: point-of-contact, count: 1 }
+
+  package-version-point-of-contact:
+    type: PACKAGE_VERSION_POINT_OF_CONTACT
+    description: Subject link at the package-version level (match flag SPECIFIC_VERSION).
+    from: { node: package-version }
+    to: { node: point-of-contact, count: 1 }
+
+  source-point-of-contact:
+    type: SOURCE_POINT_OF_CONTACT
+    description: Subject link; the source the point of contact is about.
+    from: { node: source-name }
+    to: { node: point-of-contact, count: 1 }
+
+  artifact-point-of-contact:
+    type: ARTIFACT_POINT_OF_CONTACT
+    description: Subject link; the artifact the point of contact is about.
+    from: { node: artifact }
+    to: { node: point-of-contact, count: 1 }
+
+  package-pkg-equal:
+    type: PKG_EQUAL
+    description: One side of a pkgEqual claim (GUAC's subject package); exactly one per evidence node.
+    from: { node: package-version }
+    to: { node: pkg-equal, count: 1 }
+
+  vulnerability-vuln-equal:
+    type: VULN_EQUAL
+    description: One side of a vulnEqual claim (GUAC's subject vulnerability); exactly one per evidence node.
+    from: { node: vulnerability-id }
+    to: { node: vuln-equal, count: 1 }
+
+  artifact-hash-equal:
+    type: HASH_EQUAL
+    description: One side of a hashEqual claim (GUAC's subject artifact); exactly one per evidence node.
+    from: { node: artifact }
+    to: { node: hash-equal, count: 1 }
+
+  vulnerability-vuln-metadata:
+    type: VULNERABILITY_VULN_METADATA
+    description: Subject link; the vulnerability a scoring metadata node is about.
+    from: { node: vulnerability-id }
+    to: { node: vulnerability-metadata, count: 1 }
+
+  # ---- evidence object links (evidence to software) ------------------------
+
+  is-dependency-package:
+    type: IS_DEPENDENCY_PACKAGE
+    description: Object link; the dependency package. GUAC requires the PackageVersion level here.
+    from: { node: is-dependency, count: 1 }
+    to: { node: package-version }
+
+  is-occurrence-artifact:
+    type: IS_OCCURRENCE_ARTIFACT
+    description: Object link; the artifact asserted to originate from the subject.
+    from: { node: is-occurrence, count: 1 }
+    to: { node: artifact }
+
+  has-source-at-source:
+    type: HAS_SOURCE_AT_SOURCE
+    description: Object link; the source repository the package is asserted to be built from.
+    from: { node: has-source-at, count: 1 }
+    to: { node: source-name }
+
+  has-sbom-included-software-package:
+    type: HAS_SBOM_INCLUDED_SOFTWARE_PACKAGE
+    description: Object link; a package version included in the SBOM.
+    from: { node: has-sbom }
+    to: { node: package-version }
+
+  has-sbom-included-software-artifact:
+    type: HAS_SBOM_INCLUDED_SOFTWARE_ARTIFACT
+    description: Object link; an artifact included in the SBOM.
+    from: { node: has-sbom }
+    to: { node: artifact }
+
+  has-sbom-included-dependencies:
+    type: HAS_SBOM_INCLUDED_DEPENDENCIES
+    description: Object link; a dependency edge reported inside the SBOM.
+    from: { node: has-sbom }
+    to: { node: is-dependency }
+
+  has-sbom-included-occurrences:
+    type: HAS_SBOM_INCLUDED_OCCURRENCES
+    description: Object link; an occurrence edge reported inside the SBOM.
+    from: { node: has-sbom }
+    to: { node: is-occurrence }
+
+  has-slsa-built-by:
+    type: HAS_SLSA_BUILT_BY
+    description: Object link; the builder that performed the build.
+    from: { node: has-slsa, count: 1 }
+    to: { node: builder }
+
+  has-slsa-materials:
+    type: HAS_SLSA_MATERIALS
+    description: Object link; a build material (builtFrom artifact) of the subject.
+    from: { node: has-slsa }
+    to: { node: artifact }
+
+  certify-vuln-vulnerability:
+    type: CERTIFY_VULN_VULNERABILITY
+    description: Object link; the found vulnerability, or the NoVuln node when the scan found nothing.
+    from: { node: certify-vuln, count: 1 }
+    to: { node: vulnerability-id }
+
+  certify-vex-statement-vulnerability:
+    type: CERTIFY_VEX_STATEMENT_VULNERABILITY
+    description: Object link; the vulnerability the VEX statement is about.
+    from: { node: certify-vex-statement, count: 1 }
+    to: { node: vulnerability-id }
+
+  certify-legal-declared-license:
+    type: CERTIFY_LEGAL_DECLARED_LICENSE
+    description: Object link; a license found in the declared license expression.
+    from: { node: certify-legal }
+    to: { node: license }
+
+  certify-legal-discovered-license:
+    type: CERTIFY_LEGAL_DISCOVERED_LICENSE
+    description: Object link; a license found in the discovered license expression.
+    from: { node: certify-legal }
+    to: { node: license }
+
+  pkg-equal-package:
+    type: PKG_EQUAL_PACKAGE
+    description: Object link; the package asserted equal to the subject. Exactly one per evidence node.
+    from: { node: pkg-equal, count: 1 }
+    to: { node: package-version }
+
+  vuln-equal-vulnerability:
+    type: VULN_EQUAL_VULNERABILITY
+    description: Object link; the vulnerability asserted equal to the subject. Exactly one per evidence node.
+    from: { node: vuln-equal, count: 1 }
+    to: { node: vulnerability-id }
+
+  hash-equal-artifact:
+    type: HASH_EQUAL_ARTIFACT
+    description: Object link; the artifact asserted equal to the subject. Exactly one per evidence node.
+    from: { node: hash-equal, count: 1 }
+    to: { node: artifact }

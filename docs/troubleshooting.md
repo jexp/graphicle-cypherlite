@@ -75,6 +75,11 @@ is left out, and a file past an analysis limit is analysed in part and stays
 searchable; `graphicle sync` lists both with the reasons. The code graph of
 `graphicle graph` has no such limit.
 
+A sync that must make no network calls for its lockfile sets `sync.osv` to
+`false` (or `GRAPHICLE_SYNC_OSV=0`): the lockfile is still read, and no OSV
+advisory query is sent. [Configuration](configuration.md#limits) describes the
+setting.
+
 ### The port is in use
 
 `graphicle open` serves the app on port 8854. If another program holds that

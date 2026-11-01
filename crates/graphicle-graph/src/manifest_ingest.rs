@@ -6,7 +6,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::LazyLock,
 };
@@ -216,13 +216,68 @@ pub fn parse_cargo(text: &str) -> Result<Value> {
     };
     let package = &data["package"];
     let version = package.get("version").and_then(Value::as_str);
-    let mut deps = coerce_deps(&data["dependencies"]);
-    if let Some(targets) = data.get("target").and_then(Value::as_object) {
-        for cfg in targets.values().filter(|c| c.is_object()) {
-            deps.extend(coerce_deps(&cfg["dependencies"]));
+    // The dependency tables carry what the lockfile cannot say (the
+    // requirement string, the kind, the optional flag — supply-chain plan
+    // §1), so they travel as `requirements` beside the pattern's `deps`.
+    let requirements = cargo_dependencies(&data);
+    let deps: Vec<&str> = requirements.keys().map(String::as_str).collect();
+    Ok(json!({"name":name,"version":version,"deps":deps,"requirements":requirements}))
+}
+
+/// One `[dependencies]`-table entry: the requirement the manifest asked for
+/// and whether it is optional. A `path`, `git` or `workspace` dependency
+/// declares no version, so it carries no requirement.
+fn cargo_dep(value: &Value) -> (Option<String>, bool) {
+    match value {
+        Value::String(requirement) => (Some(requirement.clone()), false),
+        Value::Object(table) => (
+            table
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            table.get("optional") == Some(&Value::Bool(true)),
+        ),
+        _ => (None, false),
+    }
+}
+
+/// The dependency tables of a `Cargo.toml` — `[dependencies]`,
+/// `[dev-dependencies]` and `[build-dependencies]`, each also per target —
+/// as name → `{requirement?, kind, optional}`. A name in several tables is
+/// the normal one: a crate that ships as a dependency is one, whatever else
+/// declares it.
+fn cargo_dependencies(data: &Value) -> BTreeMap<String, Value> {
+    let mut tables: Vec<(Option<&Value>, &str)> = Vec::new();
+    for (table, kind) in [
+        ("dependencies", "normal"),
+        ("dev-dependencies", "dev"),
+        ("build-dependencies", "build"),
+    ] {
+        // The same table per target (`[target.'cfg(unix)'.dependencies]`).
+        if let Some(targets) = data.get("target").and_then(Value::as_object) {
+            for cfg in targets.values().filter(|cfg| cfg.is_object()) {
+                tables.push((cfg.get(table), kind));
+            }
+        }
+        tables.push((data.get(table), kind));
+    }
+    let mut out = BTreeMap::new();
+    for (table, kind) in tables {
+        let Some(entries) = table.and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in entries {
+            let (requirement, optional) = cargo_dep(value);
+            out.entry(name.clone()).or_insert_with(|| {
+                let mut detail = json!({"kind": kind, "optional": optional});
+                if let Some(requirement) = requirement {
+                    detail["requirement"] = json!(requirement);
+                }
+                detail
+            });
         }
     }
-    Ok(json!({"name":name,"version":version,"deps":deps}))
+    out
 }
 pub fn parse_gomod(text: &str) -> Value {
     let mut name = None::<String>;
@@ -481,7 +536,119 @@ pub fn extract_package_manifest(path: &Path) -> Result<Value> {
         if target == id || !seen.insert(target.clone()) {
             continue;
         }
-        edges.push(json!({"source":id,"target":target,"relation":"depends_on","context":"dependency","confidence":"EXTRACTED","confidence_score":1.0,"source_file":path,"source_location":"L1","weight":1.0}));
+        let mut edge = json!({"source":id,"target":target,"relation":"depends_on","context":"dependency","confidence":"EXTRACTED","confidence_score":1.0,"source_file":path,"source_location":"L1","weight":1.0});
+        // What the manifest asked for, when the ecosystem's parser read it
+        // (Cargo's tables — supply-chain plan §1: the lockfile cannot say
+        // it). Only the declared keys travel; an absent requirement (a
+        // `path` or `git` dependency) adds none.
+        if let Some(detail) = info["requirements"].get(dep).and_then(Value::as_object) {
+            for key in ["requirement", "kind", "optional"] {
+                if let Some(value) = detail.get(key) {
+                    edge[key] = value.clone();
+                }
+            }
+        }
+        edges.push(edge);
     }
     Ok(json!({"nodes":[node],"edges":edges}))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    /// A workspace member's manifest: every dependency table, a per-target
+    /// one, and each entry form Cargo allows.
+    const MANIFEST: &str = r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+member = { path = "../member" }
+
+[dev-dependencies]
+serde = "1"
+tempfile = "3"
+
+[build-dependencies]
+cc = { version = "1.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+"#;
+
+    fn write_fixture(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    /// One dependency's `depends_on` edge, by target name.
+    fn edge_of(result: &Value, dep: &str) -> Value {
+        let target = super::pkg_id(dep);
+        result["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["target"].as_str() == Some(target.as_str()))
+            .cloned()
+            .unwrap_or_else(|| panic!("{dep} edge in {:?}", result["edges"]))
+    }
+
+    #[test]
+    fn cargo_dependencies_carry_requirement_kind_and_optional() {
+        let info = super::parse_cargo(MANIFEST).unwrap();
+        assert_eq!(info["name"], "app");
+        assert_eq!(info["version"], "0.1.0");
+        // The names the pattern's edges target, one per dependency.
+        assert_eq!(
+            info["deps"],
+            serde_json::json!(["cc", "libc", "member", "serde", "serde_json", "tempfile"])
+        );
+        let detail = |name: &str| info["requirements"][name].clone();
+        // The table form's version is the requirement; the string form is it.
+        assert_eq!(detail("serde")["requirement"], "1.0");
+        assert_eq!(detail("serde_json")["requirement"], "1");
+        // A name in several tables is the normal one.
+        assert_eq!(detail("serde")["kind"], "normal");
+        assert_eq!(detail("tempfile")["kind"], "dev");
+        assert_eq!(detail("cc")["kind"], "build");
+        // A per-target table joins the same kind as the root one.
+        assert_eq!(detail("libc")["kind"], "normal");
+        assert_eq!(detail("libc")["requirement"], "0.2");
+        // A `path` dependency declares no version, so no requirement.
+        assert_eq!(detail("member")["kind"], "normal");
+        assert!(detail("member").get("requirement").is_none());
+        assert_eq!(detail("cc")["optional"], true);
+        assert_eq!(detail("serde")["optional"], false);
+    }
+
+    #[test]
+    fn a_cargo_manifest_produces_a_versioned_package_node() {
+        let (_dir, path) = write_fixture(MANIFEST);
+        let result = super::extract_package_manifest(&path).unwrap();
+        // The Python/Node/Go pattern's node shape: a typed, versioned
+        // package named by the manifest.
+        let node = &result["nodes"][0];
+        assert_eq!(node["label"], "app");
+        assert_eq!(node["type"], "package");
+        assert_eq!(node["ecosystem"], "cargo");
+        assert_eq!(node["version"], "0.1.0");
+        assert_eq!(node["source_file"], path.to_string_lossy().to_string());
+        // Every table's dependency is one edge, carrying what the manifest
+        // asked for — which the lockfile cannot say.
+        assert_eq!(result["edges"].as_array().unwrap().len(), 6);
+        let serde = edge_of(&result, "serde");
+        assert_eq!(serde["requirement"], "1.0");
+        assert_eq!(serde["kind"], "normal");
+        let cc = edge_of(&result, "cc");
+        assert_eq!(cc["kind"], "build");
+        assert_eq!(cc["optional"], true);
+        let member = edge_of(&result, "member");
+        assert!(member.get("requirement").is_none());
+    }
 }

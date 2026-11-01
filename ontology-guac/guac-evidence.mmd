@@ -1,0 +1,85 @@
+%%{init: {"theme":"neutral"}}%%
+classDiagram
+%% GUAC evidence-node pattern (focused sub-diagram of guac.mmd).
+%% GUAC stores attestations as NODES, not edges: each evidence node carries its
+%% own provenance (origin, collector, documentRef) so disagreeing documents can
+%% coexist as counterfactuals. Subject links run software -> evidence, object
+%% links run evidence -> software. Shown for the core predicates; the full
+%% inventory (56 relationship types) is in guac.mmd / guac.graphspec.yaml.
+%% Every evidence class below also has the provenance attributes
+%% +String origin, +String collector, +String documentRef - omitted for space.
+  class PackageVersion {
+    +String purl
+  }
+  class PackageName {
+    +String name
+  }
+  class SourceName {
+    +String name
+  }
+  class Artifact {
+    +String algorithm
+    +String digest
+  }
+  class Builder {
+    +String uri
+  }
+  class VulnerabilityID {
+    +String type
+    +String vulnerabilityId
+  }
+  class License {
+    +String name
+  }
+  class IsDependency {
+    +String dependencyType
+    +String justification
+  }
+  class IsOccurrence {
+    +String justification
+  }
+  class HasSourceAt {
+    +Datetime knownSince
+    +String justification
+  }
+  class CertifyVuln {
+    +Datetime timeScanned
+    +String dbUri
+    +String dbVersion
+    +String scannerUri
+    +String scannerVersion
+  }
+  class HasSLSA {
+    +String buildType
+    +String slsaVersion
+  }
+  class HasSBOM {
+    +String uri
+    +String algorithm
+    +String digest
+  }
+  class CertifyLegal {
+    +String declaredLicense
+    +String discoveredLicense
+  }
+  PackageVersion "1" --> "0..*" IsDependency : PACKAGE_IS_DEPENDENCY
+  PackageVersion "1" --> "0..*" IsOccurrence : PACKAGE_IS_OCCURRENCE
+  SourceName "1" --> "0..*" IsOccurrence : SOURCE_IS_OCCURRENCE
+  PackageName "1" --> "0..*" HasSourceAt : PACKAGE_NAME_HAS_SOURCE_AT
+  PackageVersion "1" --> "0..*" HasSourceAt : PACKAGE_VERSION_HAS_SOURCE_AT
+  PackageVersion "1" --> "0..*" CertifyVuln : PACKAGE_CERTIFY_VULN
+  PackageVersion "1" --> "0..*" HasSBOM : PACKAGE_HAS_SBOM
+  Artifact "1" --> "0..*" HasSBOM : ARTIFACT_HAS_SBOM
+  Artifact "1" --> "0..*" HasSLSA : ARTIFACT_HAS_SLSA
+  PackageVersion "1" --> "0..*" CertifyLegal : PACKAGE_CERTIFY_LEGAL
+  IsDependency "0..*" --> "1" PackageVersion : IS_DEPENDENCY_PACKAGE
+  IsOccurrence "0..*" --> "1" Artifact : IS_OCCURRENCE_ARTIFACT
+  HasSourceAt "0..*" --> "1" SourceName : HAS_SOURCE_AT_SOURCE
+  HasSBOM "0..*" --> "0..*" PackageVersion : HAS_SBOM_INCLUDED_SOFTWARE_PACKAGE
+  HasSBOM "0..*" --> "0..*" Artifact : HAS_SBOM_INCLUDED_SOFTWARE_ARTIFACT
+  HasSBOM "0..*" --> "0..*" IsDependency : HAS_SBOM_INCLUDED_DEPENDENCIES
+  HasSLSA "0..*" --> "1" Builder : HAS_SLSA_BUILT_BY
+  HasSLSA "0..*" --> "0..*" Artifact : HAS_SLSA_MATERIALS
+  CertifyVuln "0..*" --> "1" VulnerabilityID : CERTIFY_VULN_VULNERABILITY
+  CertifyLegal "0..*" --> "0..*" License : CERTIFY_LEGAL_DECLARED_LICENSE
+  CertifyLegal "0..*" --> "0..*" License : CERTIFY_LEGAL_DISCOVERED_LICENSE

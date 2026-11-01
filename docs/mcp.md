@@ -316,7 +316,10 @@ are the ones `graphicle sync` or `graph_link` last recorded.
 |---|---|
 | `recall_project` | Finds original source evidence and current reviewed memory for a question, within a token budget; an identifier, or a question that only asks where one is defined or used, gets its definitions and references from the code graph |
 | `read_project_source` | Reads a source by ID or path, continuing exactly where an excerpt stopped |
-| `pack` | Packs the project's code for a question into one block of text within a token budget (`budget`, default 32,000, at most 200,000): architecture, focus code, call paths, tests, docs and a manifest ([packs](pack.md)) |
+| `pack` | Packs the project's code for a question into one block of text within a token budget (`budget`, default 32,000, at most 200,000): architecture, focus code, call paths, tests, dependencies, docs and a manifest ([packs](pack.md)) |
+| `deps_of` | Finds the packages a symbol's or a file's imports resolve to, with each locked version, what it depends on and its manifest requirements (a pinned fact first, else deps.dev) |
+| `vuln_impact` | Finds where a vulnerable package is used: for an advisory (its OSV or RustSec id) the locked versions it affects and the files that import them; for a package its advisories, or the clean scan that found none |
+| `license_of` | Finds the license of the package a symbol, a file or a package maps to, per locked version: a pinned fact first, else deps.dev |
 | `list_projects` | Lists the workspace's projects you can read, with the ids `repo` takes (workspace connections only) |
 | `workspace_map` | Maps the projects you can read: their counts of files, documents, code symbols, memories and links, and the imports between them (workspace connections only) |
 | `repository_status` | Shows source coverage, revisions and memory state |
@@ -337,6 +340,17 @@ are the ones `graphicle sync` or `graph_link` last recorded.
 | `god_nodes` | Returns the most connected nodes |
 | `graph_stats` | Returns node, edge and community counts and the confidence breakdown |
 | `shortest_path` | Finds the shortest path between two nodes |
+
+`deps_of`, `vuln_impact` and `license_of` answer from the project's lockfile
+and its imports: each cites an import as `path:line`, the importing file and
+the line of its `use`, one entry per file, and its summary counts the files,
+citations and packages. The store's facts answer first, so these tools need no
+network: deps.dev is read only for what a question asks, and only on a miss.
+When the network cannot answer, the answer names what it could not learn in
+`not_known` and carries on, rather than failing. `vuln_impact` answers from
+OSV's scan of the lockfile, which a sync queues unless `sync.osv` is `false`
+([Configuration](configuration.md#limits)), and says so when the scan is not
+there yet.
 
 The server's instructions say when to call `recall_project` and
 `query_graph` (where or how something works, questions across files or

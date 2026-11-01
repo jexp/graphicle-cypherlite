@@ -1,0 +1,15 @@
+{
+  "_note": "Key structure matches the live deps.dev v3 response (checked by anonymous curl, 2026-11-01); values are trimmed or synthetic, so this is not a verbatim recording.",
+  "versionKey": {"system": "CARGO", "name": "time", "version": "0.2.22"},
+  "publishedAt": "2020-09-30T09:12:44Z",
+  "isDefault": false,
+  "isDeprecated": false,
+  "licenses": ["MIT OR Apache-2.0"],
+  "advisoryKeys": [{"id": "RUSTSEC-2020-0071"}],
+  "links": [
+    {"label": "SOURCE_REPO", "url": "https://github.com/time-rs/time"},
+    {"label": "HOMEPAGE", "url": "https://time-rs.github.io"}
+  ],
+  "slsaProvenances": [],
+  "attestations": []
+}
