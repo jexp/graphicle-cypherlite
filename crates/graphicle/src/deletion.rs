@@ -1662,9 +1662,12 @@ pub fn memory_rows(db: Graph, repository: &str, ids: &[String]) -> Result<Value>
 /// Remove every derived artifact that could carry the documents' information
 /// (see the module documentation): label-scoped `DETACH DELETE` walks over
 /// the catalog, inside the caller's graph transaction. Originals are removed
-/// by [`erase`].
+/// by [`erase`]. `sql` is the store's SQL half: the extraction reads of the
+/// lost memories are cleared there, so the next `extract` re-derives what
+/// the remaining sources support (`None` only in graph-only unit tests).
 pub fn forget(
     db: Graph,
+    sql: Option<&rusqlite::Connection>,
     workspace: &str,
     repository: &str,
     scope: &Scope,
@@ -1766,25 +1769,15 @@ pub fn forget(
             )?;
         }
     }
-    // An extraction read whose drafts were just removed must run again.
-    let mut read_ids = Vec::new();
-    for row in rows(
-        db,
-        "MATCH (r:DocumentRead {repository_id: $repo}) \
-         RETURN id(r) AS nid, r.source_id AS source_id, r.claim_ids AS claim_ids",
-        repo(),
-    )? {
-        let lost_claim = |claims: &str| {
-            serde_json::from_str::<Vec<Value>>(claims).is_ok_and(|v| {
-                v.iter()
-                    .any(|c| c.as_str().is_some_and(|c| lost.iter().any(|id| id == c)))
-            })
-        };
-        if scope.source(s(&row, "source_id")) || lost_claim(s(&row, "claim_ids")) {
-            read_ids.push(row["nid"].as_i64().unwrap_or_default());
-        }
-    }
-    let reads = detach_ids(db, "DocumentRead", &read_ids)?;
+    // An extraction read whose drafts were just removed must run again. The
+    // reads are still SQL-resident (`am_document_reads`, §8.1.4), and only
+    // this graph-side forget knows which memories and claims were lost, so
+    // it clears them there — the SQL store's semantics (§8.4): forgetting
+    // re-derives, from the sources that remain, whatever it removed.
+    let reads = match sql {
+        Some(sql) => legacy::forget_reads(sql, repository, scope, &lost)?,
+        None => 0,
+    };
     // Artifacts computed while the documents were visible.
     let mut visible_since = BTreeMap::new();
     if let Some(since) = since {
@@ -3413,6 +3406,7 @@ mod tests {
                 )?;
                 let removed = forget(
                     db,
+                    None,
                     "w1",
                     "r1",
                     &Scope::connector("c1"),

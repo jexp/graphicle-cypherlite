@@ -88,9 +88,11 @@ const PARAGRAPH_BYTES: usize = 1600;
 
 // ---------------------------------------------------------------------------
 // The link store (migration plan §2.5): `(:ConnectorDoc {repository_id, id})`
-// nodes — one per document read, carrying what its rows were computed from
-// (the SQL `gf_doc_link_sources` row as properties: `source_kind`,
-// `document_sha256`, `input`, `counts`, `dependencies`, `updated_at`, and
+// nodes with the sentinel `connector_id` [`store_graph::NO_CONNECTOR`]
+// (§8.2: the key is per connector) — one per document read, carrying what
+// its rows were computed from (the SQL `gf_doc_link_sources` row as
+// properties: `source_kind`, `document_sha256`, `input`, `counts`,
+// `dependencies`, `updated_at`, and
 // `connector` for a connector document) — with one `[:LINKS_TO]` edge per
 // mention (the SQL `gf_doc_links` row as edge properties, plus `seq`, the
 // mention's order in its document), from the document to the `(:Symbol)` a
@@ -2031,10 +2033,18 @@ fn write(db: &mut cypherlite::Connection, computed: &Computed) -> Result<usize> 
     if let Some((connector, _)) = &document.connector {
         node["connector"] = json!(connector);
     }
+    // A link-state node belongs to no connector (its id already names one
+    // when it is a connector document): the sentinel `connector_id` keeps it
+    // apart from the import node under the per-connector key (§8.2).
     store_graph::rows(
         db,
-        "MERGE (d:ConnectorDoc {repository_id: $repo, id: $doc}) SET d += $props",
-        gparams(key.iter().cloned().chain([("props", node)])),
+        "MERGE (d:ConnectorDoc {repository_id: $repo, connector_id: $none, id: $doc}) \
+         SET d += $props",
+        gparams(
+            key.iter()
+                .cloned()
+                .chain([("none", json!(store_graph::NO_CONNECTOR)), ("props", node)]),
+        ),
     )?;
     let mut symbols = Vec::new();
     let mut plain = Vec::new();
