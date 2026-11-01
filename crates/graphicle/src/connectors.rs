@@ -3,7 +3,9 @@
 //! Connector state lives in the graph store: `(:Connector)-[:OF]->(:Project)`,
 //! `(:ConnectorDoc)-[:FROM]->(:Connector)` with the ACL as properties
 //! (`acl_readers`, `acl_credentials` — a list, so read-time checks are list
-//! membership, not `json_each` joins), plus `ConnectorStage`,
+//! membership, not `json_each` joins; keyed `(repository_id, connector_id,
+//! id)` with the bare document id, as SQL's per-connector primary key was —
+//! see [`crate::store_graph::NO_CONNECTOR`]), plus `ConnectorStage`,
 //! `ConnectorVersion`, `SourcePermission` and `OriginalDocument` nodes
 //! (`cypherlite-migration.md` §2.5). Cross-cutting side effects that still
 //! live in SQL (invalidation, the model cache, observer state) run in their

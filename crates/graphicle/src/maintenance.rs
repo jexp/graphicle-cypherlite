@@ -211,8 +211,14 @@ fn apply_source_retention(
             )?;
             let sql_erased = deletion::legacy::erase(sql, identifier, &scope)?;
             let receipt = graph.transaction(|g| {
-                let mut forgotten =
-                    deletion::forget(g, &p.workspace, identifier, &scope, since.as_deref())?;
+                let mut forgotten = deletion::forget(
+                    g,
+                    Some(sql),
+                    &p.workspace,
+                    identifier,
+                    &scope,
+                    since.as_deref(),
+                )?;
                 let mut erased = deletion::erase(g, identifier, &scope)?;
                 deletion::merge_removed(&mut forgotten, &sql_forgotten);
                 deletion::merge_removed(&mut erased, &sql_erased);
@@ -816,7 +822,7 @@ impl Store {
                         return graph.transaction(|g| {
                             let started=now();
                             let since=planned.since().map(str::to_string);
-                            let mut forgotten=deletion::forget(g,&p.workspace,&identifier,&scope,since.as_deref())?;
+                            let mut forgotten=deletion::forget(g,Some(db),&p.workspace,&identifier,&scope,since.as_deref())?;
                             let mut erased=deletion::erase(g,&identifier,&scope)?;
                             deletion::merge_removed(&mut forgotten,&sql_forgotten);
                             deletion::merge_removed(&mut erased,&sql_erased);
