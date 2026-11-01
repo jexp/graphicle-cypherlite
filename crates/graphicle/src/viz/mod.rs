@@ -65,6 +65,8 @@ use crate::store_graph::GraphStore;
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
+mod drift_timeline;
+
 /// The resource URI prefix of the pack: `graphicle-graph://viz/<family>`.
 pub const PREFIX: &str = "graphicle-graph://viz/";
 /// The operation of `viz_view`, the code-graph half of the server.
@@ -158,7 +160,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Drift Timeline",
         description: "Time-bucketed churn, co-change totals and violation counts over commit dates",
         mermaid: false,
-        render: drift_timeline,
+        render: drift_timeline::view,
     },
 ];
 
@@ -551,10 +553,6 @@ fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) ->
 
 fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(true))
-}
-
-fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
 }
 
 #[cfg(test)]
