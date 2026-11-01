@@ -51,7 +51,7 @@
 
 use serde_json::{Value, json};
 
-use super::{Format, Params, View, family_of, text};
+use super::{Format, Params, View, family_of, render_text};
 use crate::store_graph::{self, GraphStore, s};
 use crate::{Error, Result, digest};
 
@@ -76,7 +76,7 @@ fn render_view(
 ) -> Result<(View, String)> {
     let family = family_of(slug)?;
     let view = (family.render)(graph, repository_id, params)?;
-    let output = digest(&json!({"text": text(&view), "view": view.model}));
+    let output = digest(&json!({"text": render_text(&view), "view": view.model}));
     Ok((view, output))
 }
 

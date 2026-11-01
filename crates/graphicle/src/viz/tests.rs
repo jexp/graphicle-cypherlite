@@ -8,9 +8,9 @@ use crate::api::{self, App};
 use crate::git_history::queries;
 use crate::model;
 use crate::store::s;
+use crate::store_graph;
 use crate::supply_chain::resolve;
 use crate::supply_chain::tools_tests::{APP, Fixture, RUSTSEC_ID, import};
-use crate::store_graph;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::result::Result;
@@ -20,9 +20,6 @@ use tempfile::TempDir;
 const REPO: &str = "viz";
 /// The coupling matrix's slug: its view is served by its own module.
 const COUPLING: &str = "coupling-matrix";
-
-/// The families whose nodes have landed: their views are no longer stubs.
-const LANDED: [&str; 6] = ["risk-overlay", "coupling-matrix", "hotspot-city", "impact-neighborhood", "drift-timeline", "arch-conformance"];
 
 /// The impact-neighborhood family's slug.
 const IMPACT: &str = "impact-neighborhood";
@@ -206,37 +203,47 @@ fn the_uri_family_is_its_slug_and_nothing_else() {
 }
 
 #[test]
-fn every_family_is_listed_and_the_waiting_ones_read_as_stubs() {
+fn every_family_is_listed_and_reads_its_report() {
     let graph = graph();
     let specs = resources();
     assert_eq!(specs.len(), FAMILIES.len());
     for family in &FAMILIES {
         let uri = format!("{PREFIX}{}", family.slug);
         assert_eq!(super::family(&uri), Some(family.slug), "{uri}");
-        // The knowledge map has its own view, tested below.
-        if family.slug == "knowledge-map" {
-            continue;
-        }
         let spec = specs
             .iter()
             .find(|spec| spec["uri"] == uri.as_str())
             .unwrap_or_else(|| panic!("no spec for {uri}: {specs:?}"));
         assert_eq!(spec["name"], family.name, "{uri}");
         assert_eq!(spec["mimeType"], "text/plain", "{uri}");
-// The landed families answer their own views (their own tests below
-        // assert them); the families still waiting for their node answer the
-        // stub's note — a resource answers, never errors, exactly as the
-        // history pack's families do on a repository without their facts.
-        if LANDED.contains(&family.slug) {
+        // A resource answers on a repository without its facts, never an
+        // error and never empty text: the empty-fixture report of every
+        // family, the focus families' note included.
+        let report = report(&graph, REPO, family.slug).unwrap();
+        assert!(!report.trim().is_empty(), "{}", family.slug);
+        if family.needs_focus {
+            // The tool path keeps the typed refusal for a focus family's
+            // call without a focus.
+            let refused = render(&graph, REPO, family.slug, &Params::default(), Format::Json);
+            assert_eq!(refused.unwrap_err().message, NEEDS_FOCUS);
             continue;
         }
-        let report = report(&graph, REPO, family.slug).unwrap();
-        assert_eq!(report, format!("{NOT_YET}:\n  none"), "{}", family.slug);
-        // The stub's json view-model: the empty object, the family named.
         let packet = render(&graph, REPO, family.slug, &Params::default(), Format::Json).unwrap();
         assert_eq!(packet["family"], family.slug);
-        assert_eq!(packet["view"], json!({}), "{}", family.slug);
+        assert!(packet["view"].is_object(), "{}", family.slug);
     }
+}
+
+#[test]
+fn a_focus_family_resource_answers_the_needs_a_focus_note() {
+    let graph = graph();
+    // The resource has no focus to center on, so it answers the note; the
+    // tool path keeps the typed refusal for the same ask.
+    let note = report(&graph, REPO, IMPACT).unwrap();
+    assert!(note.starts_with("needs a focus:\n"), "{note}");
+    assert!(note.contains("needs a focus: a symbol's"), "{note}");
+    let refused = render(&graph, REPO, IMPACT, &Params::default(), Format::Json).unwrap_err();
+    assert_eq!(refused.message, NEEDS_FOCUS);
 }
 
 #[test]
@@ -365,12 +372,21 @@ fn an_unknown_family_is_refused_with_the_known_list() {
 #[test]
 fn mermaid_is_served_only_by_the_families_that_declare_it() {
     let graph = graph();
-    // A declared family: the stub's note as a mermaid comment, which is a
-    // valid diagram.
-    for family in FAMILIES
-        .iter()
-        .filter(|family| family.mermaid && !LANDED.contains(&family.slug))
-    {
+    // A declared family answers its diagram (empty without a focus, which
+    // is a valid answer), a focus family refuses a call without its focus,
+    // and the undeclared ones are refused by name.
+    for family in FAMILIES.iter().filter(|family| family.mermaid) {
+        if family.needs_focus {
+            let refused = render(
+                &graph,
+                REPO,
+                family.slug,
+                &Params::default(),
+                Format::Mermaid,
+            );
+            assert_eq!(refused.unwrap_err().message, NEEDS_FOCUS);
+            continue;
+        }
         let answer = render(
             &graph,
             REPO,
@@ -379,12 +395,7 @@ fn mermaid_is_served_only_by_the_families_that_declare_it() {
             Format::Mermaid,
         )
         .unwrap();
-        assert_eq!(
-            answer["mermaid"],
-            format!("%% {NOT_YET}\n"),
-            "{}",
-            family.slug
-        );
+        assert!(answer["mermaid"].is_string(), "{}", family.slug);
     }
     // An undeclared family: the named refusal, before the family runs.
     for slug in [
@@ -1774,6 +1785,7 @@ fn the_window_reads_the_hot_threshold_and_the_flags_with_it() {
     assert_eq!(recent["window"], "90d");
 }
 
+#[test]
 fn an_overlay_the_family_does_not_interpret_is_answered_honestly() {
     let graph = city();
     let params = Params::parse(&json!({"overlay": "risk"})).unwrap();
@@ -2632,7 +2644,6 @@ fn a_constraint_only_rule_set_shows_its_recorded_results_and_violations() {
     assert_eq!(view.model["concepts"], json!([]));
 }
 
-
 // -- The viz pin (`pin.rs`) ---------------------------------------------------
 
 /// The stamp the first pin is taken at, and a later one.
@@ -2809,3 +2820,74 @@ fn unpinned_renders_write_nothing_and_a_pin_writes_only_its_node() {
     );
 }
 
+/// Every mermaid-declaring family escapes a label the same way: `#` before
+/// the quote and angle brackets (so the entities survive), a newline as a
+/// space. Each family's own `<br/>` sits outside the escaped text.
+#[test]
+fn every_mermaid_family_escapes_a_label_with_hash_and_newline() {
+    assert_eq!(
+        super::mermaid_label("a#b\n\"<c>\""),
+        "a#35;b #quot;#lt;c#gt;#quot;"
+    );
+
+    // impact-neighborhood: a symbol whose name holds `#` and a newline.
+    let graph = GraphStore::open_in_memory().unwrap();
+    symbol(&graph, REPO, "a#b\nc", "src/a.rs");
+    symbol(&graph, REPO, "d", "src/d.rs");
+    edge(&graph, REPO, "CALLS", "a#b\nc", "d", "src/a.rs", 3);
+    let impact = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-a#b\nc", 1),
+        Format::Mermaid,
+    )
+    .unwrap();
+    let mermaid = impact["mermaid"].as_str().unwrap();
+    assert_flowchart(mermaid);
+    assert!(mermaid.contains("a#35;b c<br/>"), "{mermaid}");
+
+    // coupling-matrix: a folder whose name holds `#` and a newline, drawn
+    // beside the focus folder.
+    let graph = coupling_graph();
+    co_change(&graph, "lib#a\nb/x.rs", "src/viz/mod.rs", "all", 3);
+    let coupling = render(
+        &graph,
+        REPO,
+        COUPLING,
+        &Params {
+            focus: Some("src/viz/mod.rs".to_owned()),
+            ..Params::default()
+        },
+        Format::Mermaid,
+    )
+    .unwrap();
+    let mermaid = coupling["mermaid"].as_str().unwrap();
+    assert!(mermaid.contains("lib#35;a b<br/>"), "{mermaid}");
+    assert!(!mermaid.contains("lib#a"), "{mermaid}");
+
+    // risk-overlay: a focus file whose path holds `#` and a newline.
+    let fixture = two_files();
+    import(
+        &fixture.graph(),
+        &fixture.repo,
+        "src/a#b\nc.rs",
+        7,
+        "time::Duration",
+    );
+    resolve::resolve(&fixture.graph(), &fixture.repo).unwrap();
+    let risk = render(
+        &fixture.graph(),
+        &fixture.repo,
+        "risk-overlay",
+        &Params {
+            focus: Some("src/a#b\nc.rs".to_owned()),
+            ..Params::default()
+        },
+        Format::Mermaid,
+    )
+    .unwrap();
+    let mermaid = risk["mermaid"].as_str().unwrap();
+    assert!(mermaid.contains("src/a#35;b c.rs"), "{mermaid}");
+    assert!(!mermaid.contains("a#b"), "{mermaid}");
+}

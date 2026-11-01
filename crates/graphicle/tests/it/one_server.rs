@@ -1159,12 +1159,25 @@ fn the_engines_resources_answer_on_the_episode() {
         ownership.contains("sole owners and dominant authors:\n  none"),
         "{ownership}"
     );
-    // The viz pack's families answer their stub note, not an error, until
-    // their nodes land (`crate::viz`).
+    // The viz pack's families answer their empty-fixture reports, not an
+    // error (`crate::viz`): the city's two sections empty, the timeline's
+    // empty, and the focus family's resource the needs-a-focus note.
     let city = read("graphicle-graph://viz/hotspot-city");
-    assert!(city.starts_with("not yet implemented"), "{city}");
+    assert!(
+        city.starts_with("hotspot files by windowed churn:\n  none"),
+        "{city}"
+    );
+    assert!(
+        city.ends_with("districts by windowed churn:\n  none"),
+        "{city}"
+    );
     let timeline = read("graphicle-graph://viz/drift-timeline");
     assert!(timeline.ends_with(":\n  none"), "{timeline}");
+    let neighborhood = read("graphicle-graph://viz/impact-neighborhood");
+    assert!(
+        neighborhood.starts_with("needs a focus:\n"),
+        "{neighborhood}"
+    );
     let unknown = rpc(
         &f,
         &app,

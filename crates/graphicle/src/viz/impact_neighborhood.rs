@@ -24,14 +24,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use super::{Params, View};
+use super::{NEEDS_FOCUS, Params, View, mermaid_label, run, text};
 use crate::git_history::queries::Section;
-use crate::store_graph::{self, GraphStore};
+use crate::store_graph::GraphStore;
 use crate::supply_chain::resolve::line_of;
 use crate::{Error, Result};
-
-/// The refusal a call without a focus gets.
-const NEEDS_FOCUS: &str = "The impact-neighborhood family needs a focus: a symbol's stable_id or qualified name, or a file path";
 
 /// The most nodes one walk holds. Past it the walk stops adding nodes, in
 /// the sorted order the hop's rows are taken in, and says so (`truncated`).
@@ -296,8 +293,8 @@ fn mermaid(nodes: &[(&String, &Node)], edges: &[&Edge]) -> String {
     for (i, (_, node)) in nodes.iter().enumerate() {
         lines.push(format!(
             "  n{i}[\"{}<br/>{} (depth {})\"]",
-            label(&node.name),
-            label(&node.path),
+            mermaid_label(&node.name),
+            mermaid_label(&node.path),
             node.depth
         ));
     }
@@ -308,19 +305,10 @@ fn mermaid(nodes: &[(&String, &Node)], edges: &[&Edge]) -> String {
         };
         lines.push(format!(
             "  n{from} -->|\"{}\"| n{to}",
-            label(&format!("{} {}", edge.relation, edge.evidence))
+            mermaid_label(&format!("{} {}", edge.relation, edge.evidence))
         ));
     }
     lines.join("\n") + "\n"
-}
-
-/// A mermaid label's text with the characters a quoted label cannot carry
-/// spelled as mermaid's entity codes (`#` first, so the codes survive).
-fn label(text: &str) -> String {
-    text.replace('#', "#35;")
-        .replace('"', "#quot;")
-        .replace('<', "#lt;")
-        .replace('>', "#gt;")
 }
 
 /// The call site of a hit: the edge's own file and line, else the caller's
@@ -353,12 +341,4 @@ fn hit(row: &Value, out: bool) -> Hit {
         anchor_path: text(row, "anchor_path"),
         out,
     }
-}
-
-fn run(graph: &GraphStore, cypher: &str, args: &Value) -> Result<Vec<Value>> {
-    graph.read(|db| store_graph::rows(db, cypher, store_graph::params(args)))
-}
-
-fn text(row: &Value, key: &str) -> String {
-    store_graph::s(row, key).to_string()
 }

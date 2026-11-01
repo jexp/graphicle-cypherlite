@@ -45,10 +45,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde_json::{Value, json};
 
-use super::{Bucket, Params, TOP, View};
+use super::{Bucket, Params, TOP, View, run, text};
 use crate::git_history::coupling::MAX_CHANGESET;
 use crate::git_history::queries::Section;
-use crate::store_graph::{self, GraphStore, s};
+use crate::store_graph::GraphStore;
 use crate::{Error, Result};
 
 /// The commits of the repository, with their author dates and subjects.
@@ -371,12 +371,4 @@ fn stamp(value: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|at| at.with_timezone(&Utc))
-}
-
-fn run(graph: &GraphStore, cypher: &str, args: &Value) -> Result<Vec<Value>> {
-    graph.read(|db| store_graph::rows(db, cypher, store_graph::params(args)))
-}
-
-fn text(row: &Value, key: &str) -> String {
-    s(row, key).to_string()
 }

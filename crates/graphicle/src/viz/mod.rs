@@ -17,11 +17,6 @@
 //! | `risk-overlay`        | advisory exposure of files and symbols through their imports |
 //! | `drift-timeline`      | time-bucketed churn, co-change totals, violation counts      |
 //!
-//! Every family's renderer is a stub in this module (the plan's §5
-//! sequencing: core first, the seven families one parallel wave behind it);
-//! each family's node replaces its [`Family::render`] entry with its own
-//! view.
-//!
 //! # The contract a family implements
 //!
 //! [`Family::render`] reads `(graph, repository_id, params)` and answers a
@@ -61,13 +56,20 @@
 
 use crate::git_history::queries::{Section, line};
 use crate::store::{Store, repo, s};
-use crate::store_graph::GraphStore;
+use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
+mod arch_conformance;
+mod coupling_matrix;
 mod drift_timeline;
 mod hotspot_city;
+mod impact_neighborhood;
 mod knowledge_map;
+pub mod pin;
+mod risk_overlay;
+#[cfg(test)]
+mod tests;
 
 /// The resource URI prefix of the pack: `graphicle-graph://viz/<family>`.
 pub const PREFIX: &str = "graphicle-graph://viz/";
@@ -93,6 +95,9 @@ pub const BUCKETS: [&str; 2] = ["month", "quarter"];
 /// The fields of the parameter contract, in the order the contract states
 /// them (a refusal names them all).
 const PARAMS: [&str; 6] = ["focus", "window", "cap", "overlay", "depth", "bucket"];
+/// The refusal a focus family gives a call without a focus (the tool path),
+/// and the note its resource answers with (the report path).
+const NEEDS_FOCUS: &str = "The impact-neighborhood family needs a focus: a symbol's stable_id or qualified name, or a file path";
 
 /// One family of the pack: the slug its resource URI and the tool's `family`
 /// argument name it, its name and description as `resources/list` publishes
@@ -106,6 +111,9 @@ pub struct Family {
     /// families: a neighborhood, a matrix around a focus, the cross-repo
     /// edges). Text and json every family serves.
     pub mermaid: bool,
+    /// Whether the family's view is centered on a focus it cannot answer
+    /// without one. Its resource answers the note, its tool call refuses.
+    pub needs_focus: bool,
     /// The family's view of `(repository, params)`.
     pub render: Render,
 }
@@ -120,6 +128,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Hotspot City",
         description: "A city-shaped view of churn: files as buildings over folder rollup, colored by windowed churn, the hot list beside it",
         mermaid: false,
+        needs_focus: false,
         render: hotspot_city::view,
     },
     Family {
@@ -127,6 +136,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Coupling Matrix",
         description: "Folder-by-folder co-change beside static calls and imports, cells trend-colored by window",
         mermaid: true,
+        needs_focus: false,
         render: coupling_matrix::view,
     },
     Family {
@@ -134,6 +144,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Knowledge Map",
         description: "Per-file author knowledge against churn: the 2x2 quadrant and per-folder bus factor",
         mermaid: false,
+        needs_focus: false,
         render: knowledge_map::view,
     },
     Family {
@@ -141,6 +152,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Impact Neighborhood",
         description: "A focus symbol's bounded calls and imports neighborhood, with direction and depth",
         mermaid: true,
+        needs_focus: true,
         render: impact_neighborhood::view,
     },
     Family {
@@ -148,6 +160,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Architecture Conformance",
         description: "Stored rule results with evidence: violations, concept coverage, declared against actual at folder rollup",
         mermaid: false,
+        needs_focus: false,
         render: arch_conformance::view,
     },
     Family {
@@ -155,6 +168,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Supply-chain Risk",
         description: "Advisory exposure of files and symbols through the packages their imports resolve to",
         mermaid: true,
+        needs_focus: false,
         render: risk_overlay::view,
     },
     Family {
@@ -162,6 +176,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Drift Timeline",
         description: "Time-bucketed churn, co-change totals and violation counts over commit dates",
         mermaid: false,
+        needs_focus: false,
         render: drift_timeline::view,
     },
 ];
@@ -174,7 +189,7 @@ pub struct View {
     /// family's own.
     pub model: Value,
     /// Its mermaid diagram; `None` for a family that declares the format
-    /// but has no diagram for the parameters (a stub, an empty focus).
+    /// but has no diagram for the parameters (an empty focus).
     pub mermaid: Option<String>,
 }
 
@@ -439,11 +454,21 @@ pub fn resources() -> Vec<Value> {
 }
 
 /// The family's default-parameter text report, the resource its
-/// `graphicle-graph://viz/<slug>` URI serves.
+/// `graphicle-graph://viz/<slug>` URI serves. A focus family has no focus
+/// here, so its resource answers the needs-a-focus note rather than the
+/// tool's refusal: a resource answers, it never errors on an empty ask.
 pub fn report(graph: &GraphStore, repository_id: &str, slug: &str) -> Result<String> {
     let family = family_of(slug)?;
-    let view = (family.render)(graph, repository_id, &Params::default())?;
-    Ok(text(&view))
+    let view = if family.needs_focus {
+        View {
+            sections: vec![("needs a focus", vec![json!({"note": NEEDS_FOCUS})])],
+            model: json!({"found": false}),
+            mermaid: None,
+        }
+    } else {
+        (family.render)(graph, repository_id, &Params::default())?
+    };
+    Ok(render_text(&view))
 }
 
 /// The family's answer in `format`, as the `viz_view` tool serves it: the
@@ -469,7 +494,7 @@ pub fn render(
     let mut packet =
         json!({"family": family.slug, "format": format.name(), "params": params.json()});
     match format {
-        Format::Text => packet["text"] = json!(text(&view)),
+        Format::Text => packet["text"] = json!(render_text(&view)),
         Format::Json => packet["view"] = view.model,
         Format::Mermaid => packet["mermaid"] = json!(view.mermaid.unwrap_or_default()),
     }
@@ -506,7 +531,7 @@ pub fn mcp_reply(packet: Value) -> Value {
 /// The text form of a view: one block per section, one line per row, the
 /// row's `evidence` first (the history pack's renderer, through its
 /// [`line`]).
-fn text(view: &View) -> String {
+fn render_text(view: &View) -> String {
     let mut out = Vec::new();
     for (title, rows) in &view.sections {
         out.push(format!("{title}:"));
@@ -518,25 +543,41 @@ fn text(view: &View) -> String {
     out.join("\n")
 }
 
-/// The stub's section title: every family answers this until its own node
-/// lands its view.
-const NOT_YET: &str = "not yet implemented: this family's view lands with its own node";
-
-/// The stub every family answers with until its node lands: the note in
-/// text form, an empty view-model, and — where the family declares mermaid —
-/// the note as a mermaid comment (a comment is a valid diagram).
-fn stub(mermaid: bool) -> View {
-    View {
-        sections: vec![(NOT_YET, Vec::new())],
-        model: json!({}),
-        mermaid: mermaid.then(|| format!("%% {NOT_YET}\n")),
-    }
+/// The rows of a view's row accessor: a row's text field, `""` when absent.
+fn text(row: &Value, key: &str) -> String {
+    store_graph::s(row, key).to_string()
 }
 
-mod arch_conformance;
-mod coupling_matrix;
-mod impact_neighborhood;
-pub mod pin;
-mod risk_overlay;
-#[cfg(test)]
-mod tests;
+/// A row's integer field, `0` when absent (the history pack's `int`).
+fn int(row: &Value, key: &str) -> i64 {
+    row[key].as_i64().unwrap_or(0)
+}
+
+/// A row's evidence: the citation every row names what it is about by, the
+/// tie key of the canonical sort.
+fn evidence(row: &Value) -> &str {
+    store_graph::s(row, "evidence")
+}
+
+/// The folder of a file: its directory, `.` for a file at the root.
+fn folder_of(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(|| ".".to_owned(), |(dir, _)| dir.to_owned())
+}
+
+/// The read a family's statement runs on the code graph, its rows back.
+fn run(graph: &GraphStore, cypher: &str, args: &Value) -> Result<Vec<Value>> {
+    graph.read(|db| store_graph::rows(db, cypher, store_graph::params(args)))
+}
+
+/// A mermaid label's text, escaped for a double-quoted label by every
+/// mermaid-declaring family: `#` first so its own entity survives, then the
+/// quote and the angle brackets, and a newline as a space. A family wraps the
+/// escaped text in its quotes and inserts its own `<br/>` outside it.
+fn mermaid_label(text: &str) -> String {
+    text.replace('#', "#35;")
+        .replace('"', "#quot;")
+        .replace('<', "#lt;")
+        .replace('>', "#gt;")
+        .replace(['\n', '\r'], " ")
+}

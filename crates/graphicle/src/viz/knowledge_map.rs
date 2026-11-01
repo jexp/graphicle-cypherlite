@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
-use super::{Overlay, Params, View};
+use super::{Overlay, Params, View, folder_of};
 use crate::git_history::queries::{self, Author, SOLE_OWNER};
 use crate::store_graph::GraphStore;
 use crate::{Error, Result};
@@ -235,8 +235,7 @@ fn file_row(quadrant: Quadrant, file: &Scored, overlay: Overlay) -> Value {
 fn folder_rows(files: &[Scored], cap: usize) -> Vec<Value> {
     let mut folders: BTreeMap<String, Vec<&Scored>> = BTreeMap::new();
     for file in files {
-        let folder = file.file.rsplit_once('/').map_or(".", |(parent, _)| parent);
-        folders.entry(folder.to_string()).or_default().push(file);
+        folders.entry(folder_of(&file.file)).or_default().push(file);
     }
     let mut rows: Vec<(usize, i64, Value)> = folders
         .into_iter()
