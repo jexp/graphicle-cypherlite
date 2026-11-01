@@ -981,7 +981,20 @@ fn sync_folder_with(
     // The project's own Cargo.lock becomes package facts (supply-chain plan
     // §4 P1): offline, idempotent, and never a failed sync.
     match crate::supply_chain::lock::ingest(&store.graph(), &repository, &root) {
-        Ok(Some(lock)) => result["cargo_lock"] = lock,
+        Ok(Some(lock)) => {
+            // The lockfile's advisory query queues after it is ingested, keyed on
+            // its digest; an offline store queues none (supply_chain::osv).
+            let digest = lock["digest"].as_str().unwrap_or_default().to_string();
+            let enabled = crate::supply_chain::osv::enabled();
+            result["osv"] =
+                match store.authorized(&session.workspace, &session.capability, "read", |db, p| {
+                    crate::jobs::enqueue_osv(store, db, &repository, p, &digest, enabled)
+                }) {
+                    Ok(queued) => queued,
+                    Err(error) => json!({"error": error.message}),
+                };
+            result["cargo_lock"] = lock;
+        }
         Ok(None) => {}
         Err(error) => result["cargo_lock"] = json!({"error": error.message}),
     }

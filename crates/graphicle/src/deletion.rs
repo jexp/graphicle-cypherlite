@@ -182,6 +182,10 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     // the project's derived content; they are not history (see HISTORY).
     ("Package", "Package", Scoped::Repository),
     ("PackageVersion", "PackageVersion", Scoped::Repository),
+    // OSV advisories (supply_chain::osv): current facts about the lockfile, like
+    // the packages they name, so they walk with the project and are not history.
+    ("Advisory", "Advisory", Scoped::Repository),
+    ("AdvisoryCorpus", "AdvisoryCorpus", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),

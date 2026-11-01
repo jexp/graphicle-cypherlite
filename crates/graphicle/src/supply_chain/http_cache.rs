@@ -13,7 +13,7 @@
 //! still serves the response.
 //!
 //! Disk entries live under the store's directory, beside its graph:
-//! `<store>/http-cache/<namespace>/`, one file per URL (SHA-256 of the URL).
+//! `<store>/http-cache/<namespace>/`, one file per key (SHA-256 of the key).
 //! That is the embedding cache's precedent, where the store owns its cache. The
 //! namespace names the client (`deps-dev`, `osv`), so two clients never share
 //! keys.
@@ -25,11 +25,12 @@
 //! calls, and the throttle never holds a lock across a request.
 //!
 //! The layer is HTTP-generic. [`Transport`] fetches a URL, and the cache knows
-//! nothing about deps.dev. It keys on the URL alone, so it fits GET endpoints;
-//! a POST body (OSV's `querybatch`) would need a body-keyed variant.
+//! nothing about deps.dev. A GET is keyed on its URL. A POST (OSV's
+//! `querybatch`) is keyed on its URL and the SHA-256 of its body, as the
+//! synthetic key `POST <sha256(body)> <url>`, so two bodies sent to one URL
+//! are two entries. The key is opaque to the disk and memory layers.
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -65,7 +66,7 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(message) => write!(f, "request failed: {message}"),
-            Self::Status { url, status } => write!(f, "GET {url} returned HTTP {status}"),
+            Self::Status { url, status } => write!(f, "{url} returned HTTP {status}"),
         }
     }
 }
@@ -76,6 +77,13 @@ impl std::error::Error for FetchError {}
 /// tests supply a fake, so nothing in CI reaches the network.
 pub trait Transport: Send + Sync {
     fn get(&self, url: &str) -> impl Future<Output = Result<HttpResponse, FetchError>> + Send;
+
+    /// A POST of `body` as JSON to `url`.
+    fn post(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> impl Future<Output = Result<HttpResponse, FetchError>> + Send;
 }
 
 /// [`Transport`] over a shared reqwest client.
@@ -84,29 +92,41 @@ pub struct ReqwestTransport(pub reqwest::Client);
 
 impl Transport for ReqwestTransport {
     async fn get(&self, url: &str) -> Result<HttpResponse, FetchError> {
-        let response = self
-            .0
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| FetchError::Transport(error.to_string()))?;
-        let status = response.status().as_u16();
-        let cache_control = response
-            .headers()
-            .get(reqwest::header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| FetchError::Transport(error.to_string()))?
-            .to_vec();
-        Ok(HttpResponse {
-            status,
-            cache_control,
-            body,
-        })
+        send(self.0.get(url)).await
     }
+
+    async fn post(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError> {
+        let request = self
+            .0
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_owned());
+        send(request).await
+    }
+}
+
+/// Sends `request` and reads its status, `Cache-Control` and body.
+async fn send(request: reqwest::RequestBuilder) -> Result<HttpResponse, FetchError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| FetchError::Transport(error.to_string()))?;
+    let status = response.status().as_u16();
+    let cache_control = response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| FetchError::Transport(error.to_string()))?
+        .to_vec();
+    Ok(HttpResponse {
+        status,
+        cache_control,
+        body,
+    })
 }
 
 /// A transport shared between a client and its caller (tests read its call
@@ -114,6 +134,14 @@ impl Transport for ReqwestTransport {
 impl<T: Transport> Transport for Arc<T> {
     fn get(&self, url: &str) -> impl Future<Output = Result<HttpResponse, FetchError>> + Send {
         (**self).get(url)
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> impl Future<Output = Result<HttpResponse, FetchError>> + Send {
+        (**self).post(url, body)
     }
 }
 
@@ -165,7 +193,8 @@ struct Entry {
     body: Arc<[u8]>,
 }
 
-/// The first line of a disk entry; the body follows it.
+/// The first line of a disk entry; the body follows it. `url` is the entry's
+/// key: the URL for a GET, the body-keyed form for a POST.
 #[derive(Serialize, Deserialize)]
 struct Header {
     url: String,
@@ -192,16 +221,44 @@ impl HttpCache {
         transport: &T,
         url: &str,
     ) -> Result<Arc<[u8]>, FetchError> {
-        if let Some(entry) = self.remembered(url, now_secs()) {
+        self.read_through(url, url, || transport.get(url)).await
+    }
+
+    /// The body `url` answers to a POST of `body`, cached like a GET: the
+    /// entry is keyed on the body too, so each distinct body is its own entry.
+    pub async fn post<T: Transport>(
+        &self,
+        transport: &T,
+        url: &str,
+        body: &str,
+    ) -> Result<Arc<[u8]>, FetchError> {
+        let key = format!("POST {} {url}", digest_hex(body.as_bytes()));
+        self.read_through(&key, url, || transport.post(url, body))
+            .await
+    }
+
+    /// The cache's one path: memory, disk, else `fetch` under the throttle.
+    /// `key` names the entry; `url` names the request in a status error.
+    async fn read_through<F, Fut>(
+        &self,
+        key: &str,
+        url: &str,
+        fetch: F,
+    ) -> Result<Arc<[u8]>, FetchError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<HttpResponse, FetchError>>,
+    {
+        if let Some(entry) = self.remembered(key, now_secs()) {
             return Ok(entry.body);
         }
-        let path = entry_path(&self.dir, url);
-        if let Some(entry) = read_disk(&path, url, now_secs()) {
-            self.remember(url, entry.clone());
+        let path = entry_path(&self.dir, key);
+        if let Some(entry) = read_disk(&path, key, now_secs()) {
+            self.remember(key, entry.clone());
             return Ok(entry.body);
         }
         self.throttle.wait().await;
-        let response = transport.get(url).await?;
+        let response = fetch().await?;
         if !(200..300).contains(&response.status) {
             return Err(FetchError::Status {
                 url: url.to_owned(),
@@ -215,29 +272,29 @@ impl HttpCache {
                 body: body.clone(),
             };
             // A cache that cannot be written still serves the response.
-            let _ = write_disk(&self.dir, &path, url, &entry);
-            self.remember(url, entry);
+            let _ = write_disk(&self.dir, &path, key, &entry);
+            self.remember(key, entry);
         }
         Ok(body)
     }
 
-    fn remembered(&self, url: &str, now: u64) -> Option<Entry> {
+    fn remembered(&self, key: &str, now: u64) -> Option<Entry> {
         let mut memory = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-        match memory.get(url) {
+        match memory.get(key) {
             Some(entry) if entry.expires_at > now => Some(entry.clone()),
             Some(_) => {
-                memory.pop(url);
+                memory.pop(key);
                 None
             }
             None => None,
         }
     }
 
-    fn remember(&self, url: &str, entry: Entry) {
+    fn remember(&self, key: &str, entry: Entry) {
         self.memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .put(url.to_owned(), entry);
+            .put(key.to_owned(), entry);
     }
 }
 
@@ -270,30 +327,31 @@ fn now_secs() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-fn entry_path(dir: &Path, url: &str) -> PathBuf {
-    let digest: String = Sha256::digest(url.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    dir.join(format!("{digest}.http"))
+fn entry_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{}.http", digest_hex(key.as_bytes())))
 }
 
-/// A disk entry for `url` that is still fresh. Anything else is a miss.
-fn read_disk(path: &Path, url: &str, now: u64) -> Option<Entry> {
+/// The lowercase hexadecimal SHA-256 of `bytes`.
+fn digest_hex(bytes: &[u8]) -> String {
+    graphicle_memory::text::sha256(bytes)
+}
+
+/// A disk entry for `key` that is still fresh. Anything else is a miss.
+fn read_disk(path: &Path, key: &str, now: u64) -> Option<Entry> {
     let bytes = std::fs::read(path).ok()?;
     let split = bytes.iter().position(|byte| *byte == b'\n')?;
     let header: Header = serde_json::from_slice(&bytes[..split]).ok()?;
-    (header.url == url && header.expires_at > now).then(|| Entry {
+    (header.url == key && header.expires_at > now).then(|| Entry {
         expires_at: header.expires_at,
         body: bytes[split + 1..].into(),
     })
 }
 
 /// Writes the entry through a temporary file, so a reader never sees half of it.
-fn write_disk(dir: &Path, path: &Path, url: &str, entry: &Entry) -> std::io::Result<()> {
+fn write_disk(dir: &Path, path: &Path, key: &str, entry: &Entry) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut bytes = serde_json::to_vec(&Header {
-        url: url.to_owned(),
+        url: key.to_owned(),
         expires_at: entry.expires_at,
     })
     .map_err(std::io::Error::other)?;
@@ -315,6 +373,7 @@ pub(crate) mod test_transport {
     pub(crate) struct FixtureTransport {
         routes: HashMap<String, HttpResponse>,
         calls: AtomicUsize,
+        posted: Mutex<Vec<String>>,
     }
 
     impl FixtureTransport {
@@ -322,12 +381,30 @@ pub(crate) mod test_transport {
             Self {
                 routes: routes.into_iter().collect(),
                 calls: AtomicUsize::new(0),
+                posted: Mutex::new(Vec::new()),
             }
         }
 
         /// The number of requests that reached this transport.
         pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        /// The bodies POSTed to this transport, in order.
+        pub(crate) fn posted(&self) -> Vec<String> {
+            self.posted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn answer(&self, url: &str) -> HttpResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.routes.get(url).cloned().unwrap_or(HttpResponse {
+                status: 404,
+                cache_control: None,
+                body: Vec::new(),
+            })
         }
     }
 
@@ -342,12 +419,15 @@ pub(crate) mod test_transport {
 
     impl Transport for FixtureTransport {
         async fn get(&self, url: &str) -> Result<HttpResponse, FetchError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.routes.get(url).cloned().unwrap_or(HttpResponse {
-                status: 404,
-                cache_control: None,
-                body: Vec::new(),
-            }))
+            Ok(self.answer(url))
+        }
+
+        async fn post(&self, url: &str, body: &str) -> Result<HttpResponse, FetchError> {
+            self.posted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(body.to_owned());
+            Ok(self.answer(url))
         }
     }
 }
@@ -493,5 +573,44 @@ mod tests {
         cache.get(&private, URL).await.unwrap();
         cache.get(&private, URL).await.unwrap();
         assert_eq!(private.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn posts_are_cached_per_body_and_never_collide_with_gets() {
+        let store = TempDir::new().unwrap();
+        let cache = cache(&store, Duration::ZERO);
+        let transport = FixtureTransport::new([(URL.to_owned(), json("{\"a\":1}"))]);
+        let first = cache.post(&transport, URL, "{\"q\":1}").await.unwrap();
+        // The same body is served from the cache; a fresh cache reads disk.
+        let again = cache.post(&transport, URL, "{\"q\":1}").await.unwrap();
+        assert_eq!(first, again);
+        assert_eq!(
+            cache_in(&store)
+                .post(&transport, URL, "{\"q\":1}")
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(transport.calls(), 1);
+        // Another body to the same URL is another request and another entry.
+        cache.post(&transport, URL, "{\"q\":2}").await.unwrap();
+        assert_eq!(transport.calls(), 2);
+        assert_eq!(transport.posted(), ["{\"q\":1}", "{\"q\":2}"]);
+        // The GET at the same URL keeps its own entry, keyed on the URL alone.
+        cache.get(&transport, URL).await.unwrap();
+        assert_eq!(transport.calls(), 3);
+        cache.get(&transport, URL).await.unwrap();
+        assert_eq!(transport.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_is_never_kept() {
+        let store = TempDir::new().unwrap();
+        let cache = cache(&store, Duration::ZERO);
+        let missing = FixtureTransport::new([]);
+        let error = cache.post(&missing, URL, "{}").await.unwrap_err();
+        assert!(matches!(error, FetchError::Status { status: 404, .. }));
+        cache.post(&missing, URL, "{}").await.unwrap_err();
+        assert_eq!(missing.calls(), 2);
     }
 }

@@ -37,6 +37,7 @@ use std::path::Path;
 
 use cargo_lock::{Lockfile, SourceId};
 
+use super::batches;
 use crate::store_graph::{self, GraphStore};
 use crate::{Error, Result};
 use serde_json::{Value, json};
@@ -50,9 +51,6 @@ pub const ORIGIN: &str = "cargo.lock";
 
 /// The ecosystem segment of every purl this module mints.
 const SYSTEM: &str = "cargo";
-
-/// Rows per transaction (git_history/writer.rs's `BATCH`).
-const BATCH: usize = 1000;
 
 /// Where a locked package came from, as the lockfile names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,8 +181,8 @@ fn source_of(source: Option<&SourceId>) -> Source {
 
 /// Read `<root>/Cargo.lock` and write its package facts into
 /// `repository_id`. `None` when the project has no lockfile. The result is
-/// the sync's `cargo_lock` entry: the counts written and the shadowed
-/// entries skipped.
+/// the sync's `cargo_lock` entry: the counts written, the shadowed entries
+/// skipped and the lockfile's `digest`.
 pub fn ingest(graph: &GraphStore, repository_id: &str, root: &Path) -> Result<Option<Value>> {
     let path = root.join(FILE);
     if !path.is_file() {
@@ -192,7 +190,11 @@ pub fn ingest(graph: &GraphStore, repository_id: &str, root: &Path) -> Result<Op
     }
     let text = std::fs::read_to_string(&path)?;
     let lock = parse(&text)?;
-    write(graph, repository_id, &lock).map(Some)
+    // The digest of the bytes read: the key of the advisory query this
+    // lockfile queues (supply_chain::osv).
+    let mut result = write(graph, repository_id, &lock)?;
+    result["digest"] = json!(graphicle_memory::text::sha256(text.as_bytes()));
+    Ok(Some(result))
 }
 
 /// Write one parsed lockfile. Batches are per [`BATCH`] rows, one
@@ -310,20 +312,4 @@ pub fn write(graph: &GraphStore, repository_id: &str, lock: &Lock) -> Result<Val
         "described": described.len(),
         "shadowed": lock.shadowed,
     }))
-}
-
-/// Run `query` once per [`BATCH`]-row chunk of `rows`, one transaction per
-/// chunk.
-fn batches(graph: &GraphStore, repository_id: &str, rows: &[Value], query: &str) -> Result<()> {
-    for chunk in rows.chunks(BATCH) {
-        graph.transaction(|db| {
-            store_graph::write(
-                db,
-                query,
-                store_graph::params(&json!({"repo": repository_id, "rows": chunk})),
-            )?;
-            Ok(())
-        })?;
-    }
-    Ok(())
 }

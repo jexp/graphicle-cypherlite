@@ -1333,6 +1333,7 @@ where
     crate::limits::install(limits);
     // Whether a sync reads tracked files an ignore pattern matches.
     crate::local::install_tracked_ignored(&config);
+    crate::supply_chain::osv::install(&config);
     let store = store.with_limits(limits);
     let app = App::new(store.clone(), config.clone(), vec![])?;
     match command {
