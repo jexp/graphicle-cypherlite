@@ -94,6 +94,7 @@ pub mod terminal;
 pub mod update_notice;
 pub mod vault;
 pub mod vector;
+pub mod viz;
 pub mod work_state;
 mod workflow_retrieval;
 pub mod workflows;

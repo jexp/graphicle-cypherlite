@@ -46,6 +46,9 @@ const EDITION_GRAPH_TOOLS: [&str; 2] = ["change_impact", "overlay_status"];
 /// The supply-chain tools, which read the code graph's imports and the
 /// store's package facts (plan §4 P3): in the graph half, after the engine's.
 const SUPPLY_CHAIN: [&str; 3] = ["deps_of", "vuln_impact", "license_of"];
+/// The viz pack's one tool (software-visualization plan §2): in the graph
+/// half, after the supply-chain tools.
+const VIZ: [&str; 1] = ["viz_view"];
 
 const A: &str = "def alpha():\n    return 1\n\ndef beta():\n    return 2\n";
 const A_EDITED: &str = "def alpha():\n    return 10\n\ndef beta():\n    return 2\n";
@@ -265,6 +268,8 @@ fn every_flag_combination_lists_each_tool_once() {
                 for name in graph_tools::NAVIGATION.iter().chain(&GRAPH_HISTORY) {
                     assert!(graph.contains(&name.to_string()), "{name}: {graph:?}");
                 }
+                // The viz pack's tool reads the store's graphs: graph half.
+                assert!(graph.contains(&"viz_view".to_string()), "{graph:?}");
                 for name in EDITION_GRAPH_TOOLS {
                     let listed = all.contains(&name.to_string());
                     assert_eq!(graph.contains(&name.to_string()), listed, "{name}");
@@ -291,17 +296,18 @@ fn every_flag_combination_lists_each_tool_once() {
     // `graph_stats` is the engine's (Graphify's), once.
     assert_eq!(listed.iter().filter(|n| *n == "graph_stats").count(), 1);
     // A project connection's core tools: `list_projects` is a workspace
-    // connection's, the other 23 as the one server lists them, `pack` last,
-    // then the supply-chain tools.
+    // connection's, the others as the one server lists them, `pack`, then
+    // the supply-chain tools, then the viz pack's one tool.
     let core: Vec<String> = api::core_mcp_tools(false, false)
         .into_iter()
         .filter_map(McpTool::confined)
         .map(|tool| tool.name().to_string())
         .collect();
-    assert_eq!(core.len(), 26, "{core:?}");
+    assert_eq!(core.len(), 27, "{core:?}");
     assert_eq!(core[15..22], graph_tools::NAVIGATION.map(String::from));
     assert_eq!(core[22], "pack");
-    assert_eq!(core[23..], SUPPLY_CHAIN.map(String::from));
+    assert_eq!(core[23..26], SUPPLY_CHAIN.map(String::from));
+    assert_eq!(core[26], "viz_view");
     assert_eq!(
         listed[..core.len()],
         core[..],
@@ -960,6 +966,7 @@ fn a_tool_set_serves_one_half_of_the_server() {
         .iter()
         .chain(&graph_tools::NAVIGATION)
         .chain(&SUPPLY_CHAIN)
+        .chain(&VIZ)
         .map(|name| name.to_string())
         .collect();
     assert_eq!(listed[..expected.len()], expected[..], "{listed:?}");
@@ -981,6 +988,7 @@ fn a_tool_set_serves_one_half_of_the_server() {
         .iter()
         .chain(&GRAPH_HISTORY)
         .chain(&SUPPLY_CHAIN)
+        .chain(&VIZ)
         .chain(&EDITION_GRAPH_TOOLS)
     {
         assert!(!listed.contains(&name.to_string()), "{name}: {listed:?}");
@@ -1122,8 +1130,9 @@ fn the_engines_resources_answer_on_the_episode() {
         .map(|resource| s(resource, "uri").to_string())
         .collect();
     // The engine's six resources, then the five history families the pack
-    // appends to the shared list (`git_history::queries`).
-    assert_eq!(uris.len(), 11, "{listed}");
+    // appends to the shared list (`git_history::queries`), then the viz
+    // pack's seven (`crate::viz`).
+    assert_eq!(uris.len(), 18, "{listed}");
     for uri in &uris {
         let read = rpc(&f, &app, &f.key, "resources/read", json!({"uri":uri}));
         let content = &read["result"]["contents"][0];
@@ -1150,6 +1159,12 @@ fn the_engines_resources_answer_on_the_episode() {
         ownership.contains("sole owners and dominant authors:\n  none"),
         "{ownership}"
     );
+    // The viz pack's families answer their stub note, not an error, until
+    // their nodes land (`crate::viz`).
+    let city = read("graphicle-graph://viz/hotspot-city");
+    assert!(city.starts_with("not yet implemented"), "{city}");
+    let timeline = read("graphicle-graph://viz/drift-timeline");
+    assert!(timeline.ends_with(":\n  none"), "{timeline}");
     let unknown = rpc(
         &f,
         &app,
