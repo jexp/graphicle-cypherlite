@@ -123,7 +123,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Coupling Matrix",
         description: "Folder-by-folder co-change beside static calls and imports, cells trend-colored by window",
         mermaid: true,
-        render: coupling_matrix,
+        render: coupling_matrix::view,
     },
     Family {
         slug: "knowledge-map",
@@ -533,10 +533,6 @@ fn hotspot_city(_graph: &GraphStore, _repository: &str, _params: &Params) -> Res
     Ok(stub(false))
 }
 
-fn coupling_matrix(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(true))
-}
-
 fn knowledge_map(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
@@ -556,6 +552,8 @@ fn risk_overlay(_graph: &GraphStore, _repository: &str, _params: &Params) -> Res
 fn drift_timeline(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
     Ok(stub(false))
 }
+
+mod coupling_matrix;
 
 #[cfg(test)]
 mod tests;
