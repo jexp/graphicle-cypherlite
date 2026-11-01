@@ -514,6 +514,14 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     // expression, NOASSERTION when deps.dev lists none, so the licenses of
     // many versions dedupe onto shared nodes.
     (lc:License => {repository_id IS STRING NOT NULL, spdx IS STRING NOT NULL}),
+    // Viz pins (software-visualization-plan §3; written only by viz::pin): the
+    // analysis reference a cited view re-renders from, one node per input
+    // tuple. The view-model itself is never stored: `output_sha256` is the
+    // digest a re-run verifies against.
+    (vp:ViewPin => {repository_id IS STRING NOT NULL, input_hash IS STRING NOT NULL,
+                    family IS STRING NOT NULL, params IS STRING NOT NULL,
+                    window_keys IS STRING NOT NULL, as_of IS STRING NOT NULL,
+                    analysis IS STRING NOT NULL, output_sha256 IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -538,6 +546,7 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (up:UnresolvedPackage) REQUIRE (up.repository_id, up.origin, up.symbol,
                                                    up.package) IS KEY,
     CONSTRAINT FOR (lc:License) REQUIRE (lc.repository_id, lc.spdx) IS KEY,
+    CONSTRAINT FOR (vp:ViewPin) REQUIRE (vp.repository_id, vp.input_hash) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)

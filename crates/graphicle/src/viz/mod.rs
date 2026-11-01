@@ -539,6 +539,7 @@ fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) ->
 
 mod coupling_matrix;
 mod impact_neighborhood;
+pub mod pin;
 mod risk_overlay;
 #[cfg(test)]
 mod tests;
