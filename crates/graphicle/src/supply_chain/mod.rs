@@ -29,7 +29,19 @@
 //! [`osv`] is the advisory half: one bulk query per lockfile digest, queued
 //! by the sync after the lockfile is ingested and drained as an `osv` job.
 //!
-//! [`batches`] is the writer both lockfile and advisory facts share.
+//! [`on_demand`] is the enrichment half of plan §4 P2: deps.dev is a
+//! read-through source, never an eager job. An analysis, a tool or a pack
+//! calls it when it needs a license, a Scorecard, a source repository, a
+//! deprecation or a manifest requirement; the call serves from the HTTP
+//! cache and fetches through the shared throttle only on a miss, and writes
+//! nothing to the store. The store grows only through
+//! [`on_demand::pin`](on_demand::pin), when an answer must outlive the
+//! question: the facts it consumed are written with origin, `known_at`,
+//! `as_of` and the analysis reference, so a pinned analysis re-runs against
+//! the pinned data. There is no deps.dev job kind — OSV stays the only
+//! supply-chain job a sync queues, the plan's one eager exception.
+//!
+//! [`batches`] is the writer lockfile, advisory and pin facts share.
 
 use crate::Result;
 use crate::store_graph::{self, GraphStore};
@@ -38,6 +50,9 @@ use serde_json::{Value, json};
 pub mod deps_dev;
 pub mod http_cache;
 pub mod lock;
+pub mod on_demand;
+#[cfg(test)]
+pub(crate) mod on_demand_tests;
 pub mod osv;
 #[cfg(test)]
 pub(crate) mod osv_tests;

@@ -191,6 +191,13 @@ const LABELS: &[(&str, &str, Scoped)] = &[
     // resolution run, so it walks with its project's derived content the
     // same way.
     ("UnresolvedPackage", "UnresolvedPackage", Scoped::Repository),
+    // deps.dev license facts (supply_chain::on_demand): pinned evidence a
+    // cited analysis consumed, written only when an answer must outlive the
+    // question. It is scoped like the packages it names and is not history
+    // (see HISTORY): it is part of the project's derived content, so a
+    // forgotten project loses its pins and a store that never pinned any
+    // digests the same way.
+    ("License", "License", Scoped::Repository),
     ("Claim", "am_claims", Scoped::Repository),
     ("Chunk", "repo_chunks", Scoped::Repository),
     ("ClaimEvent", "am_claim_events", Scoped::Repository),

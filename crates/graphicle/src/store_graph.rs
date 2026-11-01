@@ -454,16 +454,36 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     // sources; a path package carries none.
     (pk:Package => {repository_id IS STRING NOT NULL, purl IS STRING NOT NULL,
                     system IS STRING, name IS STRING}),
+    // The pin path's deps.dev facts (supply_chain::on_demand) ride the same
+    // nodes: deprecation, source repository and Scorecard as origin-tagged
+    // properties, each family with its own known_at/as_of/analysis because
+    // families pin at different times. Present only when an analysis pinned
+    // them; a version the lockfile alone describes carries none.
     (pv:PackageVersion => {repository_id IS STRING NOT NULL, purl_at_version IS STRING NOT NULL,
                            purl IS STRING, name IS STRING, version IS STRING,
                            source_kind IS STRING, source IS STRING, source_url IS STRING,
-                           source_rev IS STRING}),
+                           source_rev IS STRING,
+                           is_deprecated IS BOOLEAN, deprecated_reason IS STRING,
+                           deprecation_origin IS STRING, deprecation_known_at IS STRING,
+                           deprecation_as_of IS STRING, deprecation_analysis IS STRING,
+                           source_repo IS STRING, source_repo_origin IS STRING,
+                           source_repo_known_at IS STRING, source_repo_as_of IS STRING,
+                           source_repo_analysis IS STRING,
+                           scorecard_project IS STRING, scorecard_stars IS INTEGER,
+                           scorecard_overall IS FLOAT, scorecard_date IS STRING,
+                           scorecard_origin IS STRING, scorecard_known_at IS STRING,
+                           scorecard_as_of IS STRING, scorecard_analysis IS STRING}),
     // OSV advisories (supply-chain plan §2; written by supply_chain::osv). Scoped
     // to the repository like every label: one advisory in two projects is two
     // nodes. `aliases` is the JSON array the advisory reports.
     (ad:Advisory => {repository_id IS STRING NOT NULL, osv_id IS STRING NOT NULL,
                      title IS STRING, aliases IS STRING, url IS STRING}),
     (ac:AdvisoryCorpus => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL}),
+    // deps.dev license facts (supply-chain plan §2; written only by the pin
+    // path of supply_chain::on_demand): one node per distinct SPDX
+    // expression, NOASSERTION when deps.dev lists none, so the licenses of
+    // many versions dedupe onto shared nodes.
+    (lc:License => {repository_id IS STRING NOT NULL, spdx IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -485,6 +505,7 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (pv:PackageVersion) REQUIRE (pv.repository_id, pv.purl_at_version) IS KEY,
     CONSTRAINT FOR (ad:Advisory) REQUIRE (ad.repository_id, ad.osv_id) IS KEY,
     CONSTRAINT FOR (ac:AdvisoryCorpus) REQUIRE (ac.repository_id, ac.source) IS KEY,
+    CONSTRAINT FOR (lc:License) REQUIRE (lc.repository_id, lc.spdx) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)
@@ -558,6 +579,9 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX package_version_key IF NOT EXISTS FOR (pv:PackageVersion) ON (pv.repository_id, pv.purl_at_version)",
     // OSV advisories (supply_chain::osv): the MERGE anchor of the advisory batches.
     "CREATE INDEX advisory_key IF NOT EXISTS FOR (ad:Advisory) ON (ad.repository_id, ad.osv_id)",
+    // deps.dev license facts (supply_chain::on_demand): the MERGE anchor of
+    // the license pin batches.
+    "CREATE INDEX license_key IF NOT EXISTS FOR (lc:License) ON (lc.repository_id, lc.spdx)",
 ];
 
 /// Vector indexes created by [`GraphStore::ensure_vector_indexes`]:
