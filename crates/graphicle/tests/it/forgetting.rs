@@ -53,19 +53,6 @@ const PROBES: &[&str] = &[
     "Which running shoes do I use?",
 ];
 
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
-}
-
 struct Provider {
     config: model::Config,
     task: tokio::task::JoinHandle<()>,
@@ -565,12 +552,14 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
     assert_same_world(&a, &b);
     // The comparison covers the derived state, not an empty shell.
     let covered = a.state();
-    // The connector tables moved to the graph store; the SQL state covers
-    // the rest.
+    // The state digest names each migrated label by its legacy table (the
+    // receipt reads the same whichever backend wrote the store): observer
+    // notes are `Observation` nodes reported as `am_observer_notes`.
     for table in [
-        // Observer notes moved to the graph store (Observation nodes).
-        "Observation",
-        "am_vectors",
+        "am_observer_notes",
+        // Passage embeddings live on the chunk nodes they describe (checked
+        // directly below); the chunks themselves are state.
+        "repo_chunks",
         "repo_memories",
         "repo_memory_revisions",
         "am_claims",
@@ -583,6 +572,12 @@ async fn forgetting_documents_leaves_the_store_a_never_ingested_fork_would_have(
             "{table}: {covered:#}"
         );
     }
+    assert!(
+        !graphicle_runtime::vector::graph_vectors_all(&a.store.graph(), &a.repo)
+            .unwrap()
+            .is_empty(),
+        "the graph store holds the re-derived passage embeddings"
+    );
     assert!(
         crate::gql_one(
             &a.store,

@@ -1,0 +1,11 @@
+[package]
+name = "cypherlite-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Planner IR (lowered Cypher AST)"
+license.workspace = true
+
+[dependencies]
+cypherlite-parser = { workspace = true }
+cypherlite-core = { workspace = true }

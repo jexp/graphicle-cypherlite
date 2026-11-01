@@ -1,0 +1,26 @@
+[[fixture-git:PersonsByEmail]]
+[source,cypher,role=concept]
+.Flag author nodes that share an email as having aliases.
+----
+MATCH (a:Author)
+WITH a.email AS email, collect(a.name) AS names
+WHERE size(names) > 1
+MATCH (b:Author {email: email})
+SET b.has_aliases = true
+----
+
+[[fixture-git:CommitsWithParents]]
+[source,cypher,role=concept]
+.Label commits that have a parent, as a count of HAS_PARENT edges.
+----
+MATCH (c:Commit)-[:HAS_PARENT]->(:Commit)
+WITH c, count(*) AS parents
+SET c.parent_count = parents
+----
+
+Listings without a role are examples, not rules, and are skipped:
+
+[source,cypher]
+----
+MATCH (a:Author) RETURN a.email
+----

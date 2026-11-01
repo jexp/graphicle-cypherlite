@@ -175,6 +175,13 @@ pub async fn execute(worker: &Worker, job: &Job) -> Result<Value> {
                 .await
                 .map_err(|_| Error::bad("Cross-repository linking interrupted"))?
         }
+        "enrich" => {
+            let store = worker.store.clone();
+            let job = job.clone();
+            tokio::task::spawn_blocking(move || jobs::run_enrich(&store, &job))
+                .await
+                .map_err(|_| Error::bad("Rule-set enrichment interrupted"))?
+        }
         _ => match crate::extension::installed().job(worker, job) {
             Some(run) => run.await,
             // Known by name, run only by an extension (never leased without one).
@@ -367,10 +374,12 @@ pub async fn extract(worker: &Worker, job: &Job) -> Result<Value> {
                 &worker.store.graph(),
                 repo,
                 p,
-                &value["claims"],
-                input["sources"].as_array().unwrap(),
-                &target_context,
-                &json!({"model":profile.model,"job_id":job.id}),
+                claims::Proposal {
+                    claims: &value["claims"],
+                    sources: input["sources"].as_array().unwrap(),
+                    targets: &target_context,
+                    provider: &json!({"model":profile.model,"job_id":job.id}),
+                },
             )?;
             // A derived result inherits visibility from every source supplied to
             // the model, including disambiguating context it did not cite.
@@ -676,7 +685,7 @@ async fn semantic_rankings_role(
         .filter(|(identity, sha)| valid.get(identity.as_str()) == Some(&sha.as_str()))
         .count();
     // Writes a cached-call record, so it takes the write path.
-let mut query_vectors = {
+    let mut query_vectors = {
         let graph = worker.store.graph();
         jobs::guarded(&worker.store, job, |_, _, _| {
             let queries = graph.transaction(|db| {

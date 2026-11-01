@@ -1,0 +1,5 @@
+{
+  "codec": "json",
+  "checkpoint_lsn": 1,
+  "commit_ts": 1
+}

@@ -182,9 +182,7 @@ impl GraphStore {
                                 *slot = Arc::downgrade(&database);
                                 return Ok(database);
                             }
-                            Err(cypherlite::Error::Locked(_))
-                                if Instant::now() < deadline =>
-                            {
+                            Err(cypherlite::Error::Locked(_)) if Instant::now() < deadline => {
                                 drop(slot);
                                 std::thread::sleep(LEASE_RETRY);
                             }
@@ -317,6 +315,14 @@ impl GraphStore {
             for name in FALLBACK_CONSTRAINTS {
                 db.query(&format!("DROP CONSTRAINT {name} IF EXISTS"))?;
             }
+            // A store written before the `ConnectorDoc` key gained
+            // `connector_id` (see [`NO_CONNECTOR`]) holds link-state nodes
+            // without it; promotion would reject them, so stamp the
+            // sentinel first. A no-op on every later open.
+            db.query(&format!(
+                "MATCH (d:ConnectorDoc) WHERE d.connector_id IS NULL \
+                 SET d.connector_id = '{NO_CONNECTOR}'"
+            ))?;
             db.query(GRAPH_TYPE)?;
             db.query(PROMOTE_GRAPH_TYPE)?;
             for ddl in INDEXES {
@@ -390,6 +396,21 @@ const FALLBACK_CONSTRAINTS: &[&str] = &[
     "run_key", "del_key",
 ];
 
+/// The `connector_id` of a `ConnectorDoc` that belongs to no connector: the
+/// link-state nodes `doc_links` writes for repository files and for the
+/// `connector:<cid>:<docid>` link view of a connector document.
+///
+/// A connector document is identified per connector, as SQL's
+/// `am_connector_docs PRIMARY KEY(connector_id, id)` did (migration plan
+/// §8.2, option (b)): the graph key is `(repository_id, connector_id, id)`,
+/// so two connectors of one repository may each hold a document `doc`, and
+/// the bare document id stays what receipts report. The engine rejects a key
+/// whose property is absent, so the nodes outside any connector carry this
+/// sentinel instead of no `connector_id`. Rejected alternative (option (a)):
+/// rewriting imported ids to `connector:<cid>:<docid>` would merge the
+/// import and link-state nodes and change the receipt's `documents` ids.
+pub const NO_CONNECTOR: &str = "";
+
 /// The store's graph type (migration plan §2.6), with the v0.12.2
 /// corrections the spike verified: `=>` after the identifying label, `IS
 /// <TYPE>` property declarations, `CONSTRAINT FOR … REQUIRE … IS KEY`
@@ -417,11 +438,28 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
                   title IS STRING, body IS STRING}),
     (r:Run => {id IS STRING, repository_id IS STRING NOT NULL, external_key IS STRING NOT NULL}),
     (d:DeletionReceipt => {workspace_id IS STRING NOT NULL, sequence IS INTEGER, digest IS STRING}),
-    (q:ConnectorDoc => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
-                        source_kind IS STRING, document_sha256 IS STRING, input IS STRING,
+    (q:ConnectorDoc => {repository_id IS STRING NOT NULL, connector_id IS STRING NOT NULL,
+                        id IS STRING NOT NULL, source_kind IS STRING, document_sha256 IS STRING, input IS STRING,
                         connector IS STRING, updated_at IS STRING}),
     (k:DocLinkCheckpoint => {repository_id IS STRING IS KEY, episode IS STRING, updated_at IS STRING}),
     (t:DocLinkState => {workspace_id IS STRING IS KEY, rules IS STRING, updated_at IS STRING}),
+    (cr:ConceptRule => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                        description IS STRING, requires IS STRING, severity IS STRING,
+                        cypher IS STRING, rule_sha IS STRING NOT NULL, source IS STRING}),
+    (xr:ConstraintRule => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                           description IS STRING, requires IS STRING, severity IS STRING,
+                           cypher IS STRING, rule_sha IS STRING NOT NULL, source IS STRING}),
+    (rg:RuleGroup => {repository_id IS STRING NOT NULL, id IS STRING NOT NULL,
+                      description IS STRING, include IS STRING, overrides IS STRING,
+                      rule_sha IS STRING NOT NULL, source IS STRING}),
+    (rs:RuleSource => {repository_id IS STRING NOT NULL, source IS STRING NOT NULL,
+                       doc_sha IS STRING NOT NULL}),
+    (ra:RuleApplication => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
+                            episode IS STRING NOT NULL, provenance IS STRING,
+                            applied_at IS STRING}),
+    (vi:Violation => {repository_id IS STRING NOT NULL, rule IS STRING NOT NULL,
+                      episode IS STRING NOT NULL, severity IS STRING NOT NULL,
+                      rule_sha IS STRING NOT NULL}),
     CONSTRAINT FOR (p:Project) REQUIRE (p.workspace_id, p.project_key) IS KEY,
     CONSTRAINT FOR (o:Object) REQUIRE (o.repository_id, o.sha256) IS KEY,
     CONSTRAINT FOR (s:Symbol) REQUIRE (s.repository_id, s.stable_id) IS KEY,
@@ -429,7 +467,12 @@ const GRAPH_TYPE: &str = "CREATE GRAPH TYPE graphicle AS {
     CONSTRAINT FOR (j:Job) REQUIRE (j.repository_id, j.kind, j.input_hash) IS KEY,
     CONSTRAINT FOR (r:Run) REQUIRE (r.repository_id, r.external_key) IS KEY,
     CONSTRAINT FOR (d:DeletionReceipt) REQUIRE (d.workspace_id, d.sequence) IS KEY,
-    CONSTRAINT FOR (q:ConnectorDoc) REQUIRE (q.repository_id, q.id) IS KEY,
+    CONSTRAINT FOR (q:ConnectorDoc) REQUIRE (q.repository_id, q.connector_id, q.id) IS KEY,
+    CONSTRAINT FOR (cr:ConceptRule) REQUIRE (cr.repository_id, cr.id) IS KEY,
+    CONSTRAINT FOR (xr:ConstraintRule) REQUIRE (xr.repository_id, xr.id) IS KEY,
+    CONSTRAINT FOR (rg:RuleGroup) REQUIRE (rg.repository_id, rg.id) IS KEY,
+    CONSTRAINT FOR (rs:RuleSource) REQUIRE (rs.repository_id, rs.source) IS KEY,
+    CONSTRAINT FOR (ra:RuleApplication) REQUIRE (ra.repository_id, ra.rule, ra.episode) IS KEY,
     (s)-[:HAS_VERSION]->(v),
     (s)-[:CALLS => {key IS STRING, relpath IS STRING, source_location IS STRING}]->(s),
     (s)-[:CALLS_HIST => {key IS STRING, valid_from_episode IS STRING, valid_to_episode IS STRING}]->(s)

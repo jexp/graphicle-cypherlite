@@ -540,7 +540,7 @@ pub fn configure_neo4j(store: &Store, workspace: &str, token: &str, args: &Value
     string(&secret, "username", 200)?;
     string(&secret, "password", 1000)?;
     let value = json!({"endpoint":endpoint,"database":database,"credential_ref":reference});
-    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(cfg)=crate::projection::backend_config(db,s(&repository,"id"),"neo4j")?{if cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}}crate::projection::backend_set(db,s(&repository,"id"),"neo4j",&value)?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
+    store.authorized(workspace,token,"admin",|db,p|{let repository=repo(db,p,string(args,"repository_id",100)?)?;if let Some(cfg)=crate::projection::backend_config(db,s(&repository,"id"),"neo4j")?&&cfg!=value{crate::projection::enqueue_config(db,workspace,s(&repository,"id"),"neo4j",&cfg,"backend_reconfigured")?;}crate::projection::backend_set(db,s(&repository,"id"),"neo4j",&value)?;Ok(json!({"configured":true,"index_visibility":"private administrator-owned graph projection"}))})
 }
 async fn cypher(
     store: &Store,

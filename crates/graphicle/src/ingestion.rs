@@ -40,7 +40,7 @@ pub const INTERACTIVE: &[&str] = &["context", "search", "impact", "status", "rea
 /// Kinds whose cost is dominated by local CPU (extraction, local inference)
 /// rather than remote provider latency. Installed extensions add the kinds
 /// they declare CPU-bound (`extension::JobKind::cpu`).
-pub const CPU_BOUND: &[&str] = &["project", "link", "embed", "semantic_overlay"];
+pub const CPU_BOUND: &[&str] = &["project", "link", "enrich", "embed", "semantic_overlay"];
 
 pub fn interactive(kind: &str) -> bool {
     INTERACTIVE.contains(&kind)
@@ -53,7 +53,7 @@ pub fn cpu_bound(kind: &str) -> bool {
 }
 /// Every non-source, non-projection job may call a model.
 pub fn model_bound(kind: &str) -> bool {
-    !crate::jobs::source_task(kind) && kind != "project" && kind != "link"
+    !crate::jobs::source_task(kind) && !matches!(kind, "project" | "link" | "enrich")
 }
 
 pub fn default_cpu_jobs() -> usize {
@@ -293,6 +293,7 @@ mod tests {
         assert!(interactive("context") && interactive("search") && interactive("impact"));
         assert!(!interactive("project") && !interactive("embed"));
         assert!(cpu_bound("project") && !model_bound("project"));
+        assert!(cpu_bound("enrich") && !model_bound("enrich"));
         assert!(model_bound("embed") && !model_bound("connector"));
     }
 }

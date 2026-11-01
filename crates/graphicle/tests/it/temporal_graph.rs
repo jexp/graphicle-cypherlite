@@ -42,8 +42,7 @@ impl Fixture {
         }
     }
     fn episode(&self, content: &str) -> String {
-        let episode = self
-            .store
+        self.store
             .transaction(|db| {
                 let sha = graphicle_memory::text::sha256(content.as_bytes());
                 let project = graphicle_runtime::store::rows(db, "SELECT * FROM repo_projects WHERE id=?", rusqlite::params![self.repo])?.pop().unwrap();
@@ -54,8 +53,7 @@ impl Fixture {
                 graph_projection::persist(db, &self.store.graph(), &self.repo, &episode, &graph)?;
                 Ok(episode)
             })
-            .unwrap();
-        episode
+            .unwrap()
     }
     fn view(&self, args: Value) -> Value {
         self.store

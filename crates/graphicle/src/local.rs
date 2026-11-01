@@ -518,7 +518,12 @@ fn converted(
     store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
         let project = crate::store::repo(db, p, repository)?;
         let mut found = std::collections::HashMap::new();
-        if !crate::fresh::converted_here(&store.graph(), &p.workspace, root, s(&project, "snapshot"))? {
+        if !crate::fresh::converted_here(
+            &store.graph(),
+            &p.workspace,
+            root,
+            s(&project, "snapshot"),
+        )? {
             return Ok(found);
         }
         // Binary conversions are SQL (`am_binary_heads`); the heads and
@@ -533,8 +538,11 @@ fn converted(
             if heads.get(&path) != Some(&source_sha) {
                 continue;
             }
-            let Some(text) =
-                crate::store_content::object_content(&store.graph(), s(&project, "id"), &source_sha)?
+            let Some(text) = crate::store_content::object_content(
+                &store.graph(),
+                s(&project, "id"),
+                &source_sha,
+            )?
             else {
                 continue;
             };
@@ -915,7 +923,13 @@ fn sync_folder_with(
             }
             // The folder is this project's from now on.
             crate::folders::record(&store.graph(), &p.workspace, &repository, &root)?;
-            crate::fresh::record(&store.graph(), &p.workspace, &root, &mark, s(&current, "snapshot"))?;
+            crate::fresh::record(
+                &store.graph(),
+                &p.workspace,
+                &root,
+                &mark,
+                s(&current, "snapshot"),
+            )?;
             Ok(())
         },
     )?;
@@ -924,6 +938,10 @@ fn sync_folder_with(
     let passage_index = crate::phase::phase("sync_passage_index", || {
         crate::passage_index::update(store, &repository, index_full)
     });
+    // The rule documents (architecture-concepts.md §1.5) are read from the
+    // folder beside the files the commit took; a failure is reported, never a
+    // failed sync.
+    let rules = crate::arch_rules::ingest(&store.graph(), &repository, &root, limits.file_bytes);
     let (limited, not_analysed) =
         store.authorized_read(&session.workspace, &session.capability, "read", |db, p| {
             let current = crate::store::repo(db, p, &repository)?;
@@ -955,6 +973,11 @@ fn sync_folder_with(
         Ok(updated) => updated.report(),
         Err(error) => json!({"error": error.message}),
     };
+    match rules {
+        Ok(Some(rules)) => result["rules"] = rules,
+        Ok(None) => {}
+        Err(error) => result["rules"] = json!({"error": error.message}),
+    }
     Ok(result)
 }
 
@@ -1507,11 +1530,13 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         let destination = directory.join("reviews.sqlite3");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&destination)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        options.open(&destination)?;
         if let Err(error) = source.backup(rusqlite::MAIN_DB, &destination, None) {
             let _ = std::fs::remove_file(&destination);
             return Err(error.into());
@@ -1525,7 +1550,14 @@ pub fn restore(backup: &std::path::Path, directory: &std::path::Path) -> Result<
     if graph_backup.is_dir() {
         let destination = directory.join("reviews.graph");
         let copied = (|| -> Result<()> {
-            std::fs::DirBuilder::new().mode(0o700).create(&destination)?;
+            #[cfg(unix)]
+            {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&destination)?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(&destination)?;
             for file in ["manifest.json", "graph.json"] {
                 let source = graph_backup.join(file);
                 if source.is_file() {

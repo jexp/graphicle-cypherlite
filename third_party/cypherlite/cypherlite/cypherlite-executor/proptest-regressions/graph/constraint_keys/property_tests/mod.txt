@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1012adb01f4b27f89b04441b7fdabb5e331e979e916c0a017ad15390118bd9db # shrinks to entropy = [100, 0, 55, 55, 100, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 0, 130, 0]
+cc 6983ccc611333049737e20e915d6328095cc0da25f4f1aea631b209041191553 # shrinks to entropy = [45, 73, 0, 55, 100, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 60, 100, 0, 0, 0, 135, 100, 60, 100, 0, 0, 0, 100, 30, 0]

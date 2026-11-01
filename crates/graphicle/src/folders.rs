@@ -36,7 +36,11 @@ use std::path::{Path, PathBuf};
 /// folder_key, repository_id, path, freshness, created_at, updated_at})`
 /// nodes; projects stay in SQL until the ownership spine migrates, so a
 /// lookup reads the alias from the graph and checks the project in SQL.
-pub(crate) fn folder_of(graph_store: &GraphStore, workspace: &str, key: &str) -> Result<Option<Value>> {
+pub(crate) fn folder_of(
+    graph_store: &GraphStore,
+    workspace: &str,
+    key: &str,
+) -> Result<Option<Value>> {
     graph_store.read(|db| {
         graph::one(
             db,
@@ -120,7 +124,9 @@ fn at_folder(
         let filter = if synced { " AND r.snapshot<>''" } else { "" };
         let held = one(
             db,
-            &format!("SELECT r.id FROM repo_projects r WHERE r.workspace_id=?1 AND r.id=?2{filter}"),
+            &format!(
+                "SELECT r.id FROM repo_projects r WHERE r.workspace_id=?1 AND r.id=?2{filter}"
+            ),
             params![p.workspace, id],
         )?;
         if let Some(row) = held {
@@ -160,7 +166,12 @@ fn at_folder(
 
 /// The nearest registered ancestor of `path` (itself included) whose project
 /// holds a snapshot, and whether `p` may read that project.
-pub fn lookup(graph_store: &GraphStore, db: &Connection, p: &Principal, path: &Path) -> Result<Lookup> {
+pub fn lookup(
+    graph_store: &GraphStore,
+    db: &Connection,
+    p: &Principal,
+    path: &Path,
+) -> Result<Lookup> {
     let Ok(path) = path.canonical() else {
         return Ok(Lookup::Nothing);
     };
@@ -179,7 +190,12 @@ pub fn lookup(graph_store: &GraphStore, db: &Connection, p: &Principal, path: &P
 /// [`lookup`]'s project when `p` may read it: what the capture hooks and the
 /// `graphicle graph` note use, which pass over a folder whose project the
 /// principal may not read (they never fall through to an ancestor's).
-pub fn project_for_path(graph_store: &GraphStore, db: &Connection, p: &Principal, path: &Path) -> Result<Option<Found>> {
+pub fn project_for_path(
+    graph_store: &GraphStore,
+    db: &Connection,
+    p: &Principal,
+    path: &Path,
+) -> Result<Option<Found>> {
     Ok(match lookup(graph_store, db, p, path)? {
         Lookup::Found(found) => Some(found),
         Lookup::Nothing | Lookup::Unreadable(_) => None,
@@ -227,7 +243,12 @@ pub(crate) fn folders_of(graph_store: &GraphStore, repository: &str) -> Result<V
     })
 }
 
-pub fn record(graph_store: &GraphStore, workspace: &str, repository: &str, folder: &Path) -> Result<()> {
+pub fn record(
+    graph_store: &GraphStore,
+    workspace: &str,
+    repository: &str,
+    folder: &Path,
+) -> Result<()> {
     let stamp = now();
     graph_store.transaction(|db| {
         graph::write(
@@ -312,7 +333,12 @@ pub fn requested(
 
 /// The project a project id, a project key or a recorded folder key names,
 /// checked readable by `p`; `None` when none does.
-fn by_name(graph_store: &GraphStore, db: &Connection, p: &Principal, value: &str) -> Result<Option<String>> {
+fn by_name(
+    graph_store: &GraphStore,
+    db: &Connection,
+    p: &Principal,
+    value: &str,
+) -> Result<Option<String>> {
     for sql in [
         "SELECT id FROM repo_projects WHERE workspace_id=? AND id=?",
         "SELECT id FROM repo_projects WHERE workspace_id=? AND project_key=?",
@@ -334,14 +360,21 @@ fn by_name(graph_store: &GraphStore, db: &Connection, p: &Principal, value: &str
 /// resolved as `--project` resolves a path. Over HTTP (`cwd` is `None`) no
 /// path is read: a remote caller never names the server's folders. A project
 /// the caller may not read is refused, whichever way it is named.
-pub fn named(graph_store: &GraphStore, db: &Connection, p: &Principal, value: &str, cwd: Option<&Path>) -> Result<String> {
+pub fn named(
+    graph_store: &GraphStore,
+    db: &Connection,
+    p: &Principal,
+    value: &str,
+    cwd: Option<&Path>,
+) -> Result<String> {
     if cwd.is_some() {
         return requested(graph_store, db, p, value, cwd, false);
     }
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
         return Err(Error::bad("Invalid project: use a project id or key"));
     }
-    by_name(graph_store, db, p, value)?.ok_or_else(|| Error::bad("Unknown project: use a project id or key"))
+    by_name(graph_store, db, p, value)?
+        .ok_or_else(|| Error::bad("Unknown project: use a project id or key"))
 }
 
 /// The project a command acts on, and how it was chosen.
@@ -460,7 +493,9 @@ impl Store {
 
     /// [`lookup`] for `path`.
     pub fn lookup_folder(&self, workspace: &str, token: &str, path: &Path) -> Result<Lookup> {
-        self.authorized_read(workspace, token, "read", |db, p| lookup(&self.graph(), db, p, path))
+        self.authorized_read(workspace, token, "read", |db, p| {
+            lookup(&self.graph(), db, p, path)
+        })
     }
 
     /// The project a local sync of `folder` (canonical) goes into, and

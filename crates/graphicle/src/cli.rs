@@ -299,6 +299,28 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Analyse this project's architecture: apply its rule set to the current
+    /// episode, then print the concept counts and the violations. Exits 1
+    /// when a violation at or above --min-severity exists, 2 on a rule error
+    /// (a malformed document, an unknown group, a failed rule), else 0.
+    Analyze {
+        /// The rule group to report (default: every declared group, once).
+        #[arg(long, value_name = "GROUP")]
+        group: Option<String>,
+        /// Gate on violations at or above this severity: INFO, MINOR, MAJOR,
+        /// CRITICAL or BLOCKER. Without it every violation is reported and
+        /// the exit status is 0.
+        #[arg(long, value_name = "SEVERITY", value_parser = ["INFO", "MINOR", "MAJOR", "CRITICAL", "BLOCKER"])]
+        min_severity: Option<String>,
+        /// The output: table, markdown, or json. Without it, a table in a
+        /// terminal and JSON otherwise.
+        #[arg(long, value_parser = ["table", "markdown", "json"])]
+        format: Option<String>,
+        /// The project: an id, a key or a synced folder (default: this
+        /// folder's project, else the last synced one).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Retrieve evidence without calling a model.
     Context {
         /// The question; `-` reads it from standard input (at most 1 MiB).
@@ -1905,6 +1927,54 @@ where
                 fresh.tell();
                 print(&status)
             }
+        }
+        Command::Analyze {
+            group,
+            min_severity,
+            format,
+            project,
+        } => {
+            let session = local::session(&store, false)?;
+            let resolved = local::resolve(&store, &session, project.as_deref())?;
+            // clap has validated the spelling (a usage error exits 2).
+            let min = min_severity
+                .as_deref()
+                .and_then(crate::arch_rules::Severity::parse);
+            let report = crate::arch_rules::analyze::run(
+                &store,
+                &session,
+                &resolved.id,
+                resolved.folder.as_deref(),
+                &crate::arch_rules::analyze::Request {
+                    group: group.as_deref(),
+                    min,
+                },
+                crate::limits::current().file_bytes,
+            )?;
+            // Explicit formats win; without --format, the readable table is
+            // printed in a terminal and JSON otherwise (as other commands do).
+            let text = match format.as_deref() {
+                Some("json") => None,
+                Some("markdown") => Some(crate::terminal::analyze_markdown(&report)),
+                Some(_) => Some(crate::terminal::analyze_text(
+                    &report,
+                    crate::terminal::Style::detect(),
+                )),
+                None if crate::terminal::human(false) => Some(crate::terminal::analyze_text(
+                    &report,
+                    crate::terminal::Style::detect(),
+                )),
+                None => None,
+            };
+            match text {
+                Some(text) => crate::terminal::say(&text)?,
+                None => crate::terminal::say(&serde_json::to_string_pretty(&report)?)?,
+            }
+            let exit = report["exit"].as_i64().unwrap_or(2) as i32;
+            if exit != 0 {
+                std::process::exit(exit);
+            }
+            Ok(())
         }
         Command::Jobs { project, job } => {
             let session = local::session(&store, false)?;

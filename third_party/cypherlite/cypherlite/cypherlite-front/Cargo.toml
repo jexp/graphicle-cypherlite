@@ -1,0 +1,18 @@
+[package]
+name = "cypherlite-front"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "CypherLite parser front-end lowered to planner IR"
+publish = false
+license.workspace = true
+
+[dependencies]
+cypherlite-error = { workspace = true }
+cypherlite-model = { workspace = true }
+cypherlite-parser = { workspace = true }
+cypherlite-core = { workspace = true }
+cypherlite-ir = { workspace = true }
+
+[dev-dependencies]
+cypherlite-test-support = { workspace = true }

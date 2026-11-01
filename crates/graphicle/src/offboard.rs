@@ -632,7 +632,6 @@ fn scrub(
                 p,
                 id,
                 json!({"offboarding": {"backup": relative}}),
-                false,
             )?,
         };
         receipts.push(json!({

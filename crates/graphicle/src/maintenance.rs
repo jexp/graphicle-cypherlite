@@ -125,8 +125,7 @@ pub(crate) fn delete_project(
         // out of the data folder — the plan refuses that folder, and the
         // deletion must not touch what lies behind it either.
         let through_link = cache.ancestors().take(2).any(|component| {
-            std::fs::symlink_metadata(component)
-                .is_ok_and(|meta| meta.file_type().is_symlink())
+            std::fs::symlink_metadata(component).is_ok_and(|meta| meta.file_type().is_symlink())
         });
         if !through_link {
             crate::graph_materialize::purge(&cache)?;
@@ -212,8 +211,14 @@ fn apply_source_retention(
             )?;
             let sql_erased = deletion::legacy::erase(sql, identifier, &scope)?;
             let receipt = graph.transaction(|g| {
-                let mut forgotten =
-                    deletion::forget(g, &p.workspace, identifier, &scope, since.as_deref())?;
+                let mut forgotten = deletion::forget(
+                    g,
+                    Some(sql),
+                    &p.workspace,
+                    identifier,
+                    &scope,
+                    since.as_deref(),
+                )?;
                 let mut erased = deletion::erase(g, identifier, &scope)?;
                 deletion::merge_removed(&mut forgotten, &sql_forgotten);
                 deletion::merge_removed(&mut erased, &sql_erased);
@@ -433,7 +438,11 @@ fn storage_prune(
         let mut pruned: Vec<String> = Vec::new();
         pruned.extend(snapshots_removed.iter().map(|k| format!("snapshot:{k}")));
         pruned.extend(objects_removed.iter().map(|k| format!("object:{k}")));
-        pruned.extend(originals_removed.iter().map(|(a, b)| format!("original:{a}@{b}")));
+        pruned.extend(
+            originals_removed
+                .iter()
+                .map(|(a, b)| format!("original:{a}@{b}")),
+        );
         let removed = json!({"repo_snapshots":snapshots_removed.len(),"repo_objects":objects_removed.len(),"repo_syncs":syncs_removed,"am_original_documents":originals_removed.len(),"bytes":freed+originals_freed});
         result["receipt"] = deletion::rows_receipt(
             db,
@@ -484,7 +493,6 @@ pub(crate) fn delete_project_sql(
     p: &store::Principal,
     identifier: &str,
     mut removed: Value,
-    graph_cache: bool,
 ) -> Result<Value> {
     let connectors: Vec<String> = store::rows(
         db,
@@ -543,8 +551,14 @@ fn apply_source_retention_sql(
 ) -> Result<Value> {
     let identifier = s(repository, "id");
     let policy = crate::retention::SourcePolicy::from_args(args)?;
-    let plan =
-        crate::retention::legacy::source_plan(db, graph, p, repository, &policy, chrono::Utc::now())?;
+    let plan = crate::retention::legacy::source_plan(
+        db,
+        graph,
+        p,
+        repository,
+        &policy,
+        chrono::Utc::now(),
+    )?;
     if args["plan_hash"].as_str() != Some(plan.plan_hash.as_str()) {
         return Err(Error::conflict(
             "The retention plan changed or was not previewed; run retention.preview and pass its plan_hash",
@@ -565,8 +579,14 @@ fn apply_source_retention_sql(
             }
             crate::projection::enqueue(db, identifier, "source_forgotten")?;
             let since = forget_plan.since().map(str::to_string);
-            let forgotten =
-                deletion::legacy::forget(db, graph, &p.workspace, identifier, &scope, since.as_deref())?;
+            let forgotten = deletion::legacy::forget(
+                db,
+                graph,
+                &p.workspace,
+                identifier,
+                &scope,
+                since.as_deref(),
+            )?;
             let erased = deletion::legacy::erase(db, identifier, &scope)?;
             graphicle_memory::cache::clear(identifier).map_err(Error::bad)?;
             store::event(
@@ -650,7 +670,11 @@ fn storage_prune_sql(
             snapshots_removed.push(s(snapshot, "sha256").to_string());
         }
     }
-    for revision in store::rows(db,"SELECT r.data FROM repo_memory_revisions r JOIN repo_memories m ON m.id=r.memory_id WHERE m.repository_id=?",[identifier])? {
+    for revision in store::rows(
+        db,
+        "SELECT r.data FROM repo_memory_revisions r JOIN repo_memories m ON m.id=r.memory_id WHERE m.repository_id=?",
+        [identifier],
+    )? {
         let mut memory: Value = serde_json::from_str(s(&revision, "data"))?;
         decode(&mut memory, "data")?;
         for sha in memory["data"]["dependencies"]
@@ -682,7 +706,11 @@ fn storage_prune_sql(
         [identifier],
     )?;
     let mut originals_freed = 0;
-    for original in store::rows(db,"SELECT source_id,sha256,text_sha256,length(bytes) AS bytes FROM am_original_documents WHERE repository_id=?",[identifier])? {
+    for original in store::rows(
+        db,
+        "SELECT source_id,sha256,text_sha256,length(bytes) AS bytes FROM am_original_documents WHERE repository_id=?",
+        [identifier],
+    )? {
         // Keep originals referenced by any retained source object, including snapshots.
         let current = crate::store::one(db,"SELECT 1 AS yes FROM am_connector_docs WHERE connector_id IN (SELECT id FROM am_connectors WHERE repository_id=?) AND 'connector:'||connector_id||':'||id=? AND present=1 AND json_extract(metadata,'$.provider_metadata.original_sha256')=?",sqlparams![identifier,s(&original,"source_id"),s(&original,"sha256")])?.is_some();
         if !current && !objects.contains(s(&original, "text_sha256")) {
@@ -711,7 +739,11 @@ fn storage_prune_sql(
         });
         pruned.extend(snapshots_removed.iter().map(|k| format!("snapshot:{k}")));
         pruned.extend(objects_removed.iter().map(|k| format!("object:{k}")));
-        pruned.extend(originals_removed.iter().map(|(a, b)| format!("original:{a}@{b}")));
+        pruned.extend(
+            originals_removed
+                .iter()
+                .map(|(a, b)| format!("original:{a}@{b}")),
+        );
         let removed = json!({"repo_snapshots":snapshots_removed.len(),"repo_objects":objects_removed.len(),"repo_syncs":syncs_removed,"am_original_documents":originals_removed.len(),"bytes":freed+originals_freed});
         result["receipt"] = deletion::legacy::rows_receipt(
             db,
@@ -790,7 +822,7 @@ impl Store {
                         return graph.transaction(|g| {
                             let started=now();
                             let since=planned.since().map(str::to_string);
-                            let mut forgotten=deletion::forget(g,&p.workspace,&identifier,&scope,since.as_deref())?;
+                            let mut forgotten=deletion::forget(g,Some(db),&p.workspace,&identifier,&scope,since.as_deref())?;
                             let mut erased=deletion::erase(g,&identifier,&scope)?;
                             deletion::merge_removed(&mut forgotten,&sql_forgotten);
                             deletion::merge_removed(&mut erased,&sql_erased);
@@ -825,10 +857,10 @@ impl Store {
                         // Legacy SQL store (project mid-migration).
                         let mut scratch=Vec::with_capacity(copies.len());
                         for copy in &copies {
-                            scratch.push(delete_project_sql(db,p,copy,json!({}),false)?);
+                            scratch.push(delete_project_sql(db,p,copy,json!({}))?);
                         }
                         let removed=if copies.is_empty() {json!({})} else {json!({"pr_scratch_projects":copies})};
-                        let receipt=delete_project_sql(db,p,&identifier,removed,false)?;
+                        let receipt=delete_project_sql(db,p,&identifier,removed)?;
                         let mut result=json!({"deleted":true,"local_backups_are_separate":true,"receipt":receipt});
                         if !scratch.is_empty() {result["pr_scratch_projects"]=json!(scratch);}
                         return Ok(result);
@@ -938,11 +970,13 @@ impl Store {
             let store = graph_store(self)?;
             return backup_graph(&store, path);
         }
-        use std::os::unix::fs::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let file = options.open(path)?;
         drop(file);
         let result = (|| {
@@ -961,14 +995,10 @@ impl Store {
                 return Err(Error::bad("Backup integrity verification failed"));
             }
             // The graph half, beside the SQL file.
-            let mut out =
-                json!({"path":path,"created_at":now(),"integrity":"ok","contains_private_sources":true,"provider_credentials_included":false,"reconnect_accounts_after_restore":true});
+            let mut out = json!({"path":path,"created_at":now(),"integrity":"ok","contains_private_sources":true,"provider_credentials_included":false,"reconnect_accounts_after_restore":true});
             let graph = graph_store(self)?;
             graph.checkpoint()?;
-            if graph
-                .path()
-                .is_some_and(|p| p.join("graph.json").is_file())
-            {
+            if graph.path().is_some_and(|p| p.join("graph.json").is_file()) {
                 let graph_path = std::path::PathBuf::from(format!("{}.graph", path.display()));
                 backup_graph(&graph, &graph_path)?;
                 out["graph"] = json!(graph_path);
@@ -997,9 +1027,7 @@ pub fn backup_graph(store: &GraphStore, path: &Path) -> Result<Value> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)?;
+        std::fs::DirBuilder::new().mode(0o700).create(path)?;
     }
     #[cfg(not(unix))]
     std::fs::create_dir(path)?;
@@ -1094,14 +1122,30 @@ mod tests {
         copy.read(|db| {
             let secrets = one(db, "MATCH (s:Secret) RETURN count(s) AS n", Params::new())?.unwrap();
             assert_eq!(secrets["n"], json!(0));
-            let sessions = one(db, "MATCH (s:Session) RETURN count(s) AS n", Params::new())?.unwrap();
+            let sessions =
+                one(db, "MATCH (s:Session) RETURN count(s) AS n", Params::new())?.unwrap();
             assert_eq!(sessions["n"], json!(0));
-            let connector = one(db, "MATCH (c:Connector {id: 'c'}) RETURN c.state AS state, c.generation AS generation", Params::new())?.unwrap();
+            let connector = one(
+                db,
+                "MATCH (c:Connector {id: 'c'}) RETURN c.state AS state, c.generation AS generation",
+                Params::new(),
+            )?
+            .unwrap();
             assert_eq!(connector["state"], json!("paused"));
             assert_eq!(connector["generation"], json!(1));
-            let job = one(db, "MATCH (j:Job {id: 'j'}) RETURN j.state AS state", Params::new())?.unwrap();
+            let job = one(
+                db,
+                "MATCH (j:Job {id: 'j'}) RETURN j.state AS state",
+                Params::new(),
+            )?
+            .unwrap();
             assert_eq!(job["state"], json!("cancelled"));
-            let memory = one(db, "MATCH (m:Memory {id: 'm'}) RETURN m.title AS title", Params::new())?.unwrap();
+            let memory = one(
+                db,
+                "MATCH (m:Memory {id: 'm'}) RETURN m.title AS title",
+                Params::new(),
+            )?
+            .unwrap();
             assert_eq!(memory["title"], json!("kept"));
             Ok(())
         })
@@ -1109,9 +1153,15 @@ mod tests {
         // The live store is untouched.
         store
             .read(|db| {
-                let secrets = one(db, "MATCH (s:Secret) RETURN count(s) AS n", Params::new())?.unwrap();
+                let secrets =
+                    one(db, "MATCH (s:Secret) RETURN count(s) AS n", Params::new())?.unwrap();
                 assert_eq!(secrets["n"], json!(1));
-                let job = one(db, "MATCH (j:Job {id: 'j'}) RETURN j.state AS state", Params::new())?.unwrap();
+                let job = one(
+                    db,
+                    "MATCH (j:Job {id: 'j'}) RETURN j.state AS state",
+                    Params::new(),
+                )?
+                .unwrap();
                 assert_eq!(job["state"], json!("queued"));
                 Ok(())
             })

@@ -431,7 +431,13 @@ pub fn packet(
         None
     } else {
         Some(crate::phase::phase("context_arm", || {
-            code_graph_arm::plan(&graph_store, db, id, query, links.documents() && !code_first.applied)
+            code_graph_arm::plan(
+                &graph_store,
+                db,
+                id,
+                query,
+                links.documents() && !code_first.applied,
+            )
         }))
     };
     let arm = match plan {
@@ -449,11 +455,12 @@ pub fn packet(
                 .collect();
             docs.load(db, repository, &wanted)?;
             let by_id: HashMap<&str, &Value> = docs.list.iter().map(|d| (s(d, "id"), d)).collect();
-            plan.anchor(&graph_store, id, &by_id).unwrap_or_else(|error| {
-                let mut arm = code_graph_arm::Arm::skipped("error");
-                arm.diagnostics["error"] = json!(error.message);
-                arm
-            })
+            plan.anchor(&graph_store, id, &by_id)
+                .unwrap_or_else(|error| {
+                    let mut arm = code_graph_arm::Arm::skipped("error");
+                    arm.diagnostics["error"] = json!(error.message);
+                    arm
+                })
         }
     };
     // The identifier arm over the index; names with separators are matched
@@ -822,8 +829,9 @@ pub fn packet(
     if !identifiers.defining.is_empty() {
         rankings[crate::code_question::DEFINING] = json!(identifiers.defining);
     }
-    let lookup = crate::doc_links::Lookup::new(db, id)?
-        .with_folder(crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?);
+    let lookup = crate::doc_links::Lookup::new(db, id)?.with_folder(
+        crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?,
+    );
     let mut packet = crate::phase::phase("context_assemble", || {
         query::context_indexed(
             &snap,
@@ -1152,8 +1160,9 @@ pub fn graph_only_packet(
     if !identifiers.defining.is_empty() {
         rankings[crate::code_question::DEFINING] = json!(identifiers.defining);
     }
-    let lookup = crate::doc_links::Lookup::new(db, id)?
-        .with_folder(crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?);
+    let lookup = crate::doc_links::Lookup::new(db, id)?.with_folder(
+        crate::folders::current_folder(&*crate::store::graph_for(db)?, id)?,
+    );
     let mut packet = query::context_on(
         &snap,
         &quick,

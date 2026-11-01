@@ -113,6 +113,7 @@ then run `graphicle setup --yes` in this repository and list every file it chang
 | Browse the graph, the sources and the memory | `graphicle open` |
 | See what a change to a symbol touches | `graphicle graph extract . --code-only`, then `graphicle graph affected "retry()"` |
 | Check that everything works | `graphicle doctor` |
+| Check the architecture rules in CI | `graphicle analyze --group arch:default --min-severity MAJOR` (exit 1 on violations, 2 on rule errors) |
 | Undo everything setup did | `graphicle disconnect` |
 | Move from Graphify, or run a server for a team | [Moving from Graphify](docs/migrate-from-graphify.md) · [Team server](docs/team.md) |
 

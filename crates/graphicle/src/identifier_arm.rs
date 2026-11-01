@@ -374,9 +374,12 @@ fn code_graph(db: &Connection, repository: &str, saved: bool) -> Option<CodeGrap
             unchanged,
         });
     }
-    let handle =
-        graph_projection::resident(crate::store::graph_for(db).ok()?.as_ref(), repository, &episode)
-            .ok()?;
+    let handle = graph_projection::resident(
+        crate::store::graph_for(db).ok()?.as_ref(),
+        repository,
+        &episode,
+    )
+    .ok()?;
     let graph: &Graph = &handle;
     let list: Vec<(usize, String, String)> = graph
         .nodes()

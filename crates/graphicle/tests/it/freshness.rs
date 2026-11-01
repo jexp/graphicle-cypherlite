@@ -357,8 +357,7 @@ fn many_changes_or_a_slow_sync_give_a_stale_note_and_leave_the_store() {
         graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(project))]),
     )
     .unwrap();
-    let mut updated: Value =
-        serde_json::from_str(record["freshness"].as_str().unwrap()).unwrap();
+    let mut updated: Value = serde_json::from_str(record["freshness"].as_str().unwrap()).unwrap();
     updated["scan_ms"] = json!(5000);
     crate::gql_write(
         &h.store(),
@@ -778,11 +777,13 @@ fn an_unchanged_sync_converts_no_document_again() {
     let current = crate::gql_one(
         &store,
         "MATCH (f:Folder {repository_id: $repository}) RETURN f.freshness AS freshness",
-        graphicle_runtime::store_graph::Params::from([crate::gp("repository", json!(project.clone()))]),
+        graphicle_runtime::store_graph::Params::from([crate::gp(
+            "repository",
+            json!(project.clone()),
+        )]),
     )
     .unwrap();
-    let mut record: Value =
-        serde_json::from_str(current["freshness"].as_str().unwrap()).unwrap();
+    let mut record: Value = serde_json::from_str(current["freshness"].as_str().unwrap()).unwrap();
     record.as_object_mut().unwrap().remove("converter");
     crate::gql_write(
         &store,
@@ -805,8 +806,9 @@ fn an_unchanged_sync_converts_no_document_again() {
     let fourth = sync(&mut session);
     assert_ne!(fourth["snapshot"], first["snapshot"]);
     assert_eq!(parser(), "html2text");
-    let sha = graphicle_runtime::store_content::heads(&store.graph(), &project).unwrap()["guide.html"]
-        .clone();
+    let sha =
+        graphicle_runtime::store_content::heads(&store.graph(), &project).unwrap()["guide.html"]
+            .clone();
     let text: String =
         graphicle_runtime::store_content::object_content(&store.graph(), &project, &sha)
             .unwrap()

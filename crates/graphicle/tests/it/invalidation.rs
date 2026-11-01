@@ -393,7 +393,12 @@ fn connector_document_updates_and_deletes_invalidate_dependents() {
         (SUMMARY, "notes-summary"),
         (DOCUMENT, &notes),
     );
-    record(graph, &f.workspace, (CHUNK, "plan-chunk"), (DOCUMENT, &plan));
+    record(
+        graph,
+        &f.workspace,
+        (CHUNK, "plan-chunk"),
+        (DOCUMENT, &plan),
+    );
 
     // Re-importing identical content is not a change.
     import(
@@ -478,7 +483,12 @@ fn revocation_invalidates_answers_cached_for_the_principal() {
     assert_eq!(status["freshness"]["by_kind"]["answer"], 1);
 }
 
-fn record(graph: &graphicle_runtime::store_graph::GraphStore, ws: &str, dependent: (&str, &str), source: (&str, &str)) {
+fn record(
+    graph: &graphicle_runtime::store_graph::GraphStore,
+    ws: &str,
+    dependent: (&str, &str),
+    source: (&str, &str),
+) {
     invalidation::record_dependency(graph, ws, dependent, source).unwrap();
 }
 

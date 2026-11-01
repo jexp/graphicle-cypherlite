@@ -548,7 +548,7 @@ pub fn import(
         }
         data["pack"] = marks;
         imported.push(memory::save(
-            db, &graph, repository, None, None, kind, title, body, "draft", &data,
+            db, graph, repository, None, None, kind, title, body, "draft", &data,
         )?);
     }
     let mut result = json!({"imported":imported,"skipped":skipped,"approval_required":true});

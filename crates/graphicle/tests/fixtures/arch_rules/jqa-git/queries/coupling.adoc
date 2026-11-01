@@ -1,0 +1,22 @@
+[[fixture-git:CoupledFiles]]
+[source,cypher,role=concept,requiresConcepts="fixture-git:ChurnPerFile, fixture-git:CommitsWithParents"]
+.Pairs of files that change in the same commit.
+----
+MATCH (c:Commit)-[:CONTAINS_CHANGE]->(:Change)-[:MODIFIES]->(f1:File),
+      (c)-[:CONTAINS_CHANGE]->(:Change)-[:MODIFIES]->(f2:File)
+WHERE f1.path < f2.path
+WITH f1, f2, count(DISTINCT c) AS together
+WHERE together > 2
+MERGE (f1)-[r:CHANGED_TOGETHER_WITH]-(f2)
+SET r.count = together
+----
+
+[[fixture-git:Refactorings]]
+[source,cypher,role=constraint,severity=CRITICAL,requiresConcepts="fixture-git:*"]
+.Commits that touch more than fifty files.
+----
+MATCH (c:Commit)-[:CONTAINS_CHANGE]->(ch:Change)
+WITH c, count(ch) AS files
+WHERE files > 50
+RETURN c.oid AS commit, files
+----

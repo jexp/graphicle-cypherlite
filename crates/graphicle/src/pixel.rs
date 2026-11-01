@@ -1583,58 +1583,59 @@ pub fn search(run: &Run<'_>, query: &Query, top: usize) -> Result<Found> {
             });
     }
     let mut lookup = Lookup::new(query);
-    run.store.authorized_read(workspace, token, "read", |db, p| {
-        crate::store::repo(db, p, id)?;
-        let mut paths = HashSet::new();
-        // The heads' file text lives on the graph content store now: the
-        // documents are read once and walked twice (the scan, then the key
-        // uses), and the per-path fetch reads a head object from there too.
-        let content_store = crate::store::graph_for(db)?;
-        let documents = crate::store_content::head_documents(&content_store, id, true)?;
-        for row in &documents {
-            let path = row["path"].as_str().unwrap_or_default();
-            if let Some(text) = row["content"].as_str() {
-                lookup.scan(path, text);
-            }
-            paths.insert(path.to_string());
-        }
-        let mut fetch = |path: &str| {
-            crate::store_content::head_content(&content_store, id, path)
-                .ok()
-                .flatten()
-        };
-        lookup.follow_keys(&mut fetch);
-        let keys = lookup.locale_keys(&mut fetch);
-        if !keys.is_empty() {
+    run.store
+        .authorized_read(workspace, token, "read", |db, p| {
+            crate::store::repo(db, p, id)?;
+            let mut paths = HashSet::new();
+            // The heads' file text lives on the graph content store now: the
+            // documents are read once and walked twice (the scan, then the key
+            // uses), and the per-path fetch reads a head object from there too.
+            let content_store = crate::store::graph_for(db)?;
+            let documents = crate::store_content::head_documents(&content_store, id, true)?;
             for row in &documents {
                 let path = row["path"].as_str().unwrap_or_default();
                 if let Some(text) = row["content"].as_str() {
-                    lookup.key_uses(path, text, &keys);
+                    lookup.scan(path, text);
+                }
+                paths.insert(path.to_string());
+            }
+            let mut fetch = |path: &str| {
+                crate::store_content::head_content(&content_store, id, path)
+                    .ok()
+                    .flatten()
+            };
+            lookup.follow_keys(&mut fetch);
+            let keys = lookup.locale_keys(&mut fetch);
+            if !keys.is_empty() {
+                for row in &documents {
+                    let path = row["path"].as_str().unwrap_or_default();
+                    if let Some(text) = row["content"].as_str() {
+                        lookup.key_uses(path, text, &keys);
+                    }
                 }
             }
-        }
-        let episode = crate::graph_projection::current_episode(db, id)?;
-        let graph = crate::query_file::open(db, id, &episode);
-        if let Some(file) = &graph {
-            let symbols = (0..file.symbol_count()).filter_map(|position| {
-                let (_, name, path, line) = file.symbol(position).ok()?;
-                Some((name, path, line?))
-            });
-            lookup.symbols(symbols, &mut fetch);
-        }
-        let mut candidates = lookup.ranked();
-        candidates.truncate(top);
-        if let Some(file) = &graph {
-            enrich(&mut candidates, file);
-        }
-        Ok(Found {
-            candidates,
-            files: lookup.scanned,
-            graph: graph.is_some(),
-            paths,
-            seconds: round3(started.elapsed().as_secs_f64()),
+            let episode = crate::graph_projection::current_episode(db, id)?;
+            let graph = crate::query_file::open(db, id, &episode);
+            if let Some(file) = &graph {
+                let symbols = (0..file.symbol_count()).filter_map(|position| {
+                    let (_, name, path, line) = file.symbol(position).ok()?;
+                    Some((name, path, line?))
+                });
+                lookup.symbols(symbols, &mut fetch);
+            }
+            let mut candidates = lookup.ranked();
+            candidates.truncate(top);
+            if let Some(file) = &graph {
+                enrich(&mut candidates, file);
+            }
+            Ok(Found {
+                candidates,
+                files: lookup.scanned,
+                graph: graph.is_some(),
+                paths,
+                seconds: round3(started.elapsed().as_secs_f64()),
+            })
         })
-    })
 }
 
 // ---------------------------------------------------------------- calls

@@ -5012,7 +5012,8 @@ impl Store {
                 files.insert(path, bytes as usize);
             }
             let episode = crate::graph_projection::current_episode(db, id)?;
-            let graph = crate::query_file::open(db, id, &episode).and_then(GraphView::of_query_file);
+            let graph =
+                crate::query_file::open(db, id, &episode).and_then(GraphView::of_query_file);
             let commit = crate::folders::current_folder(&content_store, id)?
                 .and_then(|folder| git_head(&folder));
             let repo_id = id.to_string();
