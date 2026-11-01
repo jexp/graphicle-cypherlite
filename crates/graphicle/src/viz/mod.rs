@@ -148,7 +148,7 @@ pub const FAMILIES: [Family; 7] = [
         name: "Architecture Conformance",
         description: "Stored rule results with evidence: violations, concept coverage, declared against actual at folder rollup",
         mermaid: false,
-        render: arch_conformance,
+        render: arch_conformance::view,
     },
     Family {
         slug: "risk-overlay",
@@ -533,10 +533,7 @@ fn stub(mermaid: bool) -> View {
     }
 }
 
-fn arch_conformance(_graph: &GraphStore, _repository: &str, _params: &Params) -> Result<View> {
-    Ok(stub(false))
-}
-
+mod arch_conformance;
 mod coupling_matrix;
 mod impact_neighborhood;
 mod risk_overlay;
