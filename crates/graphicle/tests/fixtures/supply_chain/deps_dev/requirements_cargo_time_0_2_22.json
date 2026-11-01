@@ -1,10 +1,16 @@
 {
-  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "_note": "Key structure matches the live deps.dev v3 response (checked by anonymous curl, 2026-11-01); values are trimmed or synthetic, so this is not a verbatim recording.",
   "cargo": {
-    "requirements": [
-      {"name": "libc", "requirement": "^0.2", "kind": "NORMAL", "optional": true, "features": [], "target": ""},
-      {"name": "serde", "requirement": "^1.0", "kind": "NORMAL", "optional": true, "features": ["derive"], "target": ""},
-      {"name": "winapi", "requirement": "^0.3", "kind": "NORMAL", "optional": false, "features": ["minwindef"], "target": "cfg(windows)"}
+    "dependencies": [
+      {"name": "const_fn", "requirement": "^0.4.2", "kind": "normal", "optional": false, "packageAlias": "", "usesDefaultFeatures": true, "features": [], "target": ""},
+      {"name": "libc", "requirement": "^0.2", "kind": "normal", "optional": true, "packageAlias": "", "usesDefaultFeatures": true, "features": [], "target": "cfg(unix)"},
+      {"name": "rand", "requirement": "^0.7", "kind": "dev", "optional": false, "packageAlias": "", "usesDefaultFeatures": false, "features": [], "target": ""},
+      {"name": "winapi", "requirement": "^0.3", "kind": "normal", "optional": true, "packageAlias": "", "usesDefaultFeatures": true, "features": ["minwinbase", "minwindef", "timezoneapi"], "target": "cfg(windows)"}
+    ],
+    "features": [
+      {"name": "default", "implies": ["deprecated", "std"]},
+      {"name": "deprecated", "implies": []},
+      {"name": "std", "implies": ["libc", "winapi"]}
     ]
   }
 }

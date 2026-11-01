@@ -1,5 +1,5 @@
 {
-  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "_note": "Key structure matches the live deps.dev v3 response (checked by anonymous curl, 2026-11-01); values are trimmed or synthetic, so this is not a verbatim recording.",
   "packageKey": {"system": "CARGO", "name": "time"},
   "versions": [
     {"versionKey": {"system": "CARGO", "name": "time", "version": "0.1.45"}, "publishedAt": "2019-08-10T14:21:07Z", "isDefault": false, "isDeprecated": true, "deprecationReason": "Superseded by time 0.3"},

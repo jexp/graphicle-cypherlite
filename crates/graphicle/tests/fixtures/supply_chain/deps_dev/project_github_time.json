@@ -1,18 +1,21 @@
 {
-  "_note": "Recorded-shape fixture: hand-written from the verified deps.dev v3 shapes in supply-chain-plan.md section 1. Not a live capture; regenerate from a real response when one is recorded.",
+  "_note": "Key structure matches the live deps.dev v3 response (checked by anonymous curl, 2026-11-01); values are trimmed or synthetic, so this is not a verbatim recording.",
   "projectKey": {"id": "github.com/time-rs/time"},
-  "openIssuesCount": 220,
-  "starsCount": 1100,
-  "forksCount": 180,
-  "license": "MIT OR Apache-2.0",
-  "description": "Date and time library for Rust",
+  "openIssuesCount": 11,
+  "starsCount": 1347,
+  "forksCount": 315,
+  "license": "Apache-2.0",
+  "description": "Date and time handling in Rust.",
   "homepage": "https://time-rs.github.io",
   "scorecard": {
-    "date": "2026-09-01T00:00:00Z",
-    "overall": 6.1,
+    "date": "2026-08-24T00:00:00Z",
+    "repository": {"name": "github.com/time-rs/time", "commit": "857d9c404c5b6f6cb64d1bfa604c695be3369e12"},
+    "scorecard": {"version": "v5.5.1-0.20260815060127-d1fab88f5463", "commit": "d1fab88f54636ff366076edfc5c239f97b3c8e66"},
     "checks": [
-      {"name": "Maintained", "score": 10, "reason": "30 commits in the last 90 days"},
-      {"name": "Vulnerabilities", "score": 0, "reason": "2 existing vulnerabilities"}
-    ]
+      {"name": "Maintained", "documentation": {"shortDescription": "Determines if the project is \"actively maintained\".", "url": "https://github.com/ossf/scorecard/blob/d1fab88f54636ff366076edfc5c239f97b3c8e66/docs/checks.md#maintained"}, "score": 10, "reason": "30 commit(s) and 17 issue activity found in the last 90 days -- score normalized to 10", "details": []},
+      {"name": "Code-Review", "documentation": {"shortDescription": "Determines if the project requires human code review before pull requests (aka merge requests) are merged.", "url": "https://github.com/ossf/scorecard/blob/d1fab88f54636ff366076edfc5c239f97b3c8e66/docs/checks.md#code-review"}, "score": 0, "reason": "Found 0/30 approved changesets -- score normalized to 0", "details": []}
+    ],
+    "overallScore": 4.6,
+    "metadata": []
   }
 }

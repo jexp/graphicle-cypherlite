@@ -1,7 +1,9 @@
 //! The native deps.dev v3 REST client (supply-chain plan §1), and the purl
 //! decomposition its keys come from (plan §2).
 //!
-//! Endpoints, base [`BASE_URL`], no auth:
+//! Endpoints, base [`BASE_URL`], no auth. The field names are the live v3
+//! keys (checked by anonymous curl, 2026-11-01); a renamed key fails decode
+//! rather than silently defaulting:
 //! - [`Client::package`]: `GET /systems/{system}/packages/{name}`, every version
 //!   with `isDefault` and `isDeprecated`.
 //! - [`Client::version`]: `GET .../versions/{version}`, with `licenses`,
@@ -23,8 +25,8 @@
 //! The transport is injected ([`Transport`]). Production passes
 //! [`ReqwestTransport`]; the tests pass a fake that answers from the golden
 //! fixtures under `tests/fixtures/supply_chain/deps_dev/`, so CI never touches
-//! the network. Those fixtures are recorded-shape: hand-written from the verified
-//! shapes in plan §1, not a live capture.
+//! the network. Those fixtures match the live key structure; their values are
+//! trimmed or synthetic.
 //!
 //! purl decomposition ([`version_key`]), following GUAC's rules: `golang` maps
 //! to `GO`; every other type is upper-cased (`cargo` to `CARGO`, `npm` to
@@ -348,42 +350,49 @@ pub struct Attestation {
 /// `GET .../versions/{version}:requirements`, keyed by ecosystem. Only the
 /// Cargo shape is typed here; the other ecosystems parse to `None`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Requirements {
     #[serde(default)]
     pub cargo: Option<CargoRequirements>,
 }
 
+/// The Cargo manifest: `dependencies` (the `[dependencies]`, `[dev-dependencies]`
+/// and `[build-dependencies]` tables, flattened) and the `[features]` table.
+/// Both lists are required, so a renamed key is a decode error, not an empty list.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CargoRequirements {
-    #[serde(default)]
-    pub requirements: Vec<CargoRequirement>,
+    pub dependencies: Vec<CargoRequirement>,
+    pub features: Vec<CargoFeature>,
 }
 
-/// One manifest constraint: `requirement` is the version req, `kind` is the
-/// dependency section (`NORMAL`, `DEV`, `BUILD`), and `target` is the
-/// platform cfg, empty when there is none.
+/// One manifest dependency. `requirement` is the version req, `kind` the table
+/// (`normal`, `dev`, `build`, lowercase as the API sends it), `target` the
+/// platform cfg (empty when there is none), and `package_alias` the rename
+/// from `package =`, empty when there is none.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CargoRequirement {
     pub name: String,
     pub requirement: String,
-    #[serde(default)]
     pub kind: String,
-    #[serde(default)]
     pub optional: bool,
-    #[serde(default)]
+    pub uses_default_features: bool,
+    pub package_alias: String,
     pub features: Vec<String>,
-    #[serde(default)]
-    pub target: Option<String>,
+    pub target: String,
+}
+
+/// One `[features]` entry: the features it turns on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CargoFeature {
+    pub name: String,
+    pub implies: Vec<String>,
 }
 
 /// `GET .../versions/{version}:dependencies`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyGraph {
-    #[serde(default)]
-    pub resolved_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub nodes: Vec<Node>,
     /// Edges index into `nodes`.
@@ -453,16 +462,35 @@ pub struct ProjectKey {
     pub id: String,
 }
 
-/// The OpenSSF Scorecard for a project: an overall score and one entry per check.
+/// The OpenSSF Scorecard for a project: the scan date, the repository and
+/// Scorecard tool versions it ran against, an overall score and one entry per check.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scorecard {
     #[serde(default)]
     pub date: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub overall: f64,
+    pub repository: Option<ScorecardRepository>,
+    #[serde(default)]
+    pub scorecard: Option<ScorecardTool>,
+    #[serde(default)]
+    pub overall_score: f64,
     #[serde(default)]
     pub checks: Vec<ScorecardCheck>,
+}
+
+/// The repository a Scorecard scan read, at the commit it read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScorecardRepository {
+    pub name: String,
+    pub commit: String,
+}
+
+/// The Scorecard tool that produced the scan.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScorecardTool {
+    pub version: String,
+    pub commit: String,
 }
 
 /// One Scorecard check; `score` is -1 when the check does not apply.
@@ -471,7 +499,18 @@ pub struct ScorecardCheck {
     pub name: String,
     pub score: i64,
     #[serde(default)]
-    pub reason: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub documentation: Option<CheckDocumentation>,
+    #[serde(default)]
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckDocumentation {
+    pub short_description: String,
+    pub url: String,
 }
 
 /// `GET /advisories/{osv-id}`. deps.dev carries no affected or fixed ranges;
@@ -651,16 +690,25 @@ mod tests {
         let requirements = client.requirements(&time_key()).await.unwrap();
         assert_eq!(transport.calls(), 1);
         let cargo = requirements.cargo.unwrap();
-        assert_eq!(cargo.requirements.len(), 3);
+        assert_eq!(cargo.dependencies.len(), 4);
         let windows = cargo
-            .requirements
+            .dependencies
             .iter()
             .find(|r| r.name == "winapi")
             .unwrap();
-        assert_eq!(windows.kind, "NORMAL");
-        assert!(!windows.optional);
-        assert_eq!(windows.target.as_deref(), Some("cfg(windows)"));
-        assert_eq!(windows.features, ["minwindef"]);
+        assert_eq!(windows.kind, "normal");
+        assert!(windows.optional);
+        assert_eq!(windows.target, "cfg(windows)");
+        assert_eq!(windows.features, ["minwinbase", "minwindef", "timezoneapi"]);
+        let dev = cargo
+            .dependencies
+            .iter()
+            .find(|r| r.name == "rand")
+            .unwrap();
+        assert_eq!(dev.kind, "dev");
+        assert!(!dev.uses_default_features);
+        assert_eq!(cargo.features.len(), 3);
+        assert_eq!(cargo.features[2].implies, ["libc", "winapi"]);
     }
 
     #[tokio::test]
@@ -670,11 +718,12 @@ mod tests {
         assert_eq!(transport.calls(), 1);
         assert_eq!(graph.nodes[0].relation, Relation::SelfNode);
         assert_eq!(graph.nodes[1].relation, Relation::Direct);
-        assert_eq!(graph.nodes[2].relation, Relation::Indirect);
+        assert_eq!(graph.nodes[3].relation, Relation::Indirect);
         assert_eq!(graph.edges.len(), 2);
         assert_eq!(graph.edges[0].from_node, 0);
         assert_eq!(graph.edges[0].to_node, 1);
-        assert_eq!(graph.edges[0].requirement, "^0.2");
+        assert_eq!(graph.edges[0].requirement, "^0.4.2");
+        assert_eq!(graph.edges[1].requirement, "^0.2");
         assert!(graph.error.is_empty());
     }
 
@@ -683,15 +732,27 @@ mod tests {
         let (client, transport, _store) = client(golden_routes());
         let project = client.project("github.com/time-rs/time").await.unwrap();
         assert_eq!(transport.calls(), 1);
-        assert_eq!(project.stars_count, 1100);
-        assert_eq!(project.license.as_deref(), Some("MIT OR Apache-2.0"));
+        assert_eq!(project.stars_count, 1347);
+        assert_eq!(project.license.as_deref(), Some("Apache-2.0"));
         let scorecard = project.scorecard.unwrap();
-        assert!(scorecard.overall > 0.0);
+        assert!((scorecard.overall_score - 4.6).abs() < f64::EPSILON);
+        let repository = scorecard.repository.unwrap();
+        assert_eq!(repository.name, "github.com/time-rs/time");
+        let tool = scorecard.scorecard.unwrap();
+        assert_eq!(tool.version, "v5.5.1-0.20260815060127-d1fab88f5463");
+        let maintained = scorecard
+            .checks
+            .iter()
+            .find(|c| c.name == "Maintained")
+            .unwrap();
+        assert_eq!(maintained.score, 10);
         assert!(
-            scorecard
-                .checks
-                .iter()
-                .any(|c| c.name == "Maintained" && c.score == 10)
+            maintained
+                .documentation
+                .as_ref()
+                .unwrap()
+                .url
+                .ends_with("#maintained")
         );
     }
 
