@@ -22,7 +22,10 @@ const REPO: &str = "viz";
 const COUPLING: &str = "coupling-matrix";
 
 /// The families whose nodes have landed: their views are no longer stubs.
-const LANDED: [&str; 3] = ["risk-overlay", "coupling-matrix", "hotspot-city"];
+const LANDED: [&str; 4] = ["risk-overlay", "coupling-matrix", "hotspot-city", "impact-neighborhood"];
+
+/// The impact-neighborhood family's slug.
+const IMPACT: &str = "impact-neighborhood";
 
 /// A graph store with one repository and the least history facts a family
 /// reads: one commit, its one modification, one file (the history writer's
@@ -510,10 +513,15 @@ fn viz_view_answers_on_the_tool_surface_read_only() {
         .unwrap();
     assert_eq!(text["structuredContent"]["format"], "text");
     assert_eq!(text["content"][0]["text"], format!("{NOT_YET}:\n  none"));
-    let mermaid = project
+    // Every mermaid-declared family has landed; the tool surface answers
+    // the focus contract for them (their own tests cover the diagram).
+    let needs_focus = project
         .call(json!({"family":"impact-neighborhood","format":"mermaid"}))
-        .unwrap();
-    assert_eq!(mermaid["content"][0]["text"], format!("%% {NOT_YET}\n"));
+        .unwrap_err();
+    assert_eq!(
+        needs_focus,
+        "The impact-neighborhood family needs a focus: a symbol's stable_id or qualified name, or a file path"
+    );
     // Mermaid for a family that does not serve it: the named refusal.
     let refused = project
         .call(json!({"family":"hotspot-city","format":"mermaid"}))
@@ -651,6 +659,23 @@ fn co_change(graph: &GraphStore, a: &str, b: &str, window: &str, count: i64) {
                  MERGE (x)-[r:CO_CHANGED {window: $window}]->(y) SET r.count = $count",
                 store_graph::params(&json!({"repo": REPO, "a": a, "b": b,
                     "window": window, "count": count})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// One symbol of a code-graph fixture: its stable id `id-<name>`, its
+/// qualified name, its file.
+fn symbol(graph: &GraphStore, repository: &str, name: &str, path: &str) {
+    graph
+        .transaction(|db| {
+            crate::store_graph::write(
+                db,
+                "MERGE (s:Symbol {repository_id: $repo, stable_id: $id}) \
+                 SET s.qualified_name = $name, s.relpath = $path, s.kind = 'function'",
+                crate::store_graph::params(&json!({"repo": repository,
+                    "id": format!("id-{name}"), "name": name, "path": path})),
             )?;
             Ok(())
         })
@@ -1056,6 +1081,38 @@ fn relation(
         .unwrap();
 }
 
+/// One live edge `from -> to` of `relation` (the projection's live-edge keys:
+/// written from episode e1, not yet closed), its call site `path:line`.
+fn edge(
+    graph: &GraphStore,
+    repository: &str,
+    relation: &str,
+    from: &str,
+    to: &str,
+    path: &str,
+    line: usize,
+) {
+    let cypher = format!(
+        "MATCH (a:Symbol {{repository_id: $repo, stable_id: $from}}) \
+         MATCH (b:Symbol {{repository_id: $repo, stable_id: $to}}) \
+         MERGE (a)-[r:{relation} {{relpath: $path, source_location: $loc}}]->(b) \
+         SET r.valid_from_episode = 'e1', r.relation = $relation"
+    );
+    graph
+        .transaction(|db| {
+            crate::store_graph::write(
+                db,
+                &cypher,
+                crate::store_graph::params(&json!({"repo": repository,
+                    "from": format!("id-{from}"), "to": format!("id-{to}"),
+                    "path": path, "loc": format!("L{line}"),
+                    "relation": relation.to_lowercase()})),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// The matrix's rendered view under `params`, in its json view-model.
 fn coupling_model(graph: &GraphStore, params: &Params) -> Value {
     render(graph, REPO, COUPLING, params, Format::Json).unwrap()["view"].clone()
@@ -1285,6 +1342,81 @@ fn the_same_inputs_render_byte_identical_output_for_the_matrix() {
                 serde_json::to_string(&render(&graph, REPO, COUPLING, &params, format).unwrap())
                     .unwrap();
             assert_eq!(first, again, "{format:?}");
+        }
+    }
+}
+
+/// A chain of `length` symbols `m0 -> m1 -> ... -> m{length-1}`, one file
+/// each (`src/m{i}.rs`), the call from `m{i}` on its line `i + 10`. From
+/// `m0`, hop `k` is `m{k}`.
+fn chain(length: usize) -> GraphStore {
+    let graph = GraphStore::open_in_memory().unwrap();
+    for i in 0..length {
+        symbol(&graph, REPO, &format!("m{i}"), &format!("src/m{i}.rs"));
+    }
+    for i in 0..length - 1 {
+        edge(
+            &graph,
+            REPO,
+            "CALLS",
+            &format!("m{i}"),
+            &format!("m{}", i + 1),
+            &format!("src/m{i}.rs"),
+            i + 10,
+        );
+    }
+    graph
+}
+
+/// The impact-neighborhood parameters of `focus` at `depth`.
+fn focus_params(focus: &str, depth: usize) -> Params {
+    Params::parse(&json!({"focus": focus, "depth": depth})).unwrap()
+}
+
+/// The node ids of a view-model's `nodes`.
+fn node_ids(model: &Value) -> BTreeSet<String> {
+    model["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The expected ids `id-m0 .. id-m{count-1}`.
+fn chain_ids(count: usize) -> BTreeSet<String> {
+    (0..count).map(|i| format!("id-m{i}")).collect()
+}
+
+/// Asserts `mermaid` is a flowchart this family writes: the header, quoted
+/// node lines and quoted edge lines between declared nodes, no raw quote or
+/// angle bracket inside a label.
+fn assert_flowchart(mermaid: &str) {
+    let mut lines = mermaid.lines();
+    assert_eq!(lines.next(), Some("flowchart LR"), "{mermaid}");
+    let mut declared = BTreeSet::new();
+    for line in lines {
+        let rest = line
+            .strip_prefix("  n")
+            .unwrap_or_else(|| panic!("not a flowchart line: {line}"));
+        if let Some((index, label)) = rest.split_once("[\"") {
+            let inner = label
+                .strip_suffix("\"]")
+                .unwrap_or_else(|| panic!("unclosed node label: {line}"));
+            let inner = inner.replace("<br/>", "");
+            assert!(!inner.contains(['"', '<', '>']), "unescaped label: {line}");
+            assert!(index.chars().all(|c| c.is_ascii_digit()), "{line}");
+            declared.insert(index.to_owned());
+        } else {
+            let (from, rest) = rest
+                .split_once(" -->|\"")
+                .unwrap_or_else(|| panic!("not a node or edge line: {line}"));
+            let (label, to) = rest
+                .split_once("\"| n")
+                .unwrap_or_else(|| panic!("unclosed edge label: {line}"));
+            assert!(!label.contains(['"', '<', '>']), "unescaped label: {line}");
+            assert!(declared.contains(from), "undeclared source: {line}");
+            assert!(declared.contains(to), "undeclared target: {line}");
         }
     }
 }
@@ -1609,4 +1741,240 @@ fn an_overlay_the_family_does_not_interpret_is_answered_honestly() {
     )
     .unwrap();
     assert_eq!(plain["view"]["overlay"], json!({"asked": "none"}));
+}
+
+#[test]
+fn the_focus_is_required_and_the_depth_cap_is_refused_past_three() {
+    let graph = chain(3);
+    let error = render(&graph, REPO, IMPACT, &Params::default(), Format::Json).unwrap_err();
+    assert!(error.message.contains("needs a focus"), "{}", error.message);
+    // The contract's own bound: a fourth hop is never asked for.
+    assert!(Params::parse(&json!({"focus": "id-m0", "depth": 4})).is_err());
+}
+
+#[test]
+fn the_depth_cap_is_enforced_and_the_fourth_hop_is_absent() {
+    // A six-symbol chain, longer than any depth the contract allows.
+    let graph = chain(6);
+    for (depth, count) in [(1, 2), (2, 3), (3, 4)] {
+        let answer = render(
+            &graph,
+            REPO,
+            IMPACT,
+            &focus_params("id-m0", depth),
+            Format::Json,
+        )
+        .unwrap();
+        assert_eq!(node_ids(&answer["view"]), chain_ids(count), "depth {depth}");
+        assert_eq!(answer["view"]["depth"], depth);
+    }
+    // The focus's fourth-hop neighbor, m4, is absent at depth 3; m3 is the
+    // third hop and present.
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-m0", 3),
+        Format::Json,
+    )
+    .unwrap();
+    assert!(!node_ids(&answer["view"]).contains("id-m4"));
+    assert!(node_ids(&answer["view"]).contains("id-m3"));
+    let depths: Vec<_> = answer["view"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| (node["id"].clone(), node["depth"].clone()))
+        .collect();
+    assert!(depths.contains(&(json!("id-m3"), json!(3))), "{depths:?}");
+}
+
+#[test]
+fn edges_are_labelled_by_direction_and_keep_their_orientation() {
+    let graph = chain(4);
+    // The focus m2 at depth 1: m1 calls m2 (reached in), m2 calls m3 (out).
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-m2", 1),
+        Format::Json,
+    )
+    .unwrap();
+    let edges = answer["view"]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    let found = |from: &str, to: &str| {
+        edges
+            .iter()
+            .find(|edge| edge["from"] == from && edge["to"] == to)
+            .unwrap_or_else(|| panic!("no edge {from} -> {to}: {edges:?}"))
+            .clone()
+    };
+    let caller = found("id-m1", "id-m2");
+    assert_eq!(caller["direction"], "in");
+    assert_eq!(caller["relation"], "CALLS");
+    assert_eq!(caller["evidence"], "src/m1.rs:11");
+    let callee = found("id-m2", "id-m3");
+    assert_eq!(callee["direction"], "out");
+    assert_eq!(callee["evidence"], "src/m2.rs:12");
+    assert_eq!(answer["view"]["direction"], "both");
+}
+
+#[test]
+fn imports_are_walked_beside_calls() {
+    let graph = GraphStore::open_in_memory().unwrap();
+    symbol(&graph, REPO, "lib", "src/lib.rs");
+    symbol(&graph, REPO, "util", "src/util.rs");
+    edge(&graph, REPO, "IMPORTS_FROM", "lib", "util", "src/lib.rs", 3);
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("src/lib.rs", 1),
+        Format::Json,
+    )
+    .unwrap();
+    assert_eq!(
+        node_ids(&answer["view"]),
+        ["id-lib", "id-util"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(answer["view"]["edges"][0]["relation"], "IMPORTS_FROM");
+}
+
+#[test]
+fn an_unknown_focus_answers_an_empty_neighborhood() {
+    let graph = chain(3);
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("nowhere", 2),
+        Format::Json,
+    )
+    .unwrap();
+    assert_eq!(answer["view"]["found"], false);
+    assert!(node_ids(&answer["view"]).is_empty());
+    assert_eq!(answer["view"]["truncated"], false);
+    let mermaid = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("nowhere", 2),
+        Format::Mermaid,
+    )
+    .unwrap();
+    assert_eq!(mermaid["mermaid"], "");
+}
+
+#[test]
+fn the_walk_stays_inside_its_repository() {
+    let graph = chain(3);
+    // The same stable id in another repository, with a call to a symbol of
+    // its own: the focus's neighborhood never reaches it.
+    symbol(&graph, "other", "m0", "other/m0.rs");
+    symbol(&graph, "other", "x", "other/x.rs");
+    edge(&graph, "other", "CALLS", "m0", "x", "other/m0.rs", 1);
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-m0", 3),
+        Format::Json,
+    )
+    .unwrap();
+    assert_eq!(node_ids(&answer["view"]), chain_ids(3));
+}
+
+#[test]
+fn the_cap_cuts_both_sections_and_says_so() {
+    let graph = chain(6);
+    let params = Params::parse(&json!({"focus": "id-m0", "depth": 3, "cap": 2})).unwrap();
+    let packet = render(&graph, REPO, IMPACT, &params, Format::Json).unwrap();
+    assert_eq!(packet["view"]["nodes"].as_array().unwrap().len(), 2);
+    // Nearer rows first: the focus, then its first hop; the one edge
+    // between them is the only one whose both ends are kept.
+    assert_eq!(node_ids(&packet["view"]), chain_ids(2));
+    assert_eq!(packet["view"]["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(packet["view"]["truncated"], true);
+}
+
+#[test]
+fn the_mermaid_output_is_a_flowchart_with_quoted_labels() {
+    let graph = chain(4);
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-m1", 2),
+        Format::Mermaid,
+    )
+    .unwrap();
+    let mermaid = answer["mermaid"].as_str().unwrap();
+    assert_flowchart(mermaid);
+    // The focus is the first node; its neighbors follow by depth.
+    assert!(
+        mermaid.contains("  n0[\"m1<br/>src/m1.rs (depth 0)\"]"),
+        "{mermaid}"
+    );
+    assert!(mermaid.contains("-->|\"CALLS src/m1.rs:11\"|"), "{mermaid}");
+}
+
+#[test]
+fn special_characters_in_paths_are_escaped_in_mermaid() {
+    let graph = GraphStore::open_in_memory().unwrap();
+    let path = "src/we#ird \"<name>\".rs";
+    symbol(&graph, REPO, "a", path);
+    symbol(&graph, REPO, "b", "src/b.rs");
+    edge(&graph, REPO, "CALLS", "a", "b", path, 7);
+    let answer = render(
+        &graph,
+        REPO,
+        IMPACT,
+        &focus_params("id-a", 1),
+        Format::Mermaid,
+    )
+    .unwrap();
+    let mermaid = answer["mermaid"].as_str().unwrap();
+    assert_flowchart(mermaid);
+    assert!(
+        mermaid.contains("-->|\"CALLS src/we#35;ird #quot;#lt;name#gt;#quot;.rs:7\"| n1"),
+        "{mermaid}"
+    );
+}
+
+#[test]
+fn the_same_inputs_render_byte_identical_output_and_every_row_is_cited() {
+    let params = focus_params("id-m2", 3);
+    let graph = chain(6);
+    for format in [Format::Text, Format::Json, Format::Mermaid] {
+        let first =
+            serde_json::to_string(&render(&graph, REPO, IMPACT, &params, format).unwrap()).unwrap();
+        let again =
+            serde_json::to_string(&render(&graph, REPO, IMPACT, &params, format).unwrap()).unwrap();
+        // A second store seeded the same way: the same bytes.
+        let other =
+            serde_json::to_string(&render(&chain(6), REPO, IMPACT, &params, format).unwrap())
+                .unwrap();
+        assert_eq!(first, again, "{format:?}");
+        assert_eq!(first, other, "{format:?}");
+    }
+    let answer = render(&graph, REPO, IMPACT, &params, Format::Json).unwrap();
+    for row in answer["view"]["nodes"].as_array().unwrap() {
+        assert!(
+            row["evidence"].as_str().unwrap().starts_with("src/m"),
+            "{row}"
+        );
+    }
+    for row in answer["view"]["edges"].as_array().unwrap() {
+        let evidence = row["evidence"].as_str().unwrap();
+        assert!(
+            evidence.starts_with("src/m") && evidence.contains(':'),
+            "{row}"
+        );
+    }
+    let text = render(&graph, REPO, IMPACT, &params, Format::Text).unwrap();
+    assert!(text["text"].as_str().unwrap().contains("src/m1.rs:11"));
 }
