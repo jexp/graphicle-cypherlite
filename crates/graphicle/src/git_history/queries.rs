@@ -461,8 +461,10 @@ fn parse_date(text: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(text).ok()
 }
 
-/// One report line: the evidence, then the row's other fields by name.
-fn line(row: &Value) -> String {
+/// One report line: the evidence, then the row's other fields by name. The
+/// viz pack prints its rows through the same line, so both packs report
+/// identically.
+pub(crate) fn line(row: &Value) -> String {
     let fields: Vec<String> = row
         .as_object()
         .into_iter()

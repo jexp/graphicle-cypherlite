@@ -1193,6 +1193,7 @@ pub const CORE_OPERATIONS: &[&str] = &[
     "graph.deps_of",
     "graph.license_of",
     "graph.vuln_impact",
+    "graph.viz_view",
     "history",
     "impact.report",
     "interpretation.prepare",
@@ -1386,6 +1387,10 @@ pub(crate) fn dispatch(
         "graph.license_of" => {
             crate::supply_chain::tools::license_of(store, workspace, capability, args)
         }
+        // The software-visualization pack's one tool (plan §2): any of the
+        // seven viz families, in any of its formats, through the shared
+        // parameter contract.
+        "graph.viz_view" => crate::viz::viz_view(store, workspace, capability, args),
         "retention.preview" => store.retention_preview(workspace, capability, args),
         // Captured agent sessions (connector documents): browse and forget.
         "session.timeline" => store.session_timeline(workspace, capability, args),
@@ -1867,6 +1872,30 @@ pub fn core_mcp_tools(learning: bool, work_state: bool) -> Vec<McpTool> {
             false,
         ),
         crate::supply_chain::tools::LICENSE_OF,
+        true,
+    ));
+    // The software-visualization pack's one tool (plan §2): one family of
+    // the seven, in the format asked, through the shared parameter
+    // contract; the resources serve each family's default text report.
+    let families: Vec<&str> = crate::viz::FAMILIES.iter().map(|f| f.slug).collect();
+    tools.push(McpTool::new(
+        tool(
+            "viz_view",
+            "Read one named software-visualization view of the project — a hotspot city over folder churn, a coupling matrix, a knowledge map, an impact neighborhood, architecture conformance, a supply-chain risk overlay or a drift timeline — as a JSON view-model (the default), a cited text report or, for the graph-shaped families, a mermaid diagram. Every row cites path:line evidence, and the same inputs always render byte-identical output. The graphicle-graph://viz/<family> resources serve each family's default text report.",
+            json!({"family":{"type":"string","enum":families,"description":"the view family to read"},
+                "format":{"type":"string","enum":["text","json","mermaid"],"default":"json","description":"json serves the view-model, text the cited report, mermaid the diagram (only the graph-shaped families)"},
+                "params":{"type":"object","additionalProperties":false,"description":"the shared parameter contract, every field optional","properties":{
+                    "focus":{"type":"string","description":"a symbol's stable_id or qualified name, or a file path: what the focus families center on"},
+                    "window":{"type":"string","enum":crate::viz::WINDOWS,"default":"all","description":"the stored co-change window the churn-colored views read"},
+                    "cap":{"type":"integer","minimum":1,"maximum":crate::viz::MAX_CAP,"default":crate::viz::TOP,"description":"rows one section reports"},
+                    "overlay":{"type":"string","enum":crate::viz::OVERLAYS,"default":"none","description":"the overlay column a map family adds"},
+                    "depth":{"type":"integer","minimum":1,"maximum":crate::viz::MAX_DEPTH,"default":crate::viz::DEFAULT_DEPTH,"description":"the focus families' neighborhood bound"},
+                    "bucket":{"type":"string","enum":crate::viz::BUCKETS,"default":"month","description":"the timeline families' time bucket"}}},
+                "repo":{"type":"string","description":REPO_DESCRIPTION}}),
+            &["family"],
+            false,
+        ),
+        crate::viz::OPERATION,
         true,
     ));
     tools
@@ -2723,6 +2752,7 @@ fn mcp_in(
                 {
                     Some(lean) => lean,
                     None if name == "pack" => crate::code_pack::mcp_reply(packet),
+                    None if name == "viz_view" => crate::viz::mcp_reply(packet),
                     None => tool_reply(graph_tool, packet),
                 };
                 if let Err(error) = admission.serve(&app.worker.store, served_text(&reply), shares)
